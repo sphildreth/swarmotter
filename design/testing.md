@@ -26,6 +26,10 @@ feature completion and acceptance criteria, not by time estimates.
 - Bandwidth limit logic.
 - Config validation.
 - Network containment validation logic.
+- Per-torrent health calculation: complete / network-blocked / paused /
+  missing pieces with zero sources / good active swarm / many connected but
+  useless peers / slow-but-completable / private torrent (no DHT/PEX
+  penalty) / bar+label mapping.
 
 ### Integration tests
 
@@ -42,6 +46,9 @@ feature completion and acceptance criteria, not by time estimates.
 - Queue behavior.
 - Settings behavior.
 - WebSocket/SSE event delivery.
+- Per-torrent health serialization: `TorrentSummary` and the torrent detail
+  endpoint both include a `health` object with score, bars, label, and
+  per-component sub-scores.
 
 ### Network containment tests
 
@@ -83,6 +90,9 @@ feature completion and acceptance criteria, not by time estimates.
   download over uTP, verifying piece hashes and final file contents; a
   fail-closed test proves the `BlockedBinder` blocks uTP swarm downloads)
 - Recheck after completion: covered via `StorageIo::recheck`
+- Per-torrent health during active download: an actively-downloading
+  generated lawful local payload reports a non-zero health score and at
+  least one bar, computed from the live engine state.
 
 ## Test data
 

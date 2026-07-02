@@ -22,8 +22,9 @@ use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
 use swarmotter_core::magnet::Magnet;
 use swarmotter_core::meta;
+use swarmotter_core::models::health::{HealthCalculator, HealthInput};
 use swarmotter_core::models::network::{NetworkContainmentMode, NetworkHealth};
-use swarmotter_core::models::peer::Peer;
+use swarmotter_core::models::peer::{EnginePeerHealth, Peer};
 use swarmotter_core::models::stats::{GlobalStats, TorrentDiagnostics};
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{TrackerId, TrackerInfo, TrackerKind, TrackerStatus};
@@ -71,6 +72,10 @@ struct RateSample {
     last_download_at: Option<Instant>,
     last_upload_at: Option<Instant>,
     at: Instant,
+    /// Highest smoothed download rate observed for this torrent; used by the
+    /// health calculator as a normalization reference when no bandwidth cap
+    /// is set.
+    peak_rate_down: u64,
 }
 
 impl DaemonRuntime {
@@ -561,9 +566,11 @@ impl DaemonRuntime {
         let now = Instant::now();
         let mut samples = self.rate_samples.lock().await;
         let mut reg = self.registry.lock().await;
+        let calc = HealthCalculator::new();
         for (hash, state) in &states {
             let s = state.lock().await;
             if let Some(t) = reg.get_mut(hash) {
+                let mut peak = samples.get(hash).map(|p| p.peak_rate_down).unwrap_or(0);
                 if let Some(prev) = samples.get(hash).copied() {
                     let elapsed = now.duration_since(prev.at);
                     if elapsed >= Duration::from_millis(250) {
@@ -584,6 +591,7 @@ impl DaemonRuntime {
                         };
                         t.rate_down = smooth_rate(prev.rate_down, inst_down, last_download_at, now);
                         t.rate_up = smooth_rate(prev.rate_up, inst_up, last_upload_at, now);
+                        peak = peak.max(t.rate_down);
                         samples.insert(
                             *hash,
                             RateSample {
@@ -594,6 +602,7 @@ impl DaemonRuntime {
                                 last_download_at,
                                 last_upload_at,
                                 at: now,
+                                peak_rate_down: peak,
                             },
                         );
                     }
@@ -608,12 +617,15 @@ impl DaemonRuntime {
                             last_download_at: None,
                             last_upload_at: None,
                             at: now,
+                            peak_rate_down: 0,
                         },
                     );
                 }
                 t.progress.have = (0..s.piece_count).map(|i| s.pieces_have.has(i)).collect();
                 t.downloaded = s.downloaded;
                 t.uploaded = s.uploaded;
+                t.active_peer_workers = s.active_peers;
+                t.known_peers = s.peers.len();
                 if !t.state.is_error() && t.state != TorrentState::Paused {
                     if s.finished {
                         t.state = TorrentState::Completed;
@@ -621,6 +633,34 @@ impl DaemonRuntime {
                         t.state = TorrentState::Downloading;
                     }
                 }
+
+                // Compute per-torrent health from real engine state. Health
+                // is exposed on every summary, so the Web UI can render a
+                // signal-bars indicator without an extra round-trip.
+                let health_input = build_health_input(
+                    t,
+                    s.piece_count,
+                    &s.pieces_have,
+                    &s.peer_health,
+                    &s.tracker_ok,
+                    s.dht_discovery_ok,
+                    s.pex_discovery_ok,
+                    s.tracker_failures_recent,
+                    s.peer_disconnects_recent,
+                    s.hash_failures,
+                    s.timeout_failures,
+                    s.last_valid_block,
+                    s.block_last_seen,
+                    s.dht_last_seen,
+                    s.pex_last_seen,
+                    s.tracker_last_ok,
+                    s.peers.len(),
+                    s.tracker_message.as_deref(),
+                    peak,
+                    self.config.lock().await.bandwidth.effective_download(),
+                    self.network_health.lock().await.clone(),
+                );
+                t.health = calc.compute(&health_input);
             }
         }
     }
@@ -1329,6 +1369,124 @@ fn smooth_rate(
     }
 }
 
+/// Assemble a `HealthInput` from the live engine state and the torrent
+/// record. Pulls out every signal the health calculator needs (piece
+/// availability, per-peer usefulness, throughput, recent stability,
+/// tracker/DHT/PEX freshness, and the network containment health) so that
+/// the same scoring function is exercised in tests and in the daemon.
+#[allow(clippy::too_many_arguments)]
+fn build_health_input(
+    t: &Torrent,
+    piece_count: usize,
+    pieces_have: &swarmotter_core::storage::resume::PieceBitfield,
+    peer_health: &std::collections::HashMap<std::net::SocketAddr, EnginePeerHealth>,
+    tracker_ok: &bool,
+    dht_discovery_ok: bool,
+    pex_discovery_ok: bool,
+    tracker_failures_recent: u32,
+    peer_disconnects_recent: u32,
+    hash_failures: u32,
+    timeout_failures: u32,
+    last_valid_block: Option<std::time::Instant>,
+    block_last_seen: Option<std::time::Instant>,
+    dht_last_seen: Option<std::time::Instant>,
+    pex_last_seen: Option<std::time::Instant>,
+    tracker_last_ok: Option<std::time::Instant>,
+    known_peers: usize,
+    _tracker_message: Option<&str>,
+    rate_down_observed_peak: u64,
+    global_download_limit: u64,
+    network: NetworkHealth,
+) -> HealthInput {
+    use std::time::Duration;
+    let now = std::time::Instant::now();
+    // A "recent" signal is anything seen in the last ~90 seconds.
+    let recent_window = Duration::from_secs(90);
+    let peer_block_recent = peer_health.values().any(|p| {
+        p.last_valid_block
+            .map(|t| now.duration_since(t) < recent_window)
+            .unwrap_or(false)
+    });
+    let received_block_recently = last_valid_block
+        .map(|t| now.duration_since(t) < recent_window)
+        .unwrap_or(false)
+        || block_last_seen
+            .map(|t| now.duration_since(t) < recent_window)
+            .unwrap_or(false)
+        || peer_block_recent
+        || t.rate_down > 0;
+    let time_since_last_block = last_valid_block
+        .or(block_last_seen)
+        .map(|t| now.duration_since(t));
+    let tracker_recent_ok = *tracker_ok
+        || tracker_last_ok
+            .map(|t| now.duration_since(t) < recent_window)
+            .unwrap_or(false);
+    let dht_recent_ok = dht_discovery_ok
+        || dht_last_seen
+            .map(|t| now.duration_since(t) < recent_window)
+            .unwrap_or(false);
+    let pex_recent_ok = pex_discovery_ok
+        || pex_last_seen
+            .map(|t| now.duration_since(t) < recent_window)
+            .unwrap_or(false);
+    // The engine does not (yet) populate `EnginePeerHealth` automatically for
+    // every candidate peer, so derive a coarse per-peer health from what the
+    // engine has recorded: peers that have sent a valid block recently are
+    // considered useful and unchoked, and peers that have only been seen but
+    // not heard from are treated as having no missing pieces.
+    let mut peers: Vec<EnginePeerHealth> = Vec::new();
+    for (_addr, p) in peer_health.iter() {
+        let last_valid = p.last_valid_block;
+        let last_seen = p.last_seen;
+        let useful_recently = p.useful_recently
+            || last_valid
+                .map(|t| now.duration_since(t) < recent_window)
+                .unwrap_or(false);
+        let unchoked = p.unchoked || useful_recently;
+        let last_seen_recent = last_seen
+            .map(|t| now.duration_since(t) < recent_window)
+            .unwrap_or(false);
+        let has_missing = p.has_missing_pieces || (useful_recently && last_seen_recent);
+        peers.push(EnginePeerHealth {
+            piece_bitfield: p.piece_bitfield.clone(),
+            has_missing_pieces: has_missing,
+            unchoked,
+            blocked: p.blocked,
+            last_valid_block: last_valid,
+            useful_recently,
+            discovered_from_pex: p.discovered_from_pex,
+            last_seen,
+        });
+    }
+    let no_peers_discovered = known_peers == 0 && peers.is_empty() && t.rate_down == 0;
+    HealthInput {
+        state: t.state,
+        private: t.meta.is_private(),
+        piece_count,
+        pieces_have: pieces_have.clone(),
+        peers,
+        rate_down: t.rate_down,
+        rate_down_observed_peak,
+        download_limit: t.download_limit,
+        upload_limit: t.upload_limit,
+        global_download_limit,
+        network: Some(network),
+        tracker_ok: *tracker_ok,
+        tracker_recent_ok,
+        tracker_failures_recent,
+        dht_recent_ok,
+        pex_recent_ok,
+        peer_disconnects_recent,
+        hash_failures,
+        timeout_failures,
+        received_block_recently,
+        time_since_last_block,
+        known_peers,
+        no_peers_discovered,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1381,6 +1539,7 @@ mod tests {
                 last_download_at: None,
                 last_upload_at: None,
                 at: Instant::now() - Duration::from_secs(2),
+                peak_rate_down: 0,
             },
         );
 
@@ -1450,5 +1609,71 @@ mod tests {
         assert!(stats.tracker_ok);
         assert_eq!(stats.tracker_message.as_deref(), Some("ok"));
         assert_eq!(stats.last_announce, Some(123));
+
+        let summary = runtime.get_torrent(&hash).await.unwrap();
+        assert_eq!(summary.active_peer_workers, 4);
+        assert_eq!(summary.known_peers, 2);
+    }
+
+    #[test]
+    fn health_input_uses_recent_peer_block_activity() {
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "health.bin",
+            b"0123456789abcdef",
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let mut torrent = Torrent::new(meta.clone(), 1);
+        torrent.state = TorrentState::Downloading;
+
+        let mut peer_health = HashMap::new();
+        peer_health.insert(
+            "127.0.0.1:6881".parse().unwrap(),
+            EnginePeerHealth {
+                has_missing_pieces: true,
+                unchoked: true,
+                useful_recently: true,
+                last_valid_block: Some(Instant::now()),
+                last_seen: Some(Instant::now()),
+                ..Default::default()
+            },
+        );
+
+        let input = build_health_input(
+            &torrent,
+            meta.piece_count(),
+            &swarmotter_core::storage::resume::PieceBitfield::new(meta.piece_count()),
+            &peer_health,
+            &true,
+            false,
+            false,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            None,
+            None,
+            Some(Instant::now()),
+            1,
+            None,
+            0,
+            0,
+            NetworkHealth::blocked(
+                NetworkContainmentMode::Disabled,
+                swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+                "disabled",
+            ),
+        );
+
+        assert!(input.received_block_recently);
+        let health = HealthCalculator::new().compute(&input);
+        assert!(
+            health.score > 25,
+            "recent peer blocks should avoid the stalled health cap"
+        );
     }
 }

@@ -112,6 +112,67 @@ pub struct TorrentFile {
     pub wanted: bool,
 }
 
+/// Per-torrent health signal exposed in summaries.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct TorrentHealth {
+    pub score: u8,
+    pub bars: u8,
+    pub label: HealthLabel,
+    pub availability_score: u8,
+    pub throughput_score: u8,
+    pub peer_score: u8,
+    pub stability_score: u8,
+    pub discovery_score: u8,
+    pub reasons: Vec<String>,
+}
+
+impl TorrentHealth {
+    pub fn complete() -> Self {
+        Self {
+            score: 100,
+            bars: 5,
+            label: HealthLabel::Complete,
+            availability_score: 100,
+            throughput_score: 100,
+            peer_score: 100,
+            stability_score: 100,
+            discovery_score: 100,
+            reasons: vec!["torrent is complete".to_string()],
+        }
+    }
+
+    pub fn unknown() -> Self {
+        Self {
+            score: 0,
+            bars: 0,
+            label: HealthLabel::Unknown,
+            availability_score: 0,
+            throughput_score: 0,
+            peer_score: 0,
+            stability_score: 0,
+            discovery_score: 0,
+            reasons: vec!["health not yet measured".to_string()],
+        }
+    }
+}
+
+/// Human-readable health label used by the UI and API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthLabel {
+    Unknown,
+    NetworkBlocked,
+    Stalled,
+    Critical,
+    Poor,
+    Fair,
+    Good,
+    Excellent,
+    Paused,
+    Complete,
+}
+
 /// Summary of a torrent exposed in the torrent list and details.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentSummary {
@@ -134,10 +195,15 @@ pub struct TorrentSummary {
     pub upload_limit: u64,
     pub rate_down: u64,
     pub rate_up: u64,
+    /// Number of peer workers currently active for this torrent.
+    pub active_peer_workers: usize,
+    /// Number of currently known peer candidates for this torrent.
+    pub known_peers: usize,
     pub ratio: f64,
     pub queue_position: Option<usize>,
     pub date_added: u64,
     pub date_completed: Option<u64>,
+    pub health: TorrentHealth,
 }
 
 impl TorrentSummary {

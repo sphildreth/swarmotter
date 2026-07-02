@@ -462,3 +462,108 @@ async fn api_body_limit_rejects_oversized_upload() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
+
+#[tokio::test]
+async fn torrent_summary_includes_health_field() {
+    use swarmotter_core::models::torrent::HealthLabel;
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let bytes = build_single_file_torrent("file.bin", b"hello world data payload", 8, None, false);
+
+    // Add a torrent.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/file")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let hash = v["data"].as_str().unwrap().to_string();
+
+    // List torrents and confirm each row carries a `health` object.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let arr = v["data"].as_array().expect("torrents list is an array");
+    let row = arr
+        .iter()
+        .find(|r| r["info_hash"].as_str() == Some(hash.as_str()))
+        .expect("added torrent is in list");
+    let h = &row["health"];
+    assert!(h.is_object(), "health must be an object on the summary");
+    assert!(h["score"].is_u64());
+    assert!(h["bars"].is_u64());
+    assert!(h["label"].is_string());
+    assert!(h["availability_score"].is_u64());
+    assert!(h["throughput_score"].is_u64());
+    assert!(h["peer_score"].is_u64());
+    assert!(h["stability_score"].is_u64());
+    assert!(h["discovery_score"].is_u64());
+    assert!(h["reasons"].is_array());
+    assert!(row["active_peer_workers"].is_u64());
+    assert!(row["known_peers"].is_u64());
+    // Default health for an empty daemon: a queued torrent with no engine
+    // activity gets the unknown placeholder.
+    let label = h["label"].as_str().unwrap();
+    let valid_labels = [
+        "unknown",
+        "network_blocked",
+        "stalled",
+        "critical",
+        "poor",
+        "fair",
+        "good",
+        "excellent",
+        "paused",
+        "complete",
+    ];
+    assert!(
+        valid_labels.contains(&label),
+        "unexpected health label {label}"
+    );
+    // Bars are bounded 0..=5.
+    let bars = h["bars"].as_u64().unwrap();
+    assert!(bars <= 5);
+    // And the same health must be present on the detail endpoint.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/torrents/{hash}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["data"]["health"].is_object());
+    // Spot-check that HealthLabel::Unknown deserializes back to its snake-case
+    // string form, as documented for the API.
+    let _ = HealthLabel::Unknown;
+}

@@ -155,3 +155,85 @@ Required event types (per `design/PRD.md`): `torrent_added`,
 - Both support per-torrent filtering via `?info_hash=<40-hex>`.
 
 Clients may subscribe to all torrents or filter to a specific torrent.
+
+## Per-torrent health
+
+Every torrent list row and detail response includes a `health` object that
+answers the question "can this torrent complete, and is it downloading well
+right now?" Health is computed from real engine state — piece availability,
+peer usefulness, throughput, recent stability, and discovery — and is not a
+proxy for seed count or completion percentage.
+
+Torrent summaries also include `active_peer_workers` and `known_peers` so UI
+and API clients can show current peer activity without making a separate
+diagnostics request for every row.
+
+```json
+{
+  "health": {
+    "score": 82,
+    "bars": 4,
+    "label": "good",
+    "availability_score": 91,
+    "throughput_score": 76,
+    "peer_score": 80,
+    "stability_score": 88,
+    "discovery_score": 70,
+    "reasons": [
+      "all missing pieces are available",
+      "6 useful peers are active"
+    ]
+  }
+}
+```
+
+Fields:
+
+- `score` (`0..100`): weighted health score. `0` = stalled / blocked /
+  paused (inactive), `100` = complete.
+- `bars` (`0..5`): UI mapping for signal-bars rendering.
+- `label`: one of `unknown`, `network_blocked`, `stalled`, `critical`,
+  `poor`, `fair`, `good`, `excellent`, `paused`, `complete`.
+- `availability_score` / `throughput_score` / `peer_score` /
+  `stability_score` / `discovery_score` (`0..100` each): the five
+  component sub-scores that combine into the overall score.
+- `reasons`: short human-readable strings explaining the score. Surfaced in
+  the Web UI as a tooltip and a list under the bars.
+
+Score formula:
+
+```text
+health_score =
+    availability_score * 0.40
+  + throughput_score   * 0.25
+  + peer_score         * 0.15
+  + stability_score    * 0.10
+  + discovery_score    * 0.10
+```
+
+Bar/label mapping:
+
+| Score  | Bars | Label             |
+| ---    | ---  | ---               |
+| 0      | 0    | `stalled`         |
+| 1..34  | 1    | `critical`        |
+| 35..54 | 2    | `poor`            |
+| 55..74 | 3    | `fair`            |
+| 75..89 | 4    | `good`            |
+| 90..100| 5    | `excellent`       |
+
+Hard caps override the weighted score: network containment blocking
+(`network_blocked`), paused (`paused`), or complete (`complete`) always
+short-circuit to their own label and score. Incomplete torrents with missing
+pieces that have zero known sources cap at 35; incomplete torrents with no
+useful peer cap at 30; incomplete torrents with no recently received valid
+block cap at 25; torrents with no discovery and no connected peers cap at
+20.
+
+Why health is not seed count: a torrent can have many seeders but no
+piece the client can actually fetch (choked, banned, slow, unidirectional
+NAT), or the client can be network-blocked. Health looks at whether the
+missing pieces are actually reachable from connected peers that are
+sending data right now. Health is also distinct from completion
+percentage: a 99% torrent with one missing piece that no connected peer
+has is stalled, not excellent, even though almost everything is on disk.

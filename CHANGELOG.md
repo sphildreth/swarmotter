@@ -23,6 +23,23 @@ status.
 
 ### Added
 
+- **Per-torrent health calculation and display**: every torrent summary and
+  detail response now includes a `health` object with a 0..100 score, a
+  0..5 signal-bar mapping, a human-readable label
+  (`unknown`/`network_blocked`/`stalled`/`critical`/`poor`/`fair`/`good`/
+  `excellent`/`paused`/`complete`), per-component sub-scores
+  (availability, throughput, peers, stability, discovery), and
+  human-readable reasons. The score is computed from real engine state
+  — piece availability, peer usefulness, throughput, recent stability,
+  and discovery — and is **not** a proxy for seed count or completion
+  percentage. The Web UI renders a signal-bars indicator on the torrent
+  list row and on the details header using CSS-only bars (no image
+  asset), with a tooltip and a per-component sub-score table on the
+  details view. See `design/api.md` and `docs/v1-completion-tracker.md`.
+- **Web UI layout and peer counts:** the main Web UI content now uses the
+  available window width instead of a centered 1200px cap, and the torrent
+  list Peers column shows active peer workers / known peers from the summary
+  API instead of a placeholder.
 - **Selfish completion policy** (`torrent.selfish`, default `false`): an
   optional completion policy that removes a torrent from SwarmOtter
   immediately after its download completes. When enabled, on completion the

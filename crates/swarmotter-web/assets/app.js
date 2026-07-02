@@ -60,10 +60,11 @@ async function refreshTorrents() {
         <td>${fmtBytes(t.total_length)}</td>
         <td><progress value="${t.bytes_completed}" max="${t.total_length}"></progress> ${((t.total_length ? t.bytes_completed / t.total_length : 0) * 100).toFixed(1)}%</td>
         <td>${t.state}</td>
+        <td>${renderHealth(t.health)}</td>
         <td>${fmtRate(t.rate_down)}</td>
         <td>${fmtRate(t.rate_up)}</td>
         <td>${t.ratio.toFixed(2)}</td>
-        <td>-</td>
+        <td>${renderPeerCount(t)}</td>
         <td>
           <button data-act="pause">Pause</button>
           <button data-act="resume">Resume</button>
@@ -81,6 +82,13 @@ async function refreshTorrents() {
   } catch (e) {
     log("torrent list error: " + e.message);
   }
+}
+
+function renderPeerCount(t) {
+  const active = Number.isFinite(t.active_peer_workers) ? t.active_peer_workers : 0;
+  const known = Number.isFinite(t.known_peers) ? t.known_peers : 0;
+  if (known === 0) return String(active);
+  return `${active}/${known}`;
 }
 
 function bindActionButtons() {
@@ -111,10 +119,71 @@ async function openDetails(hash) {
   $("#view-details").classList.remove("hidden");
   const t = await api(`/torrents/${hash}`);
   $("#details-title").textContent = t.name;
+  renderDetailsHealth(t.health);
   $("#details-summary").innerHTML = `<pre>${escapeHtml(JSON.stringify(t, null, 2))}</pre>`;
   loadFiles(hash);
   loadPeers(hash);
   loadTrackers(hash);
+}
+
+function healthLabelName(label) {
+  switch (label) {
+    case "excellent": return "Excellent";
+    case "good": return "Good";
+    case "fair": return "Fair";
+    case "poor": return "Poor";
+    case "critical": return "Critical";
+    case "stalled": return "Stalled";
+    case "network_blocked": return "Blocked";
+    case "paused": return "Paused";
+    case "complete": return "Complete";
+    default: return "Unknown";
+  }
+}
+
+function renderHealth(h) {
+  if (!h) return "";
+  const label = h.label || "unknown";
+  const score = h.score == null ? 0 : h.score;
+  const bars = Math.max(0, Math.min(5, h.bars || 0));
+  const reasons = (h.reasons || []).join("; ");
+  const tooltip = `${healthLabelName(label)} — ${score}/100${reasons ? ": " + reasons : ""}`;
+  const srText = `Health: ${healthLabelName(label)}, ${score} out of 100`;
+  let barsHtml = "";
+  for (let i = 0; i < 5; i++) {
+    barsHtml += `<span class="bar${i < bars ? " active" : ""}"></span>`;
+  }
+  return `<div class="torrent-health health-${escapeHtml(label)}" title="${escapeHtml(tooltip)}">`
+    + `<span class="sr-only">${escapeHtml(srText)}</span>`
+    + `<span class="health-bars" aria-hidden="true">${barsHtml}</span>`
+    + `<span class="health-label">${escapeHtml(healthLabelName(label))}</span>`
+    + `</div>`;
+}
+
+function renderDetailsHealth(h) {
+  if (!h) { $("#details-health").innerHTML = ""; return; }
+  const label = h.label || "unknown";
+  const score = h.score == null ? 0 : h.score;
+  const bars = Math.max(0, Math.min(5, h.bars || 0));
+  const reasons = (h.reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join("");
+  const subs = `
+    <table class="health-subscores">
+      <thead><tr><th>Component</th><th>Score</th></tr></thead>
+      <tbody>
+        <tr><td>Availability</td><td>${h.availability_score == null ? 0 : h.availability_score}/100</td></tr>
+        <tr><td>Throughput</td><td>${h.throughput_score == null ? 0 : h.throughput_score}/100</td></tr>
+        <tr><td>Peers</td><td>${h.peer_score == null ? 0 : h.peer_score}/100</td></tr>
+        <tr><td>Stability</td><td>${h.stability_score == null ? 0 : h.stability_score}/100</td></tr>
+        <tr><td>Discovery</td><td>${h.discovery_score == null ? 0 : h.discovery_score}/100</td></tr>
+      </tbody>
+    </table>`;
+  $("#details-health").innerHTML = `
+    <h3>Health</h3>
+    ${renderHealth(h)}
+    <p class="muted">Score ${score}/100. Health answers: can this torrent complete, and is it downloading well right now?</p>
+    <ul class="health-list">${reasons}</ul>
+    ${subs}
+  `;
 }
 
 $$(".tab").forEach(btn => btn.addEventListener("click", () => {

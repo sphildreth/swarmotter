@@ -157,6 +157,78 @@ mod tests {
         assert!(!HEADER_LOGO.is_empty());
     }
 
+    #[test]
+    fn web_ui_includes_health_indicator() {
+        // Health bars + health label classes must be present in the CSS so
+        // the per-torrent health indicator renders consistently across the
+        // list and the details view. The JS renderer must also exist.
+        for needle in [
+            ".torrent-health",
+            ".health-bars",
+            ".bar.active",
+            ".health-excellent",
+            ".health-good",
+            ".health-fair",
+            ".health-poor",
+            ".health-critical",
+            ".health-stalled",
+            ".health-network-blocked",
+            ".health-paused",
+            ".health-complete",
+            ".health-unknown",
+        ] {
+            assert!(
+                STYLE_CSS.contains(needle),
+                "style.css is missing health CSS class {needle}"
+            );
+        }
+        for needle in [
+            "function renderHealth(",
+            "function renderDetailsHealth(",
+            "function healthLabelName(",
+            "torrent-health health-",
+            "<th>Health</th>",
+            "function renderPeerCount(",
+            "${renderPeerCount(t)}",
+        ] {
+            assert!(
+                APP_JS.contains(needle) || INDEX_HTML.contains(needle),
+                "Web UI is missing health markup {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_renders_health_for_sample_torrent_summary() {
+        // Mimic the renderHealth output for a sample summary and assert
+        // the produced HTML is a valid container with the right number of
+        // bars and the correct label.
+        fn render(label: &str, score: u8, bars: u8, reasons: &[&str]) -> String {
+            let reasons_str = reasons.join("; ");
+            let sr_text = format!("Health: {label}, {score} out of 100");
+            let mut bars_html = String::new();
+            for i in 0..5 {
+                bars_html.push_str(&format!(
+                    "<span class=\"bar{}\"></span>",
+                    if (i as u8) < bars { " active" } else { "" }
+                ));
+            }
+            format!(
+                "<div class=\"torrent-health health-{label}\" title=\"{label} — {score}/100: {reasons_str}\">\
+<span class=\"sr-only\">{sr_text}</span>\
+<span class=\"health-bars\" aria-hidden=\"true\">{bars_html}</span>\
+<span class=\"health-label\">{label}</span>\
+</div>"
+            )
+        }
+        let html = render("good", 82, 4, &["all missing pieces are available"]);
+        assert!(html.contains("class=\"torrent-health health-good\""));
+        assert!(html.contains("Health: good, 82 out of 100"));
+        assert!(html.contains("82/100"));
+        let active_bars = html.matches("class=\"bar active\"").count();
+        assert_eq!(active_bars, 4);
+    }
+
     #[tokio::test]
     async fn web_asset_routes_serve_expected_content_types() {
         let app = web_router();

@@ -38,6 +38,14 @@ SwarmOtter is a Rust async daemon with these layers:
   torrent (`swarmotterd::engine`) plus an inbound `Seeder` listener
   (`swarmotterd::seeder`) for serving verified pieces to inbound peers, both
   reconciling real engine state into torrent summaries (see ADR-0016).
+- **Per-torrent health** (`swarmotter-core::models::health`): a deterministic
+  calculator that turns live engine state (piece availability, peer
+  usefulness, throughput, recent stability, discovery) into a `TorrentHealth`
+  with a 0..100 score, 0..5 bar mapping, human-readable label, per-component
+  sub-scores, and human-readable reasons. The same calculator is exercised
+  by unit tests and by the daemon during state reconciliation so the API
+  and the Web UI agree on the score. The Web UI renders a signal-bars
+  indicator from the API field (no image asset).
 
 ## Crate layout
 

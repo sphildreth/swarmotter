@@ -31,6 +31,13 @@ POST /api/v1/torrents/file
 
 The app refreshes the torrent list after successful upload.
 
+## Torrent list
+
+The Peers column shows active peer workers / known peers from the torrent
+summary response. The main UI area uses the available browser width so wide
+tables can show operational details without being capped to a narrow centered
+column.
+
 ## Network health
 
 The header shows network containment health from:

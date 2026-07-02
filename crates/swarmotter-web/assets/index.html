@@ -15,7 +15,7 @@
 <body>
   <header>
     <div class="brand">
-      <img src="/swarmotter-icon-48x48.png" width="28" height="28" alt="">
+      <img src="/swarmotter-icon-48x48.png" alt="Logo">
       <h1>SwarmOtter</h1>
     </div>
     <nav>
@@ -45,6 +45,7 @@
         <thead>
           <tr>
             <th>Name</th><th>Size</th><th>Progress</th><th>Status</th>
+            <th>Health</th>
             <th>Down</th><th>Up</th><th>Ratio</th><th>Peers</th><th>Actions</th>
           </tr>
         </thead>
@@ -74,6 +75,7 @@
     <section id="view-details" class="view hidden">
       <button id="back-btn">Back</button>
       <h2 id="details-title">Torrent Details</h2>
+      <div id="details-health" class="card"></div>
       <div id="details-summary"></div>
       <div class="tabs">
         <button data-tab="files" class="tab active">Files</button>

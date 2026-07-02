@@ -37,3 +37,18 @@ pub struct Peer {
     pub flags: PeerFlags,
     pub banned: bool,
 }
+
+/// Per-peer health signals used by the engine to feed the health calculator.
+/// The fields describe whether a peer is currently useful: does it carry any
+/// piece we still need, is it unchoked or recently useful, and is it blocked?
+#[derive(Debug, Clone, Default)]
+pub struct EnginePeerHealth {
+    pub piece_bitfield: Option<crate::storage::resume::PieceBitfield>,
+    pub has_missing_pieces: bool,
+    pub unchoked: bool,
+    pub blocked: bool,
+    pub last_valid_block: Option<std::time::Instant>,
+    pub useful_recently: bool,
+    pub discovered_from_pex: bool,
+    pub last_seen: Option<std::time::Instant>,
+}

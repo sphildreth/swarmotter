@@ -17,7 +17,7 @@
 //! See `design/architecture.md`, `design/vpn-network-containment.md`, and
 //! ADR-0012 (peer protocol architecture) / ADR-0013 (task/runtime model).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,6 +30,7 @@ use tokio::time::timeout;
 use swarmotter_core::bandwidth::{RateDirection, RateLimiter, ShapedLimiter};
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::meta::TorrentMeta;
+use swarmotter_core::models::peer::EnginePeerHealth;
 use swarmotter_core::net::NetworkBinder;
 use swarmotter_core::peer::{
     self, block_requests, Bitfield, Handshake, Message, PeerAddr, PeerReader,
@@ -64,10 +65,34 @@ pub struct EngineState {
     #[allow(dead_code)]
     pub active_peers: usize,
     pub peers: Vec<PeerAddr>,
+    /// Per-peer telemetry used for health scoring.
+    pub peer_health: HashMap<std::net::SocketAddr, EnginePeerHealth>,
     pub tracker_ok: bool,
     pub tracker_message: Option<String>,
     pub last_announce: Option<u64>,
     pub finished: bool,
+    /// Recent tracker/announce failures counted across poll windows.
+    pub tracker_failures_recent: u32,
+    /// Whether DHT discovery succeeded recently.
+    pub dht_discovery_ok: bool,
+    /// Whether PEX discovery provided peers recently.
+    pub pex_discovery_ok: bool,
+    /// Number of peer connection attempts that ended in an error.
+    pub peer_disconnects_recent: u32,
+    /// Number of blocked/invalid blocks encountered since start.
+    pub hash_failures: u32,
+    /// Number of timeout/bad-response events while downloading blocks.
+    pub timeout_failures: u32,
+    /// Last time a valid block was successfully validated and written.
+    pub last_valid_block: Option<std::time::Instant>,
+    /// Timestamp of the latest DHT discovery result.
+    pub dht_last_seen: Option<std::time::Instant>,
+    /// Timestamp of the latest PEX discovery result.
+    pub pex_last_seen: Option<std::time::Instant>,
+    /// Timestamp of the latest successful tracker announce.
+    pub tracker_last_ok: Option<std::time::Instant>,
+    /// Timestamp of the latest successful block receive.
+    pub block_last_seen: Option<std::time::Instant>,
     /// For magnets: the real metadata once fetched via BEP 9, so the daemon
     /// can replace the placeholder torrent record.
     pub resolved_meta: Option<TorrentMeta>,
@@ -538,6 +563,20 @@ impl TorrentEngine {
         peer::write_message(&mut write_half, &our_bf.encode_message()).await?;
         write_half.flush().await.ok();
 
+        // Register a per-peer health entry so the daemon's health calculator
+        // can see this peer. We update `last_seen`/`has_missing_pieces` on
+        // every meaningful event.
+        {
+            let mut st = self.state.lock().await;
+            st.peer_health
+                .entry(peer_addr.socket_addr())
+                .or_insert(EnginePeerHealth {
+                    last_seen: Some(Instant::now()),
+                    ..Default::default()
+                })
+                .last_seen = Some(Instant::now());
+        }
+
         // Send a BEP 10 extension handshake advertising ut_pex (and
         // ut_metadata for the magnet metadata path). PEX is honored only for
         // non-private torrents; private torrents skip PEX entirely.
@@ -631,6 +670,17 @@ impl TorrentEngine {
                                 {
                                     received_blocks += 1;
                                     self.record_downloaded(block.len() as u64).await;
+                                    // Per-peer health: this peer just sent a
+                                    // valid block of a piece we still needed.
+                                    let mut st = self.state.lock().await;
+                                    let entry =
+                                        st.peer_health.entry(peer_addr.socket_addr()).or_default();
+                                    entry.last_valid_block = Some(Instant::now());
+                                    entry.has_missing_pieces = true;
+                                    entry.useful_recently = true;
+                                    entry.unchoked = true;
+                                    entry.last_seen = Some(Instant::now());
+                                    drop(st);
                                 }
                             }
                             Message::Choke => {
@@ -696,10 +746,27 @@ impl TorrentEngine {
                 _ => break,
             };
             match msg {
-                Message::Unchoke => peer_choking = false,
+                Message::Unchoke => {
+                    peer_choking = false;
+                    let mut st = self.state.lock().await;
+                    st.peer_health
+                        .entry(peer_addr.socket_addr())
+                        .or_default()
+                        .unchoked = true;
+                }
                 Message::Choke => peer_choking = true,
                 Message::Bitfield { bits } => {
-                    peer_bf = Some(Bitfield::from_bytes(bits, piece_count));
+                    let bf = Bitfield::from_bytes(bits, piece_count);
+                    // If the peer advertises any piece we still need, record
+                    // it as having missing pieces for health purposes.
+                    let has_any_missing = (0..piece_count).any(|i| bf.has(i) && !have.has(i));
+                    if has_any_missing {
+                        let mut st = self.state.lock().await;
+                        let entry = st.peer_health.entry(peer_addr.socket_addr()).or_default();
+                        entry.has_missing_pieces = true;
+                        entry.last_seen = Some(Instant::now());
+                    }
+                    peer_bf = Some(bf);
                 }
                 Message::Have { piece } => {
                     if let Some(bf) = &mut peer_bf {
@@ -1398,6 +1465,16 @@ async fn endgame_peer_session(
                         {
                             received += 1;
                             record_downloaded_state(&state, block.len() as u64).await;
+                            {
+                                let mut st = state.lock().await;
+                                let entry =
+                                    st.peer_health.entry(peer_addr.socket_addr()).or_default();
+                                entry.last_valid_block = Some(Instant::now());
+                                entry.has_missing_pieces = true;
+                                entry.useful_recently = true;
+                                entry.unchoked = true;
+                                entry.last_seen = Some(Instant::now());
+                            }
                             outstanding.lock().await.delivered(piece, offset);
                         } else if piece as usize != piece_index {
                             // A block for a piece we no longer need (completed
@@ -1637,6 +1714,16 @@ async fn parallel_peer_session(
                         {
                             received += 1;
                             record_downloaded_state(&state, block.len() as u64).await;
+                            {
+                                let mut st = state.lock().await;
+                                let entry =
+                                    st.peer_health.entry(peer_addr.socket_addr()).or_default();
+                                entry.last_valid_block = Some(Instant::now());
+                                entry.has_missing_pieces = true;
+                                entry.useful_recently = true;
+                                entry.unchoked = true;
+                                entry.last_seen = Some(Instant::now());
+                            }
                         }
                     }
                     Message::Choke => {
@@ -1740,6 +1827,7 @@ async fn record_downloaded_state(state: &Arc<Mutex<EngineState>>, bytes: u64) {
     }
     let mut s = state.lock().await;
     s.downloaded = s.downloaded.saturating_add(bytes);
+    s.block_last_seen = Some(Instant::now());
 }
 
 async fn update_progress_state(

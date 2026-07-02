@@ -5,7 +5,9 @@
 
 use crate::hash::InfoHash;
 use crate::meta::TorrentMeta;
-use crate::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
+use crate::models::torrent::{
+    FilePriority, TorrentFile, TorrentHealth, TorrentState, TorrentSummary,
+};
 use crate::storage::PieceProgress;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -29,6 +31,8 @@ pub struct Torrent {
     pub uploaded: u64,
     pub rate_down: u64,
     pub rate_up: u64,
+    pub active_peer_workers: usize,
+    pub known_peers: usize,
     pub labels: Vec<String>,
     pub download_dir: Option<String>,
     pub date_added: u64,
@@ -37,6 +41,7 @@ pub struct Torrent {
     pub priorities: Vec<FilePriority>,
     pub wanted: Vec<bool>,
     pub error: Option<String>,
+    pub health: TorrentHealth,
     /// Per-torrent download limit in bytes/sec (0 = unlimited).
     pub download_limit: u64,
     /// Per-torrent upload limit in bytes/sec (0 = unlimited).
@@ -76,6 +81,8 @@ impl Torrent {
             uploaded: 0,
             rate_down: 0,
             rate_up: 0,
+            active_peer_workers: 0,
+            known_peers: 0,
             labels: Vec::new(),
             download_dir: None,
             date_added,
@@ -84,6 +91,7 @@ impl Torrent {
             priorities: vec![FilePriority::Normal; file_count],
             wanted: vec![true; file_count],
             error: None,
+            health: TorrentHealth::unknown(),
             download_limit: 0,
             upload_limit: 0,
             needs_metadata: false,
@@ -142,10 +150,13 @@ impl Torrent {
             upload_limit: self.upload_limit,
             rate_down: self.rate_down,
             rate_up: self.rate_up,
+            active_peer_workers: self.active_peer_workers,
+            known_peers: self.known_peers,
             ratio: self.ratio(),
             queue_position: None,
             date_added: self.date_added,
             date_completed: self.date_completed,
+            health: self.health.clone(),
         }
     }
 }

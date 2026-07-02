@@ -230,6 +230,9 @@ UDP socket (see ADR-0020).
 - [x] Watch-folder endpoints
 - [x] Stats/health endpoints
 - [x] WebSocket/SSE events (broker + endpoints; required event kinds defined)
+- [x] Per-torrent health in torrent list and detail responses
+      (`TorrentHealth` with score, bars, label, per-component sub-scores,
+      and human-readable reasons)
 
 ### Web UI
 
@@ -243,6 +246,13 @@ UDP socket (see ADR-0020).
 - [x] Network/VPN health
 - [x] Watch-folder status
 - [x] Logs/errors
+- [x] Per-torrent health indicator — a signal-bars style (0..5) display on
+      each torrent list row and on the details header, computed from real
+      engine state (availability, throughput, peers, stability, discovery),
+      with a tooltip and a per-component sub-score table on the details
+      view. The same `health` object is exposed in the API and rendered by
+      the Web UI; the UI is CSS-only (no image asset). See
+      `design/api.md` for the score formula and bar/label mapping.
 
 ### Deployment
 
@@ -257,10 +267,15 @@ UDP socket (see ADR-0020).
 
 - [x] Unit tests (magnet, torrent, info hash, tracker tiers, queue, ratio,
       bandwidth, config, network containment, storage, fast resume, watch,
-      peer wire protocol, tracker announce, storage I/O)
+      peer wire protocol, tracker announce, storage I/O, per-torrent
+      health calculation: complete / network-blocked / paused / missing
+      pieces with zero sources / good active swarm / many connected but
+      useless peers / slow-but-completable / private torrent / bar+label
+      mapping)
 - [x] Integration tests (API: add magnet/file, lifecycle, settings, network,
-      stats, duplicate; daemon: containment fail-closed, watch import,
-      daemon-driven real download via local tracker + seed peer)
+      stats, duplicate, per-torrent health serialization; daemon:
+      containment fail-closed, watch import, daemon-driven real download
+      via local tracker + seed peer)
 - [x] Network containment live tests (fail-closed via daemon) — `BlockedBinder`
       proves TCP/UDP/listener fail-closed at the binder; daemon strict-mode
       integration tests cover add-under-blocked and health reporting; live
@@ -275,7 +290,10 @@ UDP socket (see ADR-0020).
       seeding/upload via the inbound `Seeder` listener is covered; PEX, magnet
       metadata fetch, DHT, endgame, bandwidth, and a full uTP download over the
       contained UDP path are covered by local fixtures; a uTP fail-closed test
-      proves the `BlockedBinder` blocks uTP swarm downloads
+      proves the `BlockedBinder` blocks uTP swarm downloads; an
+      active-download health test samples the live engine state during a
+      generated lawful local download and asserts the per-torrent health
+      reports a non-zero score with at least one bar.
 
 ### Legal / Repository
 
@@ -309,7 +327,7 @@ honest platform-coverage limitation, not a missing capability.
 | `cargo fmt --all -- --check` | pass |
 | `cargo check --workspace --all-targets --all-features` | pass |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass (no warnings) |
-| `cargo test --all --all-features` | pass (core 168 unit + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 11 local swarm + 1 daemon download) |
+| `cargo test --all --all-features` | pass (core 201 unit including 10 per-torrent health + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 12 local swarm including active-download health + 1 daemon download) |
 | local swarm download (HTTP tracker + direct peer) | pass |
 | local swarm download (UDP tracker, BEP 15) | pass |
 | local swarm seeding (inbound Seeder serves completed download) | pass |
@@ -320,6 +338,7 @@ honest platform-coverage limitation, not a missing capability.
 | local swarm magnet (BEP 9 metadata fetch then download) | pass |
 | local swarm uTP download (contained uTP seed + engine over uTP) | pass |
 | local swarm uTP fail-closed (BlockedBinder blocks uTP download) | pass |
+| local swarm active-download health (live engine reports non-zero health) | pass |
 | uTP contained byte-stream round trip over contained socket | pass |
 | DHT get_peers discovery (local KRPC fixture) | pass |
 | uTP reliable exchange over contained socket (local fixture) | pass |
