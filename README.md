@@ -124,7 +124,7 @@ See:
 ### First-Time Setup
 
 ```bash
-git clone https://github.com/swarmotter/swarmotter.git
+git clone https://github.com/sphildreth/swarmotter.git
 cd swarmotter
 cargo fmt
 cargo check

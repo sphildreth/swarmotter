@@ -1,6 +1,6 @@
 [Unit]
 Description=SwarmOtter BitTorrent daemon
-Documentation=https://github.com/swarmotter/swarmotter
+Documentation=https://github.com/sphildreth/swarmotter
 After=network-online.target
 Wants=network-online.target
 

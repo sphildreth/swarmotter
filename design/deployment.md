@@ -25,7 +25,7 @@ containment and fail-closed behavior.
 ## Building
 
 ```bash
-git clone https://github.com/swarmotter/swarmotter.git
+git clone https://github.com/sphildreth/swarmotter.git
 cd swarmotter
 cargo build --release
 # Binary: target/release/swarmotterd
