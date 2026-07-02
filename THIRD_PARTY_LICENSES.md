@@ -1,7 +1,6 @@
 # Third-Party Licenses
 
 This file tracks third-party dependencies and licenses used by SwarmOtter.
-
 SwarmOtter source code is licensed under the Apache License, Version 2.0 (see
 `LICENSE`). Each direct dependency must be compatible with Apache-2.0.
 
@@ -17,21 +16,45 @@ Before adding a dependency, review it for:
   network traffic outside the network containment layer must not be used for
   torrent operations.
 
-Record significant dependency additions or removals here, and create an ADR
-in `design/adr/` when the dependency is significant.
+Record significant dependency additions or removals here, and create an ADR in
+`design/adr/` when the dependency is significant. See ADR-0009 for the
+foundational dependency stack rationale.
 
 ## Direct dependencies
 
-_None._ The current workspace skeleton has no external dependencies. As
-dependencies are added, list them below with crate name, version, license, and
-a brief justification.
-
 | Crate | Version | License | Justification |
 |-------|---------|---------|---------------|
-| _(none yet)_ | | | |
+| tokio | 1 | MIT | Async runtime for daemon and networking |
+| bytes | 1 | MIT | Efficient byte buffers for peer/storage I/O |
+| serde | 1 | MIT/Apache-2.0 | API and config serialization |
+| serde_json | 1 | MIT/Apache-2.0 | API JSON responses |
+| toml | 0.8 | MIT/Apache-2.0 | Configuration file parsing |
+| thiserror | 1 | MIT/Apache-2.0 | Typed domain error enums |
+| tracing | 0.1 | MIT | Structured logging |
+| tracing-subscriber | 0.3 | MIT | Log output formatting |
+| axum | 0.7 | MIT | Async HTTP API framework (control plane only) |
+| tower | 0.5 | MIT | Tower service/middleware for axum |
+| tower-http | 0.6 | MIT | HTTP middleware (static fs, trace, cors) |
+| hyper | 1 | MIT | HTTP server under axum |
+| sha1 | 0.10 | BSD-3-Clause | Info-hash and piece-hash computation (pure Rust) |
+| hex | 0.4 | MIT/Apache-2.0 | Hex encoding/decoding |
+| url | 2 | MIT/Apache-2.0 | Magnet link and tracker URL parsing |
+| once_cell | 1 | MIT/Apache-2.0 | Lazy statics |
+| async-trait | 0.1 | MIT/Apache-2.0 | Async trait object dispatch |
+| futures-util | 0.3 | MIT/Apache-2.0 | Async stream utilities for SSE/WebSocket |
+| tokio-stream | 0.1 | MIT | Broadcast stream adapters for events |
+| clap | 4 | MIT/Apache-2.0 | CLI argument parsing |
+
+## Network containment note
+
+None of the direct dependencies above create torrent data-plane network
+traffic on their own. All torrent-related sockets (peers, trackers, DHT, PEX,
+webseeds, magnet metadata) are created through SwarmOtter's central network
+containment layer. `axum`/`hyper`/`tower-http` are scoped to the control plane
+(API/Web UI) and do not participate in torrent data traffic.
 
 ## Notes
 
-- Do not add unnecessary dependencies during setup tasks.
-- Dependency traffic must respect the network containment layer.
-- This document does not constitute legal advice.
+- This file does not constitute legal advice.
+- Transitive dependency licenses are resolved by `cargo`; review the full tree
+  before distribution. All listed licenses are compatible with Apache-2.0.

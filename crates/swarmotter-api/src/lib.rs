@@ -1,14 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! API layer for SwarmOtter.
+//! SwarmOtter API layer.
 //!
-//! This crate is a placeholder during repository setup. The API surface is
-//! described in `design/api.md`.
+//! Versioned REST API built on axum. The API is a first-class product surface
+//! (ADR-0004): the Web UI consumes the same endpoints exposed to external
+//! automation. All responses use a consistent envelope with machine-readable
+//! error codes.
+//!
+//! Routes are prefixed with `/api/v1`. Events are delivered via Server-Sent
+//! Events (SSE) at `/api/v1/events` and WebSocket at `/api/v1/ws`.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn placeholder() {
-        let _ = ();
-    }
-}
+pub mod envelope;
+pub mod error;
+pub mod handlers;
+pub mod routes;
+pub mod state;
+
+pub use routes::app_router;
+pub use state::{AppState, SharedState};

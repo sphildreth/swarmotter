@@ -1,0 +1,34 @@
+[Unit]
+Description=SwarmOtter BitTorrent daemon
+Documentation=https://github.com/swarmotter/swarmotter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=swarmotter
+Group=swarmotter
+
+# Configuration file.
+Environment=SWARMOTTER_CONFIG=/etc/swarmotter/swarmotter.toml
+ExecStart=/usr/bin/swarmotterd --config /etc/swarmotter/swarmotter.toml
+
+# Persistent state and download directories.
+StateDirectory=swarmotter
+ReadWritePaths=/var/lib/swarmotter /data/downloads /data/incomplete
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false
+RestrictSUIDSGID=true
+LockPersonality=true
+
+# Restart policy.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

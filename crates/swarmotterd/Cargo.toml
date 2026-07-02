@@ -7,8 +7,24 @@ rust-version.workspace = true
 repository.workspace = true
 description = "SwarmOtter daemon binary"
 
-[dependencies]
-
-[[bin]]
+[lib]
 name = "swarmotterd"
-path = "src/main.rs"
+path = "src/lib.rs"
+
+[dependencies]
+swarmotter-core = { path = "../swarmotter-core" }
+swarmotter-api = { path = "../swarmotter-api" }
+swarmotter-web = { path = "../swarmotter-web" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+once_cell = { workspace = true }
+clap = { workspace = true }

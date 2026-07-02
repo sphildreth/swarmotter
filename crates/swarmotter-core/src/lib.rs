@@ -1,17 +1,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Core types and future BitTorrent engine logic for SwarmOtter.
+//! Core types and BitTorrent engine logic for SwarmOtter.
 //!
-//! This crate is a placeholder during repository setup. Engine implementation
-//! is deferred until the design and acceptance criteria are finalized.
+//! This crate holds domain models, parsing, validation, and the central
+//! network-containment-aware logic. Engine components must not create network
+//! sockets directly; all torrent traffic goes through the containment layer
+//! (see `swarmotter-core::net` and `design/vpn-network-containment.md`).
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod bandwidth;
+pub mod bencode;
+pub mod config;
+pub mod error;
+pub mod hash;
+pub mod magnet;
+pub mod meta;
+pub mod models;
+pub mod net;
+pub mod queue;
+pub mod ratio;
+pub mod storage;
+pub mod torrent;
+pub mod watch;
 
-    #[test]
-    fn placeholder() {
-        // Ensures the crate compiles and its test harness is wired up.
-        let _ = ();
-    }
-}
+pub use error::{CoreError, Result};
+pub use hash::InfoHash;
+pub use magnet::Magnet;
+pub use meta::TorrentMeta;
+pub use models::*;

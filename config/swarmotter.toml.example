@@ -1,0 +1,84 @@
+# SwarmOtter example configuration file.
+#
+# SwarmOtter is configured through this file plus environment variable
+# overrides (prefix SWARMOTTER_, nested fields separated by __).
+# Invalid required configuration produces clear startup errors.
+
+# --- Control plane (API + Web UI) ---
+[api]
+bind_address = "127.0.0.1:9091"
+# Set require_auth = true and auth_token to enable API authentication.
+require_auth = false
+# auth_token = "change-me"
+
+# --- Storage ---
+[storage]
+download_dir = "/data/downloads"
+incomplete_dir = "/data/incomplete"
+preallocate = false
+sparse = true
+
+# --- Network containment (release-critical) ---
+# Strict mode forces all torrent traffic through the configured path and
+# fails closed if that path is unavailable. See design/vpn-network-containment.md.
+[network]
+mode = "strict"
+required_interface = "tun0"
+required_source_ipv4 = "10.8.0.2"
+allow_ipv6 = false
+fail_closed = true
+validate_route = true
+validate_dns = true
+
+# --- Torrent peer listener (data plane) ---
+[torrent]
+listen_port = 51413
+allow_ipv6 = false
+
+# --- Bandwidth ---
+[bandwidth]
+global_download = 0       # bytes/sec, 0 = unlimited
+global_upload = 0
+alt_download = 0
+alt_upload = 0
+alt_enabled = false
+max_peers = 0
+max_peers_per_torrent = 0
+
+# --- Queue ---
+[queue]
+max_active_downloads = 5
+max_active_seeds = 5
+auto_start = true
+
+# --- Seeding / ratio ---
+[seeding]
+global_ratio_limit = 2.0
+global_idle_limit = 1800   # seconds
+
+# --- DHT ---
+[dht]
+enabled = true
+port = 51413
+bootstrap_nodes = [
+    "dht.transmissionbt.com:6881",
+    "router.bittorrent.com:6881",
+]
+
+# --- PEX ---
+[pex]
+enabled = true
+max_peers = 0
+
+# --- Watch folders (uncomment and adjust) ---
+# [[watch]]
+# path = "/data/watch"
+# recursive = false
+# label = "auto"
+# start_behavior = "start"   # or "paused"
+# delete_after_import = true
+
+# --- Logging ---
+[logging]
+level = "info"
+json = false

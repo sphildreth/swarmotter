@@ -1,0 +1,142 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//! Fast resume metadata: persisted piece bitfield and per-torrent accounting.
+//!
+//! The fast-resume format is JSON (`.swarmotter.resume`) so it is human-readable
+//! and debuggable. It records the info hash, piece bitfield, byte counts, and
+//! file priorities so a torrent can resume without a full recheck.
+
+use crate::hash::InfoHash;
+use crate::models::torrent::FilePriority;
+use serde::{Deserialize, Serialize};
+
+/// A piece bitfield serialized as a hex string.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PieceBitfield(#[serde(with = "hex_bitfield")] Vec<u8>);
+
+impl PieceBitfield {
+    pub fn new(piece_count: usize) -> Self {
+        let bytes = piece_count.div_ceil(8);
+        Self(vec![0u8; bytes])
+    }
+
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn set(&mut self, index: usize) {
+        let byte = index / 8;
+        let bit = 7 - (index % 8);
+        if byte < self.0.len() {
+            self.0[byte] |= 1 << bit;
+        }
+    }
+
+    pub fn clear(&mut self, index: usize) {
+        let byte = index / 8;
+        let bit = 7 - (index % 8);
+        if byte < self.0.len() {
+            self.0[byte] &= !(1 << bit);
+        }
+    }
+
+    pub fn has(&self, index: usize) -> bool {
+        let byte = index / 8;
+        let bit = 7 - (index % 8);
+        if byte < self.0.len() {
+            self.0[byte] & (1 << bit) != 0
+        } else {
+            false
+        }
+    }
+
+    pub fn count(&self, total: usize) -> usize {
+        (0..total).filter(|&i| self.has(i)).count()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Fast resume data persisted to disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FastResume {
+    pub info_hash: InfoHash,
+    pub name: String,
+    pub piece_bitfield: PieceBitfield,
+    pub piece_count: usize,
+    pub downloaded: u64,
+    pub uploaded: u64,
+    pub bytes_completed: u64,
+    pub total_length: u64,
+    pub priorities: Vec<FilePriority>,
+    pub download_dir: Option<String>,
+    pub date_added: u64,
+    pub date_completed: Option<u64>,
+}
+
+impl FastResume {
+    pub fn serialize_json(&self) -> std::result::Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    pub fn parse_json(s: &str) -> std::result::Result<Self, serde_json::Error> {
+        serde_json::from_str(s)
+    }
+}
+
+mod hex_bitfield {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &Vec<u8>, s: S) -> std::result::Result<S::Ok, S::Error> {
+        hex::encode(v).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        hex::decode(s).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bitfield_set_get_count() {
+        let mut bf = PieceBitfield::new(20);
+        bf.set(0);
+        bf.set(7);
+        bf.set(19);
+        assert!(bf.has(0));
+        assert!(!bf.has(1));
+        assert!(bf.has(19));
+        assert_eq!(bf.count(20), 3);
+        bf.clear(0);
+        assert_eq!(bf.count(20), 2);
+    }
+
+    #[test]
+    fn resume_roundtrip() {
+        let resume = FastResume {
+            info_hash: InfoHash::ZERO,
+            name: "test".into(),
+            piece_bitfield: PieceBitfield::new(10),
+            piece_count: 10,
+            downloaded: 1000,
+            uploaded: 2000,
+            bytes_completed: 1000,
+            total_length: 1000,
+            priorities: vec![FilePriority::Normal; 2],
+            download_dir: Some("/data".into()),
+            date_added: 1,
+            date_completed: Some(2),
+        };
+        let json = resume.serialize_json().unwrap();
+        let back = FastResume::parse_json(&json).unwrap();
+        assert_eq!(back.info_hash, resume.info_hash);
+        assert_eq!(back.piece_count, 10);
+        assert_eq!(back.priorities.len(), 2);
+    }
+}

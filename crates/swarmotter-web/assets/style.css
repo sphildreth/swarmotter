@@ -1,0 +1,102 @@
+:root {
+  --bg: #1a1a1a;
+  --fg: #e0e0e0;
+  --muted: #888;
+  --accent: #4a9;
+  --danger: #e55;
+  --card: #222;
+  --border: #333;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 14px;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.6rem 1rem;
+  background: #111;
+  border-bottom: 1px solid var(--border);
+}
+header h1 { margin: 0; font-size: 1.2rem; }
+nav { display: flex; gap: 0.3rem; }
+.nav {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid transparent;
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+  border-radius: 3px;
+}
+.nav:hover { border-color: var(--border); }
+.nav.active { background: var(--accent); color: #111; }
+.badge {
+  margin-left: auto;
+  padding: 0.2rem 0.6rem;
+  border-radius: 3px;
+  background: #333;
+  font-size: 0.8rem;
+}
+.badge.ok { background: var(--accent); color: #111; }
+.badge.bad { background: var(--danger); }
+main { padding: 1rem; max-width: 1200px; margin: 0 auto; }
+.view.hidden { display: none; }
+.toolbar { display: flex; gap: 1rem; align-items: center; margin-bottom: 0.8rem; }
+.muted { color: var(--muted); }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); }
+th { color: var(--muted); font-weight: 600; }
+tr.torrent { cursor: pointer; }
+tr.torrent:hover { background: #2a2a2a; }
+progress { width: 120px; }
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+input, textarea, select {
+  background: #181818;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.3rem 0.5rem;
+}
+textarea { width: 100%; }
+button {
+  background: var(--accent);
+  color: #111;
+  border: none;
+  padding: 0.3rem 0.8rem;
+  border-radius: 3px;
+  cursor: pointer;
+}
+button:hover { opacity: 0.9; }
+button.danger { background: var(--danger); color: #fff; }
+.tabs { display: flex; gap: 0.3rem; margin: 0.8rem 0; }
+.tab {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+  border-radius: 3px;
+}
+.tab.active { background: #333; }
+.tab-pane.hidden { display: none; }
+pre#log-stream {
+  background: #111;
+  border: 1px solid var(--border);
+  padding: 0.8rem;
+  overflow: auto;
+  max-height: 60vh;
+  white-space: pre-wrap;
+}
+label { display: block; margin: 0.4rem 0; }
+input[type="number"] { width: 12rem; }

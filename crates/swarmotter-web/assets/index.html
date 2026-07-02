@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SwarmOtter</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header>
+    <h1>SwarmOtter</h1>
+    <nav>
+      <button data-view="torrents" class="nav active">Torrents</button>
+      <button data-view="add" class="nav">Add</button>
+      <button data-view="network" class="nav">Network</button>
+      <button data-view="settings" class="nav">Settings</button>
+      <button data-view="watch" class="nav">Watch</button>
+      <button data-view="logs" class="nav">Logs</button>
+    </nav>
+    <div id="health-badge" class="badge">unknown</div>
+  </header>
+
+  <main>
+    <!-- Torrents view -->
+    <section id="view-torrents" class="view">
+      <div class="toolbar">
+        <input id="search" type="search" placeholder="Filter torrents...">
+        <span id="stats-summary" class="muted"></span>
+      </div>
+      <table id="torrent-table">
+        <thead>
+          <tr>
+            <th>Name</th><th>Size</th><th>Progress</th><th>Status</th>
+            <th>Down</th><th>Up</th><th>Ratio</th><th>Peers</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <!-- Add view -->
+    <section id="view-add" class="view hidden">
+      <h2>Add Torrent</h2>
+      <div class="card">
+        <h3>Add Magnet</h3>
+        <textarea id="magnet-input" rows="3" placeholder="magnet:?xt=urn:btih:..."></textarea>
+        <input id="magnet-dir" type="text" placeholder="Download directory (optional)">
+        <button id="add-magnet-btn">Add Magnet</button>
+        <p id="add-magnet-result" class="muted"></p>
+      </div>
+      <div class="card">
+        <h3>Upload .torrent</h3>
+        <input id="torrent-file" type="file" accept=".torrent">
+        <button id="add-file-btn">Upload</button>
+        <p id="add-file-result" class="muted"></p>
+      </div>
+    </section>
+
+    <!-- Details view -->
+    <section id="view-details" class="view hidden">
+      <button id="back-btn">Back</button>
+      <h2 id="details-title">Torrent Details</h2>
+      <div id="details-summary"></div>
+      <div class="tabs">
+        <button data-tab="files" class="tab active">Files</button>
+        <button data-tab="peers" class="tab">Peers</button>
+        <button data-tab="trackers" class="tab">Trackers</button>
+      </div>
+      <div id="tab-files" class="tab-pane">
+        <table id="files-table"><thead><tr><th>Path</th><th>Size</th><th>Done</th><th>Priority</th><th>Wanted</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div id="tab-peers" class="tab-pane hidden">
+        <table id="peers-table"><thead><tr><th>Address</th><th>Client</th><th>Progress</th><th>Down</th><th>Up</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div id="tab-trackers" class="tab-pane hidden">
+        <table id="trackers-table"><thead><tr><th>URL</th><th>Tier</th><th>Status</th><th>Seeders</th><th>Leechers</th></tr></thead><tbody></tbody></table>
+      </div>
+    </section>
+
+    <!-- Network view -->
+    <section id="view-network" class="view hidden">
+      <h2>Network Containment</h2>
+      <div id="network-health" class="card"></div>
+    </section>
+
+    <!-- Settings view -->
+    <section id="view-settings" class="view hidden">
+      <h2>Settings</h2>
+      <div class="card">
+        <h3>Bandwidth</h3>
+        <label>Global download limit (B/s, 0=unlimited) <input id="bw-dl" type="number" value="0"></label>
+        <label>Global upload limit (B/s, 0=unlimited) <input id="bw-ul" type="number" value="0"></label>
+        <label>Alternate speed mode <input id="bw-alt" type="checkbox"></label>
+        <button id="save-bw-btn">Save Bandwidth</button>
+        <p id="save-bw-result" class="muted"></p>
+      </div>
+    </section>
+
+    <!-- Watch view -->
+    <section id="view-watch" class="view hidden">
+      <h2>Watch Folders</h2>
+      <button id="watch-scan-btn">Scan Now</button>
+      <div id="watch-history"></div>
+    </section>
+
+    <!-- Logs view -->
+    <section id="view-logs" class="view hidden">
+      <h2>Logs &amp; Errors</h2>
+      <pre id="log-stream"></pre>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
