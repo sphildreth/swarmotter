@@ -27,6 +27,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+use swarmotter_core::bandwidth::{RateDirection, RateLimiter};
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::meta::TorrentMeta;
 use swarmotter_core::net::NetworkBinder;
@@ -36,6 +37,18 @@ use swarmotter_core::peer::{
 use swarmotter_core::storage::resume::PieceBitfield;
 use swarmotter_core::storage::StorageIo;
 use swarmotter_core::tracker::{self, AnnounceEvent, AnnounceRequest};
+use swarmotter_core::udp_tracker;
+
+/// Magnet parameters for a torrent that still needs its metadata fetched
+/// (BEP 9). The placeholder `TorrentMeta` in the engine has a dummy info hash;
+/// these hold the real info hash, name, and trackers so metadata can be
+/// fetched and the meta rebuilt.
+#[derive(Debug, Clone)]
+pub struct MagnetParams {
+    pub info_hash: swarmotter_core::hash::InfoHash,
+    pub name: String,
+    pub trackers: Vec<String>,
+}
 
 /// Live engine state, shared between the engine task and the daemon so the
 /// API/UI can observe real progress, speeds, peers, and tracker status.
@@ -54,6 +67,9 @@ pub struct EngineState {
     pub tracker_message: Option<String>,
     pub last_announce: Option<u64>,
     pub finished: bool,
+    /// For magnets: the real metadata once fetched via BEP 9, so the daemon
+    /// can replace the placeholder torrent record.
+    pub resolved_meta: Option<TorrentMeta>,
 }
 
 /// Commands sent to an engine task to control its lifecycle.
@@ -83,10 +99,15 @@ pub struct TorrentEngine {
     commands: Arc<Mutex<tokio::sync::mpsc::Receiver<EngineCommand>>>,
     seed_peers: Vec<PeerAddr>,
     listen_port: u16,
+    limiter: RateLimiter,
+    magnet: Option<MagnetParams>,
+    /// Optional DHT runner for trackerless peer discovery (disabled for
+    /// private torrents).
+    dht: Option<Arc<crate::dht::DhtRunner>>,
 }
 
 impl TorrentEngine {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, dead_code)]
     pub fn new(
         meta: TorrentMeta,
         download_dir: PathBuf,
@@ -97,6 +118,36 @@ impl TorrentEngine {
         seed_peers: Vec<PeerAddr>,
         listen_port: u16,
     ) -> Self {
+        Self::with_limiter(
+            meta,
+            download_dir,
+            peer_id,
+            binder,
+            state,
+            commands,
+            seed_peers,
+            listen_port,
+            RateLimiter::unlimited(),
+            None,
+        )
+    }
+
+    /// Like [`new`] but with an explicit live rate limiter (download/upload
+    /// shaping) wired from the daemon's bandwidth config, and optional magnet
+    /// parameters for BEP 9 metadata fetch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_limiter(
+        meta: TorrentMeta,
+        download_dir: PathBuf,
+        peer_id: [u8; 20],
+        binder: Arc<dyn NetworkBinder>,
+        state: Arc<Mutex<EngineState>>,
+        commands: tokio::sync::mpsc::Receiver<EngineCommand>,
+        seed_peers: Vec<PeerAddr>,
+        listen_port: u16,
+        limiter: RateLimiter,
+        magnet: Option<MagnetParams>,
+    ) -> Self {
         Self {
             meta,
             download_dir,
@@ -106,12 +157,36 @@ impl TorrentEngine {
             commands: Arc::new(Mutex::new(commands)),
             seed_peers,
             listen_port,
+            limiter,
+            magnet,
+            dht: None,
         }
+    }
+
+    /// Attach a DHT runner for trackerless peer discovery (ignored for private
+    /// torrents).
+    pub fn with_dht(mut self, dht: Arc<crate::dht::DhtRunner>) -> Self {
+        self.dht = Some(dht);
+        self
     }
 
     /// Main engine loop. Runs announce + peer download until complete or
     /// commanded to stop. Returns the final engine state.
-    pub async fn run(self) -> Result<EngineState> {
+    pub async fn run(mut self) -> Result<EngineState> {
+        // If this is a magnet (no real metadata yet), fetch the `info` dict
+        // from a peer via BEP 9 before downloading. The real info hash,
+        // name, and trackers come from the magnet parameters.
+        if let Some(magnet) = self.magnet.clone() {
+            self.state.lock().await.tracker_message = Some("fetching metadata via BEP 9".into());
+            let info = self.fetch_magnet_metadata(&magnet).await?;
+            let rebuilt =
+                crate::metadata::build_meta_from_info(&info, &magnet.name, &magnet.trackers)?;
+            // Stash the real metadata so the daemon can update the record.
+            self.state.lock().await.resolved_meta = Some(rebuilt.clone());
+            // Replace the placeholder meta with the real one.
+            self.meta = rebuilt;
+        }
+
         let piece_count = self.meta.piece_count();
         let total_length = self.meta.total_length;
         // Initialize state.
@@ -146,12 +221,25 @@ impl TorrentEngine {
             return Ok(self.state.lock().await.clone());
         }
 
-        // Discover peers via tracker announce (HTTP) on each tier.
+        // Discover peers via tracker announce (HTTP/UDP) on each tier.
         let mut discovered = self.announce(AnnounceEvent::Started).await;
         // Merge any directly-supplied seed peers (local swarm / PEX / DHT).
         for p in &self.seed_peers {
             if !discovered.contains(p) {
                 discovered.push(*p);
+            }
+        }
+        // Trackerless / supplemental DHT discovery: for non-private torrents,
+        // ask the DHT for peers holding this info hash.
+        if !self.meta.is_private() {
+            if let Some(dht) = &self.dht {
+                if let Ok(peers) = dht.get_peers(self.meta.info_hash, 3).await {
+                    for p in peers {
+                        if !discovered.contains(&p) {
+                            discovered.push(p);
+                        }
+                    }
+                }
             }
         }
         self.state.lock().await.peers = discovered.clone();
@@ -186,6 +274,29 @@ impl TorrentEngine {
                 }
             }
 
+            let remaining = piece_count - have.count(piece_count);
+
+            // Endgame mode: when few pieces remain, request the remaining
+            // blocks from multiple peers concurrently and cancel duplicates
+            // as they complete. Falls back to the normal sequential path when
+            // endgame is inactive or there are too few usable peers.
+            if swarmotter_core::endgame::is_endgame(remaining) {
+                let candidates: Vec<PeerAddr> = discovered
+                    .iter()
+                    .filter(|p| !bad_peers.contains(&p.socket_addr()))
+                    .copied()
+                    .take(max_concurrent)
+                    .collect();
+                if !candidates.is_empty() {
+                    let progressed = self
+                        .run_endgame(&candidates, &storage, &mut have, &mut bad_peers)
+                        .await;
+                    if progressed || have.count(piece_count) == piece_count {
+                        continue;
+                    }
+                }
+            }
+
             // Try peers until we make progress or exhaust the list.
             let mut made_progress = false;
             let mut to_try: Vec<PeerAddr> = discovered
@@ -200,7 +311,13 @@ impl TorrentEngine {
                     break;
                 }
                 match self
-                    .download_from_peer(&peer_addr, &storage, &mut have, &mut bad_peers)
+                    .download_from_peer(
+                        &peer_addr,
+                        &storage,
+                        &mut have,
+                        &mut bad_peers,
+                        &mut discovered,
+                    )
                     .await
                 {
                     Ok(progressed) => {
@@ -246,6 +363,7 @@ impl TorrentEngine {
         storage: &StorageIo,
         have: &mut PieceBitfield,
         bad_peers: &mut HashSet<SocketAddr>,
+        discovered: &mut Vec<PeerAddr>,
     ) -> Result<bool> {
         if !self.binder.traffic_allowed() {
             return Ok(false);
@@ -253,10 +371,11 @@ impl TorrentEngine {
         let stream = self.binder.connect_peer(peer_addr.socket_addr()).await?;
         let (read_half, mut write_half) = tokio::io::split(stream);
 
-        // Handshake.
+        // Handshake. Advertise BEP 10 extension support for PEX/metadata.
         let hs = Handshake {
             info_hash: self.meta.info_hash,
             peer_id: self.peer_id,
+            reserved: swarmotter_core::extensions::EXTENSION_RESERVED,
         };
         peer::write_handshake(&mut write_half, &hs).await?;
         let mut reader = PeerReader::new(read_half);
@@ -278,6 +397,32 @@ impl TorrentEngine {
         peer::write_message(&mut write_half, &our_bf.encode_message()).await?;
         write_half.flush().await.ok();
 
+        // Send a BEP 10 extension handshake advertising ut_pex (and
+        // ut_metadata for the magnet metadata path). PEX is honored only for
+        // non-private torrents; private torrents skip PEX entirely.
+        let local_pex_id: u8 = 1u8;
+        let local_metadata_id: u8 = 2u8;
+        let ext_payload = swarmotter_core::extensions::encode_extension_handshake(
+            &[
+                (swarmotter_core::extensions::UT_PEX_NAME, local_pex_id),
+                (
+                    swarmotter_core::extensions::UT_METADATA_NAME,
+                    local_metadata_id,
+                ),
+            ],
+            "SwarmOtter/0.1",
+            None,
+        );
+        peer::write_message(
+            &mut write_half,
+            &Message::Extended {
+                id: swarmotter_core::extensions::EXTENSION_HANDSHAKE_ID,
+                payload: ext_payload,
+            },
+        )
+        .await?;
+        write_half.flush().await.ok();
+
         // We are interested; ask to be unchoked.
         peer::write_message(&mut write_half, &Message::Interested).await?;
 
@@ -285,6 +430,7 @@ impl TorrentEngine {
         let mut peer_choking = true;
         let mut made_progress = false;
         let piece_count = self.meta.piece_count();
+        let mut remote_pex_id: Option<u8> = None;
 
         // Drive a small download loop: pick a missing piece the peer has,
         // request its blocks, assemble, verify, write.
@@ -363,6 +509,7 @@ impl TorrentEngine {
                             | Message::NotInterested
                             | Message::Request { .. }
                             | Message::Cancel { .. }
+                            | Message::Extended { .. }
                             | Message::Unknown { .. } => {}
                         }
                     }
@@ -370,6 +517,11 @@ impl TorrentEngine {
                     if received_blocks == reqs.len() {
                         let data = assembler.data().to_vec();
                         if swarmotter_core::storage::verify_piece(&self.meta, piece_index, &data) {
+                            // Live download rate shaping: acquire tokens for the
+                            // downloaded bytes before committing them.
+                            self.limiter
+                                .acquire(RateDirection::Download, data.len() as u64)
+                                .await;
                             storage.write_block(piece_index, 0, &data).await?;
                             have.set(piece_index);
                             made_progress = true;
@@ -419,10 +571,123 @@ impl TorrentEngine {
                 | Message::Piece { .. }
                 | Message::Cancel { .. }
                 | Message::Unknown { .. } => {}
+                Message::Extended { id, payload } => {
+                    // BEP 10 extension: handshake (id 0) or a PEX message.
+                    if id == swarmotter_core::extensions::EXTENSION_HANDSHAKE_ID {
+                        if let Ok(hs) =
+                            swarmotter_core::extensions::parse_extension_handshake(&payload)
+                        {
+                            remote_pex_id = hs.id_for(swarmotter_core::extensions::UT_PEX_NAME);
+                        }
+                    } else if Some(id) == remote_pex_id && !self.meta.is_private() {
+                        if let Ok(pex) = swarmotter_core::extensions::parse_pex(&payload) {
+                            for p in pex.added {
+                                if !discovered.contains(&p) {
+                                    discovered.push(p);
+                                }
+                            }
+                            for p in pex.added6 {
+                                if !discovered.contains(&p) {
+                                    discovered.push(p);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
         Ok(made_progress)
+    }
+
+    /// Concurrent endgame download: request the remaining pieces' blocks from
+    /// multiple peers at once, sharing a verified `have` bitfield, and cancel
+    /// duplicate outstanding requests as pieces complete. Returns true if any
+    /// new piece was verified and written.
+    ///
+    /// This implements real endgame behavior: the same remaining blocks are
+    /// requested from several peers (bounded by the outstanding-request
+    /// duplicate cap), and once a piece completes the still-outstanding
+    /// blocks of that piece are cancelled to avoid request explosion. The
+    /// request queues stay bounded by `ENDGAME_MAX_PEERS` and the duplicate
+    /// cap.
+    async fn run_endgame(
+        &self,
+        candidates: &[PeerAddr],
+        storage: &StorageIo,
+        have: &mut PieceBitfield,
+        bad_peers: &mut HashSet<SocketAddr>,
+    ) -> bool {
+        use swarmotter_core::endgame::{is_endgame, OutstandingRequests};
+        const ENDGAME_MAX_PEERS: usize = 4;
+        const ENDGAME_STEP_DEADLINE: Duration = Duration::from_secs(30);
+
+        let piece_count = self.meta.piece_count();
+        let shared_have = Arc::new(Mutex::new(have.clone()));
+        let outstanding = Arc::new(Mutex::new(OutstandingRequests::new(ENDGAME_MAX_PEERS)));
+        let made_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let download_dir = self.download_dir.clone();
+
+        let peers: Vec<PeerAddr> = candidates.iter().take(ENDGAME_MAX_PEERS).copied().collect();
+        let mut handles = Vec::new();
+        let deadline = Instant::now() + ENDGAME_STEP_DEADLINE;
+        for peer_addr in peers {
+            let meta = self.meta.clone();
+            let binder = self.binder.clone();
+            let peer_id = self.peer_id;
+            let shared_have = shared_have.clone();
+            let outstanding = outstanding.clone();
+            let made_progress = made_progress.clone();
+            let download_dir = download_dir.clone();
+            let limiter = self.limiter.clone();
+            handles.push(tokio::spawn(async move {
+                endgame_peer_session(
+                    binder.as_ref(),
+                    peer_addr,
+                    meta,
+                    peer_id,
+                    shared_have,
+                    outstanding,
+                    download_dir,
+                    deadline,
+                    made_progress,
+                    limiter,
+                )
+                .await
+            }));
+        }
+
+        // Wait for all endgame peer sessions; record bad peers on failure.
+        let mut any_progress = false;
+        for (peer_addr, h) in candidates.iter().take(ENDGAME_MAX_PEERS).zip(handles) {
+            match h.await {
+                Ok(Ok(progressed)) => {
+                    if progressed {
+                        any_progress = true;
+                    }
+                }
+                Ok(Err(_)) => {
+                    bad_peers.insert(peer_addr.socket_addr());
+                }
+                // Task panic/cancellation: treat as a failed peer.
+                Err(_) => {
+                    bad_peers.insert(peer_addr.socket_addr());
+                }
+            }
+        }
+
+        // Merge the shared have back into the local copy and persist progress.
+        let merged = shared_have.lock().await.clone();
+        let progressed = any_progress || made_progress.load(std::sync::atomic::Ordering::Relaxed);
+        let _still_endgame = is_endgame(piece_count - merged.count(piece_count));
+        if progressed {
+            *have = merged.clone();
+            self.update_progress(&merged).await;
+            if let Err(e) = self.persist_resume(storage, &merged).await {
+                tracing::warn!(error = %e, "endgame resume persist failed");
+            }
+        }
+        progressed
     }
 
     /// Pick a piece we don't have that the peer has.
@@ -430,7 +695,6 @@ impl TorrentEngine {
         let peer_bf = peer_bf?;
         (0..self.meta.piece_count()).find(|&i| peer_bf.has(i) && !have.has(i))
     }
-
     fn piece_length(&self, index: usize) -> u64 {
         if index + 1 == self.meta.piece_count() {
             self.meta.last_piece_length()
@@ -467,7 +731,12 @@ impl TorrentEngine {
                     numwant: Some(50),
                     compact: true,
                 };
-                match tracker::http_announce(self.binder.as_ref(), &req).await {
+                let result = if url.starts_with("udp://") {
+                    udp_tracker::udp_announce(self.binder.as_ref(), &req).await
+                } else {
+                    tracker::http_announce(self.binder.as_ref(), &req).await
+                };
+                match result {
                     Ok(resp) => {
                         if let Some(fr) = resp.failure_reason {
                             msg = Some(format!("{url}: {fr}"));
@@ -487,6 +756,100 @@ impl TorrentEngine {
         s.tracker_message = msg;
         s.last_announce = Some(now_secs());
         all
+    }
+
+    /// Fetch magnet metadata via BEP 9. Announces to the magnet's trackers
+    /// (using the real info hash) to discover peers, merges directly-supplied
+    /// seed peers, then fetches the `info` dict from the candidates. All peer
+    /// connections go through the binder.
+    async fn fetch_magnet_metadata(&self, magnet: &MagnetParams) -> Result<Vec<u8>> {
+        // Build a temporary announce request set against the real info hash
+        // using the magnet's trackers. We reuse the engine's announce helper
+        // shape but with the magnet info hash by temporarily swapping it in:
+        // simpler to announce directly here.
+        let mut candidates: Vec<PeerAddr> = Vec::new();
+        for tier in tracker::announce_tiers(magnet.trackers.first().map(|s| s.as_str()), &[]) {
+            for url in tier {
+                let req = AnnounceRequest {
+                    tracker_url: url.clone(),
+                    info_hash: magnet.info_hash,
+                    peer_id: self.peer_id,
+                    port: self.listen_port,
+                    uploaded: 0,
+                    downloaded: 0,
+                    left: 0,
+                    event: AnnounceEvent::Started,
+                    numwant: Some(50),
+                    compact: true,
+                };
+                let result = if url.starts_with("udp://") {
+                    udp_tracker::udp_announce(self.binder.as_ref(), &req).await
+                } else {
+                    tracker::http_announce(self.binder.as_ref(), &req).await
+                };
+                if let Ok(resp) = result {
+                    if resp.failure_reason.is_none() {
+                        candidates.extend(resp.peers);
+                    }
+                }
+            }
+        }
+        // Merge announce-list tiers too.
+        if magnet.trackers.len() > 1 {
+            let extra = tracker::announce_tiers(None, &[magnet.trackers[1..].to_vec()]);
+            for tier in extra {
+                for url in tier {
+                    let req = AnnounceRequest {
+                        tracker_url: url.clone(),
+                        info_hash: magnet.info_hash,
+                        peer_id: self.peer_id,
+                        port: self.listen_port,
+                        uploaded: 0,
+                        downloaded: 0,
+                        left: 0,
+                        event: AnnounceEvent::Started,
+                        numwant: Some(50),
+                        compact: true,
+                    };
+                    let result = if url.starts_with("udp://") {
+                        udp_tracker::udp_announce(self.binder.as_ref(), &req).await
+                    } else {
+                        tracker::http_announce(self.binder.as_ref(), &req).await
+                    };
+                    if let Ok(resp) = result {
+                        if resp.failure_reason.is_none() {
+                            candidates.extend(resp.peers);
+                        }
+                    }
+                }
+            }
+        }
+        for p in &self.seed_peers {
+            if !candidates.contains(p) {
+                candidates.push(*p);
+            }
+        }
+        // Trackerless magnet fallback: if no trackers/peers, discover via DHT.
+        if candidates.is_empty() {
+            if let Some(dht) = &self.dht {
+                if let Ok(peers) = dht.get_peers(magnet.info_hash, 3).await {
+                    candidates.extend(peers);
+                }
+            }
+        }
+        self.state.lock().await.peers = candidates.clone();
+        if candidates.is_empty() {
+            return Err(CoreError::Internal(
+                "magnet metadata fetch: no peers discovered".into(),
+            ));
+        }
+        crate::metadata::fetch_metadata_from_candidates(
+            self.binder.clone(),
+            magnet.info_hash,
+            self.peer_id,
+            &candidates,
+        )
+        .await
     }
 
     async fn update_progress(&self, have: &PieceBitfield) {
@@ -557,6 +920,249 @@ enum CommandOutcome {
     Continue,
     Pause,
     Stop,
+}
+
+/// A single endgame peer session: connect, handshake, and request the
+/// remaining pieces' blocks (bounded by the shared outstanding-request cap),
+/// writing and verifying any piece this peer delivers first. Duplicate
+/// outstanding requests for a completed piece are cancelled on the
+/// connection that receives a now-redundant block.
+#[allow(clippy::too_many_arguments)]
+async fn endgame_peer_session(
+    binder: &dyn NetworkBinder,
+    peer_addr: PeerAddr,
+    meta: TorrentMeta,
+    peer_id: [u8; 20],
+    shared_have: Arc<Mutex<PieceBitfield>>,
+    outstanding: Arc<Mutex<swarmotter_core::endgame::OutstandingRequests>>,
+    download_dir: PathBuf,
+    deadline: Instant,
+    made_progress: Arc<std::sync::atomic::AtomicBool>,
+    limiter: RateLimiter,
+) -> Result<bool> {
+    use swarmotter_core::peer::{block_requests, Bitfield, Handshake, Message, PeerReader};
+    if !binder.traffic_allowed() {
+        return Ok(false);
+    }
+    let storage = StorageIo::new(meta.clone(), download_dir);
+    let stream = binder.connect_peer(peer_addr.socket_addr()).await?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+
+    // Handshake.
+    let hs = Handshake {
+        info_hash: meta.info_hash,
+        peer_id,
+        reserved: swarmotter_core::extensions::EXTENSION_RESERVED,
+    };
+    peer::write_handshake(&mut write_half, &hs).await?;
+    let mut reader = PeerReader::new(read_half);
+    let their_hs = timeout(Duration::from_secs(10), reader.read_handshake()).await??;
+    if their_hs.info_hash != meta.info_hash {
+        return Err(CoreError::Internal(
+            "peer handshake info hash mismatch".into(),
+        ));
+    }
+
+    // Send our bitfield and express interest.
+    let mut our_bf = Bitfield::new(meta.piece_count());
+    {
+        let have = shared_have.lock().await;
+        for i in 0..meta.piece_count() {
+            if have.has(i) {
+                our_bf.set(i);
+            }
+        }
+    }
+    peer::write_message(&mut write_half, &our_bf.encode_message()).await?;
+    peer::write_message(&mut write_half, &Message::Interested).await?;
+    write_half.flush().await.ok();
+
+    let mut peer_bf: Option<Bitfield> = None;
+    let mut peer_choking = true;
+    let mut progressed = false;
+    let piece_count = meta.piece_count();
+
+    loop {
+        if Instant::now() > deadline {
+            break;
+        }
+        // Already complete?
+        let complete = {
+            let have = shared_have.lock().await;
+            have.count(piece_count) == piece_count
+        };
+        if complete {
+            break;
+        }
+
+        if !peer_choking {
+            // Pick a remaining piece the peer has and request its blocks,
+            // honoring the outstanding duplicate cap.
+            let candidate = {
+                let have = shared_have.lock().await;
+                let bf = match &peer_bf {
+                    Some(b) => b,
+                    None => return Ok(progressed),
+                };
+                (0..piece_count).find(|&i| bf.has(i) && !have.has(i))
+            };
+            let Some(piece_index) = candidate else {
+                // Nothing this peer can give us right now.
+                peer::write_message(&mut write_half, &Message::NotInterested).await?;
+                break;
+            };
+            let piece_len = if piece_index + 1 == piece_count {
+                meta.last_piece_length()
+            } else {
+                meta.piece_length
+            } as u32;
+            let reqs = block_requests(piece_len);
+            // Request blocks respecting the duplicate cap.
+            let mut sent_any = false;
+            for (off, len) in &reqs {
+                let allowed = outstanding.lock().await.request(piece_index as u32, *off);
+                if allowed {
+                    peer::write_message(
+                        &mut write_half,
+                        &Message::Request {
+                            piece: piece_index as u32,
+                            offset: *off,
+                            length: *len,
+                        },
+                    )
+                    .await?;
+                    sent_any = true;
+                }
+            }
+            write_half.flush().await.ok();
+            if !sent_any {
+                // All blocks already at the duplicate cap from other peers;
+                // wait briefly for progress.
+                continue;
+            }
+
+            // Assemble the piece from blocks this peer returns.
+            let mut assembler = peer::PieceAssembler::new(piece_index as u32, piece_len as usize);
+            let mut received = 0usize;
+            let piece_deadline = Instant::now() + Duration::from_secs(20);
+            while received < reqs.len() {
+                let remaining = piece_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let msg = match timeout(remaining, reader.read_message()).await {
+                    Ok(Ok(Some(m))) => m,
+                    _ => break,
+                };
+                match msg {
+                    Message::Piece {
+                        piece,
+                        offset,
+                        block,
+                    } => {
+                        if piece as usize == piece_index
+                            && assembler.add_block(offset, &block).is_ok()
+                        {
+                            received += 1;
+                            outstanding.lock().await.delivered(piece, offset);
+                        } else if piece as usize != piece_index {
+                            // A block for a piece we no longer need (completed
+                            // by another peer): cancel outstanding duplicates
+                            // and ignore.
+                            let stale = outstanding.lock().await.outstanding_for_piece(piece);
+                            for (p, o) in &stale {
+                                peer::write_message(
+                                    &mut write_half,
+                                    &Message::Cancel {
+                                        piece: *p,
+                                        offset: *o,
+                                        length: peer::BLOCK_SIZE,
+                                    },
+                                )
+                                .await?;
+                            }
+                            write_half.flush().await.ok();
+                        }
+                    }
+                    Message::Choke => {
+                        peer_choking = true;
+                        break;
+                    }
+                    Message::Unchoke => peer_choking = false,
+                    Message::Have { piece } => {
+                        if let Some(bf) = &mut peer_bf {
+                            bf.set(piece as usize);
+                        }
+                    }
+                    Message::Bitfield { bits } => {
+                        peer_bf = Some(Bitfield::from_bytes(bits, piece_count));
+                    }
+                    _ => {}
+                }
+            }
+
+            if received == reqs.len() {
+                let data = assembler.data().to_vec();
+                if swarmotter_core::storage::verify_piece(&meta, piece_index, &data) {
+                    // Only the first peer to complete writes it.
+                    let already = {
+                        let have = shared_have.lock().await;
+                        have.has(piece_index)
+                    };
+                    if !already {
+                        // Live download rate shaping for the endgame path too.
+                        limiter
+                            .acquire(RateDirection::Download, data.len() as u64)
+                            .await;
+                        storage.write_block(piece_index, 0, &data).await?;
+                        shared_have.lock().await.set(piece_index);
+                        outstanding.lock().await.clear_piece(piece_index as u32);
+                        progressed = true;
+                        made_progress.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // Cancel any still-outstanding duplicates of this piece.
+                    let stale = outstanding
+                        .lock()
+                        .await
+                        .outstanding_for_piece(piece_index as u32);
+                    for (p, o) in &stale {
+                        peer::write_message(
+                            &mut write_half,
+                            &Message::Cancel {
+                                piece: *p,
+                                offset: *o,
+                                length: peer::BLOCK_SIZE,
+                            },
+                        )
+                        .await?;
+                    }
+                    write_half.flush().await.ok();
+                }
+            }
+            continue;
+        }
+
+        // Wait for unchoke / bitfield / have.
+        let msg = match timeout(Duration::from_secs(15), reader.read_message()).await {
+            Ok(Ok(Some(m))) => m,
+            _ => break,
+        };
+        match msg {
+            Message::Unchoke => peer_choking = false,
+            Message::Choke => peer_choking = true,
+            Message::Bitfield { bits } => {
+                peer_bf = Some(Bitfield::from_bytes(bits, piece_count));
+            }
+            Message::Have { piece } => {
+                if let Some(bf) = &mut peer_bf {
+                    bf.set(piece as usize);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(progressed)
 }
 
 fn now_secs() -> u64 {

@@ -20,7 +20,9 @@ pub mod binder;
 pub mod config;
 pub mod probe;
 
-pub use binder::{parse_http_response, HttpResponse, NetworkBinder};
+pub use binder::{
+    parse_http_response, ContainedUdpSocket, HttpResponse, NetworkBinder, PeerListener,
+};
 pub use config::NetworkConfig;
 pub use probe::{InterfaceInfo, InterfaceProbe, InterfaceStatus, OsInterfaceProbe};
 

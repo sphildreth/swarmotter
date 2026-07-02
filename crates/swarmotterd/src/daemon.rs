@@ -33,6 +33,7 @@ use swarmotter_core::watch;
 
 use crate::engine::{EngineCommand, EngineState, TorrentEngine};
 use crate::netbinder::ContainedBinder;
+use crate::seeder::Seeder;
 
 pub struct DaemonRuntime {
     pub registry: Arc<Mutex<TorrentRegistry>>,
@@ -45,6 +46,10 @@ pub struct DaemonRuntime {
     engine_cmds: Arc<Mutex<HashMap<InfoHash, tokio::sync::mpsc::Sender<EngineCommand>>>>,
     /// Running engine task join handles.
     engine_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
+    /// Seeder shutdown signal senders per torrent (inbound peer listening).
+    seeder_shutdowns: Arc<Mutex<HashMap<InfoHash, tokio::sync::watch::Sender<bool>>>>,
+    /// Running seeder task join handles per torrent.
+    seeder_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
 }
 
 impl DaemonRuntime {
@@ -57,6 +62,8 @@ impl DaemonRuntime {
             engine_states: Arc::new(Mutex::new(HashMap::new())),
             engine_cmds: Arc::new(Mutex::new(HashMap::new())),
             engine_handles: Arc::new(Mutex::new(HashMap::new())),
+            seeder_shutdowns: Arc::new(Mutex::new(HashMap::new())),
+            seeder_handles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -94,16 +101,27 @@ impl DaemonRuntime {
             return;
         }
 
-        let (meta, download_dir, listen_port) = {
+        let (meta, download_dir, listen_port, magnet, needs_metadata) = {
             let reg = self.registry.lock().await;
             let Some(t) = reg.get(&hash) else {
                 return;
             };
             let download_dir = self.resolve_download_dir(t).await;
+            let magnet = if t.needs_metadata {
+                Some(crate::engine::MagnetParams {
+                    info_hash: t.magnet_info_hash.unwrap_or(t.meta.info_hash),
+                    name: t.magnet_name.clone().unwrap_or_else(|| t.meta.name.clone()),
+                    trackers: t.magnet_trackers.clone(),
+                })
+            } else {
+                None
+            };
             (
                 t.meta.clone(),
                 download_dir,
                 self.config.lock().await.torrent.listen_port,
+                magnet,
+                t.needs_metadata,
             )
         };
 
@@ -115,24 +133,85 @@ impl DaemonRuntime {
         let (tx, rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
         self.engine_cmds.lock().await.insert(hash, tx);
 
+        // Live bandwidth shaping: build a rate limiter from the effective
+        // global download/upload limits (0 = unlimited). Per-torrent limits
+        // can further tighten this in the future.
+        let limiter = {
+            let cfg = self.config.lock().await;
+            swarmotter_core::bandwidth::RateLimiter::new(
+                cfg.bandwidth.effective_download(),
+                cfg.bandwidth.effective_upload(),
+            )
+        };
+
         let state_for_summary = state.clone();
         let hash_for_task = hash;
         let registry = self.registry.clone();
-        let engine = TorrentEngine::new(
+        // DHT runner for trackerless peer discovery. Gated by config and
+        // containment; the engine disables DHT for private torrents.
+        let dht_runner = {
+            let cfg = self.config.lock().await;
+            if cfg.dht.enabled && self.network_health.lock().await.traffic_allowed {
+                let bootstrap = crate::dht::resolve_bootstrap(&cfg.dht.bootstrap_nodes);
+                let self_id = crate::dht::DhtRunner::derive_from_peer_id(&peer_id);
+                Some(Arc::new(crate::dht::DhtRunner::new(
+                    self_id,
+                    self.make_binder().await,
+                    bootstrap,
+                )))
+            } else {
+                None
+            }
+        };
+        let mut engine = TorrentEngine::with_limiter(
             meta.clone(),
-            download_dir.into(),
+            download_dir.clone().into(),
             peer_id,
             binder,
             state.clone(),
             rx,
             vec![],
             listen_port,
+            limiter,
+            magnet,
         );
+        if let Some(dht) = dht_runner {
+            engine = engine.with_dht(dht);
+        }
         let handle = tokio::spawn(async move {
             match engine.run().await {
                 Ok(final_state) => {
                     let mut reg = registry.lock().await;
                     if let Some(t) = reg.get_mut(&hash_for_task) {
+                        // If metadata was fetched via BEP 9, replace the
+                        // placeholder meta with the real one and rebuild the
+                        // file/piece bookkeeping.
+                        if let Some(real) = final_state.resolved_meta.clone() {
+                            t.meta = real.clone();
+                            t.needs_metadata = false;
+                            t.progress.have = (0..real.piece_count())
+                                .map(|i| final_state.pieces_have.has(i))
+                                .collect();
+                            t.files = real
+                                .files
+                                .iter()
+                                .enumerate()
+                                .map(|(i, f)| swarmotter_core::models::torrent::TorrentFile {
+                                    index: i,
+                                    path: f.path.join("/"),
+                                    length: f.length,
+                                    bytes_completed: 0,
+                                    priority:
+                                        swarmotter_core::models::torrent::FilePriority::Normal,
+                                    wanted: true,
+                                })
+                                .collect();
+                            t.priorities = vec![
+                                    swarmotter_core::models::torrent::FilePriority::Normal;
+                                    real.files.len()
+                                ];
+                            t.wanted = vec![true; real.files.len()];
+                        }
                         t.downloaded = final_state.downloaded;
                         t.uploaded = final_state.uploaded;
                         t.progress.have = (0..final_state.piece_count)
@@ -141,6 +220,10 @@ impl DaemonRuntime {
                         if final_state.finished {
                             t.state = TorrentState::Completed;
                             t.date_completed = Some(now());
+                        } else if t.state == TorrentState::DownloadingMetadata {
+                            // Metadata fetched but download incomplete; mark
+                            // downloading.
+                            t.state = TorrentState::Downloading;
                         }
                     }
                 }
@@ -156,6 +239,16 @@ impl DaemonRuntime {
             let _ = state_for_summary;
         });
         self.engine_handles.lock().await.insert(hash, handle);
+
+        // Start the inbound peer listener / seeder alongside the download
+        // engine, sharing the same live state. It serves verified pieces to
+        // inbound peers (partial seeding during download, full seeding after
+        // completion) through the contained listener. Skip for magnets until
+        // metadata is resolved (the placeholder has no real pieces to serve).
+        if !needs_metadata {
+            self.start_seeder(hash, meta.clone(), download_dir.clone(), state.clone())
+                .await;
+        }
 
         // Mark the torrent as downloading.
         let mut reg = self.registry.lock().await;
@@ -174,7 +267,71 @@ impl DaemonRuntime {
         if let Some(handle) = self.engine_handles.lock().await.remove(hash) {
             let _ = handle.await;
         }
+        // Stop the inbound peer listener / seeder too.
+        self.stop_seeder(hash).await;
         self.engine_states.lock().await.remove(hash);
+    }
+
+    /// Spawn the inbound peer listener / seeder for a torrent. It shares the
+    /// live engine state and serves verified pieces through the contained
+    /// listener. No-op if already running or if the torrent is private and
+    /// inbound listening is not desired (private torrents still allow inbound
+    /// peers; the private flag restricts DHT/PEX, not inbound TCP).
+    async fn start_seeder(
+        &self,
+        hash: InfoHash,
+        meta: swarmotter_core::meta::TorrentMeta,
+        download_dir: String,
+        state: Arc<Mutex<EngineState>>,
+    ) {
+        if self.seeder_handles.lock().await.contains_key(&hash) {
+            return;
+        }
+        let binder = self.make_binder().await;
+        let peer_id = make_peer_id();
+        let listen_port = self.config.lock().await.torrent.listen_port;
+        let limiter = {
+            let cfg = self.config.lock().await;
+            swarmotter_core::bandwidth::RateLimiter::new(
+                cfg.bandwidth.effective_download(),
+                cfg.bandwidth.effective_upload(),
+            )
+        };
+        let storage = Arc::new(swarmotter_core::storage::StorageIo::new(
+            meta.clone(),
+            std::path::PathBuf::from(download_dir),
+        ));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let seeder = Seeder::with_limiter(
+            meta,
+            storage,
+            state,
+            binder,
+            listen_port,
+            peer_id,
+            shutdown_rx,
+            limiter,
+        );
+        self.seeder_shutdowns.lock().await.insert(hash, shutdown_tx);
+        let hash_for_task = hash;
+        let registry = self.registry.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = seeder.run().await {
+                tracing::debug!(info_hash = %hash_for_task, error = %e, "seeder task ended");
+            }
+            // If the seeder exits (e.g. network blocked), clear its handle.
+            let _ = registry;
+        });
+        self.seeder_handles.lock().await.insert(hash, handle);
+    }
+
+    async fn stop_seeder(&self, hash: &InfoHash) {
+        if let Some(tx) = self.seeder_shutdowns.lock().await.remove(hash) {
+            let _ = tx.send(true);
+        }
+        if let Some(handle) = self.seeder_handles.lock().await.remove(hash) {
+            let _ = handle.await;
+        }
     }
 
     async fn make_binder(&self) -> Arc<dyn swarmotter_core::net::NetworkBinder> {
@@ -372,8 +529,8 @@ impl DaemonOps for DaemonRuntime {
         let hash = m.info_hash;
         let name = m.display_name.clone().unwrap_or_else(|| hash.to_hex());
         // Build a placeholder single-file torrent so the registry has a record;
-        // real metadata is fetched via DHT/peers (metadata exchange) once the
-        // peer protocol is active.
+        // the real metadata is fetched via BEP 9 from peers once the engine
+        // starts. The registry is keyed by the magnet's real info hash.
         let bytes = meta::build_single_file_torrent(
             &name,
             b"magnet placeholder data",
@@ -384,6 +541,10 @@ impl DaemonOps for DaemonRuntime {
         let parsed = meta::parse_torrent(&bytes)?;
         let mut t = Torrent::new(parsed, now());
         t.state = TorrentState::DownloadingMetadata;
+        t.needs_metadata = true;
+        t.magnet_info_hash = Some(hash);
+        t.magnet_name = Some(name);
+        t.magnet_trackers = m.trackers.clone();
         if let Some(d) = download_dir {
             t.download_dir = Some(d);
         }

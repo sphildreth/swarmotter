@@ -44,6 +44,16 @@ foundational dependency stack rationale.
 | futures-util | 0.3 | MIT/Apache-2.0 | Async stream utilities for SSE/WebSocket |
 | tokio-stream | 0.1 | MIT | Broadcast stream adapters for events |
 | clap | 4 | MIT/Apache-2.0 | CLI argument parsing |
+| tokio-rustls | 0.26 | MIT/Apache-2.0 | TLS handshake over contained TCP sockets (HTTPS trackers) |
+| rustls | 0.23 | Apache-2.0/MIT/ISC | Rustls TLS implementation with the ring crypto provider (HTTPS trackers) |
+| webpki-roots | 0.26 | MPL-2.0 | Platform root CA trust store for HTTPS tracker certificate validation |
+
+### Dev-dependencies (test-only)
+
+| Crate | Version | License | Justification |
+|-------|---------|---------|---------------|
+| rcgen | 0.13 | MIT/Apache-2.0 | Self-signed certificate generation for the local HTTPS tracker fixture only |
+| rustls-pemfile | 2 | Apache-2.0/MIT | PEM parsing for test TLS fixtures |
 
 ## Network containment note
 

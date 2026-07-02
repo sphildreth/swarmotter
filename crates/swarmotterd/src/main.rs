@@ -7,9 +7,12 @@
 //! data-plane traffic is enforced through the network containment layer.
 
 mod daemon;
+mod dht;
 mod engine;
+mod metadata;
 mod netbinder;
 mod runtime;
+mod seeder;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +38,10 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Install the rustls crypto provider (ring) so HTTPS trackers over
+    // contained sockets work.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();

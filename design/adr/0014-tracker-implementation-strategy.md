@@ -31,22 +31,26 @@ peers, and `completed` when the download finishes. Private torrents are
 honored by restricting peer discovery to trackers (DHT/PEX are disabled for
 private torrents — modeled here by relying solely on `announce_tiers`).
 
-UDP trackers are modeled (`TrackerKind::Udp`) but the live UDP announce
-engine is not part of this slice; it is tracked as remaining v1.0.0 work in
-`docs/v1-completion-tracker.md`. When added, it will use a binder UDP method
-and the same compact-peer parsing.
+UDP trackers are implemented in `swarmotter-core::udp_tracker` (BEP 15):
+connect request/response handshake to obtain a connection id, announce
+request/response with compact IPv4 peer parsing, transaction-id matching,
+error response handling, and a bounded retry loop. All UDP traffic goes
+through the binder's `udp_socket()` contained UDP socket; no UDP socket is
+created directly. The engine's `announce()` dispatches by scheme: `udp://`
+URLs use `udp_tracker::udp_announce`, `http://`/`https://` URLs use
+`http_announce`. HTTPS TLS over the contained socket remains future work.
 
 ## Consequences
 
 - Tracker announce URL construction and compact peer parsing are unit-tested
   without sockets.
-- All tracker HTTP traffic is containment-gated.
-- Adding UDP trackers requires a binder UDP method, not a bypass.
-- HTTPS trackers reuse the same `http_get` binder path (TLS over the contained
-  socket is future work; HTTP is the initial path).
+- All tracker HTTP and UDP traffic is containment-gated.
+- UDP trackers use the binder `udp_socket()` method, not a bypass.
+- HTTPS trackers will reuse the contained socket path with TLS (future work).
 
 ## Related Documents
 
 - `crates/swarmotter-core/src/tracker.rs`
+- `crates/swarmotter-core/src/udp_tracker.rs`
 - ADR-0012 (network binder)
 - ADR-0013 (peer protocol)

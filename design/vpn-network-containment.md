@@ -89,9 +89,17 @@ Live torrent sockets are created exclusively through the `NetworkBinder` trait
 daemon. The binder binds outbound TCP to the configured source
 address/interface, re-evaluates containment before each connection, and
 returns `CoreError::NetworkBlocked` in strict fail-closed mode when the path
-is unavailable. Tracker HTTP GETs are issued through the same binder. A
+is unavailable. Tracker HTTP GETs are issued through the same binder. HTTPS trackers
+(`https://`) perform TLS over the binder's contained TCP socket
+(`tokio-rustls` + `rustls` with system-root certificate validation); the TLS
+layer never creates an independent network path. UDP
+data-plane traffic (UDP trackers, DHT, future uTP) goes through the binder's
+`udp_socket()` method, which returns a source-bound contained UDP socket.
+Inbound peer connections (seeding) go through `bind_peer_listener()`, which
+binds a contained TCP listener to the configured source address. A
 `LoopbackBinder` (test feature) lets integration tests exercise the full
-engine over loopback without the default route. See ADR-0012.
+engine over loopback without the default route, and a `BlockedBinder` proves
+fail-closed behavior for TCP, UDP, and the listener. See ADR-0012.
 
 ## TODO
 

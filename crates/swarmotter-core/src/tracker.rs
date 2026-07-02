@@ -345,6 +345,14 @@ mod tests {
     }
 
     #[test]
+    fn build_url_https_scheme_preserved() {
+        let mut r = req();
+        r.tracker_url = "https://tracker.example:8443/announce".into();
+        let url = r.build_url().unwrap();
+        assert!(url.starts_with("https://tracker.example:8443/announce?"));
+    }
+
+    #[test]
     fn bytes_escape_formats_all_bytes() {
         let bytes = [0u8, 1u8, 0xff, b'A', b' '];
         let enc = bytes_escape(&bytes);

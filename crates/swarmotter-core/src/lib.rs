@@ -10,7 +10,10 @@
 pub mod bandwidth;
 pub mod bencode;
 pub mod config;
+pub mod dht;
+pub mod endgame;
 pub mod error;
+pub mod extensions;
 pub mod hash;
 pub mod magnet;
 pub mod meta;
@@ -22,6 +25,7 @@ pub mod ratio;
 pub mod storage;
 pub mod torrent;
 pub mod tracker;
+pub mod udp_tracker;
 pub mod watch;
 
 pub use error::{CoreError, Result};

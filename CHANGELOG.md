@@ -70,8 +70,67 @@ MVP release.
   tests completing a real download from a generated payload through an
   in-process HTTP tracker and seed peer (tracker and direct-peer paths), plus
   a daemon-driven download test through `DaemonOps`.
-- Tests now total: core 108 unit + engine/daemon/containment/api/web + 2 local
-  swarm + 1 daemon download.
+- **Network binder extension:** `NetworkBinder` now exposes `udp_socket()`
+  (contained, source-bound UDP datagram socket via `ContainedUdpSocket`) and
+  `bind_peer_listener()` (contained, source-bound inbound TCP listener via
+  `PeerListener`), both fail-closed. `LoopbackBinder` implements both for
+  tests; a new `BlockedBinder` proves fail-closed behavior for TCP, UDP, and
+  the inbound listener. Used by UDP trackers, future DHT/uTP, and seeding.
+- **UDP trackers (BEP 15):** live UDP tracker connect + announce in
+  `swarmotter-core::udp_tracker`, routed through the binder's contained UDP
+  socket, with compact IPv4 peer parsing, transaction-id matching, error
+  response handling, and a bounded retry loop. The engine dispatches
+  announce by scheme (`udp://` vs `http://`). Includes a local UDP tracker
+  fixture test and a fail-closed test, plus an engine-level local swarm test
+  downloading via a BEP 15 UDP tracker.
+- **Endgame mode:** near completion (remaining pieces at or below
+  `ENDGAME_THRESHOLD`), the engine switches to a concurrent endgame path
+  (`swarmotter-core::endgame` planner + `engine::run_endgame`) that requests
+  the remaining blocks from multiple peers at once, bounds duplicate
+  outstanding requests per block, and cancels still-outstanding duplicates as
+  pieces complete, keeping request queues bounded. A local swarm test resumes
+  a near-complete torrent and completes it through endgame.
+- **Live bandwidth shaping:** a `RateLimiter` (token-bucket, async) is wired
+  from the daemon's effective global download/upload limits into the engine
+  download path (per-piece acquire) and the seeder upload path (per-block
+  acquire), including the endgame path. A throttling local swarm test proves a
+  tight download limit materially slows a real download. Per-torrent limits
+  are modeled in settings; global limits are live.
+- **PEX peer exchange (BEP 10/11):** the extension protocol (`swarmotter-core
+  ::extensions`) adds extension-handshake encode/decode, a `Handshake.reserved`
+  field with the BEP 10 extension bit, an `Extended` peer-wire message variant
+  (id 20), and `ut_pex` message encode/decode. The engine sends an extension
+  handshake, learns the remote `ut_pex` id, parses incoming PEX messages, and
+  adds discovered peers to the candidate pool; private torrents block PEX. All
+  PEX-discovered outbound connections go through the binder. A local swarm
+  test proves a leecher discovers a seed peer via PEX and completes.
+- **BEP 9 magnet metadata fetch:** `swarmotterd::metadata` implements the
+  `ut_metadata` extension: extension handshake with `metadata_size`, metadata
+  piece request/assembly, SHA-1 info-hash validation of the assembled `info`
+  dict, and conversion into a real `TorrentMeta` so the download proceeds as
+  for a `.torrent` file. The daemon keys magnet records by the real info hash,
+  surfaces `DownloadingMetadata` state, fetches metadata from tracker-
+  discovered peers, then replaces the placeholder meta. Magnets with trackers
+  are supported; fail-closed blocks metadata fetch. A local swarm test proves
+  a magnet fetches metadata then downloads the real content.
+- **HTTPS tracker support over contained sockets:** HTTPS is performed as TLS
+  (`tokio-rustls` + `rustls` with the ring provider, `webpki-roots`) over the
+  binder's contained TCP connection, with system-root certificate validation.
+  The engine dispatches `https://` trackers through the same contained
+  `http_get` path. Fail-closed blocks HTTPS; a local self-signed TLS fixture
+  test proves the contained-socket HTTPS path with certificate validation.
+  See ADR-0018.
+- Tests now total: core 138 unit + engine/daemon/seeder/endgame/bandwidth/metadata/tls/containment/api/web + 8 local
+  swarm (HTTP tracker, UDP tracker, direct peer, inbound seeding, endgame, bandwidth, PEX, magnet) + 1 daemon download.
+- **Inbound peer listening and seeding/upload:** the daemon now spawns an
+  inbound `Seeder` (`swarmotterd::seeder`) alongside each active torrent. It
+  binds a contained TCP listener through the binder's `bind_peer_listener()`,
+  validates inbound handshakes, serves verified piece blocks from `StorageIo`,
+  handles interested/unchoke, and accounts uploaded bytes into the shared
+  `EngineState`. Pause/remove/network-block stop the seeder; fail-closed
+  blocks the listener. A local swarm test verifies a completed download is
+  served to a fresh leecher over the real protocol with uploaded-byte
+  accounting.
 
 ### Changed
 

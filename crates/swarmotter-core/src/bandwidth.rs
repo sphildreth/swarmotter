@@ -8,6 +8,7 @@
 //! module provides the pure scheduling logic so it can be unit-tested.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Bandwidth limits.
@@ -97,6 +98,110 @@ impl TokenBucket {
     pub fn available(&self) -> u64 {
         self.tokens
     }
+
+    /// Current capacity (bytes/sec), or 0 for unlimited.
+    pub fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    /// Update the capacity (bytes/sec) at runtime, preserving the refill clock.
+    pub fn set_capacity(&mut self, capacity_per_sec: u64) {
+        self.capacity = capacity_per_sec;
+        if self.tokens > capacity_per_sec {
+            self.tokens = capacity_per_sec;
+        }
+    }
+}
+
+/// A live async rate limiter combining a download and an upload token bucket,
+/// driven by `tokio::time`. `acquire(direction, bytes)` consumes tokens and
+/// sleeps until enough are available, enforcing global and per-torrent rate
+/// limits in the real peer read/write paths. A capacity of 0 means unlimited.
+#[derive(Debug, Clone)]
+pub struct RateLimiter {
+    pub download: Arc<tokio::sync::Mutex<TokenBucket>>,
+    pub upload: Arc<tokio::sync::Mutex<TokenBucket>>,
+}
+
+/// Direction of a rate-limited transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateDirection {
+    Download,
+    Upload,
+}
+
+impl RateLimiter {
+    /// Build a rate limiter from effective byte/sec limits (0 = unlimited).
+    pub fn new(download_bps: u64, upload_bps: u64) -> Self {
+        let now_ms = now_millis();
+        Self {
+            download: Arc::new(tokio::sync::Mutex::new(TokenBucket::new(
+                download_bps,
+                now_ms,
+            ))),
+            upload: Arc::new(tokio::sync::Mutex::new(TokenBucket::new(
+                upload_bps, now_ms,
+            ))),
+        }
+    }
+
+    /// An unlimited limiter (no shaping).
+    pub fn unlimited() -> Self {
+        Self::new(0, 0)
+    }
+
+    /// Consume `bytes` of the given direction, sleeping in small increments
+    /// until the bucket can afford them. With capacity 0 this returns
+    /// immediately (unlimited).
+    pub async fn acquire(&self, dir: RateDirection, mut bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let bucket = match dir {
+            RateDirection::Download => &self.download,
+            RateDirection::Upload => &self.upload,
+        };
+        loop {
+            let allowed;
+            let cap;
+            {
+                let mut tb = bucket.lock().await;
+                if tb.capacity() == 0 {
+                    return; // unlimited
+                }
+                tb.refill(now_millis());
+                allowed = tb.consume(bytes);
+                cap = tb.capacity();
+            }
+            if allowed >= bytes {
+                return;
+            }
+            bytes -= allowed;
+            // Sleep long enough to accrue the residual tokens, bounded.
+            let sleep_ms = if cap == 0 {
+                1
+            } else {
+                ((bytes as u128) * 1000 / cap as u128).max(1) as u64
+            };
+            tokio::time::sleep(Duration::from_millis(sleep_ms.min(500))).await;
+        }
+    }
+
+    /// Current configured capacity for a direction (0 = unlimited).
+    pub async fn capacity(&self, dir: RateDirection) -> u64 {
+        let bucket = match dir {
+            RateDirection::Download => &self.download,
+            RateDirection::Upload => &self.upload,
+        };
+        bucket.lock().await.capacity()
+    }
+}
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 /// Compute allowed bytes given a per-second limit and elapsed time.
@@ -152,5 +257,33 @@ mod tests {
     fn token_bucket_unlimited_when_zero() {
         let mut tb = TokenBucket::new(0, 0);
         assert_eq!(tb.consume(999_999), 999_999);
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_unlimited_returns_immediately() {
+        let rl = RateLimiter::unlimited();
+        let start = std::time::Instant::now();
+        rl.acquire(RateDirection::Download, 1_000_000).await;
+        rl.acquire(RateDirection::Upload, 1_000_000).await;
+        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_throttles_download() {
+        // 10_000 bytes/sec cap. The bucket starts full (10_000 tokens), so
+        // requesting 20_000 requires ~1s for the second half to accrue.
+        let rl = RateLimiter::new(10_000, 0);
+        let start = std::time::Instant::now();
+        rl.acquire(RateDirection::Download, 20_000).await;
+        let elapsed = start.elapsed();
+        // Allow generous tolerance for scheduler jitter; must be throttled.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(800),
+            "expected throttling, elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(2500),
+            "throttling too aggressive: {elapsed:?}"
+        );
     }
 }

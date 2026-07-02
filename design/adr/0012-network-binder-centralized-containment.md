@@ -25,6 +25,10 @@ connections:
   address/interface.
 - `http_get(url)` issues tracker (and webseed/metadata) HTTP GETs through the
   same contained path.
+- `udp_socket()` returns a contained, source-bound UDP datagram socket
+  (`ContainedUdpSocket` trait) for UDP trackers, DHT, and future uTP.
+- `bind_peer_listener(port)` returns a contained, source-bound inbound TCP
+  listener (`PeerListener` trait) for seeding/upload.
 - `traffic_allowed()` reports the current containment gate so the engine can
   decide whether to start/continue peer activity.
 
@@ -36,7 +40,10 @@ so the peer protocol code is identical for production and tests.
 
 A `LoopbackBinder` (gated behind the `test-binder` feature) lets cross-crate
 integration tests exercise the full engine over loopback without touching the
-default route or real hardware.
+default route or real hardware. A `BlockedBinder` (test feature) models strict
+fail-closed containment: every data-plane operation returns
+`NetworkBlocked` and `traffic_allowed` is false, so fail-closed behavior for
+TCP, UDP, and the inbound listener is provable in tests.
 
 The trait is defined in core (the contract); the implementation lives in the
 daemon (where real sockets and platform binding belong). No engine component

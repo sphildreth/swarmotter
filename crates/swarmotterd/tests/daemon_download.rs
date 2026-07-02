@@ -89,7 +89,11 @@ async fn serve_seed(
     if their_hs.info_hash != info_hash {
         return Err("info hash mismatch".into());
     }
-    let our_hs = Handshake { info_hash, peer_id };
+    let our_hs = Handshake {
+        info_hash,
+        peer_id,
+        reserved: swarmotter_core::peer::RESERVED,
+    };
     wr.write_all(&our_hs.encode()).await?;
     let mut bf = Bitfield::new(piece_count);
     for i in 0..piece_count {

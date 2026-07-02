@@ -19,8 +19,8 @@ use crate::hash::InfoHash;
 /// The standard BitTorrent protocol handshake pstr: "BitTorrent protocol".
 pub const PSTR: &[u8] = b"BitTorrent protocol";
 
-/// Reserved bytes (8). All zero by default; metadata extension bit is not set
-/// for the basic `.torrent` download path.
+/// Reserved bytes (8). All zero by default; the extension-protocol bit
+/// (`EXTENSION_RESERVED`) is set by callers that want BEP 10/PEX/metadata.
 pub const RESERVED: [u8; 8] = [0u8; 8];
 
 /// Block size used for piece requests (16 KiB), per BEP 3 convention.
@@ -31,15 +31,26 @@ pub const BLOCK_SIZE: u32 = 16 * 1024;
 pub struct Handshake {
     pub info_hash: InfoHash,
     pub peer_id: [u8; 20],
+    /// Reserved bytes. Use [`crate::extensions::EXTENSION_RESERVED`] to
+    /// advertise BEP 10 extension support.
+    pub reserved: [u8; 8],
 }
 
 impl Handshake {
+    pub fn new(info_hash: InfoHash, peer_id: [u8; 20]) -> Self {
+        Self {
+            info_hash,
+            peer_id,
+            reserved: RESERVED,
+        }
+    }
+
     /// Encode to the 68-byte wire form: pstrlen(1) pstr(19) reserved(8) info(20) peerid(20).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(1 + PSTR.len() + 8 + 20 + 20);
         out.push(PSTR.len() as u8);
         out.extend_from_slice(PSTR);
-        out.extend_from_slice(&RESERVED);
+        out.extend_from_slice(&self.reserved);
         out.extend_from_slice(self.info_hash.as_bytes());
         out.extend_from_slice(&self.peer_id);
         out
@@ -57,7 +68,8 @@ impl Handshake {
         if pstrlen != 19 || &buf[1..20] != PSTR {
             return Err(CoreError::Parse("handshake has wrong pstr".into()));
         }
-        // reserved bytes 20..28 ignored for basic protocol.
+        let mut reserved = [0u8; 8];
+        reserved.copy_from_slice(&buf[20..28]);
         let mut info = [0u8; 20];
         info.copy_from_slice(&buf[28..48]);
         let mut peer_id = [0u8; 20];
@@ -65,7 +77,13 @@ impl Handshake {
         Ok(Handshake {
             info_hash: InfoHash::from_bytes(info),
             peer_id,
+            reserved,
         })
+    }
+
+    /// Whether the peer advertises BEP 10 extension protocol support.
+    pub fn supports_extensions(&self) -> bool {
+        self.reserved[5] & 0x10 != 0
     }
 }
 
@@ -130,6 +148,13 @@ pub enum Message {
         offset: u32,
         length: u32,
     },
+    /// A BEP 10 extension message (wire id 20). `id` is the extension id from
+    /// the extension handshake (`0` = handshake itself); `payload` is the
+    /// bencoded extension payload following the extension id byte.
+    Extended {
+        id: u8,
+        payload: Vec<u8>,
+    },
     /// An unrecognized message id with its raw payload, for forward compat.
     Unknown {
         id: u8,
@@ -186,6 +211,13 @@ impl Message {
                 payload.extend_from_slice(&offset.to_be_bytes());
                 payload.extend_from_slice(&length.to_be_bytes());
                 len_prefix(13, &payload)
+            }
+            Self::Extended { id, payload } => {
+                let mut p = Vec::with_capacity(1 + payload.len());
+                p.push(20); // BEP 10 extension message id
+                p.push(*id);
+                p.extend_from_slice(payload);
+                len_prefix(p.len() as u32, &p)
             }
             Self::Unknown { id, payload } => {
                 let mut p = Vec::with_capacity(1 + payload.len());
@@ -254,6 +286,14 @@ impl Message {
                     piece,
                     offset,
                     length,
+                })
+            }
+            // BEP 10 extension message: first payload byte is the extension id.
+            _ if id == 20 && !payload.is_empty() => {
+                let ext_id = payload[0];
+                Ok(Self::Extended {
+                    id: ext_id,
+                    payload: payload[1..].to_vec(),
                 })
             }
             _ => Ok(Self::Unknown {
@@ -524,6 +564,7 @@ mod tests {
         let hs = Handshake {
             info_hash: info,
             peer_id: *b"-SW001-abcdefghij123",
+            reserved: RESERVED,
         };
         let enc = hs.encode();
         assert_eq!(enc.len(), 68);

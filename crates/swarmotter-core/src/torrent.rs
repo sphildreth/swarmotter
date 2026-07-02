@@ -37,6 +37,14 @@ pub struct Torrent {
     pub priorities: Vec<FilePriority>,
     pub wanted: Vec<bool>,
     pub error: Option<String>,
+    /// True for magnets that still need their metadata fetched via BEP 9.
+    pub needs_metadata: bool,
+    /// The real info hash for a magnet (before metadata is fetched); used as
+    /// the registry key and for tracker announce. `None` for `.torrent` files.
+    pub magnet_info_hash: Option<InfoHash>,
+    /// Magnet display name and trackers (for metadata fetch + announce).
+    pub magnet_name: Option<String>,
+    pub magnet_trackers: Vec<String>,
 }
 
 impl Torrent {
@@ -72,11 +80,17 @@ impl Torrent {
             priorities: vec![FilePriority::Normal; file_count],
             wanted: vec![true; file_count],
             error: None,
+            needs_metadata: false,
+            magnet_info_hash: None,
+            magnet_name: None,
+            magnet_trackers: Vec::new(),
         }
     }
 
     pub fn info_hash(&self) -> InfoHash {
-        self.meta.info_hash
+        // For magnets that still need metadata, the real info hash is the
+        // magnet's; otherwise use the parsed metadata's info hash.
+        self.magnet_info_hash.unwrap_or(self.meta.info_hash)
     }
 
     pub fn name(&self) -> &str {
