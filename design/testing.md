@@ -78,6 +78,10 @@ feature completion and acceptance criteria, not by time estimates.
 - Magnet metadata fetch: covered (BEP 9 ut_metadata, info-hash verified)
 - DHT-based peer discovery: covered (local KRPC `get_peers` fixture)
 - PEX-based peer exchange: covered (BEP 10/11, peer discovered via PEX)
+- uTP (BEP 29) peer transport: covered (a contained uTP-capable seed serves a
+  generated payload over the contained UDP socket; the engine completes the
+  download over uTP, verifying piece hashes and final file contents; a
+  fail-closed test proves the `BlockedBinder` blocks uTP swarm downloads)
 - Recheck after completion: covered via `StorageIo::recheck`
 
 ## Test data

@@ -143,6 +143,12 @@ impl DaemonRuntime {
                 cfg.bandwidth.effective_upload(),
             )
         };
+        // Peer transport selection (TCP/uTP) from config. All transports stay
+        // on the contained binder; fail-closed blocks both.
+        let (utp_enabled, utp_prefer_tcp) = {
+            let cfg = self.config.lock().await;
+            (cfg.torrent.utp_enabled, cfg.torrent.utp_prefer_tcp)
+        };
 
         let state_for_summary = state.clone();
         let hash_for_task = hash;
@@ -174,7 +180,8 @@ impl DaemonRuntime {
             listen_port,
             limiter,
             magnet,
-        );
+        )
+        .with_transport(utp_enabled, utp_prefer_tcp);
         if let Some(dht) = dht_runner {
             engine = engine.with_dht(dht);
         }

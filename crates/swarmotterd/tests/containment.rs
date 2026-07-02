@@ -71,6 +71,11 @@ async fn network_health_reported_strict_blocked() {
 async fn torrent_allowed_when_disabled() {
     let mut cfg = Config::default();
     cfg.network.mode = swarmotter_core::models::network::NetworkContainmentMode::Disabled;
+    // This test asserts the torrent is not network-blocked under disabled
+    // containment. It must not depend on third-party DHT bootstrap nodes or
+    // real network access, so disable DHT; the engine still starts and, with
+    // no trackers/peers, terminates after bounded no-peer retries.
+    cfg.dht.enabled = false;
     let healthy = NetworkHealth::blocked(
         swarmotter_core::models::network::NetworkContainmentMode::Disabled,
         NetworkContainmentStatus::Disabled,

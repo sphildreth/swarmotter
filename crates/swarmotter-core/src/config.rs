@@ -101,6 +101,21 @@ pub struct TorrentConfig {
     pub listen_port: u16,
     #[serde(default)]
     pub allow_ipv6: bool,
+    /// Whether uTP (BEP 29) peer connections are enabled. When true, the
+    /// engine attempts uTP for peer candidates (with TCP fallback per
+    /// `utp_prefer_tcp`). When false, only TCP is used. All uTP traffic goes
+    /// through the contained UDP socket; fail-closed blocks it.
+    #[serde(default = "default_utp_enabled")]
+    pub utp_enabled: bool,
+    /// When uTP is enabled, whether TCP is preferred (tried first, with uTP
+    /// as a fallback if TCP fails). When false, uTP is preferred. Either way
+    /// the other transport remains available.
+    #[serde(default = "default_true")]
+    pub utp_prefer_tcp: bool,
+}
+
+fn default_utp_enabled() -> bool {
+    true
 }
 
 fn default_listen_port() -> u16 {
@@ -112,6 +127,8 @@ impl Default for TorrentConfig {
         Self {
             listen_port: default_listen_port(),
             allow_ipv6: false,
+            utp_enabled: default_utp_enabled(),
+            utp_prefer_tcp: true,
         }
     }
 }

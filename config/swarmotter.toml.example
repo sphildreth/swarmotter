@@ -34,6 +34,13 @@ validate_dns = true
 [torrent]
 listen_port = 51413
 allow_ipv6 = false
+# Enable uTP (BEP 29) peer connections over the contained UDP socket. When
+# true, the engine attempts uTP alongside TCP (see utp_prefer_tcp). All uTP
+# traffic fail-closes with the rest of the data plane.
+utp_enabled = true
+# When uTP is enabled, prefer TCP (try TCP first, fall back to uTP). Set to
+# false to prefer uTP.
+utp_prefer_tcp = true
 
 # --- Bandwidth ---
 [bandwidth]

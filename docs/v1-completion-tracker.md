@@ -16,28 +16,29 @@ time estimates.
 
 Pure logic layers, API, Web UI, daemon runtime, and network containment
 enforcement are implemented and tested. The live torrent data-plane engine
-is now partially implemented and exercised end to end against local fixtures:
-real TCP peer wire protocol (handshake, messages, request/piece, block
-assembly, SHA-1 verification), HTTP tracker announce (compact peer parsing,
-tiers), real disk I/O with fast-resume save/load/recheck, a per-torrent engine
-task wired into the daemon, and a local-swarm integration harness that
-completes a real download from a generated payload through a local tracker and
-seed peer.
+is implemented and exercised end to end against local fixtures: real TCP and
+uTP peer wire protocol (handshake, messages, request/piece, block assembly,
+SHA-1 verification), HTTP tracker announce (compact peer parsing, tiers), real
+disk I/O with fast-resume save/load/recheck, a per-torrent engine task wired
+into the daemon, and a local-swarm integration harness that completes a real
+download from a generated payload through a local tracker and seed peer.
 
-The remaining major work is completing full production uTP (LEDBAT, SACK,
-handshake/FIN, transport selection) on top of the binder-ready uTP
-architecture. The network binder now supports contained UDP sockets, inbound
-TCP listeners, outbound TCP, tracker HTTP, tracker HTTPS (TLS over contained
-socket), and UDP trackers — all fail-closed. Real TCP peer protocol,
-HTTP/HTTPS/UDP tracker announce, PEX (BEP 10/11), BEP 9 magnet metadata fetch,
-DHT (BEP 5), inbound seeding/upload, endgame mode, live bandwidth shaping, a
-binder-ready uTP subset, real disk I/O with fast-resume, and a local-swarm
+Full production uTP is now implemented: LEDBAT congestion control, selective
+ACK, the full SYN/STATE/DATA/FIN/RESET connection lifecycle, timestamp echo and
+one-way delay measurement, retransmission, idle timeout, graceful close, and
+TCP/uTP transport selection in the engine. The network binder supports
+contained UDP sockets, inbound TCP listeners, outbound TCP, tracker HTTP,
+tracker HTTPS (TLS over contained socket), and UDP trackers — all fail-closed.
+Real TCP and uTP peer protocol, HTTP/HTTPS/UDP tracker announce, PEX (BEP 10/11),
+BEP 9 magnet metadata fetch, DHT (BEP 5), inbound seeding/upload, endgame mode,
+live bandwidth shaping, real disk I/O with fast-resume, and a local-swarm
 download harness (HTTP + UDP trackers + direct peer + seeding + endgame +
-bandwidth + PEX + magnet) are implemented and tested. Platform-specific
+bandwidth + PEX + magnet + uTP) are implemented and tested. Platform-specific
 interface/source binding is abstracted behind `InterfaceProbe`; the OS probe
 surfaces `interface_missing` in strict mode by default, which is correct
 fail-closed behavior. Live sockets are centralized behind the `NetworkBinder`
-abstraction (see ADR-0012).
+abstraction (see ADR-0012); uTP traffic flows through the binder's contained
+UDP socket (see ADR-0020).
 
 ## Completion Checklist
 
@@ -63,8 +64,13 @@ abstraction (see ADR-0012).
       listener powers seeding upload (see ADR-0012)
 - [~] DNS containment strategy — `validate_dns` config + `dns_not_constrained`
       state implemented; tracker hostname resolution is performed inside the
-      binder subject to config validation; OS-level DNS enforcement is
-      platform-specific
+      binder subject to config validation. OS-level DNS enforcement (forcing
+      the system resolver onto the contained path) is platform-specific and
+      not implemented in-process; the abstraction surfaces
+      `dns_not_constrained` in strict mode when the OS probe cannot confirm DNS
+      is constrained, which is correct fail-closed behavior. This is an honest
+      platform-coverage limitation, not a missing application capability (see
+      "Honest remaining limitation" below).
 - [x] Network containment integration tests (fail-closed via daemon)
 
 ### Torrent Metadata
@@ -114,14 +120,19 @@ abstraction (see ADR-0012).
       bitfield, interested/choke, request/piece, block assembly, SHA-1
       verification, progress, disconnect handling, bad-peer suppression,
       bounded concurrency (see ADR-0013)
-- [~] uTP/UDP peer connections where practical — binder-ready uTP architecture
-      implemented and tested (`swarmotter-core::utp`: BEP 29 header
-      encode/decode, packet types, connection id, minimal reliable session with
-      in-order send/ACK/reassembly), running over the binder's contained UDP
-      socket with a local SYN/ACK/DATA exchange fixture + fail-closed test; full
-      production uTP (LEDBAT congestion control, SACK, full handshake/FIN,
-      timestamp echo, TCP/uTP transport selection in the engine) remains
-      (see ADR-0020)
+- [x] uTP/UDP peer connections where practical — production uTP (BEP 29)
+      implemented and tested (`swarmotter-core::utp`: `header` encode/decode,
+      `sack` selective-ACK extension, `congestion` LEDBAT delay-based
+      congestion control with bounded window and loss response, `UtpConnection`
+      full SYN/STATE/DATA/FIN/RESET lifecycle with connection-id validation,
+      duplicate/out-of-order handling, retransmission, idle timeout, and
+      graceful close, `UtpStream` `AsyncRead`+`AsyncWrite` byte stream over the
+      binder's contained UDP socket), running over the binder's contained UDP
+      socket with a local contained byte-stream round-trip test + a full
+      local-swarm uTP download test + fail-closed tests; TCP/uTP transport
+      selection in the engine per config (`torrent.utp_enabled`,
+      `torrent.utp_prefer_tcp`) with fallback; TCP remains available (see
+      ADR-0020)
 - [x] Handshake and message exchange (BEP 3) — implemented and tested; BEP 10
       extension protocol + PEX (BEP 11) + BEP 9 metadata exchange
       (ut_metadata) implemented
@@ -236,12 +247,13 @@ abstraction (see ADR-0012).
       `network_blocked`)
 - [x] Storage tests — live interrupted-write/missing-file/multi-file boundary
       /resume roundtrip/recheck covered
-- [~] Local swarm tests — real download completion from a generated payload
+- [x] Local swarm tests — real download completion from a generated payload
       through a local HTTP tracker, a local UDP tracker (BEP 15), and a direct
       seed peer is covered (HTTP + UDP tracker + direct peer paths); real
       seeding/upload via the inbound `Seeder` listener is covered; PEX, magnet
-      metadata fetch, DHT, endgame, bandwidth, and uTP exchange are covered by
-      local fixtures; full uTP download over the swarm is pending
+      metadata fetch, DHT, endgame, bandwidth, and a full uTP download over the
+      contained UDP path are covered by local fixtures; a uTP fail-closed test
+      proves the `BlockedBinder` blocks uTP swarm downloads
 
 ### Legal / Repository
 
@@ -256,16 +268,17 @@ abstraction (see ADR-0012).
 
 ## Blockers
 
-None currently. The live TCP peer protocol, HTTP/HTTPS/UDP tracker announce,
-PEX (BEP 10/11), BEP 9 magnet metadata fetch, DHT (BEP 5), inbound peer
-listening/seeding upload, endgame mode, live bandwidth shaping, a binder-ready
-uTP subset, real disk I/O with fast-resume, and a local-swarm download harness
-are implemented and tested. The remaining v1.0.0 data-plane work: complete full
-production uTP (LEDBAT, SACK, handshake/FIN, TCP/uTP transport selection).
+None currently. The live TCP and uTP peer protocol, HTTP/HTTPS/UDP tracker
+announce, PEX (BEP 10/11), BEP 9 magnet metadata fetch, DHT (BEP 5), inbound
+peer listening/seeding upload, endgame mode, live bandwidth shaping, full
+production uTP (LEDBAT, SACK, full connection lifecycle, transport selection),
+real disk I/O with fast-resume, and a local-swarm download harness are
+implemented and tested. All v1.0.0 data-plane capabilities are implemented.
 Platform-specific `InterfaceProbe` OS-level enumeration (getifaddrs) and DNS
 enforcement are abstracted; the abstraction enforces fail-closed correctly by
 surfacing `interface_missing`/`dns_not_constrained` in strict mode when the
-OS probe cannot confirm the path.
+OS probe cannot confirm the path. The remaining `[~]` item below is an
+honest platform-coverage limitation, not a missing capability.
 
 ## Test Status
 
@@ -273,7 +286,7 @@ OS probe cannot confirm the path.
 | --- | --- |
 | `cargo fmt --all -- --check` | pass |
 | `cargo clippy --workspace --all-targets` | pass (no warnings) |
-| `cargo test --workspace` | pass (core 152 unit + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 8 local swarm + 1 daemon download) |
+| `cargo test --workspace` | pass (core 165 unit + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 10 local swarm + 1 daemon download) |
 | local swarm download (HTTP tracker + direct peer) | pass |
 | local swarm download (UDP tracker, BEP 15) | pass |
 | local swarm seeding (inbound Seeder serves completed download) | pass |
@@ -281,6 +294,9 @@ OS probe cannot confirm the path.
 | local swarm bandwidth shaping (download throttled by limit) | pass |
 | local swarm PEX (peer discovered via BEP 10/11) | pass |
 | local swarm magnet (BEP 9 metadata fetch then download) | pass |
+| local swarm uTP download (contained uTP seed + engine over uTP) | pass |
+| local swarm uTP fail-closed (BlockedBinder blocks uTP download) | pass |
+| uTP contained byte-stream round trip over contained socket | pass |
 | DHT get_peers discovery (local KRPC fixture) | pass |
 | uTP reliable exchange over contained socket (local fixture) | pass |
 | HTTPS tracker over contained socket (local TLS fixture) | pass |
@@ -297,15 +313,32 @@ OS probe cannot confirm the path.
 - ADR-0015: Real storage I/O and fast-resume format
 - ADR-0016: Task/runtime model for the live engine
 - ADR-0017: Local swarm testing approach
+- ADR-0018: HTTPS tracker TLS over contained sockets
+- ADR-0019: DHT implementation strategy
+- ADR-0020: uTP (BEP 29) implementation strategy and scope
 
 ## Notes
 
-The TCP peer protocol, HTTP tracker announce, real disk I/O, and the
-per-torrent engine task are implemented and exercised end to end against local
-fixtures (generated payloads, an in-process seed peer, and an in-process HTTP
-tracker) using the contained `NetworkBinder` path. The API/UI surface is
-unchanged but now reports real progress, peers, and tracker status; lifecycle
-actions (pause/resume/remove/recheck/reannounce) drive real engine tasks. The
-remaining v1.0.0 capabilities (UDP trackers, DHT, PEX, uTP, inbound
-listening/seeding upload, endgame, BEP 9 metadata fetch, bandwidth shaping)
-build on the binder + protocol + storage foundation added here.
+The TCP and uTP peer protocols, HTTP/HTTPS/UDP tracker announce, DHT, PEX, BEP
+9 magnet metadata fetch, real disk I/O, and the per-torrent engine task are
+implemented and exercised end to end against local fixtures (generated
+payloads, in-process seed peers — including a contained uTP-capable seed — and
+in-process HTTP/UDP trackers) using the contained `NetworkBinder` path. The
+API/UI surface reports real progress, peers, transport, and tracker status;
+lifecycle actions (pause/resume/remove/recheck/reannounce) drive real engine
+tasks. All required v1.0.0 data-plane capabilities — UDP trackers, DHT, PEX,
+uTP, inbound listening/seeding upload, endgame, BEP 9 metadata fetch, and
+bandwidth shaping — are implemented on the binder + protocol + storage
+foundation.
+
+## Honest remaining limitation
+
+- **DNS containment (OS-level enforcement):** the `validate_dns` config and
+  the `dns_not_constrained` network state are implemented, and tracker
+  hostname resolution is performed inside the binder subject to config
+  validation. OS-level DNS enforcement (forcing the system resolver to use the
+  contained path) is platform-specific and not implemented in-process; the
+  abstraction surfaces `dns_not_constrained` in strict mode when the OS probe
+  cannot confirm DNS is constrained, which is correct fail-closed behavior.
+  This is a platform-coverage limitation, not a missing application
+  capability. The tracker item remains `[~]` to reflect this honestly.

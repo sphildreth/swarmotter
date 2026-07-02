@@ -92,14 +92,17 @@ returns `CoreError::NetworkBlocked` in strict fail-closed mode when the path
 is unavailable. Tracker HTTP GETs are issued through the same binder. HTTPS trackers
 (`https://`) perform TLS over the binder's contained TCP socket
 (`tokio-rustls` + `rustls` with system-root certificate validation); the TLS
-layer never creates an independent network path. UDP
-data-plane traffic (UDP trackers, DHT, future uTP) goes through the binder's
-`udp_socket()` method, which returns a source-bound contained UDP socket.
-Inbound peer connections (seeding) go through `bind_peer_listener()`, which
-binds a contained TCP listener to the configured source address. A
-`LoopbackBinder` (test feature) lets integration tests exercise the full
-engine over loopback without the default route, and a `BlockedBinder` proves
-fail-closed behavior for TCP, UDP, and the listener. See ADR-0012.
+layer never creates an independent network path. UDP data-plane traffic (UDP
+trackers, DHT, and uTP) goes through the binder's `udp_socket()` method,
+which returns a source-bound contained UDP socket. uTP (BEP 29) is a live peer
+transport selected by the engine alongside TCP; all uTP peer traffic — SYN,
+DATA, STATE, FIN, RESET, and SACK — flows through the contained UDP socket and
+fail-closes when the path is unavailable (see ADR-0020). Inbound peer
+connections (seeding) go through `bind_peer_listener()`, which binds a
+contained TCP listener to the configured source address. A `LoopbackBinder`
+(test feature) lets integration tests exercise the full engine over loopback
+without the default route, and a `BlockedBinder` proves fail-closed behavior
+for TCP, UDP, uTP, and the listener. See ADR-0012.
 
 ## TODO
 

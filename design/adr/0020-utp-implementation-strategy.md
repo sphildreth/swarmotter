@@ -7,53 +7,78 @@ Accepted
 ## Context
 
 SwarmOtter v1.0.0 requires uTP (the BitTorrent reliable UDP transport, BEP 29)
-support where practical. A full uTP implementation is large: it requires the
-LEDBAT delay-based congestion-control algorithm, selective ACK, the full
-connection lifecycle (SYN/DATA/State/FIN/Reset), one-way delay measurement, and
-selection between TCP and uTP peer transports. All uTP traffic is UDP and must
-go through the network containment layer.
+support where practical. uTP is a reliable, congestion-controlled byte stream
+layered over UDP. A full implementation requires the LEDBAT delay-based
+congestion-control algorithm, selective ACK (SACK), the full connection
+lifecycle (SYN/STATE/DATA/FIN/RESET), one-way delay measurement via timestamp
+echo, retransmission, and selection between TCP and uTP peer transports. All
+uTP traffic is UDP and must go through the network containment layer; it must
+fail closed when the configured path is unavailable and must never silently
+fall back to the default route.
 
 ## Decision
 
-Implement a binder-ready uTP architecture and the largest testable subset now,
-and document exactly what remains:
+Implement production-grade uTP entirely on top of the `NetworkBinder`'s
+contained UDP socket. The implementation lives in
+`swarmotter-core::utp` and is split into focused modules:
 
-- `swarmotter-core::utp` implements the uTP packet header encode/decode per
-  BEP 29 (20-byte header: type/extension, version, connection id, timestamps,
-  window size, seq/ack numbers), the packet types (DATA, FIN, STATE, RESET,
-  SYN), connection-id assignment, and a minimal reliable session
-  (`UtpSession`) with in-order send sequence, ACK generation, and in-order
-  receive reassembly (with duplicate/out-of-order suppression). This is fully
-  unit-tested without sockets.
-- The live transport runs over the `NetworkBinder::udp_socket()` contained UDP
-  socket. A local uTP echo fixture test proves a SYN/ACK/DATA exchange over the
-  contained UDP path on loopback, and a fail-closed test proves the binder
-  blocks uTP when the path is unavailable.
+- `header`: BEP 29 20-byte packet header encode/decode, packet types
+  (DATA/FIN/STATE/RESET/SYN), the first-extension nibble, and the wrapping
+  microsecond timestamp helper.
+- `sack`: Selective ACK extension (BEP 29 extension 1) encode/decode, built
+  from the held out-of-order sequence set relative to the cumulative ack.
+- `congestion`: LEDBAT-style delay-based congestion control — base/current
+  delay tracking, queuing-delay target, congestion-window growth/shrink,
+  slow start, loss/retransmit response with RTO backoff, and a bounded window
+  to prevent unbounded growth.
+- `stream`: `UtpStream`, an `AsyncRead`+`AsyncWrite` byte-stream adapter that
+  runs the connection's drive loop in a background task over the contained UDP
+  socket, plus `PeerTransport`/`PeerDuplex`/`connect_peer_stream` so the engine
+  opens a transport-agnostic peer stream (TCP or uTP) through the binder.
+- `mod` (`UtpConnection`): the live connection — SYN/STATE handshake (initiator
+  `connect` and responder `accept_from_syn`), connection-id assignment and
+  validation, in-order receive reassembly with out-of-order hold and SACK
+  recovery, duplicate suppression, cumulative + selective ACK, retransmission
+  of timed-out in-flight packets, bounded send/receive buffers, idle timeout,
+  graceful close (FIN with `fin_transmitted` tracking so a connection only
+  reports closed once its own FIN has actually been sent), and RESET teardown.
 
-What remains for full production uTP (tracked in
-`docs/v1-completion-tracker.md`):
-
-- The LEDBAT congestion-control algorithm (delay-based) and dynamic window
-  sizing instead of the fixed window used by the testable subset.
-- Selective ACK (SACK) extension handling for robust out-of-order recovery.
-- Full three-way connection handshake and FIN tear-down with TIME_WAIT.
-- Microsecond timestamp echo and one-way delay measurement for LEDBAT.
-- Integration of uTP as a peer transport selectable alongside TCP in the
-  engine, with connection migration between TCP/uTP as appropriate.
+The live transport runs over `NetworkBinder::udp_socket()`, the same contained
+UDP socket used by UDP trackers and DHT. The engine selects TCP and/or uTP per
+config (`torrent.utp_enabled`, `torrent.utp_prefer_tcp`), tries the preferred
+transport first, and falls back to the other when it is available and the
+preferred fails. The uTP byte stream is used with `tokio::io::split` and the
+existing peer wire protocol machinery (`PeerReader`, `write_message`), so the
+BitTorrent handshake and message exchange are identical over TCP and uTP.
+Private torrents, rate limiting, endgame, and fail-closed containment apply
+unchanged to the uTP path.
 
 ## Consequences
 
 - uTP traffic cannot bypass containment: it uses the binder's contained UDP
-  socket, which fail-closes when the path is unavailable.
-- The current subset can carry framed, in-order data over the contained UDP
-  path, which is the architectural foundation for full uTP.
-- Until the remaining work is done, peer connections continue to use TCP; the
-  uTP path is present but not yet selected by the engine for live downloads.
+  socket, which fail-closes (`CoreError::NetworkBlocked`) when the path is
+  unavailable. A `BlockedBinder` proves uTP connect and uTP swarm downloads are
+  blocked.
+- The peer protocol is transport-agnostic: the same code path serves TCP and
+  uTP, and uTP can complete a real local-swarm download from a generated
+  payload through a contained uTP-capable seed peer, with SHA-1 piece
+  verification and final file-content checks.
+- LEDBAT keeps uTP low-priority relative to competing TCP and bounds the send
+  window, so uTP cannot saturate the contained path or grow unbounded.
+- TCP remains the default-preferred transport (`utp_prefer_tcp = true`) for
+  broad compatibility; uTP is enabled by default and selectable via config.
+- The engine now terminates gracefully after a bounded number of consecutive
+  no-peer announce rounds when a torrent has no trackers, no seed peers, and
+  no DHT result, instead of looping forever (a correctness and testability
+  improvement surfaced while wiring uTP).
 
 ## Related Documents
 
-- `crates/swarmotter-core/src/utp.rs`
-- `crates/swarmotterd/src/dht.rs` (uTP transport fixture tests)
+- `crates/swarmotter-core/src/utp/` (`mod.rs`, `header.rs`, `sack.rs`,
+  `congestion.rs`, `stream.rs`)
+- `crates/swarmotterd/src/engine.rs` (transport selection)
+- `crates/swarmotterd/tests/local_swarm.rs` (uTP swarm download + fail-closed)
 - `design/vpn-network-containment.md`
+- `design/configuration.md`
 - ADR-0012 (network binder)
-- ADR-0013 (peer protocol)
+- ADR-0013 (peer wire protocol)

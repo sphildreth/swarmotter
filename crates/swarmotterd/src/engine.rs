@@ -38,6 +38,7 @@ use swarmotter_core::storage::resume::PieceBitfield;
 use swarmotter_core::storage::StorageIo;
 use swarmotter_core::tracker::{self, AnnounceEvent, AnnounceRequest};
 use swarmotter_core::udp_tracker;
+use swarmotter_core::utp::{self, PeerTransport};
 
 /// Magnet parameters for a torrent that still needs its metadata fetched
 /// (BEP 9). The placeholder `TorrentMeta` in the engine has a dummy info hash;
@@ -104,6 +105,10 @@ pub struct TorrentEngine {
     /// Optional DHT runner for trackerless peer discovery (disabled for
     /// private torrents).
     dht: Option<Arc<crate::dht::DhtRunner>>,
+    /// Peer transport selection: whether uTP is enabled and whether TCP is
+    /// preferred over uTP. All transports go through the contained binder.
+    utp_enabled: bool,
+    utp_prefer_tcp: bool,
 }
 
 impl TorrentEngine {
@@ -160,6 +165,8 @@ impl TorrentEngine {
             limiter,
             magnet,
             dht: None,
+            utp_enabled: true,
+            utp_prefer_tcp: true,
         }
     }
 
@@ -167,6 +174,15 @@ impl TorrentEngine {
     /// torrents).
     pub fn with_dht(mut self, dht: Arc<crate::dht::DhtRunner>) -> Self {
         self.dht = Some(dht);
+        self
+    }
+
+    /// Configure peer transport selection. When uTP is enabled, the engine
+    /// attempts uTP (with the non-preferred transport as a fallback); when
+    /// disabled, only TCP is used. All transports stay on the contained path.
+    pub fn with_transport(mut self, utp_enabled: bool, utp_prefer_tcp: bool) -> Self {
+        self.utp_enabled = utp_enabled;
+        self.utp_prefer_tcp = utp_prefer_tcp;
         self
     }
 
@@ -255,6 +271,12 @@ impl TorrentEngine {
         let max_concurrent = 4usize;
         let mut bad_peers: HashSet<SocketAddr> = HashSet::new();
         let start = Instant::now();
+        // Bounded consecutive no-peer rounds: if we never discover any peers
+        // after a bounded number of announce attempts, give up gracefully
+        // rather than looping forever. This handles trackerless torrents with
+        // no seed peers and no DHT result without hanging the engine.
+        const NO_PEER_ROUNDS_MAX: u32 = 5;
+        let mut no_peer_rounds: u32 = 0;
 
         loop {
             // Handle pending commands.
@@ -349,8 +371,23 @@ impl TorrentEngine {
                         }
                     }
                     if discovered.is_empty() {
+                        no_peer_rounds = no_peer_rounds.saturating_add(1);
                         self.state.lock().await.tracker_message =
                             Some("no peers discovered".into());
+                        // Bounded give-up: a torrent that never discovers peers
+                        // (no tracker, no seed peers, no DHT result) cannot
+                        // progress. Stop the engine so the daemon/test does not
+                        // hang; the torrent remains incomplete and the user can
+                        // add trackers or seed peers and re-start it.
+                        if no_peer_rounds >= NO_PEER_ROUNDS_MAX {
+                            tracing::info!(
+                                info_hash = %self.meta.info_hash,
+                                "stopping engine: no peers discovered after bounded retries"
+                            );
+                            break;
+                        }
+                    } else {
+                        no_peer_rounds = 0;
                     }
                 } else {
                     self.sleep_or_stop(Duration::from_millis(500)).await;
@@ -359,6 +396,33 @@ impl TorrentEngine {
         }
 
         Ok(self.state.lock().await.clone())
+    }
+
+    /// Open a peer byte stream with transport selection. Tries the preferred
+    /// transport first, then falls back to the other if it is available and
+    /// the preferred fails. Returns the connected duplex stream and the
+    /// transport that succeeded. All connections go through the binder; in
+    /// strict fail-closed mode both return `NetworkBlocked`.
+    async fn connect_peer(
+        &self,
+        peer_addr: &PeerAddr,
+    ) -> Result<(Box<dyn utp::PeerDuplex>, PeerTransport)> {
+        let addr = peer_addr.socket_addr();
+        if self.utp_enabled {
+            let (first, second) = if self.utp_prefer_tcp {
+                (PeerTransport::Tcp, PeerTransport::Utp)
+            } else {
+                (PeerTransport::Utp, PeerTransport::Tcp)
+            };
+            match utp::connect_peer_stream(self.binder.clone(), first, addr).await {
+                Ok(s) => return Ok(s),
+                Err(e) => {
+                    tracing::debug!(peer = %addr, transport = first.as_str(), error = %e, "preferred transport failed; trying fallback")
+                }
+            }
+            return utp::connect_peer_stream(self.binder.clone(), second, addr).await;
+        }
+        utp::connect_peer_stream(self.binder.clone(), PeerTransport::Tcp, addr).await
     }
 
     /// Attempt to download missing pieces from a single peer. Returns true if
@@ -374,7 +438,8 @@ impl TorrentEngine {
         if !self.binder.traffic_allowed() {
             return Ok(false);
         }
-        let stream = self.binder.connect_peer(peer_addr.socket_addr()).await?;
+        let (stream, transport) = self.connect_peer(peer_addr).await?;
+        tracing::debug!(peer = %peer_addr.socket_addr(), transport = transport.as_str(), "peer connected");
         let (read_half, mut write_half) = tokio::io::split(stream);
 
         // Handshake. Advertise BEP 10 extension support for PEX/metadata.
@@ -646,9 +711,11 @@ impl TorrentEngine {
             let made_progress = made_progress.clone();
             let download_dir = download_dir.clone();
             let limiter = self.limiter.clone();
+            let utp_enabled = self.utp_enabled;
+            let utp_prefer_tcp = self.utp_prefer_tcp;
             handles.push(tokio::spawn(async move {
                 endgame_peer_session(
-                    binder.as_ref(),
+                    binder,
                     peer_addr,
                     meta,
                     peer_id,
@@ -658,6 +725,8 @@ impl TorrentEngine {
                     deadline,
                     made_progress,
                     limiter,
+                    utp_enabled,
+                    utp_prefer_tcp,
                 )
                 .await
             }));
@@ -940,7 +1009,7 @@ enum CommandOutcome {
 /// connection that receives a now-redundant block.
 #[allow(clippy::too_many_arguments)]
 async fn endgame_peer_session(
-    binder: &dyn NetworkBinder,
+    binder: Arc<dyn NetworkBinder>,
     peer_addr: PeerAddr,
     meta: TorrentMeta,
     peer_id: [u8; 20],
@@ -950,13 +1019,34 @@ async fn endgame_peer_session(
     deadline: Instant,
     made_progress: Arc<std::sync::atomic::AtomicBool>,
     limiter: RateLimiter,
+    utp_enabled: bool,
+    utp_prefer_tcp: bool,
 ) -> Result<bool> {
     use swarmotter_core::peer::{block_requests, Bitfield, Handshake, Message, PeerReader};
     if !binder.traffic_allowed() {
         return Ok(false);
     }
     let storage = StorageIo::new(meta.clone(), download_dir);
-    let stream = binder.connect_peer(peer_addr.socket_addr()).await?;
+    let addr = peer_addr.socket_addr();
+    let stream = if utp_enabled {
+        let (first, second) = if utp_prefer_tcp {
+            (PeerTransport::Tcp, PeerTransport::Utp)
+        } else {
+            (PeerTransport::Utp, PeerTransport::Tcp)
+        };
+        match utp::connect_peer_stream(binder.clone(), first, addr).await {
+            Ok((s, _t)) => s,
+            Err(_) => {
+                utp::connect_peer_stream(binder.clone(), second, addr)
+                    .await?
+                    .0
+            }
+        }
+    } else {
+        utp::connect_peer_stream(binder.clone(), PeerTransport::Tcp, addr)
+            .await?
+            .0
+    };
     let (read_half, mut write_half) = tokio::io::split(stream);
 
     // Handshake.

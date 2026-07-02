@@ -15,9 +15,12 @@ SwarmOtter is a Rust async daemon with these layers:
   the `InterfaceProbe` trait and the live `NetworkBinder` abstraction. No
   engine component creates sockets directly; all torrent traffic goes through
   the binder (peer TCP, inbound TCP listener, tracker HTTP, UDP trackers,
-  and future uTP/DHT/webseed traffic) — see `vpn-network-containment.md` and
-  ADR-0012. UDP trackers are implemented in `swarmotter-core::udp_tracker`
-  (BEP 15) over the binder's contained UDP socket.
+  DHT, and uTP traffic) — see `vpn-network-containment.md` and ADR-0012. UDP
+  trackers are implemented in `swarmotter-core::udp_tracker` (BEP 15) and uTP
+  (BEP 29, with LEDBAT congestion control, SACK, and the full connection
+  lifecycle) is implemented in `swarmotter-core::utp`, both over the binder's
+  contained UDP socket. The engine selects TCP/uTP peer transports per config
+  (see `configuration.md` and ADR-0020).
 - **Storage layer** (`swarmotter-core::storage`): file layout, partial/sparse
   files, piece read/write and verification, fast resume, forced recheck,
   move/rename, missing/changed file detection logic.
@@ -43,7 +46,7 @@ crates/
 ├── swarmotterd/      # daemon binary + lib (runtime, DaemonOps impl, live engine, seeder, metadata, dht, netbinder)
 ├── swarmotter-core/  # core types and engine logic
 │   └── src/ bencode, dht, endgame, error, extensions, hash, magnet, meta, models/, net/ (binder, config, probe),
-│            peer, tracker, udp_tracker, utp, queue, ratio, bandwidth, storage/ (io, layout, resume),
+│            peer, tracker, udp_tracker, utp/ (mod, header, sack, congestion, stream), queue, ratio, bandwidth, storage/ (io, layout, resume),
 │            torrent, watch, config
 ├── swarmotter-api/   # API layer (routes, handlers, envelope, events)
 └── swarmotter-web/   # embedded static Web UI

@@ -33,7 +33,12 @@ SWARMOTTER_NETWORK__REQUIRED_INTERFACE=tun0
   (`mode`, `required_interface`, `required_source_ipv4`,
   `required_source_ipv6`, `required_network_namespace`, `allow_ipv6`,
   `fail_closed`, `validate_route`, `validate_dns`).
-- **Torrent** (`torrent`): `listen_port`, `allow_ipv6`.
+- **Torrent** (`torrent`): `listen_port`, `allow_ipv6`, `utp_enabled`,
+  `utp_prefer_tcp`. When `utp_enabled` is true the engine attempts uTP (BEP 29)
+  peer connections through the contained UDP socket alongside TCP; uTP traffic
+  fail-closes with the rest of the data plane. `utp_prefer_tcp` selects which
+  transport is tried first (with the other as a fallback). When `utp_enabled`
+  is false, only TCP is used.
 - **Bandwidth** (`bandwidth`): global/per-torrent download/upload limits,
   alternate speed mode, max peers.
 - **Queue** (`queue`): `max_active_downloads`, `max_active_seeds`,

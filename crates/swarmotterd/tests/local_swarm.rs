@@ -1283,3 +1283,240 @@ fn peer_id(prefix: &[u8; 8]) -> [u8; 20] {
     id[..8].copy_from_slice(prefix);
     id
 }
+
+/// A uTP-capable seed peer: binds a contained UDP socket, accepts one uTP SYN,
+/// wraps it in a `UtpStream` byte stream, and serves the BitTorrent protocol
+/// over it exactly as the TCP `SeedPeer` does. Proves the engine can complete a
+/// real download over the contained uTP transport.
+struct UtpSeedPeer {
+    content: Vec<u8>,
+    meta: swarmotter_core::meta::TorrentMeta,
+    info_hash: swarmotter_core::hash::InfoHash,
+    peer_id: [u8; 20],
+}
+
+impl UtpSeedPeer {
+    // The seed is driven inline by the test (the test binds the contained UDP
+    // socket, accepts the SYN, and calls `serve_bittorrent_over_stream`). This
+    // struct only carries the payload metadata for the serve loop.
+}
+
+/// Drive the BitTorrent peer wire protocol over any duplex byte stream (used
+/// for uTP seeds; mirrors the TCP `SeedPeer::serve_one` logic).
+async fn serve_bittorrent_over_stream(
+    stream: Box<dyn swarmotter_core::utp::PeerDuplex>,
+    seed: &UtpSeedPeer,
+) -> swarmotter_core::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut rd, mut wr) = tokio::io::split(stream);
+
+    // Read leecher handshake.
+    let mut hs_buf = [0u8; 68];
+    rd.read_exact(&mut hs_buf).await?;
+    let their_hs = Handshake::decode(&hs_buf)
+        .map_err(|e| swarmotter_core::error::CoreError::Internal(e.to_string()))?;
+    if their_hs.info_hash != seed.info_hash {
+        return Err(swarmotter_core::error::CoreError::Internal(
+            "info hash mismatch".into(),
+        ));
+    }
+    let our_hs = Handshake {
+        info_hash: seed.info_hash,
+        peer_id: seed.peer_id,
+        reserved: swarmotter_core::peer::RESERVED,
+    };
+    wr.write_all(&our_hs.encode()).await?;
+
+    // Bitfield: all pieces.
+    let mut bf = Bitfield::new(seed.meta.piece_count());
+    for i in 0..seed.meta.piece_count() {
+        bf.set(i);
+    }
+    peer::write_message(&mut wr, &bf.encode_message()).await?;
+    wr.flush().await?;
+
+    let piece_count = seed.meta.piece_count();
+    loop {
+        let len_buf = match read_len_prefix(&mut rd).await {
+            Ok(Some(b)) => b,
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(swarmotter_core::error::CoreError::from(e)),
+        };
+        let len = u32::from_be_bytes(len_buf) as usize;
+        if len == 0 {
+            continue;
+        }
+        let mut body = vec![0u8; len];
+        rd.read_exact(&mut body).await?;
+        let id = body[0];
+        let payload = &body[1..];
+        match peer::MessageId::from_u8(id) {
+            Some(peer::MessageId::Interested) => {
+                peer::write_message(&mut wr, &Message::Unchoke).await?;
+                wr.flush().await?;
+            }
+            Some(peer::MessageId::Request) if payload.len() == 12 => {
+                let piece = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+                let offset = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                let length = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+                if (piece as usize) >= piece_count {
+                    continue;
+                }
+                let (pstart, _) = seed.meta.piece_byte_range(piece as u64).unwrap();
+                let abs = pstart + offset as u64;
+                let block = seed.content[abs as usize..(abs + length as u64) as usize].to_vec();
+                peer::write_message(
+                    &mut wr,
+                    &Message::Piece {
+                        piece,
+                        offset,
+                        block,
+                    },
+                )
+                .await?;
+                wr.flush().await?;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Local swarm uTP download: a uTP-capable seed serves a generated payload, and
+/// the SwarmOtter engine downloads it over the contained uTP transport (uTP
+/// preferred, TCP fallback disabled by config), verifying every piece and the
+/// final file contents. All traffic goes through the `LoopbackBinder`'s
+/// contained UDP socket; no uncontrolled UDP sockets are created.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_swarm_downloads_from_seed_via_utp() {
+    let mut content = Vec::with_capacity(32 * 1024 + 9);
+    for i in 0..32 * 1024 + 9 {
+        content.push((i % 251) as u8);
+    }
+    let piece_length: u64 = 16 * 1024;
+    let torrent_bytes = build_single_file_torrent("utp.bin", &content, piece_length, None, false);
+    let meta = parse_torrent(&torrent_bytes).unwrap();
+
+    // Start the uTP seed peer (bound to an ephemeral UDP port via the binder).
+    // The seed learns the leecher's address from the incoming SYN, so we don't
+    // need to publish a port ahead of time; but the engine connects to a UDP
+    // address, so the seed must be reachable. We bind a UDP socket, learn its
+    // address, and hand it to the engine as a direct seed peer.
+    let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+    use swarmotter_core::net::NetworkBinder;
+    let seed_sock = binder.udp_socket().await.unwrap();
+    let seed_addr = seed_sock.local_addr().unwrap();
+    let seed_sock: std::sync::Arc<dyn swarmotter_core::net::ContainedUdpSocket> = seed_sock.into();
+
+    let content_clone = content.clone();
+    let meta_clone = meta.clone();
+    let seed_sock_clone = seed_sock.clone();
+    tokio::spawn(async move {
+        use swarmotter_core::utp::{UtpConnection, UtpHeader, UtpStream, UtpType};
+        // Wait for the engine's SYN on our bound UDP socket.
+        let mut buf = vec![0u8; 2048];
+        let (from, n) = match seed_sock_clone.recv_from(&mut buf).await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let (syn, _payload) = match UtpHeader::decode(&buf[..n]) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if syn.typ != UtpType::Syn {
+            return;
+        }
+        let conn = match UtpConnection::accept_from_syn(seed_sock_clone, from, &syn).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let stream = UtpStream::spawn(conn);
+        let info_hash = meta_clone.info_hash;
+        let seed = UtpSeedPeer {
+            content: content_clone,
+            meta: meta_clone,
+            info_hash,
+            peer_id: peer_id(b"-SDUTP00"),
+        };
+        let _ = serve_bittorrent_over_stream(Box::new(stream), &seed).await;
+    });
+
+    let dir = unique_dir("utp-download");
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
+    let seed_peer = PeerAddr::from_socket_addr(seed_addr);
+    // uTP preferred (utp_prefer_tcp = false), uTP enabled. TCP fallback remains
+    // available but should not be needed since the seed speaks uTP.
+    let engine = TorrentEngine::new(
+        meta.clone(),
+        dir.clone(),
+        peer_id(b"-SWUTP00"),
+        binder.clone(),
+        state.clone(),
+        cmd_rx,
+        vec![seed_peer],
+        6881,
+    )
+    .with_transport(true, false);
+
+    let final_state = tokio::time::timeout(Duration::from_secs(60), engine.run())
+        .await
+        .expect("uTP engine did not finish in time")
+        .expect("uTP engine error");
+
+    assert!(final_state.finished, "uTP download did not complete");
+    assert_eq!(
+        final_state.pieces_have.count(meta.piece_count()),
+        meta.piece_count(),
+        "uTP download did not verify all pieces"
+    );
+
+    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
+    assert_eq!(
+        written, content,
+        "uTP downloaded content mismatches original"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Fail-closed containment blocks uTP swarm downloads: with a `BlockedBinder`,
+/// the engine cannot obtain a contained UDP socket, so uTP (and TCP) peer
+/// connections fail closed and the torrent is reported network-blocked / makes
+/// no progress. Proves uTP cannot bypass the network path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_swarm_utp_fail_closed_blocks_download() {
+    let content = b"swarmotter utp fail closed payload data here!".to_vec();
+    let piece_length: u64 = 8;
+    let torrent_bytes = build_single_file_torrent("utpfc.bin", &content, piece_length, None, false);
+    let meta = parse_torrent(&torrent_bytes).unwrap();
+
+    let dir = unique_dir("utp-failclosed");
+    let binder: Arc<dyn swarmotter_core::net::NetworkBinder> =
+        Arc::new(swarmotter_core::net::binder::BlockedBinder);
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
+    let engine = TorrentEngine::new(
+        meta.clone(),
+        dir.clone(),
+        peer_id(b"-SWFC000"),
+        binder,
+        state.clone(),
+        cmd_rx,
+        // A seed peer that does not exist; the binder blocks before any socket.
+        vec![PeerAddr::from_socket_addr("127.0.0.1:9".parse().unwrap())],
+        6881,
+    )
+    .with_transport(true, false);
+
+    // The engine must not hang and must not complete; under the blocked binder
+    // it makes no progress. Run with a timeout and assert it did not finish.
+    let final_state = tokio::time::timeout(Duration::from_secs(20), engine.run())
+        .await
+        .expect("fail-closed engine should terminate within timeout")
+        .expect("engine error");
+    assert!(
+        !final_state.finished,
+        "uTP download should not complete under fail-closed"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

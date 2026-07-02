@@ -130,16 +130,37 @@ MVP release.
   blocking. The engine wraps DHT calls in hard time bounds so unreachable nodes
   cannot stall downloads. A local KRPC fixture test proves `get_peers` peer
   discovery. See ADR-0019.
-- **uTP (BEP 29) binder-ready subset:** `swarmotter-core::utp` implements the
-  uTP packet header encode/decode (BEP 29), packet types (DATA/FIN/STATE/RESET/
-  SYN), connection-id assignment, and a minimal reliable session with in-order
-  send/ACK/reassembly, running over the binder's contained UDP socket. A local
-  SYN/ACK/DATA exchange fixture and a fail-closed test prove the contained UDP
-  transport path. Full production uTP (LEDBAT congestion control, SACK, full
-  handshake/FIN, timestamp echo, TCP/uTP transport selection in the engine)
-  remains and is documented in ADR-0020 and the tracker.
-- Tests now total: core 152 unit + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 8 local
-  swarm (HTTP tracker, UDP tracker, direct peer, inbound seeding, endgame, bandwidth, PEX, magnet) + 1 daemon download.
+- **Production uTP (BEP 29):** `swarmotter-core::utp` now implements full
+  production uTP over the binder's contained UDP socket, split into focused
+  modules: `header` (BEP 29 20-byte header encode/decode, packet types, first
+  extension nibble), `sack` (Selective ACK extension encode/decode), and
+  `congestion` (LEDBAT-style delay-based congestion control with base/current
+  delay tracking, queuing-delay target, slow start, additive growth below
+  target, shrink above target, loss/retransmit response with RTO backoff, and
+  a bounded window). `UtpConnection` implements the full connection lifecycle:
+  SYN/STATE handshake (initiator and responder), connection-id assignment and
+  validation, in-order receive reassembly with out-of-order hold and SACK
+  recovery, duplicate suppression, cumulative and selective ACK, retransmission
+  of timed-out in-flight packets, bounded send/receive buffers, idle timeout,
+  graceful close (FIN with transmission tracking), and RESET teardown. `UtpStream`
+  exposes the connection as an `AsyncRead`+`AsyncWrite` byte stream via a
+  background driver task, so the existing peer wire protocol machinery runs
+  unchanged over uTP. A local contained byte-stream round-trip test, a uTP
+  fail-closed test, and a full local-swarm uTP download test (generated payload,
+  contained uTP seed, SHA-1 piece verification, final file-content check) prove
+  the transport; a fail-closed test proves the `BlockedBinder` blocks uTP swarm
+  downloads. See ADR-0020.
+- **TCP/uTP transport selection in the engine:** the engine opens peer streams
+  through `swarmotter_core::utp::connect_peer_stream`, selecting TCP and/or uTP
+  per config (`torrent.utp_enabled`, `torrent.utp_prefer_tcp`). The preferred
+  transport is tried first with the other as a fallback; TCP remains available;
+  private-torrent, rate-limit, endgame, and fail-closed containment behavior
+  apply unchanged to the uTP path.
+- The engine now terminates gracefully after a bounded number of consecutive
+  no-peer announce rounds when a torrent has no trackers, no seed peers, and no
+  DHT result, instead of looping forever.
+- Tests now total: core 165 unit + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 10 local
+  swarm (HTTP tracker, UDP tracker, direct peer, inbound seeding, endgame, bandwidth, PEX, magnet, uTP download, uTP fail-closed) + 1 daemon download.
 - **Inbound peer listening and seeding/upload:** the daemon now spawns an
   inbound `Seeder` (`swarmotterd::seeder`) alongside each active torrent. It
   binds a contained TCP listener through the binder's `bind_peer_listener()`,
