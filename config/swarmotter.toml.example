@@ -102,3 +102,8 @@ max_peers = 0
 [logging]
 level = "info"
 json = false
+# Log to stderr/journal and to a file by default. If file_path is omitted,
+# SwarmOtter writes to $XDG_STATE_HOME/swarmotter/swarmotterd.log or
+# ~/.local/state/swarmotter/swarmotterd.log.
+file = true
+# file_path = "~/.local/state/swarmotter/swarmotterd.log"

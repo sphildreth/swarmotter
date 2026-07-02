@@ -395,16 +395,29 @@ impl TorrentEngine {
                     }
                     if discovered.is_empty() {
                         no_peer_rounds = no_peer_rounds.saturating_add(1);
-                        self.state.lock().await.tracker_message =
-                            Some("no peers discovered".into());
+                        let mut state = self.state.lock().await;
+                        let existing = state.tracker_message.clone();
+                        if !existing
+                            .as_deref()
+                            .unwrap_or_default()
+                            .starts_with("no peers discovered")
+                        {
+                            state.tracker_message = Some(match existing {
+                                Some(msg) => format!("no peers discovered; last announce: {msg}"),
+                                None => "no peers discovered".into(),
+                            });
+                        }
+                        drop(state);
                         // Bounded give-up: a torrent that never discovers peers
                         // (no tracker, no seed peers, no DHT result) cannot
                         // progress. Stop the engine so the daemon/test does not
                         // hang; the torrent remains incomplete and the user can
                         // add trackers or seed peers and re-start it.
                         if no_peer_rounds >= NO_PEER_ROUNDS_MAX {
+                            let tracker_message = self.state.lock().await.tracker_message.clone();
                             tracing::info!(
                                 info_hash = %self.meta.info_hash,
+                                tracker_message = ?tracker_message,
                                 "stopping engine: no peers discovered after bounded retries"
                             );
                             break;
@@ -841,10 +854,17 @@ impl TorrentEngine {
                             continue;
                         }
                         ok = true;
+                        if resp.peers.is_empty() {
+                            msg = Some(format!(
+                                "{url}: announce returned 0 peers (seeders={}, leechers={})",
+                                resp.seeders, resp.leechers
+                            ));
+                        }
                         all.extend(resp.peers);
                     }
                     Err(e) => {
                         msg = Some(format!("{url}: {e}"));
+                        tracing::debug!(tracker = %url, error = %e, "tracker announce failed");
                     }
                 }
             }

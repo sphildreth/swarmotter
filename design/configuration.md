@@ -72,7 +72,9 @@ SWARMOTTER_API__MAX_REQUEST_BODY_BYTES=16777216
 - **PEX** (`pex`): `enabled`, `max_peers`.
 - **Watch folders** (`watch`): array of `{ path, recursive, download_dir,
   label, start_behavior, archive_dir, failure_dir, delete_after_import }`.
-- **Logging** (`logging`): `level`, `json`.
+- **Logging** (`logging`): `level`, `json`, `file`, `file_path`. File logging
+  is enabled by default so daemon logs are recorded even for direct terminal
+  starts.
 
 ## Example
 

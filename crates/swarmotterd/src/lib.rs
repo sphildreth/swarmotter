@@ -6,6 +6,7 @@
 pub mod daemon;
 pub mod dht;
 pub mod engine;
+pub mod logging;
 pub mod metadata;
 pub mod netbinder;
 pub mod runtime;

@@ -221,16 +221,31 @@ pub enum StartBehavior {
     Paused,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
     #[serde(default)]
     pub json: bool,
+    #[serde(default = "default_true")]
+    pub file: bool,
+    #[serde(default)]
+    pub file_path: Option<String>,
 }
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            json: false,
+            file: true,
+            file_path: None,
+        }
+    }
 }
 
 impl Config {
@@ -306,6 +321,22 @@ impl Config {
                 "api.max_request_body_bytes must be > 0".into(),
             ));
         }
+        if self.logging.level.trim().is_empty() {
+            return Err(CoreError::InvalidConfig(
+                "logging.level must not be empty".into(),
+            ));
+        }
+        if self
+            .logging
+            .file_path
+            .as_deref()
+            .map(|path| path.trim().is_empty())
+            .unwrap_or(false)
+        {
+            return Err(CoreError::InvalidConfig(
+                "logging.file_path must not be empty when set".into(),
+            ));
+        }
         if self.torrent.listen_port == 0 {
             return Err(CoreError::InvalidConfig(
                 "torrent.listen_port must be > 0".into(),
@@ -361,6 +392,8 @@ mod tests {
         assert!(cfg.network.allow_ipv6);
         assert!(cfg.torrent.allow_ipv6);
         assert!(cfg.torrent.utp_enabled);
+        assert_eq!(cfg.logging.level, "info");
+        assert!(cfg.logging.file);
         assert!(!cfg.torrent.selfish);
     }
 
@@ -517,6 +550,21 @@ auth_token = "secret"
 max_request_body_bytes = 0
 "#;
         assert!(Config::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn logging_defaults_to_file_enabled() {
+        let cfg = Config::from_toml_str(
+            r#"
+[logging]
+json = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.logging.level, "info");
+        assert!(cfg.logging.json);
+        assert!(cfg.logging.file);
+        assert!(cfg.logging.file_path.is_none());
     }
 
     #[test]

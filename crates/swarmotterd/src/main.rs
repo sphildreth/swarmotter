@@ -9,6 +9,7 @@
 mod daemon;
 mod dht;
 mod engine;
+mod logging;
 mod metadata;
 mod netbinder;
 mod runtime;
@@ -18,8 +19,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use tracing_subscriber::EnvFilter;
-
 use swarmotter_core::config::Config;
 use swarmotter_core::error::Result;
 use swarmotter_core::net::{self, OsInterfaceProbe};
@@ -43,20 +42,24 @@ async fn main() -> Result<()> {
     // contained sockets work.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
-
     let mut config = if let Some(path) = &args.config {
-        tracing::info!(path = %path.display(), "loading configuration");
         Config::from_file(path)?
     } else {
-        tracing::info!("no config file provided; using defaults");
         Config::default()
     };
 
     // Apply environment variable overrides.
     let env_vars: Vec<(String, String)> = std::env::vars().collect();
     config = config.apply_env_overrides(&env_vars)?;
+    let log_file = logging::init(&config.logging)?;
+    if let Some(path) = log_file {
+        tracing::info!(path = %path.display(), "daemon file logging enabled");
+    }
+    if let Some(path) = &args.config {
+        tracing::info!(path = %path.display(), "loading configuration");
+    } else {
+        tracing::info!("no config file provided; using defaults");
+    }
     tracing::info!(bind = %config.api.bind_address, "configured API bind address");
 
     // Validate network containment at startup. In strict mode with fail_closed,

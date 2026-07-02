@@ -1,5 +1,35 @@
 # Troubleshooting
 
+## Where logs are recorded
+
+SwarmOtter writes logs to stderr and to a file by default.
+
+For a terminal run, logs appear in the terminal and are also recorded at:
+
+```text
+$XDG_STATE_HOME/swarmotter/swarmotterd.log
+```
+
+If `XDG_STATE_HOME` is not set, the default is:
+
+```text
+~/.local/state/swarmotter/swarmotterd.log
+```
+
+Override the file path when needed:
+
+```toml
+[logging]
+file = true
+file_path = "/var/log/swarmotter/swarmotterd.log"
+```
+
+For systemd deployments, logs are also available through the journal:
+
+```bash
+journalctl -u swarmotterd -f
+```
+
 ## `missing field mode`
 
 Older builds required `network.mode` whenever `[network]` was present.
@@ -131,3 +161,23 @@ X-SwarmOtter-Auth: <token>
 ```
 
 The Web UI uses the same API routes as external clients.
+
+## Torrents are added but stay at `0 B/s`
+
+If torrents appear in the Web UI but stay at `0 B/s`, check tracker status:
+
+```bash
+curl -sS http://127.0.0.1:9091/api/v1/torrents/<info_hash>/trackers
+```
+
+Common causes:
+
+- The torrent has no live seeders.
+- The tracker hostnames cannot resolve under strict DNS containment.
+- UDP tracker traffic is blocked by the network path.
+- Only WebTorrent `wss://` trackers are present; those are not BitTorrent TCP
+  or UDP trackers.
+
+In strict interface-only mode, hostname trackers and DHT bootstrap hostnames
+need constrained DNS. Without that, SwarmOtter blocks hostname resolution
+instead of resolving through an unconstrained path.

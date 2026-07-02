@@ -21,6 +21,10 @@ Edit `/etc/swarmotter/swarmotter.toml`, then run:
 ./target/release/swarmotterd --config /etc/swarmotter/swarmotter.toml
 ```
 
+Logs are written to stderr and to the configured daemon log file. With default
+logging, the per-user file is `~/.local/state/swarmotter/swarmotterd.log`
+unless `XDG_STATE_HOME` is set.
+
 ## Systemd
 
 An example unit is provided in:

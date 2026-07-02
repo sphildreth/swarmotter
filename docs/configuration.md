@@ -246,3 +246,9 @@ containment policy.
 | --- | --- | --- |
 | `level` | `"info"` | Log level. |
 | `json` | `false` | Emits JSON logs when true. |
+| `file` | `true` | Records daemon logs to a file as well as stderr/journal. |
+| `file_path` | unset | Log file path. When unset, uses `$XDG_STATE_HOME/swarmotter/swarmotterd.log` or `~/.local/state/swarmotter/swarmotterd.log`. |
+
+Default logging is intentionally simple: terminal starts still show logs in the
+terminal, systemd starts still show logs in the journal, and the daemon also
+records the same logs to a per-user file.

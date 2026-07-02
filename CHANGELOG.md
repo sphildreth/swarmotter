@@ -45,6 +45,8 @@ status.
 - **Web UI assets and upload ergonomics:** the embedded Web UI now serves the
   favicon/app-manifest assets, displays the SwarmOtter icon in the header, and
   accepts `.torrent` drag-and-drop uploads anywhere in the app window.
+- **Default daemon file logging:** SwarmOtter now records daemon logs to a
+  per-user log file by default while continuing to emit logs to stderr/journal.
 - Repository scaffolding: governance documentation, ADR process, legal design
   docs, GitHub templates, and a minimal Rust workspace skeleton.
 - ADRs 0001 through 0008 recording foundational project decisions.
@@ -221,6 +223,9 @@ status.
 - IPv6 torrent networking is enabled by default in both `[network]` and
   `[torrent]`, while strict containment still blocks traffic unless the
   configured path is enforceable.
+- Tracker diagnostics now preserve the concrete last announce error when a
+  torrent stops after no peer discovery, instead of replacing it with only a
+  generic no-peer message.
 - Strict fail-closed containment now requires an enforceable socket path:
   `required_interface`, `required_source_ipv4`, `required_source_ipv6`, or
   `required_network_namespace`.
