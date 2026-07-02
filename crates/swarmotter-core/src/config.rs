@@ -112,6 +112,12 @@ pub struct TorrentConfig {
     /// the other transport remains available.
     #[serde(default = "default_true")]
     pub utp_prefer_tcp: bool,
+    /// Selfish mode: when true, SwarmOtter removes a torrent from the daemon
+    /// immediately after its download completes (all pieces verified). The
+    /// downloaded files are kept, but SwarmOtter will not seed the torrent
+    /// after completion. Default is false (normal completion/seeding).
+    #[serde(default)]
+    pub selfish: bool,
 }
 
 fn default_utp_enabled() -> bool {
@@ -129,6 +135,7 @@ impl Default for TorrentConfig {
             allow_ipv6: false,
             utp_enabled: default_utp_enabled(),
             utp_prefer_tcp: true,
+            selfish: false,
         }
     }
 }
@@ -326,6 +333,7 @@ mod tests {
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.torrent.listen_port, 51413);
         assert_eq!(cfg.api.bind_address, "127.0.0.1:9091");
+        assert!(!cfg.torrent.selfish);
     }
 
     #[test]
@@ -363,6 +371,34 @@ listen_port = 51413
 listen_port = 0
 "#;
         assert!(Config::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn torrent_selfish_defaults_false() {
+        let toml = r#"
+[torrent]
+listen_port = 51413
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert!(!cfg.torrent.selfish);
+    }
+
+    #[test]
+    fn torrent_selfish_parses_true() {
+        let toml = r#"
+[torrent]
+selfish = true
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert!(cfg.torrent.selfish);
+    }
+
+    #[test]
+    fn torrent_selfish_env_override() {
+        let cfg = Config::default();
+        let env = vec![("SWARMOTTER_TORRENT__SELFISH".into(), "true".into())];
+        let cfg = cfg.apply_env_overrides(&env).unwrap();
+        assert!(cfg.torrent.selfish);
     }
 
     #[test]

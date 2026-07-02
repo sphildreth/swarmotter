@@ -10,7 +10,17 @@ MVP release.
 
 ## [Unreleased]
 
-_No changes yet._
+### Added
+
+- **Selfish completion policy** (`torrent.selfish`, default `false`): an
+  optional completion policy that removes a torrent from SwarmOtter
+  immediately after its download completes. When enabled, on completion the
+  engine and seeder are stopped and the torrent record is removed from the
+  registry; the downloaded data is preserved on disk (no delete-data behavior
+  is invoked) and SwarmOtter does not seed the torrent after completion. When
+  disabled, normal completion and seeding behavior is unchanged. Configurable
+  via `[torrent] selfish` in the config file or `SWARMOTTER_TORRENT__SELFISH`.
+  The torrent disappears from the API/UI torrent list after completion.
 
 ## [1.0.0]
 

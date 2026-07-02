@@ -34,11 +34,16 @@ SWARMOTTER_NETWORK__REQUIRED_INTERFACE=tun0
   `required_source_ipv6`, `required_network_namespace`, `allow_ipv6`,
   `fail_closed`, `validate_route`, `validate_dns`).
 - **Torrent** (`torrent`): `listen_port`, `allow_ipv6`, `utp_enabled`,
-  `utp_prefer_tcp`. When `utp_enabled` is true the engine attempts uTP (BEP 29)
-  peer connections through the contained UDP socket alongside TCP; uTP traffic
-  fail-closes with the rest of the data plane. `utp_prefer_tcp` selects which
-  transport is tried first (with the other as a fallback). When `utp_enabled`
-  is false, only TCP is used.
+  `utp_prefer_tcp`, `selfish`. When `utp_enabled` is true the engine attempts uTP
+  (BEP 29) peer connections through the contained UDP socket alongside TCP; uTP
+  traffic fail-closes with the rest of the data plane. `utp_prefer_tcp` selects
+  which transport is tried first (with the other as a fallback). When
+  `utp_enabled` is false, only TCP is used. `selfish` is an optional completion
+  policy: when `true`, SwarmOtter removes a torrent from the daemon immediately
+  after its download completes (all pieces verified), stops its engine and
+  seeder, and preserves the downloaded data on disk (no delete-data behavior);
+  SwarmOtter will not seed the torrent after completion. When `false` (the
+  default), normal completion and seeding behavior is unchanged.
 - **Bandwidth** (`bandwidth`): global/per-torrent download/upload limits,
   alternate speed mode, max peers. Global limits live in this section and are
   enforced as a shared aggregate across all active torrents; per-torrent limits

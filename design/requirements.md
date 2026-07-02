@@ -37,7 +37,9 @@ time or duration estimates.
   bottom), start-now/bypass, auto-start behavior, per-torrent paused state.
 - **Seeding/ratio:** global and per-torrent ratio limits, idle seed limits,
   seed-forever option, stop at target, upload/download accounting, ratio
-  calculation.
+  calculation. An optional **selfish** completion policy
+  (`torrent.selfish`) removes a torrent from the daemon immediately after its
+  download completes while preserving the downloaded data and not seeding it.
 - **Bandwidth:** global and per-torrent download/upload limits, alternate
   speed mode, maximum peers globally and per torrent, rate-limit state.
 - **API:** complete REST API covering all user-facing features, JSON

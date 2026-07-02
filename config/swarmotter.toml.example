@@ -41,6 +41,12 @@ utp_enabled = true
 # When uTP is enabled, prefer TCP (try TCP first, fall back to uTP). Set to
 # false to prefer uTP.
 utp_prefer_tcp = true
+# Selfish mode removes a torrent from SwarmOtter immediately after the download
+# completes. Downloaded files are kept, but SwarmOtter will not seed the torrent
+# after completion. Useful when SwarmOtter should fetch content and then stop
+# managing the torrent without seeding. Default is false (normal completion and
+# seeding behavior).
+selfish = false
 
 # --- Bandwidth ---
 [bandwidth]

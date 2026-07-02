@@ -188,6 +188,15 @@ UDP socket (see ADR-0020).
 
 - [x] Queue management logic (limits, up/down/top/bottom, start-now, auto-start)
 - [x] Ratio/seeding limits logic (global and per-torrent, idle, seed-forever)
+- [x] Optional selfish completion policy (`torrent.selfish`): when enabled, the
+      daemon removes a torrent immediately after its download completes (engine
+      and seeder stopped, record removed from the registry) while preserving the
+      downloaded data on disk (no delete-data behavior); SwarmOtter does not
+      seed the torrent after completion. When disabled (default), normal
+      completion and seeding behavior is unchanged. Covered by daemon
+      integration tests (selfish removal + data preserved; default keeps the
+      completed torrent; `delete_data = true` still deletes data when requested)
+
 - [x] Bandwidth limits logic (global and per-torrent, alternate mode, max peers)
 - [x] Live bandwidth shaping — `RateLimiter` (token-bucket) wired into the
       engine download path and the seeder upload path. A shared global limiter

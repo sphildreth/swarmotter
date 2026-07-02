@@ -265,6 +265,171 @@ async fn daemon_add_downloads_to_completion_via_engine() {
     runtime.remove_torrent(&hash, true).await.unwrap();
     assert!(runtime.get_torrent(&hash).await.is_none());
     assert!(!storage.resume_path().exists());
+    assert!(
+        !storage.file_path(0).unwrap().exists(),
+        "delete_data = true must remove the payload file"
+    );
+
+    std::fs::remove_dir_all(&download_dir).ok();
+}
+
+/// Selfish completion policy (`torrent.selfish = true`): when a download
+/// finishes, SwarmOtter must remove the torrent from the daemon and stop
+/// seeding it, while preserving the downloaded data on disk. Equivalent to a
+/// `remove_torrent(delete_data = false)` driven automatically on completion.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_selfish_mode_removes_completed_torrent_and_preserves_data() {
+    // Generate a legal payload.
+    let mut content = Vec::with_capacity(32 * 1024 + 7);
+    for i in 0..32 * 1024 + 7 {
+        content.push((i % 251) as u8);
+    }
+    let piece_length: u64 = 16 * 1024;
+    let tracker_port = pick_port();
+    let tracker_url = format!("http://127.0.0.1:{tracker_port}/announce");
+    let torrent_bytes = build_single_file_torrent(
+        "selfish_payload.bin",
+        &content,
+        piece_length,
+        Some(&tracker_url),
+        false,
+    );
+    let meta = parse_torrent(&torrent_bytes).unwrap();
+
+    // Local seed peer + tracker.
+    let seed = spawn_seed(content.clone(), meta.clone()).await;
+    let tracker_addr: SocketAddr = format!("127.0.0.1:{tracker_port}").parse().unwrap();
+    spawn_tracker(tracker_addr, seed).await;
+
+    // Daemon with selfish mode enabled, containment disabled, and a temp dir.
+    let mut cfg = Config::default();
+    cfg.network.mode = swarmotter_core::models::network::NetworkContainmentMode::Disabled;
+    cfg.dht.enabled = false;
+    cfg.torrent.selfish = true;
+    let healthy = swarmotter_core::models::network::NetworkHealth::blocked(
+        swarmotter_core::models::network::NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let download_dir = unique_dir("daemon-selfish");
+    cfg.storage.download_dir = Some(download_dir.display().to_string());
+
+    let runtime = std::sync::Arc::new(DaemonRuntime::new(cfg, healthy));
+
+    let hash = runtime
+        .add_torrent_file(torrent_bytes, Some(download_dir.display().to_string()))
+        .await
+        .unwrap();
+
+    // Poll until the torrent disappears from the daemon (selfish removal on
+    // completion). It may briefly report Completed before being removed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if runtime.get_torrent(&hash).await.is_none() {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            let s = runtime.get_torrent(&hash).await;
+            panic!(
+                "selfish torrent was not removed after completion; summary: {:?}",
+                s
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // It must no longer appear in the torrent list.
+    assert!(
+        runtime
+            .list_torrents()
+            .await
+            .iter()
+            .all(|t| t.info_hash != hash),
+        "selfish mode must remove the torrent from the list"
+    );
+
+    // Downloaded data must be preserved with correct content (delete_data is
+    // never invoked by selfish mode).
+    let storage = swarmotter_core::storage::StorageIo::new(meta.clone(), download_dir.clone());
+    let payload_path = storage.file_path(0).unwrap();
+    assert!(payload_path.exists(), "selfish mode must preserve payload");
+    let written = std::fs::read(&payload_path).unwrap();
+    assert_eq!(written, content, "preserved content must match the payload");
+
+    std::fs::remove_dir_all(&download_dir).ok();
+}
+
+/// Regression: with the default `selfish = false`, a completed torrent stays
+/// in the registry and continues to be managed (seeded), i.e. existing
+/// completion/seeding behavior is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_selfish_disabled_keeps_completed_torrent() {
+    let mut content = Vec::with_capacity(32 * 1024 + 7);
+    for i in 0..32 * 1024 + 7 {
+        content.push((i % 251) as u8);
+    }
+    let piece_length: u64 = 16 * 1024;
+    let tracker_port = pick_port();
+    let tracker_url = format!("http://127.0.0.1:{tracker_port}/announce");
+    let torrent_bytes = build_single_file_torrent(
+        "kept_payload.bin",
+        &content,
+        piece_length,
+        Some(&tracker_url),
+        false,
+    );
+    let meta = parse_torrent(&torrent_bytes).unwrap();
+
+    let seed = spawn_seed(content.clone(), meta.clone()).await;
+    let tracker_addr: SocketAddr = format!("127.0.0.1:{tracker_port}").parse().unwrap();
+    spawn_tracker(tracker_addr, seed).await;
+
+    let mut cfg = Config::default();
+    cfg.network.mode = swarmotter_core::models::network::NetworkContainmentMode::Disabled;
+    cfg.dht.enabled = false;
+    assert!(!cfg.torrent.selfish, "default must be false");
+    let healthy = swarmotter_core::models::network::NetworkHealth::blocked(
+        swarmotter_core::models::network::NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let download_dir = unique_dir("daemon-noselfish");
+    cfg.storage.download_dir = Some(download_dir.display().to_string());
+
+    let runtime = std::sync::Arc::new(DaemonRuntime::new(cfg, healthy));
+
+    let hash = runtime
+        .add_torrent_file(torrent_bytes, Some(download_dir.display().to_string()))
+        .await
+        .unwrap();
+
+    // Wait for completion and confirm the torrent remains in the registry.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(summary) = runtime.get_torrent(&hash).await {
+            if summary.state == swarmotter_core::models::torrent::TorrentState::Completed {
+                break;
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("download did not complete in time");
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    // Completed torrent must still be listed and managed (seeding continues).
+    assert!(
+        runtime.get_torrent(&hash).await.is_some(),
+        "non-selfish mode must keep the completed torrent in the registry"
+    );
+    assert!(
+        runtime
+            .list_torrents()
+            .await
+            .iter()
+            .any(|t| t.info_hash == hash),
+        "non-selfish mode must keep the completed torrent listed"
+    );
 
     std::fs::remove_dir_all(&download_dir).ok();
 }

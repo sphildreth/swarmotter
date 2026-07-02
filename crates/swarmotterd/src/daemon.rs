@@ -172,6 +172,16 @@ impl DaemonRuntime {
         let state_for_summary = state.clone();
         let hash_for_task = hash;
         let registry = self.registry.clone();
+        // Clones needed by the engine task to perform selfish-mode removal
+        // on completion without needing `&self` (the task owns only these
+        // shared handles). Cheap `Arc` clones.
+        let config = self.config.clone();
+        let engine_cmds_arc = self.engine_cmds.clone();
+        let engine_handles_arc = self.engine_handles.clone();
+        let engine_states_arc = self.engine_states.clone();
+        let engine_limiters_arc = self.engine_limiters.clone();
+        let seeder_shutdowns_arc = self.seeder_shutdowns.clone();
+        let seeder_handles_arc = self.seeder_handles.clone();
         // DHT runner for trackerless peer discovery. Gated by config and
         // containment; the engine disables DHT for private torrents.
         let dht_runner = {
@@ -208,50 +218,71 @@ impl DaemonRuntime {
         let handle = tokio::spawn(async move {
             match engine.run().await {
                 Ok(final_state) => {
-                    let mut reg = registry.lock().await;
-                    if let Some(t) = reg.get_mut(&hash_for_task) {
-                        // If metadata was fetched via BEP 9, replace the
-                        // placeholder meta with the real one and rebuild the
-                        // file/piece bookkeeping.
-                        if let Some(real) = final_state.resolved_meta.clone() {
-                            t.meta = real.clone();
-                            t.needs_metadata = false;
-                            t.progress.have = (0..real.piece_count())
-                                .map(|i| final_state.pieces_have.has(i))
-                                .collect();
-                            t.files = real
-                                .files
-                                .iter()
-                                .enumerate()
-                                .map(|(i, f)| swarmotter_core::models::torrent::TorrentFile {
-                                    index: i,
-                                    path: f.path.join("/"),
-                                    length: f.length,
-                                    bytes_completed: 0,
-                                    priority:
-                                        swarmotter_core::models::torrent::FilePriority::Normal,
-                                    wanted: true,
-                                })
-                                .collect();
-                            t.priorities = vec![
+                    let finished = final_state.finished;
+                    {
+                        let mut reg = registry.lock().await;
+                        if let Some(t) = reg.get_mut(&hash_for_task) {
+                            // If metadata was fetched via BEP 9, replace the
+                            // placeholder meta with the real one and rebuild the
+                            // file/piece bookkeeping.
+                            if let Some(real) = final_state.resolved_meta.clone() {
+                                t.meta = real.clone();
+                                t.needs_metadata = false;
+                                t.progress.have = (0..real.piece_count())
+                                    .map(|i| final_state.pieces_have.has(i))
+                                    .collect();
+                                t.files = real
+                                    .files
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, f)| swarmotter_core::models::torrent::TorrentFile {
+                                        index: i,
+                                        path: f.path.join("/"),
+                                        length: f.length,
+                                        bytes_completed: 0,
+                                        priority:
+                                            swarmotter_core::models::torrent::FilePriority::Normal,
+                                        wanted: true,
+                                    })
+                                    .collect();
+                                t.priorities = vec![
                                     swarmotter_core::models::torrent::FilePriority::Normal;
                                     real.files.len()
                                 ];
-                            t.wanted = vec![true; real.files.len()];
+                                t.wanted = vec![true; real.files.len()];
+                            }
+                            t.downloaded = final_state.downloaded;
+                            t.uploaded = final_state.uploaded;
+                            t.progress.have = (0..final_state.piece_count)
+                                .map(|i| final_state.pieces_have.has(i))
+                                .collect();
+                            if final_state.finished {
+                                t.state = TorrentState::Completed;
+                                t.date_completed = Some(now());
+                            } else if t.state == TorrentState::DownloadingMetadata {
+                                // Metadata fetched but download incomplete; mark
+                                // downloading.
+                                t.state = TorrentState::Downloading;
+                            }
                         }
-                        t.downloaded = final_state.downloaded;
-                        t.uploaded = final_state.uploaded;
-                        t.progress.have = (0..final_state.piece_count)
-                            .map(|i| final_state.pieces_have.has(i))
-                            .collect();
-                        if final_state.finished {
-                            t.state = TorrentState::Completed;
-                            t.date_completed = Some(now());
-                        } else if t.state == TorrentState::DownloadingMetadata {
-                            // Metadata fetched but download incomplete; mark
-                            // downloading.
-                            t.state = TorrentState::Downloading;
-                        }
+                    }
+                    // Selfish completion policy: when enabled, immediately
+                    // remove the finished torrent from the daemon (engine and
+                    // seeder stopped, record removed) while preserving the
+                    // downloaded data. This must run after the registry update
+                    // above so final stats/name are captured before removal.
+                    if finished && config.lock().await.torrent.selfish {
+                        Self::selfish_remove_completed(
+                            hash_for_task,
+                            registry.clone(),
+                            engine_cmds_arc.clone(),
+                            engine_handles_arc.clone(),
+                            engine_states_arc.clone(),
+                            engine_limiters_arc.clone(),
+                            seeder_shutdowns_arc.clone(),
+                            seeder_handles_arc.clone(),
+                        )
+                        .await;
                     }
                 }
                 Err(e) => {
@@ -362,6 +393,63 @@ impl DaemonRuntime {
         if let Some(handle) = self.seeder_handles.lock().await.remove(hash) {
             let _ = handle.await;
         }
+    }
+
+    /// Selfish-mode completion: remove a finished torrent from the daemon
+    /// without deleting its downloaded data. Stops the inbound seeder and
+    /// clears all live engine/seeder bookkeeping, then removes the torrent
+    /// record from the registry. Equivalent to `remove_torrent` with
+    /// `delete_data = false`, but safe to call from within the engine task
+    /// itself because it does NOT await the engine task's own join handle
+    /// (that would deadlock); the already-returning task is simply detached.
+    ///
+    /// This is an associated function taking the shared `Arc<Mutex<...>>`
+    /// fields (rather than `&self`) precisely so the spawned engine task can
+    /// invoke it with its captured clones.
+    #[allow(clippy::too_many_arguments)]
+    async fn selfish_remove_completed(
+        hash: InfoHash,
+        registry: Arc<Mutex<TorrentRegistry>>,
+        engine_cmds: Arc<Mutex<HashMap<InfoHash, tokio::sync::mpsc::Sender<EngineCommand>>>>,
+        engine_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
+        engine_states: Arc<Mutex<HashMap<InfoHash, Arc<Mutex<EngineState>>>>>,
+        engine_limiters: Arc<Mutex<HashMap<InfoHash, swarmotter_core::bandwidth::RateLimiter>>>,
+        seeder_shutdowns: Arc<Mutex<HashMap<InfoHash, tokio::sync::watch::Sender<bool>>>>,
+        seeder_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
+    ) {
+        let name = registry
+            .lock()
+            .await
+            .get(&hash)
+            .map(|t| t.name().to_string())
+            .unwrap_or_default();
+        // Stop the inbound seeder (a separate task; safe to await).
+        if let Some(tx) = seeder_shutdowns.lock().await.remove(&hash) {
+            let _ = tx.send(true);
+        }
+        if let Some(handle) = seeder_handles.lock().await.remove(&hash) {
+            let _ = handle.await;
+        }
+        // Clear live engine bookkeeping. We deliberately do NOT await the
+        // engine join handle: it belongs to the engine task that is calling
+        // this method, so awaiting it would deadlock. Dropping the detached
+        // handle is safe because the task is already returning.
+        engine_cmds.lock().await.remove(&hash);
+        engine_states.lock().await.remove(&hash);
+        engine_limiters.lock().await.remove(&hash);
+        if let Some(handle) = engine_handles.lock().await.remove(&hash) {
+            drop(handle);
+        }
+        // Remove the torrent record; downloaded data is preserved (no
+        // delete-data behavior is invoked).
+        registry.lock().await.remove(&hash);
+        tracing::info!(
+            info_hash = %hash,
+            name = %name,
+            selfish = true,
+            delete_data = false,
+            "selfish mode removed completed torrent; downloaded data preserved"
+        );
     }
 
     async fn make_binder(&self) -> Arc<dyn swarmotter_core::net::NetworkBinder> {
