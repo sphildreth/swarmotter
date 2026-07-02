@@ -71,6 +71,7 @@ All routes are prefixed with `/api/v1`. A root `/health` alias also exists.
 | POST | `/torrents/:hash/reannounce` | Reannounce |
 | POST | `/torrents/:hash/move` | Move data (`{ path }`) |
 | POST | `/torrents/:hash/labels` | Set labels (`{ labels }`) |
+| POST | `/torrents/:hash/limits` | Set per-torrent bandwidth limits (`{ download_limit, upload_limit }`, bytes/sec, 0 = unlimited; applies live) |
 
 ### Files
 

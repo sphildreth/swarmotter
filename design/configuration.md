@@ -40,7 +40,11 @@ SWARMOTTER_NETWORK__REQUIRED_INTERFACE=tun0
   transport is tried first (with the other as a fallback). When `utp_enabled`
   is false, only TCP is used.
 - **Bandwidth** (`bandwidth`): global/per-torrent download/upload limits,
-  alternate speed mode, max peers.
+  alternate speed mode, max peers. Global limits live in this section and are
+  enforced as a shared aggregate across all active torrents; per-torrent limits
+  (`download_limit`/`upload_limit`, 0 = unlimited) live on each torrent record
+  and are set/changed live via `POST /api/v1/torrents/:hash/limits`. Both are
+  enforced live by the engine/seeder rate shapers.
 - **Queue** (`queue`): `max_active_downloads`, `max_active_seeds`,
   `auto_start`.
 - **Seeding** (`seeding`): `global_ratio_limit`, `global_idle_limit`.

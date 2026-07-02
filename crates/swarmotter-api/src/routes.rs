@@ -55,6 +55,10 @@ fn api_v1_router(state: SharedState) -> Router<SharedState> {
             post(handlers::torrents::set_labels),
         )
         .route(
+            "/torrents/:hash/limits",
+            post(handlers::torrents::set_limits),
+        )
+        .route(
             "/torrents/:hash/files",
             get(handlers::files::list_files).patch(handlers::files::patch_files),
         )

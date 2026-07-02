@@ -27,7 +27,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use swarmotter_core::bandwidth::{RateDirection, RateLimiter};
+use swarmotter_core::bandwidth::{RateDirection, RateLimiter, ShapedLimiter};
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::meta::TorrentMeta;
 use swarmotter_core::net::NetworkBinder;
@@ -100,7 +100,7 @@ pub struct TorrentEngine {
     commands: Arc<Mutex<tokio::sync::mpsc::Receiver<EngineCommand>>>,
     seed_peers: Vec<PeerAddr>,
     listen_port: u16,
-    limiter: RateLimiter,
+    limiter: ShapedLimiter,
     magnet: Option<MagnetParams>,
     /// Optional DHT runner for trackerless peer discovery (disabled for
     /// private torrents).
@@ -162,12 +162,23 @@ impl TorrentEngine {
             commands: Arc::new(Mutex::new(commands)),
             seed_peers,
             listen_port,
-            limiter,
+            limiter: ShapedLimiter::from_rate_limiter(limiter),
             magnet,
             dht: None,
             utp_enabled: true,
             utp_prefer_tcp: true,
         }
+    }
+
+    /// Attach a shared global rate limiter (the daemon's process-wide download/
+    /// upload cap) so transfers are shaped by both the per-torrent and the
+    /// global limits.
+    #[allow(dead_code)]
+    pub fn with_global_limiter(mut self, global: Option<RateLimiter>) -> Self {
+        if let Some(g) = global {
+            self.limiter = self.limiter.with_global(g);
+        }
+        self
     }
 
     /// Attach a DHT runner for trackerless peer discovery (ignored for private
@@ -1018,7 +1029,7 @@ async fn endgame_peer_session(
     download_dir: PathBuf,
     deadline: Instant,
     made_progress: Arc<std::sync::atomic::AtomicBool>,
-    limiter: RateLimiter,
+    limiter: ShapedLimiter,
     utp_enabled: bool,
     utp_prefer_tcp: bool,
 ) -> Result<bool> {

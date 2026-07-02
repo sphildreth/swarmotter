@@ -38,7 +38,16 @@ error response handling, and a bounded retry loop. All UDP traffic goes
 through the binder's `udp_socket()` contained UDP socket; no UDP socket is
 created directly. The engine's `announce()` dispatches by scheme: `udp://`
 URLs use `udp_tracker::udp_announce`, `http://`/`https://` URLs use
-`http_announce`. HTTPS TLS over the contained socket remains future work.
+`http_announce`. HTTPS (`https://`) performs TLS over the binder's contained
+TCP socket with system-root certificate validation (implemented — see
+ADR-0018); the engine dispatches `https://` trackers through the same
+contained `http_get` path and fail-closed blocks HTTPS.
+
+## Updates
+
+- HTTPS trackers over the contained socket were subsequently implemented
+  (tokio-rustls + rustls + webpki-roots); see ADR-0018, which supersedes the
+  earlier "HTTPS as future work" note in this ADR.
 
 ## Consequences
 
@@ -46,7 +55,7 @@ URLs use `udp_tracker::udp_announce`, `http://`/`https://` URLs use
   without sockets.
 - All tracker HTTP and UDP traffic is containment-gated.
 - UDP trackers use the binder `udp_socket()` method, not a bypass.
-- HTTPS trackers will reuse the contained socket path with TLS (future work).
+- HTTPS trackers reuse the contained socket path with TLS (see ADR-0018).
 
 ## Related Documents
 

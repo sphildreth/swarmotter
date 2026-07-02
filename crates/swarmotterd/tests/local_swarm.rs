@@ -822,6 +822,83 @@ async fn local_swarm_download_is_throttled_by_bandwidth_limit() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Per-torrent bandwidth limit is enforced live even when a shared global
+/// limiter is attached (the production configuration). A tight per-torrent
+/// download cap with an unlimited global limiter still throttles the download,
+/// proving per-torrent limits are real (not modeled).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_swarm_download_is_throttled_by_per_torrent_limit() {
+    use swarmotter_core::bandwidth::RateLimiter;
+
+    let mut content = Vec::with_capacity(8 * 16 * 1024 + 7);
+    for i in 0..8 * 16 * 1024 + 7 {
+        content.push((i % 251) as u8);
+    }
+    let piece_length: u64 = 16 * 1024;
+    let torrent_bytes =
+        build_single_file_torrent("throttle-per.bin", &content, piece_length, None, false);
+    let meta = parse_torrent(&torrent_bytes).unwrap();
+
+    let seed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seed_addr = seed_listener.local_addr().unwrap();
+    let seed_peer = PeerAddr::from_socket_addr(seed_addr);
+    {
+        let content_clone = content.clone();
+        let meta_clone = meta.clone();
+        tokio::spawn(async move {
+            let seed = SeedPeer {
+                content: content_clone,
+                meta: meta_clone.clone(),
+                info_hash: meta_clone.info_hash,
+                peer_id: peer_id(b"-SD0051-"),
+            };
+            if let Ok((stream, _)) = seed_listener.accept().await {
+                let _ = seed.serve_one(stream).await;
+            }
+        });
+    }
+
+    // Per-torrent cap 8 KiB/sec, but the shared GLOBAL limiter is unlimited, so
+    // only the per-torrent limit can throttle. If per-torrent limits were
+    // modeled-only, this download would complete in well under a second.
+    let dir = unique_dir("throttle-per");
+    let binder = Arc::new(LoopbackBinder);
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
+    let per_torrent = RateLimiter::new(8 * 1024, 0);
+    let engine = TorrentEngine::with_limiter(
+        meta.clone(),
+        dir.clone(),
+        peer_id(b"-SW0051-"),
+        binder,
+        state.clone(),
+        cmd_rx,
+        vec![seed_peer],
+        6881,
+        per_torrent,
+        None,
+    )
+    .with_global_limiter(Some(RateLimiter::unlimited()));
+
+    let start = std::time::Instant::now();
+    let final_state = tokio::time::timeout(Duration::from_secs(90), engine.run())
+        .await
+        .expect("per-torrent-throttled engine did not finish")
+        .expect("per-torrent-throttled engine error");
+    let elapsed = start.elapsed();
+
+    assert!(final_state.finished);
+    assert!(
+        elapsed >= Duration::from_secs(5),
+        "expected per-torrent limit to throttle download; elapsed {elapsed:?}"
+    );
+
+    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
+    assert_eq!(written, content);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 fn pick_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()

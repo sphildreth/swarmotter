@@ -11,8 +11,12 @@ for lawful torrent use cases such as Linux distributions, open-source project
 releases, public-domain media, open datasets, and other legally distributed
 files.
 
-The repository is currently in the early setup phase. The BitTorrent engine is
-**not** implemented yet. The first product release is `v1.0.0`. There is no MVP.
+The first product release is `v1.0.0`. There is no MVP: `v1.0.0` is reached only
+when every required feature in `design/requirements.md` is implemented, tested,
+documented, and usable. The live torrent data-plane engine, network containment,
+API, and Web UI are implemented; remaining work is tracked by completed
+capability and acceptance criteria in `design/requirements.md` and
+`docs/v1-completion-tracker.md`.
 
 ## Non-negotiable rules
 

@@ -157,7 +157,7 @@ impl NetworkBinder for ContainedBinder {
         let path = parsed.path();
         let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
         let req = format!(
-            "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: SwarmOtter/0.1\r\n\r\n"
+            "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: SwarmOtter/1.0\r\n\r\n"
         );
         if is_https {
             // TLS over the contained TCP connection. Certificate validation

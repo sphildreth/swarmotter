@@ -22,7 +22,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-use swarmotter_core::bandwidth::{RateDirection, RateLimiter};
+use swarmotter_core::bandwidth::{RateDirection, RateLimiter, ShapedLimiter};
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::meta::TorrentMeta;
 use swarmotter_core::net::NetworkBinder;
@@ -45,7 +45,7 @@ pub struct Seeder {
     port: u16,
     peer_id: [u8; 20],
     shutdown: tokio::sync::watch::Receiver<bool>,
-    limiter: RateLimiter,
+    limiter: ShapedLimiter,
     /// Optional one-shot sender receiving the bound listen address, for tests
     /// that bind on port 0 and need to learn the actual port.
     bound_addr: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
@@ -93,9 +93,19 @@ impl Seeder {
             port,
             peer_id,
             shutdown,
-            limiter,
+            limiter: ShapedLimiter::from_rate_limiter(limiter),
             bound_addr: None,
         }
+    }
+
+    /// Attach a shared global rate limiter (the daemon's process-wide upload
+    /// cap) so seeding is shaped by both the per-torrent and global limits.
+    #[allow(dead_code)]
+    pub fn with_global_limiter(mut self, global: Option<RateLimiter>) -> Self {
+        if let Some(g) = global {
+            self.limiter = self.limiter.with_global(g);
+        }
+        self
     }
 
     /// Set a one-shot sender that receives the bound listen address once the
@@ -168,7 +178,7 @@ async fn serve_peer(
     storage: &StorageIo,
     state: &Arc<Mutex<EngineState>>,
     peer_id: [u8; 20],
-    limiter: &RateLimiter,
+    limiter: &ShapedLimiter,
 ) -> Result<()> {
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = PeerReader::new(read_half);

@@ -50,10 +50,22 @@ pub struct DaemonRuntime {
     seeder_shutdowns: Arc<Mutex<HashMap<InfoHash, tokio::sync::watch::Sender<bool>>>>,
     /// Running seeder task join handles per torrent.
     seeder_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
+    /// Shared global download/upload rate limiter. Cloned into every engine
+    /// and seeder so the configured global bandwidth cap is enforced as a true
+    /// aggregate across all active torrents.
+    global_limiter: swarmotter_core::bandwidth::RateLimiter,
+    /// Per-torrent rate limiters for running engines, keyed by info hash. The
+    /// daemon keeps a clone (cheap: buckets are shared) so per-torrent limit
+    /// changes apply live to a running engine.
+    engine_limiters: Arc<Mutex<HashMap<InfoHash, swarmotter_core::bandwidth::RateLimiter>>>,
 }
 
 impl DaemonRuntime {
     pub fn new(config: Config, startup_health: NetworkHealth) -> Self {
+        let global_limiter = swarmotter_core::bandwidth::RateLimiter::new(
+            config.bandwidth.effective_download(),
+            config.bandwidth.effective_upload(),
+        );
         Self {
             registry: Arc::new(Mutex::new(TorrentRegistry::default())),
             config: Arc::new(Mutex::new(config)),
@@ -64,6 +76,8 @@ impl DaemonRuntime {
             engine_handles: Arc::new(Mutex::new(HashMap::new())),
             seeder_shutdowns: Arc::new(Mutex::new(HashMap::new())),
             seeder_handles: Arc::new(Mutex::new(HashMap::new())),
+            global_limiter,
+            engine_limiters: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -133,16 +147,21 @@ impl DaemonRuntime {
         let (tx, rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
         self.engine_cmds.lock().await.insert(hash, tx);
 
-        // Live bandwidth shaping: build a rate limiter from the effective
-        // global download/upload limits (0 = unlimited). Per-torrent limits
-        // can further tighten this in the future.
+        // Live bandwidth shaping: a per-torrent rate limiter built from the
+        // torrent's own download/upload limits (0 = unlimited), plus the shared
+        // global limiter so the configured global cap is also enforced. The
+        // daemon keeps a clone so per-torrent limit changes apply live.
         let limiter = {
-            let cfg = self.config.lock().await;
-            swarmotter_core::bandwidth::RateLimiter::new(
-                cfg.bandwidth.effective_download(),
-                cfg.bandwidth.effective_upload(),
-            )
+            let reg = self.registry.lock().await;
+            let Some(t) = reg.get(&hash) else {
+                return;
+            };
+            swarmotter_core::bandwidth::RateLimiter::new(t.download_limit, t.upload_limit)
         };
+        self.engine_limiters
+            .lock()
+            .await
+            .insert(hash, limiter.clone());
         // Peer transport selection (TCP/uTP) from config. All transports stay
         // on the contained binder; fail-closed blocks both.
         let (utp_enabled, utp_prefer_tcp) = {
@@ -181,6 +200,7 @@ impl DaemonRuntime {
             limiter,
             magnet,
         )
+        .with_global_limiter(Some(self.global_limiter.clone()))
         .with_transport(utp_enabled, utp_prefer_tcp);
         if let Some(dht) = dht_runner {
             engine = engine.with_dht(dht);
@@ -277,6 +297,7 @@ impl DaemonRuntime {
         // Stop the inbound peer listener / seeder too.
         self.stop_seeder(hash).await;
         self.engine_states.lock().await.remove(hash);
+        self.engine_limiters.lock().await.remove(hash);
     }
 
     /// Spawn the inbound peer listener / seeder for a torrent. It shares the
@@ -297,13 +318,14 @@ impl DaemonRuntime {
         let binder = self.make_binder().await;
         let peer_id = make_peer_id();
         let listen_port = self.config.lock().await.torrent.listen_port;
-        let limiter = {
-            let cfg = self.config.lock().await;
-            swarmotter_core::bandwidth::RateLimiter::new(
-                cfg.bandwidth.effective_download(),
-                cfg.bandwidth.effective_upload(),
-            )
+        // Per-torrent upload limit (0 = unlimited) plus the shared global cap.
+        let (dl_limit, ul_limit) = {
+            let reg = self.registry.lock().await;
+            reg.get(&hash)
+                .map(|t| (t.download_limit, t.upload_limit))
+                .unwrap_or((0, 0))
         };
+        let limiter = swarmotter_core::bandwidth::RateLimiter::new(dl_limit, ul_limit);
         let storage = Arc::new(swarmotter_core::storage::StorageIo::new(
             meta.clone(),
             std::path::PathBuf::from(download_dir),
@@ -318,7 +340,8 @@ impl DaemonRuntime {
             peer_id,
             shutdown_rx,
             limiter,
-        );
+        )
+        .with_global_limiter(Some(self.global_limiter.clone()));
         self.seeder_shutdowns.lock().await.insert(hash, shutdown_tx);
         let hash_for_task = hash;
         let registry = self.registry.clone();
@@ -733,6 +756,40 @@ impl DaemonOps for DaemonRuntime {
         }
     }
 
+    async fn set_torrent_limits(
+        &self,
+        hash: &InfoHash,
+        limits: swarmotter_core::bandwidth::TorrentBandwidth,
+    ) -> Result<()> {
+        {
+            let mut reg = self.registry.lock().await;
+            match reg.get_mut(hash) {
+                Some(t) => {
+                    t.download_limit = limits.download;
+                    t.upload_limit = limits.upload;
+                }
+                None => return Err(CoreError::NotFound("torrent".into())),
+            }
+        }
+        // Apply live to a running engine (its per-torrent limiter shares the
+        // buckets with the clone the daemon retains). The seeder reads limits
+        // at start; a running seeder picks up the upload cap via the shared
+        // global limiter and on its next start.
+        if let Some(rl) = self.engine_limiters.lock().await.get(hash).cloned() {
+            rl.set_capacity(
+                swarmotter_core::bandwidth::RateDirection::Download,
+                limits.download,
+            )
+            .await;
+            rl.set_capacity(
+                swarmotter_core::bandwidth::RateDirection::Upload,
+                limits.upload,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
     async fn list_files(&self, hash: &InfoHash) -> Option<Vec<TorrentFile>> {
         self.registry
             .lock()
@@ -916,16 +973,30 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn update_settings(&self, patch: swarmotter_api::state::SettingsPatch) -> Result<()> {
-        let mut cfg = self.config.lock().await;
-        if let Some(b) = patch.bandwidth {
-            cfg.bandwidth = b;
+        let eff_dl;
+        let eff_ul;
+        {
+            let mut cfg = self.config.lock().await;
+            if let Some(b) = patch.bandwidth {
+                cfg.bandwidth = b;
+            }
+            if let Some(q) = patch.queue {
+                cfg.queue = q;
+            }
+            if let Some(s) = patch.seeding {
+                cfg.seeding = s;
+            }
+            eff_dl = cfg.bandwidth.effective_download();
+            eff_ul = cfg.bandwidth.effective_upload();
         }
-        if let Some(q) = patch.queue {
-            cfg.queue = q;
-        }
-        if let Some(s) = patch.seeding {
-            cfg.seeding = s;
-        }
+        // Apply the new global limits live to the shared limiter (and therefore
+        // to all running engines/seeders, which share its buckets).
+        self.global_limiter
+            .set_capacity(swarmotter_core::bandwidth::RateDirection::Download, eff_dl)
+            .await;
+        self.global_limiter
+            .set_capacity(swarmotter_core::bandwidth::RateDirection::Upload, eff_ul)
+            .await;
         Ok(())
     }
 

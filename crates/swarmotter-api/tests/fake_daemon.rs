@@ -189,6 +189,21 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             None => Err(CoreError::NotFound("torrent".into())),
         }
     }
+    async fn set_torrent_limits(
+        &self,
+        hash: &InfoHash,
+        limits: swarmotter_core::bandwidth::TorrentBandwidth,
+    ) -> Result<()> {
+        let mut reg = self.registry.lock().await;
+        match reg.get_mut(hash) {
+            Some(t) => {
+                t.download_limit = limits.download;
+                t.upload_limit = limits.upload;
+                Ok(())
+            }
+            None => Err(CoreError::NotFound("torrent".into())),
+        }
+    }
     async fn list_files(&self, hash: &InfoHash) -> Option<Vec<TorrentFile>> {
         self.registry
             .lock()

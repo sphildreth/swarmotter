@@ -58,6 +58,13 @@ pub trait DaemonOps: Send + Sync + 'static {
         -> Result<()>;
     /// Update labels/categories.
     async fn set_labels(&self, hash: &InfoHash, labels: Vec<String>) -> Result<()>;
+    /// Set per-torrent bandwidth limits (bytes/sec; 0 = unlimited). Applies
+    /// live to a running engine/seeder.
+    async fn set_torrent_limits(
+        &self,
+        hash: &InfoHash,
+        limits: swarmotter_core::bandwidth::TorrentBandwidth,
+    ) -> Result<()>;
 
     /// List files for a torrent.
     async fn list_files(&self, hash: &InfoHash) -> Option<Vec<TorrentFile>>;
@@ -144,7 +151,7 @@ impl Default for BuildInfo {
     fn default() -> Self {
         Self {
             version: env!("CARGO_PKG_VERSION"),
-            commit: env!("CARGO_PKG_VERSION"),
+            commit: option_env!("SWARMOTTER_BUILD_COMMIT").unwrap_or("unknown"),
             target: std::env::consts::ARCH,
         }
     }

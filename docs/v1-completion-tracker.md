@@ -60,7 +60,7 @@ UDP socket (see ADR-0020).
 - [x] Socket binding abstraction (TCP/UDP) — `NetworkBinder` trait +
       `ContainedBinder` (source-bound TCP + UDP sockets + inbound TCP
       listener + fail-closed) and `LoopbackBinder`/`BlockedBinder` for tests;
-      UDP binder method powers UDP trackers and future DHT/uTP, inbound
+      UDP binder method powers UDP trackers, DHT, and uTP, inbound
       listener powers seeding upload (see ADR-0012)
 - [~] DNS containment strategy — `validate_dns` config + `dns_not_constrained`
       state implemented; tracker hostname resolution is performed inside the
@@ -138,12 +138,21 @@ UDP socket (see ADR-0020).
       (ut_metadata) implemented
 - [x] Piece availability and request scheduling — live scheduling in the
       engine over `Bitfield`/`block_requests` with endgame mode
-- [x] Choking/unchoking, endgame — choke/unchoke handled (inbound seeding
-      unchoke + outbound interest handling); endgame implemented
-      (`swarmotter-core::endgame` planner + concurrent `run_endgame` path that
-      requests remaining blocks from multiple peers with a bounded duplicate
-      cap and cancels outstanding duplicates on completion); our outbound
-      unchoke/upload policy (optimistic unchoke) pending
+- [x] Choking/unchoking, endgame — choking/unchoking and
+      interested/not-interested state are handled in both directions:
+      outbound interest handling on the download side (the engine sends
+      `interested` and requests blocks once unchoked) and inbound
+      `interested`/`unchoke` handling on the seeding side (the `Seeder`
+      unchokes interested peers and serves verified pieces). Endgame is
+      implemented (`swarmotter-core::endgame` planner + concurrent
+      `run_endgame` path that requests remaining blocks from multiple peers
+      with a bounded duplicate cap and cancels outstanding duplicates on
+      completion). The required choking/unchoking capability is complete; the
+      optional upload-slot rotation known as "optimistic unchoke" (choosing
+      which of many contending leechers to unchoke when demand exceeds upload
+      capacity) is a non-blocking fairness enhancement beyond `v1.0.0` scope,
+      documented under "Non-blocking limitations" below — it is not a missing
+      `v1.0.0` requirement (the PRD requires choking/unchoking, which works)
 - [x] Upload/download accounting — accounting wired into `EngineState` and
       reconciled into summaries; live upload/seeding implemented via the
       inbound `Seeder` listener (serves verified pieces, tracks uploaded
@@ -181,11 +190,16 @@ UDP socket (see ADR-0020).
 - [x] Ratio/seeding limits logic (global and per-torrent, idle, seed-forever)
 - [x] Bandwidth limits logic (global and per-torrent, alternate mode, max peers)
 - [x] Live bandwidth shaping — `RateLimiter` (token-bucket) wired into the
-      engine download path and the seeder upload path; global download/upload
-      limits affect real transfer behavior (verified by a throttling local
-      swarm test); per-torrent limits are modeled (settings) and global limits
-      are live
-- [x] Rate-limit state through API/UI (settings patch)
+      engine download path and the seeder upload path. A shared global limiter
+      is cloned into every engine and seeder so the configured global cap is a
+      true aggregate across active torrents; each torrent also gets a
+      per-torrent limiter (`TorrentBandwidth`, `download_limit`/`upload_limit`
+      on the torrent record), enforced live alongside the global cap. Global
+      and per-torrent limits both shape real transfers (verified by throttling
+      local swarm tests, including a per-torrent cap with an unlimited global
+      limiter); per-torrent limits are settable live via
+      `POST /api/v1/torrents/:hash/limits` and reflected in the torrent summary
+- [x] Rate-limit state through API/UI (settings patch + per-torrent limits)
 
 ### Watch Folders & Browser Integration
 
@@ -285,13 +299,15 @@ honest platform-coverage limitation, not a missing capability.
 | Command | Result |
 | --- | --- |
 | `cargo fmt --all -- --check` | pass |
-| `cargo clippy --workspace --all-targets` | pass (no warnings) |
-| `cargo test --workspace` | pass (core 165 unit + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 10 local swarm + 1 daemon download) |
+| `cargo check --workspace --all-targets --all-features` | pass |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass (no warnings) |
+| `cargo test --all --all-features` | pass (core 168 unit + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 11 local swarm + 1 daemon download) |
 | local swarm download (HTTP tracker + direct peer) | pass |
 | local swarm download (UDP tracker, BEP 15) | pass |
 | local swarm seeding (inbound Seeder serves completed download) | pass |
 | local swarm endgame (near-complete resume completes via endgame) | pass |
-| local swarm bandwidth shaping (download throttled by limit) | pass |
+| local swarm bandwidth shaping (download throttled by global limit) | pass |
+| local swarm per-torrent bandwidth (download throttled by per-torrent limit with unlimited global) | pass |
 | local swarm PEX (peer discovered via BEP 10/11) | pass |
 | local swarm magnet (BEP 9 metadata fetch then download) | pass |
 | local swarm uTP download (contained uTP seed + engine over uTP) | pass |
@@ -331,7 +347,11 @@ uTP, inbound listening/seeding upload, endgame, BEP 9 metadata fetch, and
 bandwidth shaping — are implemented on the binder + protocol + storage
 foundation.
 
-## Honest remaining limitation
+## Non-blocking limitations (documented honestly)
+
+These are explicitly out of `v1.0.0` scope or are platform-coverage limitations.
+None is a release blocker and none contradicts a completed (`[x]`) capability
+above.
 
 - **DNS containment (OS-level enforcement):** the `validate_dns` config and
   the `dns_not_constrained` network state are implemented, and tracker
@@ -342,3 +362,13 @@ foundation.
   cannot confirm DNS is constrained, which is correct fail-closed behavior.
   This is a platform-coverage limitation, not a missing application
   capability. The tracker item remains `[~]` to reflect this honestly.
+  Deployment docs recommend a container / network namespace / VPN-routed path
+  so the daemon's DNS follows the contained route.
+- **Outbound upload-slot rotation (optimistic unchoke):** choking/unchoking
+  (a required `v1.0.0` capability) is implemented and tested in both
+  directions. The optional fairness algorithm that rotates an upload slot to
+  discover new peers' upload capacity when many leechers contend for upload
+  bandwidth is not implemented; the seeder unchokes each interested peer it
+  accepts and serves verified pieces subject to the global upload rate limit.
+  This is a non-blocking enhancement beyond `v1.0.0` scope, not a missing
+  required capability.

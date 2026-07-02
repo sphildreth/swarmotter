@@ -44,8 +44,9 @@ Adopt a per-torrent task model in `swarmotterd`:
 - Network containment changes have immediate effect on active torrents.
 - A crash or panic in one engine task is isolated and recorded as a torrent
   error state.
-- Endgame mode, per-torrent bandwidth shaping, and inbound peer listening are
-  tracked as remaining v1.0.0 work in `docs/v1-completion-tracker.md`.
+- Endgame mode, live bandwidth shaping (global and per-torrent), and inbound
+  peer listening/seeding upload are implemented and tested; see
+  `docs/v1-completion-tracker.md`.
 
 ## Related Documents
 

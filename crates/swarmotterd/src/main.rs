@@ -79,7 +79,10 @@ async fn main() -> Result<()> {
         config: Arc::new(tokio::sync::Mutex::new(config)),
         build: BuildInfo {
             version: env!("CARGO_PKG_VERSION"),
-            commit: env!("CARGO_PKG_VERSION"),
+            // Build-time git commit, if provided via SWARMOTTER_BUILD_COMMIT
+            // at compile time (e.g. by CI/release packaging). Honest fallback
+            // rather than echoing the version as the commit.
+            commit: option_env!("SWARMOTTER_BUILD_COMMIT").unwrap_or("unknown"),
             target: std::env::consts::ARCH,
         },
         broker,

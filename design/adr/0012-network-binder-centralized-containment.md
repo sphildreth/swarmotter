@@ -26,7 +26,7 @@ connections:
 - `http_get(url)` issues tracker (and webseed/metadata) HTTP GETs through the
   same contained path.
 - `udp_socket()` returns a contained, source-bound UDP datagram socket
-  (`ContainedUdpSocket` trait) for UDP trackers, DHT, and future uTP.
+  (`ContainedUdpSocket` trait) for UDP trackers, DHT, and uTP.
 - `bind_peer_listener(port)` returns a contained, source-bound inbound TCP
   listener (`PeerListener` trait) for seeding/upload.
 - `traffic_allowed()` reports the current containment gate so the engine can

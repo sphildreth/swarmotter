@@ -10,6 +10,20 @@ MVP release.
 
 ## [Unreleased]
 
+_No changes yet._
+
+## [1.0.0]
+
+This is the initial public release of SwarmOtter. It implements every required
+`v1.0.0` capability in `design/requirements.md` and `design/PRD.md`: live TCP
+and uTP (BEP 29) peer wire protocol, HTTP/HTTPS/UDP trackers, DHT (BEP 5), PEX
+(BEP 10/11), BEP 9 magnet metadata fetch, inbound seeding/upload, endgame mode,
+live bandwidth shaping, real disk I/O with fast resume, watch folders, browser
+magnet submission, queue/ratio/seeding controls, fail-closed VPN/NIC network
+containment, the complete REST API with WebSocket/SSE events, and a practical
+Web UI. See `docs/v1-completion-tracker.md` for the capability-by-capability
+status.
+
 ### Added
 
 - Repository scaffolding: governance documentation, ADR process, legal design
@@ -53,7 +67,7 @@ MVP release.
   approach).
 - Deployment artifacts: example config, systemd service unit, Dockerfile,
   nginx reverse-proxy example.
-- **Live torrent data-plane engine (partial):** `NetworkBinder` abstraction
+- **Live torrent data-plane engine:** `NetworkBinder` abstraction
   (`ContainedBinder` with source-bound TCP + fail-closed; `LoopbackBinder` for
   tests) as the single choke point for peer/tracker/webseed sockets; real TCP
   BitTorrent peer wire protocol (handshake, bitfield, choke/unchoke, request,
@@ -75,7 +89,7 @@ MVP release.
   `bind_peer_listener()` (contained, source-bound inbound TCP listener via
   `PeerListener`), both fail-closed. `LoopbackBinder` implements both for
   tests; a new `BlockedBinder` proves fail-closed behavior for TCP, UDP, and
-  the inbound listener. Used by UDP trackers, future DHT/uTP, and seeding.
+  the inbound listener. Used by UDP trackers, DHT, uTP, and seeding.
 - **UDP trackers (BEP 15):** live UDP tracker connect + announce in
   `swarmotter-core::udp_tracker`, routed through the binder's contained UDP
   socket, with compact IPv4 peer parsing, transaction-id matching, error
@@ -93,9 +107,13 @@ MVP release.
 - **Live bandwidth shaping:** a `RateLimiter` (token-bucket, async) is wired
   from the daemon's effective global download/upload limits into the engine
   download path (per-piece acquire) and the seeder upload path (per-block
-  acquire), including the endgame path. A throttling local swarm test proves a
-  tight download limit materially slows a real download. Per-torrent limits
-  are modeled in settings; global limits are live.
+  acquire), including the endgame path. A shared global limiter is cloned into
+  every engine and seeder so the global cap is a true aggregate across active
+  torrents, and each torrent also has a per-torrent limiter enforced live
+  alongside it. Throttling local swarm tests prove a tight download limit
+  materially slows a real download, including a per-torrent cap with an
+  unlimited global limiter. Per-torrent limits are settable live via
+  `POST /api/v1/torrents/:hash/limits` and reflected in the torrent summary.
 - **PEX peer exchange (BEP 10/11):** the extension protocol (`swarmotter-core
   ::extensions`) adds extension-handshake encode/decode, a `Handshake.reserved`
   field with the BEP 10 extension bit, an `Extended` peer-wire message variant
@@ -159,8 +177,8 @@ MVP release.
 - The engine now terminates gracefully after a bounded number of consecutive
   no-peer announce rounds when a torrent has no trackers, no seed peers, and no
   DHT result, instead of looping forever.
-- Tests now total: core 165 unit + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 10 local
-  swarm (HTTP tracker, UDP tracker, direct peer, inbound seeding, endgame, bandwidth, PEX, magnet, uTP download, uTP fail-closed) + 1 daemon download.
+- Tests now total: core 168 unit + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 11 local
+  swarm (HTTP tracker, UDP tracker, direct peer, inbound seeding, endgame, global bandwidth, per-torrent bandwidth, PEX, magnet, uTP download, uTP fail-closed) + 1 daemon download.
 - **Inbound peer listening and seeding/upload:** the daemon now spawns an
   inbound `Seeder` (`swarmotterd::seeder`) alongside each active torrent. It
   binds a contained TCP listener through the binder's `bind_peer_listener()`,
@@ -185,11 +203,15 @@ MVP release.
 
 ### Notes
 
-- The pure logic layers (parsing, validation, queue/bandwidth/ratio, storage
+- All pure logic layers (parsing, validation, queue/bandwidth/ratio, storage
   layout, fast resume, watch import, network containment) are implemented and
-  tested. The live TCP peer protocol, HTTP tracker announce, real disk I/O
-  with fast-resume, and a local-swarm download harness are now implemented and
-  tested end to end against local fixtures. The remaining `v1.0.0` data-plane
-  work is UDP trackers, DHT, PEX, uTP, inbound peer listening/seeding upload,
-  endgame mode, magnet metadata fetch (BEP 9), and bandwidth shaping; see
+  tested. The live TCP and uTP peer protocols, HTTP/HTTPS/UDP tracker announce,
+  DHT, PEX, BEP 9 magnet metadata fetch, inbound seeding/upload, endgame mode,
+  live bandwidth shaping, real disk I/O with fast resume, and the local-swarm
+  download harness are implemented and tested end to end against local fixtures.
+  All required `v1.0.0` data-plane capabilities are complete; see
   `docs/v1-completion-tracker.md`.
+- The single documented non-blocking limitation is OS-level DNS enforcement,
+  which is platform-specific and not implemented in-process; the application
+  fails closed (surfacing `dns_not_constrained`) when it cannot confirm DNS is
+  constrained in strict mode. See `docs/v1-completion-tracker.md`.

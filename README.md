@@ -17,9 +17,12 @@
 
 ## Status
 
-SwarmOtter is currently in early development. The repository is being structured
-around the `v1.0.0` requirements, architecture decisions, legal/lawful-use
-posture, and implementation guardrails.
+SwarmOtter's first release is `v1.0.0`. The live torrent data-plane engine
+(real TCP and uTP peer wire protocol, HTTP/HTTPS/UDP trackers, DHT, PEX, BEP 9
+metadata fetch, endgame, live bandwidth shaping, real disk I/O with fast
+resume, inbound seeding/upload), fail-closed VPN/NIC network containment, the
+complete REST API with WebSocket/SSE events, and the Web UI are implemented and
+exercised end to end against local fixtures.
 
 The project does **not** use an MVP release model. The first product release is
 `v1.0.0`, and that release is complete only when all required features in
@@ -121,7 +124,7 @@ See:
 ### First-Time Setup
 
 ```bash
-git clone https://github.com/sphildreth/swarmotter.git
+git clone https://github.com/swarmotter/swarmotter.git
 cd swarmotter
 cargo fmt
 cargo check
@@ -135,7 +138,7 @@ SwarmOtter is a Cargo workspace with four crates:
 | Crate | Role |
 | --- | --- |
 | `crates/swarmotterd` | Daemon binary |
-| `crates/swarmotter-core` | Core types and future torrent engine |
+| `crates/swarmotter-core` | Core types and live torrent engine logic |
 | `crates/swarmotter-api` | API layer |
 | `crates/swarmotter-web` | Web UI / static asset support |
 
@@ -190,9 +193,6 @@ posture.
 
 ## Simple Homelab Deployment
 
-> SwarmOtter is in early development. The commands and config below show the
-> intended deployment shape, not a production-ready daemon.
-
 A typical homelab deployment will look like:
 
 1. Run a VPN container or VPN-enabled network namespace.
@@ -246,7 +246,9 @@ A conceptual Podman/Docker-style layout:
    torrent peers / trackers            LAN only (Web UI/API)
 ```
 
-Container images are planned but not yet published.
+An example Dockerfile is provided in `deploy/Dockerfile`; see
+[`design/deployment.md`](design/deployment.md) for container, VPN
+network-namespace, and reverse-proxy setup.
 
 See [`design/deployment.md`](design/deployment.md).
 

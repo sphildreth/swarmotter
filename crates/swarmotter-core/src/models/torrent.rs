@@ -128,6 +128,10 @@ pub struct TorrentSummary {
     pub private: bool,
     pub labels: Vec<String>,
     pub download_dir: Option<String>,
+    /// Per-torrent download limit in bytes/sec (0 = unlimited).
+    pub download_limit: u64,
+    /// Per-torrent upload limit in bytes/sec (0 = unlimited).
+    pub upload_limit: u64,
     pub rate_down: u64,
     pub rate_up: u64,
     pub ratio: f64,

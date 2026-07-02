@@ -32,6 +32,16 @@ pub struct MoveDataBody {
     pub path: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SetLimitsBody {
+    /// Per-torrent download limit in bytes/sec (0 = unlimited).
+    #[serde(default)]
+    pub download_limit: u64,
+    /// Per-torrent upload limit in bytes/sec (0 = unlimited).
+    #[serde(default)]
+    pub upload_limit: u64,
+}
+
 /// List all torrents.
 pub async fn list_torrents(State(state): State<SharedState>) -> Response {
     into_response(Ok(state.daemon.list_torrents().await))
@@ -170,6 +180,28 @@ pub async fn set_labels(
 ) -> Response {
     match require_hash(&hash).await {
         Ok(h) => into_response(state.daemon.set_labels(&h, body.labels).await),
+        Err(e) => err_response(e),
+    }
+}
+
+pub async fn set_limits(
+    State(state): State<SharedState>,
+    Path(hash): Path<String>,
+    Json(body): Json<SetLimitsBody>,
+) -> Response {
+    match require_hash(&hash).await {
+        Ok(h) => into_response(
+            state
+                .daemon
+                .set_torrent_limits(
+                    &h,
+                    swarmotter_core::bandwidth::TorrentBandwidth {
+                        download: body.download_limit,
+                        upload: body.upload_limit,
+                    },
+                )
+                .await,
+        ),
         Err(e) => err_response(e),
     }
 }

@@ -195,6 +195,67 @@ impl RateLimiter {
         };
         bucket.lock().await.capacity()
     }
+
+    /// Update the configured capacity for a direction at runtime (0 =
+    /// unlimited). Because [`RateLimiter`] holds its buckets behind an
+    /// `Arc<Mutex<...>>`, a cheap [`Clone`] shares the same underlying bucket,
+    /// so updating a cloned limiter updates the live view of all holders (used
+    /// by the daemon to adjust per-torrent and global limits on the fly).
+    pub async fn set_capacity(&self, dir: RateDirection, capacity_per_sec: u64) {
+        let bucket = match dir {
+            RateDirection::Download => &self.download,
+            RateDirection::Upload => &self.upload,
+        };
+        bucket.lock().await.set_capacity(capacity_per_sec);
+    }
+}
+
+/// A composite limiter enforcing an optional per-torrent cap and an optional
+/// shared global cap. A transfer acquires from both: the per-torrent bucket
+/// caps this torrent's rate, and the shared global bucket caps aggregate
+/// traffic across all torrents/seeders that share the same `RateLimiter`
+/// instance. A limit of 0 means unlimited for that layer.
+///
+/// The daemon holds a single shared global `RateLimiter` (cloned into every
+/// engine and seeder) and one per-torrent `RateLimiter` per torrent, so both
+/// the global and per-torrent bandwidth limits are enforced live.
+#[derive(Debug, Clone)]
+pub struct ShapedLimiter {
+    pub per_torrent: RateLimiter,
+    pub global: Option<RateLimiter>,
+}
+
+impl ShapedLimiter {
+    /// Wrap a per-torrent limiter with no shared global cap.
+    pub fn from_rate_limiter(per_torrent: RateLimiter) -> Self {
+        Self {
+            per_torrent,
+            global: None,
+        }
+    }
+
+    /// No shaping at all (per-torrent unlimited, no global cap).
+    pub fn unlimited() -> Self {
+        Self::from_rate_limiter(RateLimiter::unlimited())
+    }
+
+    /// Attach a shared global limiter (consumes and returns self).
+    pub fn with_global(self, global: RateLimiter) -> Self {
+        Self {
+            per_torrent: self.per_torrent,
+            global: Some(global),
+        }
+    }
+
+    /// Consume `bytes` of `dir`, sleeping until both the per-torrent and the
+    /// shared global buckets can afford them. Unlimited layers return
+    /// immediately.
+    pub async fn acquire(&self, dir: RateDirection, bytes: u64) {
+        self.per_torrent.acquire(dir, bytes).await;
+        if let Some(global) = &self.global {
+            global.acquire(dir, bytes).await;
+        }
+    }
 }
 
 fn now_millis() -> u128 {
@@ -285,5 +346,41 @@ mod tests {
             elapsed < std::time::Duration::from_millis(2500),
             "throttling too aggressive: {elapsed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn set_capacity_updates_live_bucket_of_clones() {
+        // RateLimiter clones share buckets, so set_capacity on one is visible
+        // to the other (the daemon relies on this for live limit changes).
+        let rl = RateLimiter::new(0, 0);
+        let twin = rl.clone();
+        rl.set_capacity(RateDirection::Download, 5_000).await;
+        assert_eq!(twin.capacity(RateDirection::Download).await, 5_000);
+    }
+
+    #[tokio::test]
+    async fn shaped_limiter_enforces_per_torrent_and_global() {
+        // Per-torrent cap 4_000 B/s and a tighter global cap 1_000 B/s. Both
+        // start full, so requesting 5_000 bytes must wait for the global
+        // bucket (1s for the 4_000 residual beyond its initial 1_000).
+        let per = RateLimiter::new(4_000, 0);
+        let global = RateLimiter::new(1_000, 0);
+        let shaped = ShapedLimiter::from_rate_limiter(per).with_global(global);
+        let start = std::time::Instant::now();
+        shaped.acquire(RateDirection::Download, 5_000).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(800),
+            "expected global cap to dominate, elapsed {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shaped_limiter_unlimited_is_fast() {
+        let shaped = ShapedLimiter::unlimited();
+        let start = std::time::Instant::now();
+        shaped.acquire(RateDirection::Download, 1_000_000).await;
+        shaped.acquire(RateDirection::Upload, 1_000_000).await;
+        assert!(start.elapsed() < std::time::Duration::from_millis(50));
     }
 }

@@ -37,6 +37,10 @@ pub struct Torrent {
     pub priorities: Vec<FilePriority>,
     pub wanted: Vec<bool>,
     pub error: Option<String>,
+    /// Per-torrent download limit in bytes/sec (0 = unlimited).
+    pub download_limit: u64,
+    /// Per-torrent upload limit in bytes/sec (0 = unlimited).
+    pub upload_limit: u64,
     /// True for magnets that still need their metadata fetched via BEP 9.
     pub needs_metadata: bool,
     /// The real info hash for a magnet (before metadata is fetched); used as
@@ -80,6 +84,8 @@ impl Torrent {
             priorities: vec![FilePriority::Normal; file_count],
             wanted: vec![true; file_count],
             error: None,
+            download_limit: 0,
+            upload_limit: 0,
             needs_metadata: false,
             magnet_info_hash: None,
             magnet_name: None,
@@ -132,6 +138,8 @@ impl Torrent {
             private: self.meta.is_private(),
             labels: self.labels.clone(),
             download_dir: self.download_dir.clone(),
+            download_limit: self.download_limit,
+            upload_limit: self.upload_limit,
             rate_down: self.rate_down,
             rate_up: self.rate_up,
             ratio: self.ratio(),
