@@ -68,14 +68,15 @@ feature completion and acceptance criteria, not by time estimates.
 
 ### Local swarm tests
 
-- Multiple local peers.
-- Magnet metadata fetch.
-- Tracker-based peer discovery.
-- DHT-based peer discovery.
-- PEX-based peer discovery.
-- Download completion.
-- Seeding behavior.
-- Recheck after completion.
+- Tracker-based peer discovery (HTTP, compact peers): covered
+- Download completion: covered (generated payload, in-process seed peer)
+- Direct-peer (PEX/DHT-style) discovery: covered (directly-supplied seed)
+- Daemon-driven download through `DaemonOps`: covered
+- Magnet metadata fetch: pending BEP 9
+- DHT-based peer discovery: pending live DHT engine
+- PEX-based peer exchange: pending live PEX engine
+- Seeding/upload behavior: pending inbound peer listening
+- Recheck after completion: covered via `StorageIo::recheck`
 
 ## Test data
 

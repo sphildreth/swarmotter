@@ -7,6 +7,8 @@
 //! data-plane traffic is enforced through the network containment layer.
 
 mod daemon;
+mod engine;
+mod netbinder;
 mod runtime;
 
 use std::path::PathBuf;

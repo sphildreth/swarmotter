@@ -11,7 +11,7 @@ use crate::models::torrent::FilePriority;
 use serde::{Deserialize, Serialize};
 
 /// A piece bitfield serialized as a hex string.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PieceBitfield(#[serde(with = "hex_bitfield")] Vec<u8>);
 
 impl PieceBitfield {

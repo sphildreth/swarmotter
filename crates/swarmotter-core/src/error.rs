@@ -56,6 +56,8 @@ pub enum CoreError {
     Storage(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("operation timed out")]
+    Elapsed(#[from] tokio::time::error::Elapsed),
     #[error("bencode error: {0}")]
     Bencode(String),
     #[error("parse error: {0}")]
@@ -79,6 +81,7 @@ impl CoreError {
             CoreError::NetworkBlocked(_) => ErrorCode::new("network_blocked"),
             CoreError::Storage(_) => ErrorCode::new("storage_error"),
             CoreError::Io(_) => ErrorCode::new("io_error"),
+            CoreError::Elapsed(_) => ErrorCode::new("timeout"),
             CoreError::Bencode(_) => ErrorCode::new("bencode_error"),
             CoreError::Parse(_) => ErrorCode::new("parse_error"),
             CoreError::InvalidArgument(_) => ErrorCode::new("invalid_argument"),

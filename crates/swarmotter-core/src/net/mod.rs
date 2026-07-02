@@ -16,9 +16,11 @@
 //!
 //! See `design/vpn-network-containment.md`.
 
+pub mod binder;
 pub mod config;
 pub mod probe;
 
+pub use binder::{parse_http_response, HttpResponse, NetworkBinder};
 pub use config::NetworkConfig;
 pub use probe::{InterfaceInfo, InterfaceProbe, InterfaceStatus, OsInterfaceProbe};
 

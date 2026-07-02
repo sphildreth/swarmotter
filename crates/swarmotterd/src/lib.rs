@@ -4,4 +4,6 @@
 //! runtime modules. The binary entry point lives in `main.rs`.
 
 pub mod daemon;
+pub mod engine;
+pub mod netbinder;
 pub mod runtime;

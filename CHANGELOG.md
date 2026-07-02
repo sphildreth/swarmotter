@@ -45,11 +45,33 @@ MVP release.
   path is unavailable), watch-folder scanner loop, network health monitor
   loop, graceful shutdown, and a single `axum::serve` for API + Web UI.
 - ADR-0009 (foundational dependency stack), ADR-0010 (API versioning,
-  envelope, events), ADR-0011 (bencode implementation and fast-resume format).
+  envelope, events), ADR-0011 (bencode implementation and fast-resume format),
+  ADR-0012 (network binder — centralized containment for live sockets),
+  ADR-0013 (peer wire protocol architecture), ADR-0014 (tracker implementation
+  strategy), ADR-0015 (real storage I/O and fast-resume format), ADR-0016
+  (task/runtime model for the live engine), ADR-0017 (local swarm testing
+  approach).
 - Deployment artifacts: example config, systemd service unit, Dockerfile,
   nginx reverse-proxy example.
-- 92 passing tests across core, API, web, and daemon (unit + integration,
-  including network containment fail-closed and watch-folder import tests).
+- **Live torrent data-plane engine (partial):** `NetworkBinder` abstraction
+  (`ContainedBinder` with source-bound TCP + fail-closed; `LoopbackBinder` for
+  tests) as the single choke point for peer/tracker/webseed sockets; real TCP
+  BitTorrent peer wire protocol (handshake, bitfield, choke/unchoke, request,
+  piece, block assembly, SHA-1 verification, bad-peer suppression, bounded
+  concurrency) in `swarmotter-core::peer`; HTTP tracker announce with compact
+  IPv4/IPv6 peer parsing, tiers, and private-torrent handling in
+  `swarmotter-core::tracker`; real async disk I/O with multi-file boundary
+  writes, piece verification, fast-resume save/load (with mismatch detection),
+  and forced recheck in `swarmotter-core::storage::io`; per-torrent
+  `TorrentEngine` task in `swarmotterd::engine` wired into the daemon so
+  add/pause/resume/remove/recheck/reannounce drive real peer/tracker activity,
+  network health changes stop engines and mark torrents `network_blocked`, and
+  API/UI summaries report real progress/peers/trackers; local swarm integration
+  tests completing a real download from a generated payload through an
+  in-process HTTP tracker and seed peer (tracker and direct-peer paths), plus
+  a daemon-driven download test through `DaemonOps`.
+- Tests now total: core 108 unit + engine/daemon/containment/api/web + 2 local
+  swarm + 1 daemon download.
 
 ### Changed
 
@@ -60,10 +82,16 @@ MVP release.
   the implemented design.
 - Updated `THIRD_PARTY_LICENSES.md` with the full direct dependency list and
   containment review notes.
+- Fixed `piece_file_ranges` to use the correct file index (it previously used
+  the output-list length), affecting multi-file piece-to-file mapping.
 
 ### Notes
 
 - The pure logic layers (parsing, validation, queue/bandwidth/ratio, storage
   layout, fast resume, watch import, network containment) are implemented and
-  tested. The live torrent peer/DHT/PEX/tracker/storage-I/O engine remains the
-  primary remaining work toward `v1.0.0`; see `docs/v1-completion-tracker.md`.
+  tested. The live TCP peer protocol, HTTP tracker announce, real disk I/O
+  with fast-resume, and a local-swarm download harness are now implemented and
+  tested end to end against local fixtures. The remaining `v1.0.0` data-plane
+  work is UDP trackers, DHT, PEX, uTP, inbound peer listening/seeding upload,
+  endgame mode, magnet metadata fetch (BEP 9), and bandwidth shaping; see
+  `docs/v1-completion-tracker.md`.

@@ -8,9 +8,11 @@
 //! through the daemon using `tokio::fs`; the pure layout/verification logic
 //! lives here.
 
+pub mod io;
 pub mod layout;
 pub mod resume;
 
+pub use io::StorageIo;
 pub use layout::{FileLayout, FileSlice, StorageLayout};
 pub use resume::{FastResume, PieceBitfield};
 
@@ -61,13 +63,13 @@ pub fn piece_file_ranges(meta: &TorrentMeta, piece_index: usize) -> Vec<FileSlic
     };
     let mut out = Vec::new();
     let mut offset = 0u64;
-    for file in &meta.files {
+    for (file_index, file) in meta.files.iter().enumerate() {
         let file_end = offset + file.length;
         if file_end > start && offset < end {
             let slice_start = offset.max(start) - offset;
             let slice_end = file_end.min(end) - offset;
             out.push(FileSlice {
-                file_index: out.len(),
+                file_index,
                 offset_in_file: slice_start,
                 length: slice_end - slice_start,
             });

@@ -16,6 +16,7 @@ swarmotter-core = { path = "../swarmotter-core" }
 swarmotter-api = { path = "../swarmotter-api" }
 swarmotter-web = { path = "../swarmotter-web" }
 tokio = { workspace = true }
+bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -28,3 +29,7 @@ async-trait = { workspace = true }
 futures-util = { workspace = true }
 once_cell = { workspace = true }
 clap = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+swarmotter-core = { path = "../swarmotter-core", features = ["test-binder"] }

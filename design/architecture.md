@@ -12,9 +12,10 @@ SwarmOtter is a Rust async daemon with these layers:
   torrent registry. Pure, testable logic with no direct socket creation.
 - **Network layer** (`swarmotter-core::net`): centralized interface/source
   binding, route validation, VPN/NIC health, and fail-closed enforcement via
-  the `InterfaceProbe` trait. No engine component creates sockets directly;
-  all torrent traffic goes through this layer (see
-  `vpn-network-containment.md`).
+  the `InterfaceProbe` trait and the live `NetworkBinder` abstraction. No
+  engine component creates sockets directly; all torrent traffic goes through
+  the binder (peer TCP, tracker HTTP, and future uTP/DHT/webseed traffic) —
+  see `vpn-network-containment.md` and ADR-0012.
 - **Storage layer** (`swarmotter-core::storage`): file layout, partial/sparse
   files, piece read/write and verification, fast resume, forced recheck,
   move/rename, missing/changed file detection logic.
@@ -28,16 +29,19 @@ SwarmOtter is a Rust async daemon with these layers:
 - **Daemon** (`swarmotterd`): owns torrent state, networking, disk I/O,
   queueing, settings, and lifecycle. Implements `DaemonOps`, wires the API +
   Web UI into a single `axum::serve`, runs the network health monitor and
-  watch-folder scanner.
+  watch-folder scanner, and spawns the live `TorrentEngine` task per active
+  torrent (`swarmotterd::engine`), reconciling real engine state into torrent
+  summaries (see ADR-0016).
 
 ## Crate layout
 
 ```text
 crates/
-├── swarmotterd/      # daemon binary + lib (runtime, DaemonOps impl)
+├── swarmotterd/      # daemon binary + lib (runtime, DaemonOps impl, live engine, netbinder)
 ├── swarmotter-core/  # core types and engine logic
-│   └── src/ bencode, error, hash, magnet, meta, models/, net/,
-│            queue, ratio, bandwidth, storage/, torrent, watch, config
+│   └── src/ bencode, error, hash, magnet, meta, models/, net/ (binder, config, probe),
+│            peer, tracker, queue, ratio, bandwidth, storage/ (io, layout, resume),
+│            torrent, watch, config
 ├── swarmotter-api/   # API layer (routes, handlers, envelope, events)
 └── swarmotter-web/   # embedded static Web UI
 ```

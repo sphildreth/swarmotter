@@ -18,5 +18,11 @@ tracing = { workspace = true }
 sha1 = { workspace = true }
 hex = { workspace = true }
 url = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
+
+[features]
+default = []
+# Exposes the loopback NetworkBinder used by integration tests across crates.
+test-binder = []

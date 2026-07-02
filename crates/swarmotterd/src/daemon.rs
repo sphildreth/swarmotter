@@ -8,11 +8,13 @@
 //! configured path is unavailable, and torrents enter a `network_blocked`
 //! state. The control plane (API/Web UI) remains available independently.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use swarmotter_api::state::DaemonOps;
 use swarmotter_core::config::Config;
@@ -29,11 +31,20 @@ use swarmotter_core::net::{self, OsInterfaceProbe};
 use swarmotter_core::torrent::{Torrent, TorrentRegistry};
 use swarmotter_core::watch;
 
+use crate::engine::{EngineCommand, EngineState, TorrentEngine};
+use crate::netbinder::ContainedBinder;
+
 pub struct DaemonRuntime {
     pub registry: Arc<Mutex<TorrentRegistry>>,
     pub config: Arc<Mutex<Config>>,
     pub network_health: Arc<Mutex<NetworkHealth>>,
     pub watch_imports: Arc<Mutex<Vec<watch::ImportResult>>>,
+    /// Live engine state per torrent, reconciled into summaries.
+    engine_states: Arc<Mutex<HashMap<InfoHash, Arc<Mutex<EngineState>>>>>,
+    /// Command channels to running engine tasks.
+    engine_cmds: Arc<Mutex<HashMap<InfoHash, tokio::sync::mpsc::Sender<EngineCommand>>>>,
+    /// Running engine task join handles.
+    engine_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
 }
 
 impl DaemonRuntime {
@@ -43,12 +54,140 @@ impl DaemonRuntime {
             config: Arc::new(Mutex::new(config)),
             network_health: Arc::new(Mutex::new(startup_health)),
             watch_imports: Arc::new(Mutex::new(Vec::new())),
+            engine_states: Arc::new(Mutex::new(HashMap::new())),
+            engine_cmds: Arc::new(Mutex::new(HashMap::new())),
+            engine_handles: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Resolve the download directory for a torrent: per-torrent override,
+    /// then global config, then a default temp dir.
+    async fn resolve_download_dir(&self, t: &Torrent) -> String {
+        if let Some(d) = &t.download_dir {
+            return d.clone();
+        }
+        let cfg = self.config.lock().await;
+        cfg.storage.download_dir.clone().unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("swarmotter-downloads")
+                .display()
+                .to_string()
+        })
+    }
+
+    /// Start the live engine task for a torrent (downloading). No-op if the
+    /// torrent is paused, queued, or already running.
+    pub async fn start_engine(&self, hash: InfoHash) {
+        let health = self.network_health.lock().await.clone();
+        if !health.traffic_allowed && health.mode != NetworkContainmentMode::Disabled {
+            // Network blocked: do not start the engine; mark torrent.
+            let mut reg = self.registry.lock().await;
+            if let Some(t) = reg.get_mut(&hash) {
+                t.state = TorrentState::NetworkBlocked;
+                t.error = Some(health.detail.clone());
+            }
+            return;
+        }
+
+        // Already running?
+        if self.engine_handles.lock().await.contains_key(&hash) {
+            return;
+        }
+
+        let (meta, download_dir, listen_port) = {
+            let reg = self.registry.lock().await;
+            let Some(t) = reg.get(&hash) else {
+                return;
+            };
+            let download_dir = self.resolve_download_dir(t).await;
+            (
+                t.meta.clone(),
+                download_dir,
+                self.config.lock().await.torrent.listen_port,
+            )
+        };
+
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        self.engine_states.lock().await.insert(hash, state.clone());
+
+        let binder: Arc<dyn swarmotter_core::net::NetworkBinder> = self.make_binder().await;
+        let peer_id = make_peer_id();
+        let (tx, rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
+        self.engine_cmds.lock().await.insert(hash, tx);
+
+        let state_for_summary = state.clone();
+        let hash_for_task = hash;
+        let registry = self.registry.clone();
+        let engine = TorrentEngine::new(
+            meta.clone(),
+            download_dir.into(),
+            peer_id,
+            binder,
+            state.clone(),
+            rx,
+            vec![],
+            listen_port,
+        );
+        let handle = tokio::spawn(async move {
+            match engine.run().await {
+                Ok(final_state) => {
+                    let mut reg = registry.lock().await;
+                    if let Some(t) = reg.get_mut(&hash_for_task) {
+                        t.downloaded = final_state.downloaded;
+                        t.uploaded = final_state.uploaded;
+                        t.progress.have = (0..final_state.piece_count)
+                            .map(|i| final_state.pieces_have.has(i))
+                            .collect();
+                        if final_state.finished {
+                            t.state = TorrentState::Completed;
+                            t.date_completed = Some(now());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(info_hash = %hash_for_task, error = %e, "engine task failed");
+                    let mut reg = registry.lock().await;
+                    if let Some(t) = reg.get_mut(&hash_for_task) {
+                        t.state = TorrentState::Error;
+                        t.error = Some(e.to_string());
+                    }
+                }
+            }
+            let _ = state_for_summary;
+        });
+        self.engine_handles.lock().await.insert(hash, handle);
+
+        // Mark the torrent as downloading.
+        let mut reg = self.registry.lock().await;
+        if let Some(t) = reg.get_mut(&hash) {
+            if t.state == TorrentState::Queued || t.state == TorrentState::NetworkBlocked {
+                t.state = TorrentState::Downloading;
+                t.error = None;
+            }
+        }
+    }
+
+    async fn stop_engine(&self, hash: &InfoHash) {
+        if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
+            let _ = tx.send(EngineCommand::Stop).await;
+        }
+        if let Some(handle) = self.engine_handles.lock().await.remove(hash) {
+            let _ = handle.await;
+        }
+        self.engine_states.lock().await.remove(hash);
+    }
+
+    async fn make_binder(&self) -> Arc<dyn swarmotter_core::net::NetworkBinder> {
+        let cfg = self.config.lock().await.clone();
+        Arc::new(ContainedBinder::new(
+            cfg.network.clone(),
+            Arc::new(OsInterfaceProbe),
+        ))
     }
 
     /// Periodically re-evaluate network containment health and flip torrent
     /// states between active and `network_blocked` as the path appears or
-    /// disappears.
+    /// disappears. Stop running engines when the path becomes unavailable.
     pub async fn network_health_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -57,14 +196,51 @@ impl DaemonRuntime {
             let health = net::evaluate(&cfg.network, &probe);
             let traffic_allowed = health.traffic_allowed;
             *self.network_health.lock().await = health.clone();
-            let mut reg = self.registry.lock().await;
-            for t in reg.torrents.values_mut() {
-                if traffic_allowed {
-                    if t.state == TorrentState::NetworkBlocked {
-                        t.state = TorrentState::Queued;
+
+            // Reconcile live engine progress into torrent records.
+            self.reconcile_engine_progress().await;
+
+            if !traffic_allowed && health.mode != NetworkContainmentMode::Disabled {
+                // Stop all running engines and mark torrents network_blocked.
+                let hashes: Vec<InfoHash> =
+                    self.engine_handles.lock().await.keys().copied().collect();
+                for h in hashes {
+                    self.stop_engine(&h).await;
+                    let mut reg = self.registry.lock().await;
+                    if let Some(t) = reg.get_mut(&h) {
+                        t.state = TorrentState::NetworkBlocked;
+                        t.error = Some(health.detail.clone());
                     }
-                } else if t.state.is_active() {
-                    t.state = TorrentState::NetworkBlocked;
+                }
+            } else {
+                let mut reg = self.registry.lock().await;
+                for t in reg.torrents.values_mut() {
+                    if traffic_allowed && t.state == TorrentState::NetworkBlocked {
+                        t.state = TorrentState::Queued;
+                        t.error = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Copy live engine state (pieces, byte counts) into the torrent records
+    /// so API/UI summaries reflect real progress while downloading.
+    async fn reconcile_engine_progress(&self) {
+        let states = self.engine_states.lock().await.clone();
+        let mut reg = self.registry.lock().await;
+        for (hash, state) in &states {
+            let s = state.lock().await;
+            if let Some(t) = reg.get_mut(hash) {
+                t.progress.have = (0..s.piece_count).map(|i| s.pieces_have.has(i)).collect();
+                t.downloaded = s.downloaded;
+                t.uploaded = s.uploaded;
+                if !t.state.is_error() && t.state != TorrentState::Paused {
+                    if s.finished {
+                        t.state = TorrentState::Completed;
+                    } else if t.state == TorrentState::Queued {
+                        t.state = TorrentState::Downloading;
+                    }
                 }
             }
         }
@@ -138,9 +314,17 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Generate a stable per-daemon peer id (`-SW0001-` + 12 bytes of zeros).
+fn make_peer_id() -> [u8; 20] {
+    let mut id = [0u8; 20];
+    id[..8].copy_from_slice(b"-SW0001-");
+    id
+}
+
 #[async_trait]
 impl DaemonOps for DaemonRuntime {
     async fn list_torrents(&self) -> Vec<TorrentSummary> {
+        self.reconcile_engine_progress().await;
         self.registry
             .lock()
             .await
@@ -151,6 +335,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn get_torrent(&self, hash: &InfoHash) -> Option<TorrentSummary> {
+        self.reconcile_engine_progress().await;
         self.registry
             .lock()
             .await
@@ -170,9 +355,15 @@ impl DaemonOps for DaemonRuntime {
             t.download_dir = Some(d);
         }
         apply_network_state(&mut t, &self.network_health).await;
-        let mut reg = self.registry.lock().await;
-        reg.add(t)
-            .map_err(|_| CoreError::DuplicateTorrent(hash.to_hex()))?;
+        let blocked = t.state == TorrentState::NetworkBlocked;
+        {
+            let mut reg = self.registry.lock().await;
+            reg.add(t)
+                .map_err(|_| CoreError::DuplicateTorrent(hash.to_hex()))?;
+        }
+        if !blocked {
+            self.start_engine(hash).await;
+        }
         Ok(hash)
     }
 
@@ -204,22 +395,41 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn remove_torrent(&self, hash: &InfoHash, delete_data: bool) -> Result<()> {
-        let mut reg = self.registry.lock().await;
-        let removed = reg
-            .remove(hash)
-            .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+        // Stop the live engine and clean up its resources.
+        self.stop_engine(hash).await;
+        let removed = {
+            let mut reg = self.registry.lock().await;
+            reg.remove(hash)
+                .ok_or_else(|| CoreError::NotFound("torrent".into()))?
+        };
         if delete_data {
-            if let Some(dir) = &removed.download_dir {
-                let path = std::path::Path::new(dir).join(removed.name());
-                if path.exists() {
-                    let _ = std::fs::remove_dir_all(&path);
+            let dir = removed.download_dir.clone().unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join("swarmotter-downloads")
+                    .display()
+                    .to_string()
+            });
+            let storage = swarmotter_core::storage::StorageIo::new(
+                removed.meta.clone(),
+                std::path::PathBuf::from(&dir),
+            );
+            // Best-effort removal of data files and resume metadata.
+            let _ = tokio::fs::remove_file(storage.resume_path()).await;
+            for i in 0..removed.meta.files.len() {
+                if let Ok(p) = storage.file_path(i) {
+                    let _ = tokio::fs::remove_file(&p).await;
                 }
+            }
+            if removed.meta.is_multi_file {
+                let _ = tokio::fs::remove_dir(&dir).await;
             }
         }
         Ok(())
     }
 
     async fn pause(&self, hash: &InfoHash) -> Result<()> {
+        // Stop the live engine; the torrent stays in the registry as paused.
+        self.stop_engine(hash).await;
         let mut reg = self.registry.lock().await;
         match reg.get_mut(hash) {
             Some(t) => {
@@ -231,14 +441,18 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn resume(&self, hash: &InfoHash) -> Result<()> {
-        let mut reg = self.registry.lock().await;
-        match reg.get_mut(hash) {
-            Some(t) => {
-                t.state = TorrentState::Downloading;
-                Ok(())
+        {
+            let mut reg = self.registry.lock().await;
+            match reg.get_mut(hash) {
+                Some(t) => {
+                    t.state = TorrentState::Downloading;
+                    t.error = None;
+                }
+                None => return Err(CoreError::NotFound("torrent".into())),
             }
-            None => Err(CoreError::NotFound("torrent".into())),
         }
+        self.start_engine(*hash).await;
+        Ok(())
     }
 
     async fn start_now(&self, hash: &InfoHash) -> Result<()> {
@@ -250,18 +464,65 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn recheck(&self, hash: &InfoHash) -> Result<()> {
-        let mut reg = self.registry.lock().await;
-        match reg.get_mut(hash) {
-            Some(t) => {
-                t.state = TorrentState::Checking;
-                Ok(())
+        self.stop_engine(hash).await;
+        {
+            let mut reg = self.registry.lock().await;
+            match reg.get_mut(hash) {
+                Some(t) => t.state = TorrentState::Checking,
+                None => return Err(CoreError::NotFound("torrent".into())),
             }
-            None => Err(CoreError::NotFound("torrent".into())),
         }
+        // Run a real storage recheck on disk.
+        let (meta, download_dir) = {
+            let reg = self.registry.lock().await;
+            let Some(t) = reg.get(hash) else {
+                return Err(CoreError::NotFound("torrent".into()));
+            };
+            let dir = t.download_dir.clone().unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join("swarmotter-downloads")
+                    .display()
+                    .to_string()
+            });
+            (t.meta.clone(), dir)
+        };
+        let storage = swarmotter_core::storage::StorageIo::new(
+            meta.clone(),
+            std::path::PathBuf::from(&download_dir),
+        );
+        match storage.recheck().await {
+            Ok(bf) => {
+                let mut reg = self.registry.lock().await;
+                if let Some(t) = reg.get_mut(hash) {
+                    t.progress.have = (0..meta.piece_count()).map(|i| bf.has(i)).collect();
+                    if bf.count(meta.piece_count()) == meta.piece_count() {
+                        t.state = TorrentState::Completed;
+                        t.date_completed = Some(now());
+                    } else if t.state == TorrentState::Checking {
+                        t.state = TorrentState::Paused;
+                    }
+                }
+            }
+            Err(e) => {
+                let mut reg = self.registry.lock().await;
+                if let Some(t) = reg.get_mut(hash) {
+                    t.state = TorrentState::StorageError;
+                    t.error = Some(e.to_string());
+                }
+            }
+        }
+        Ok(())
     }
 
-    async fn reannounce(&self, _hash: &InfoHash) -> Result<()> {
-        Ok(())
+    async fn reannounce(&self, hash: &InfoHash) -> Result<()> {
+        // If the engine is running, send a reannounce command; otherwise
+        // restart the engine which announces on start.
+        if let Some(tx) = self.engine_cmds.lock().await.get(hash) {
+            let _ = tx.send(EngineCommand::Reannounce).await;
+            Ok(())
+        } else {
+            self.resume(hash).await
+        }
     }
 
     async fn move_data(&self, hash: &InfoHash, path: String) -> Result<()> {
@@ -355,17 +616,38 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn list_trackers(&self, hash: &InfoHash) -> Option<Vec<TrackerInfo>> {
+        // Reflect real tracker status from the live engine, if present.
+        let engine_tracker_ok = self
+            .engine_states
+            .lock()
+            .await
+            .get(hash)
+            .and_then(|s| s.try_lock().ok())
+            .map(|s| (s.tracker_ok, s.tracker_message.clone(), s.last_announce));
         self.registry.lock().await.get(hash).map(|t| {
             let mut out = Vec::new();
             let mut tier = 0usize;
+            let mut urls = Vec::new();
             if let Some(a) = &t.meta.announce {
-                out.push(make_tracker(a, tier));
-                tier += 1;
+                urls.push(a.clone());
             }
             for tlist in &t.meta.announce_list {
                 for url in tlist {
-                    out.push(make_tracker(url, tier));
+                    urls.push(url.clone());
                 }
+            }
+            for url in &urls {
+                let mut info = make_tracker(url, tier);
+                if let Some((ok, msg, last)) = &engine_tracker_ok {
+                    info.status = if *ok {
+                        TrackerStatus::Ok
+                    } else {
+                        TrackerStatus::Error
+                    };
+                    info.last_error = msg.clone();
+                    info.last_announce = *last;
+                }
+                out.push(info);
                 tier += 1;
             }
             out
@@ -425,8 +707,27 @@ impl DaemonOps for DaemonRuntime {
         }
     }
 
-    async fn list_peers(&self, _hash: &InfoHash) -> Option<Vec<Peer>> {
-        Some(Vec::new())
+    async fn list_peers(&self, hash: &InfoHash) -> Option<Vec<Peer>> {
+        let states = self.engine_states.lock().await;
+        let state = states.get(hash)?;
+        let s = state.lock().await;
+        let peers = s
+            .peers
+            .iter()
+            .map(|pa| Peer {
+                address: pa.socket_addr().to_string(),
+                ip: pa.ip,
+                port: pa.port,
+                direction: swarmotter_core::models::peer::PeerDirection::Outbound,
+                client: None,
+                progress: 0.0,
+                rate_down: 0,
+                rate_up: 0,
+                flags: swarmotter_core::models::peer::PeerFlags::default(),
+                banned: false,
+            })
+            .collect();
+        Some(peers)
     }
 
     async fn queue_move_up(&self, _hash: &InfoHash) -> Result<()> {

@@ -15,12 +15,22 @@ time estimates.
 ## Current Focus
 
 Pure logic layers, API, Web UI, daemon runtime, and network containment
-enforcement are implemented and tested. The remaining major work is the live
-torrent data-plane engine: peer wire protocol, DHT, PEX, UDP/HTTP tracker
-announce, real disk I/O with fast resume, and a local-swarm test harness.
-Platform-specific interface/source binding is abstracted behind
-`InterfaceProbe`; the OS probe surfaces `interface_missing` in strict mode by
-default, which is correct fail-closed behavior.
+enforcement are implemented and tested. The live torrent data-plane engine
+is now partially implemented and exercised end to end against local fixtures:
+real TCP peer wire protocol (handshake, messages, request/piece, block
+assembly, SHA-1 verification), HTTP tracker announce (compact peer parsing,
+tiers), real disk I/O with fast-resume save/load/recheck, a per-torrent engine
+task wired into the daemon, and a local-swarm integration harness that
+completes a real download from a generated payload through a local tracker and
+seed peer.
+
+The remaining major work is the rest of the v1.0.0 data plane: UDP trackers,
+DHT, PEX, uTP, inbound peer listening/seeding upload, endgame mode, magnet
+metadata fetch (BEP 9), and bandwidth shaping. Platform-specific
+interface/source binding is abstracted behind `InterfaceProbe`; the OS probe
+surfaces `interface_missing` in strict mode by default, which is correct
+fail-closed behavior. Live sockets are centralized behind the `NetworkBinder`
+abstraction (see ADR-0012).
 
 ## Completion Checklist
 
@@ -39,10 +49,14 @@ default, which is correct fail-closed behavior.
 - [x] Fail-closed enforcement (`net::evaluate`/`enforce`)
 - [x] Network health states (all 11 required states)
 - [x] Network containment validation tests
-- [~] Socket binding abstraction (TCP/UDP) — abstraction designed; live socket
-      creation/binding for peer/DHT/tracker traffic is part of the engine work
+- [x] Socket binding abstraction (TCP/UDP) — `NetworkBinder` trait +
+      `ContainedBinder` (source-bound TCP + fail-closed) and `LoopbackBinder`
+      for tests; UDP binder method is part of the remaining UDP tracker/DHT
+      work
 - [~] DNS containment strategy — `validate_dns` config + `dns_not_constrained`
-      state implemented; OS-level DNS enforcement is platform-specific
+      state implemented; tracker hostname resolution is performed inside the
+      binder subject to config validation; OS-level DNS enforcement is
+      platform-specific
 - [x] Network containment integration tests (fail-closed via daemon)
 
 ### Torrent Metadata
@@ -55,23 +69,36 @@ default, which is correct fail-closed behavior.
 
 ### Peer Discovery
 
-- [~] HTTP/HTTPS tracker announce/scrape — model + tiers; live announce engine
-- [~] UDP tracker announce — model (`TrackerKind::Udp`); live announce engine
-- [~] DHT bootstrap/lookup — config + status model; live DHT engine
-- [~] PEX peer exchange — config + status model; live PEX engine
+- [x] HTTP/HTTPS tracker announce/scrape — announce URL construction, compact
+      peer parsing, tiers, private handling, and live announce through the
+      `NetworkBinder` (HTTPS TLS over the contained socket is remaining)
+- [~] UDP tracker announce — model (`TrackerKind::Udp`) and compact peer
+      parsing present; live UDP announce engine (binder UDP method) remaining
+- [~] DHT bootstrap/lookup — config + status model; live DHT engine remaining
+- [~] PEX peer exchange — config + status model; the engine accepts
+      directly-supplied seed peers (used by the local swarm test); live PEX
+      engine remaining
 - [x] Tracker tiers and manual tracker lists
 - [x] Tracker edit/add/remove via API
+- [x] Tracker status surfaced through API/UI from live engine state
 
 ### Peer Protocol
 
-- [ ] TCP peer connections (through containment layer) — pending engine
-- [ ] uTP/UDP peer connections where practical — pending engine
-- [ ] Handshake and metadata exchange — pending engine
-- [ ] Piece availability and request scheduling — logic present in core
-      (`PieceProgress`, file/piece range mapping); live scheduling pending
-- [ ] Choking/unchoking, endgame — pending engine
-- [ ] Upload/download accounting — accounting types + API present; live pending
-- [ ] Bad peer detection/suppression — pending engine
+- [x] TCP peer connections (through containment layer) — real handshake,
+      bitfield, interested/choke, request/piece, block assembly, SHA-1
+      verification, progress, disconnect handling, bad-peer suppression,
+      bounded concurrency (see ADR-0013)
+- [ ] uTP/UDP peer connections where practical — pending binder UDP method
+- [x] Handshake and message exchange (BEP 3) — implemented and tested; BEP 9
+      metadata exchange pending (magnet metadata fetch)
+- [x] Piece availability and request scheduling — live scheduling in the
+      engine over `Bitfield`/`block_requests`; endgame mode pending
+- [~] Choking/unchoking, endgame — choke/unchoke handled; endgame and our
+      outbound unchoke/upload policy pending
+- [x] Upload/download accounting — accounting wired into `EngineState` and
+      reconciled into summaries; live upload/seeding pending
+- [x] Bad peer detection/suppression — bounded bad-peer set; hash-mismatch
+      pieces rejected
 - [x] IPv4/IPv6 controls — `allow_ipv6` config + validation
 
 ### Storage
@@ -83,8 +110,10 @@ default, which is correct fail-closed behavior.
 - [x] Forced recheck (`recheck` action + `Checking` state)
 - [x] File selection and prioritization (API + models)
 - [x] Move/rename behavior (API + models)
-- [~] Missing/changed file detection — logic scaffolding; live detection pending
-- [~] Real disk I/O for writes/reads — `tokio::fs` available; engine pending
+- [x] Real disk I/O for writes/reads — `StorageIo` performs real `tokio::fs`
+      writes/reads/verification with multi-file boundary handling
+- [x] Missing/changed file detection — `verify_piece_on_disk` treats a missing
+      file as not-verified; recheck reflects on-disk reality
 
 ### Lifecycle
 
@@ -149,13 +178,18 @@ default, which is correct fail-closed behavior.
 ### Testing
 
 - [x] Unit tests (magnet, torrent, info hash, tracker tiers, queue, ratio,
-      bandwidth, config, network containment, storage, fast resume, watch)
+      bandwidth, config, network containment, storage, fast resume, watch,
+      peer wire protocol, tracker announce, storage I/O)
 - [x] Integration tests (API: add magnet/file, lifecycle, settings, network,
-      stats, duplicate; daemon: containment fail-closed, watch import)
+      stats, duplicate; daemon: containment fail-closed, watch import,
+      daemon-driven real download via local tracker + seed peer)
 - [ ] Network containment live tests (VPN path removed while active) — pending
-      live engine
-- [~] Storage tests — logic tested; live interrupted-write/missing-file pending
-- [ ] Local swarm tests — pending live peer/DHT/PEX/tracker engine
+      live inbound peer/listening engine
+- [x] Storage tests — live interrupted-write/missing-file/multi-file boundary
+      /resume roundtrip/recheck covered
+- [~] Local swarm tests — real download completion from a generated payload
+      through a local tracker and seed peer is covered (HTTP tracker + direct
+      peer paths); DHT/PEX/uTP/seeding-upload local swarm tests pending
 
 ### Legal / Repository
 
@@ -170,33 +204,46 @@ default, which is correct fail-closed behavior.
 
 ## Blockers
 
-None currently. The remaining work is implementation of the live torrent
-data-plane engine, which is unblocked but substantial. Platform-specific
-`InterfaceProbe` OS-level enumeration (getifaddrs) and DNS enforcement are
-abstracted; the abstraction enforces fail-closed correctly by surfacing
-`interface_missing`/`dns_not_constrained` in strict mode when the OS probe
-cannot confirm the path.
+None currently. The live TCP peer protocol, HTTP tracker announce, real disk
+I/O with fast-resume, and a local-swarm download harness are implemented and
+tested. The remaining v1.0.0 data-plane work is unblocked: UDP trackers
+(needs a binder UDP method), DHT, PEX, uTP, inbound peer listening/seeding
+upload, endgame mode, magnet metadata fetch (BEP 9), and bandwidth shaping.
+Platform-specific `InterfaceProbe` OS-level enumeration (getifaddrs) and DNS
+enforcement are abstracted; the abstraction enforces fail-closed correctly by
+surfacing `interface_missing`/`dns_not_constrained` in strict mode when the
+OS probe cannot confirm the path.
 
 ## Test Status
 
 | Command | Result |
 | --- | --- |
-| `cargo fmt` | pass |
-| `cargo check` | pass |
-| `cargo test` | pass (92 tests) |
-| `cargo clippy --all-targets` | pass (test-only style warnings) |
-| end-to-end daemon run (curl health/version/add/list) | pass |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --workspace --all-targets` | pass (no warnings) |
+| `cargo test --workspace` | pass (core 108 unit + engine/daemon/containment/api/web + 2 local swarm + 1 daemon download) |
+| local swarm download (tracker + direct peer) | pass |
+| daemon download through `DaemonOps` | pass |
 
 ## ADRs Created or Updated
 
 - ADR-0009: Foundational dependency stack
 - ADR-0010: API versioning, envelope, and event delivery
 - ADR-0011: Bencode implementation and fast-resume format
+- ADR-0012: Network binder — centralized containment for live sockets
+- ADR-0013: Peer wire protocol architecture
+- ADR-0014: Tracker implementation strategy
+- ADR-0015: Real storage I/O and fast-resume format
+- ADR-0016: Task/runtime model for the live engine
+- ADR-0017: Local swarm testing approach
 
 ## Notes
 
-The pure logic layers are complete and tested. The live networked engine
-(peer wire protocol, DHT, PEX, UDP/HTTP trackers, real disk I/O, local swarm
-tests) is the primary remaining capability for `v1.0.0`. The architecture is
-structured so the engine slots into `swarmotterd` and `swarmotter-core` without
-changing the API surface or network containment contract.
+The TCP peer protocol, HTTP tracker announce, real disk I/O, and the
+per-torrent engine task are implemented and exercised end to end against local
+fixtures (generated payloads, an in-process seed peer, and an in-process HTTP
+tracker) using the contained `NetworkBinder` path. The API/UI surface is
+unchanged but now reports real progress, peers, and tracker status; lifecycle
+actions (pause/resume/remove/recheck/reannounce) drive real engine tasks. The
+remaining v1.0.0 capabilities (UDP trackers, DHT, PEX, uTP, inbound
+listening/seeding upload, endgame, BEP 9 metadata fetch, bandwidth shaping)
+build on the binder + protocol + storage foundation added here.

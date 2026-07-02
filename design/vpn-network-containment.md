@@ -82,6 +82,17 @@ Required states include `healthy`, `disabled`, `interface_missing`,
   operations.
 - API/Web UI traffic remains independently configurable.
 
+## Binding abstraction
+
+Live torrent sockets are created exclusively through the `NetworkBinder` trait
+(`swarmotter-core::net::binder`), implemented by `ContainedBinder` in the
+daemon. The binder binds outbound TCP to the configured source
+address/interface, re-evaluates containment before each connection, and
+returns `CoreError::NetworkBlocked` in strict fail-closed mode when the path
+is unavailable. Tracker HTTP GETs are issued through the same binder. A
+`LoopbackBinder` (test feature) lets integration tests exercise the full
+engine over loopback without the default route. See ADR-0012.
+
 ## TODO
 
 - Specify the network binding abstraction API used by the engine.

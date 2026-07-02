@@ -16,10 +16,12 @@ pub mod magnet;
 pub mod meta;
 pub mod models;
 pub mod net;
+pub mod peer;
 pub mod queue;
 pub mod ratio;
 pub mod storage;
 pub mod torrent;
+pub mod tracker;
 pub mod watch;
 
 pub use error::{CoreError, Result};
