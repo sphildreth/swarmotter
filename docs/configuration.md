@@ -147,10 +147,17 @@ unlimited or high is better for raw transfer throughput.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `download_dir` | unset | Completed download directory. |
-| `incomplete_dir` | unset | Incomplete download directory. |
+| `download_dir` | unset | Final directory for verified completed downloads. |
+| `incomplete_dir` | unset | Active write directory for incomplete downloads. |
 | `preallocate` | `false` | Pre-size files before downloading. |
 | `sparse` | `true` | Use sparse files where supported. |
+
+When `incomplete_dir` is set, SwarmOtter writes partial pieces and partial
+fast-resume metadata there while the torrent is downloading. After every piece
+is verified, the daemon moves the torrent data into `download_dir` and writes
+the completed fast-resume metadata next to the completed data. If
+`incomplete_dir` is unset, the active and final directory are both
+`download_dir`.
 
 ### `[network]`
 

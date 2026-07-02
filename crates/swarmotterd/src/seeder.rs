@@ -40,6 +40,7 @@ use crate::engine::EngineState;
 pub struct Seeder {
     meta: TorrentMeta,
     storage: Arc<StorageIo>,
+    complete_storage: Option<Arc<StorageIo>>,
     state: Arc<Mutex<EngineState>>,
     binder: Arc<dyn NetworkBinder>,
     port: u16,
@@ -88,6 +89,7 @@ impl Seeder {
         Self {
             meta,
             storage,
+            complete_storage: None,
             state,
             binder,
             port,
@@ -105,6 +107,14 @@ impl Seeder {
         if let Some(g) = global {
             self.limiter = self.limiter.with_global(g);
         }
+        self
+    }
+
+    /// Configure the completed-data storage root. During active downloads the
+    /// seeder serves verified pieces from `storage`; after the engine marks
+    /// completion it serves from this final root.
+    pub fn with_complete_storage(mut self, storage: Arc<StorageIo>) -> Self {
+        self.complete_storage = Some(storage);
         self
     }
 
@@ -157,12 +167,21 @@ impl Seeder {
             let peer_addr = stream.peer_addr().ok();
             let meta = self.meta.clone();
             let storage = self.storage.clone();
+            let complete_storage = self.complete_storage.clone();
             let state = self.state.clone();
             let peer_id = self.peer_id;
             let limiter = self.limiter.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    serve_peer(stream, &meta, storage.as_ref(), &state, peer_id, &limiter).await
+                if let Err(e) = serve_peer(
+                    stream,
+                    &meta,
+                    storage,
+                    complete_storage,
+                    &state,
+                    peer_id,
+                    &limiter,
+                )
+                .await
                 {
                     tracing::debug!(peer = ?peer_addr, error = %e, "inbound peer session ended");
                 }
@@ -175,7 +194,8 @@ impl Seeder {
 async fn serve_peer(
     stream: tokio::net::TcpStream,
     meta: &TorrentMeta,
-    storage: &StorageIo,
+    storage: Arc<StorageIo>,
+    complete_storage: Option<Arc<StorageIo>>,
     state: &Arc<Mutex<EngineState>>,
     peer_id: [u8; 20],
     limiter: &ShapedLimiter,
@@ -263,12 +283,20 @@ async fn serve_peer(
                     continue;
                 }
                 // Only serve pieces we have verified.
-                let have_it = state.lock().await.pieces_have.has(p);
+                let (have_it, finished) = {
+                    let s = state.lock().await;
+                    (s.pieces_have.has(p), s.finished)
+                };
                 if !have_it {
                     continue;
                 }
+                let read_storage = if finished {
+                    complete_storage.as_deref().unwrap_or(storage.as_ref())
+                } else {
+                    storage.as_ref()
+                };
                 let length = length as usize;
-                let block = match storage.read_block(p, offset as u64, length).await {
+                let block = match read_storage.read_block(p, offset as u64, length).await {
                     Ok(b) => b,
                     Err(e) => {
                         tracing::debug!(piece = p, error = %e, "seeding read_block failed");

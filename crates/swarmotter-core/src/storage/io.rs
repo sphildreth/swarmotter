@@ -26,6 +26,7 @@ use crate::storage::resume::{FastResume, PieceBitfield};
 use crate::storage::{piece_file_ranges, verify_piece};
 
 /// Per-torrent storage handle performing real disk I/O.
+#[derive(Clone)]
 pub struct StorageIo {
     meta: TorrentMeta,
     download_dir: PathBuf,
@@ -42,6 +43,11 @@ impl StorageIo {
     /// The torrent name (top-level directory or single-file name).
     pub fn name(&self) -> &str {
         &self.meta.name
+    }
+
+    /// Base directory containing this torrent's data.
+    pub fn base_dir(&self) -> &Path {
+        &self.download_dir
     }
 
     /// Resolve the absolute path for a file index.
@@ -266,11 +272,54 @@ impl StorageIo {
             .join(format!("{}.swarmotter.resume", self.meta.name))
     }
 
+    /// Move verified torrent data from this storage root to another root,
+    /// preserving torrent-relative paths. The destination must not already
+    /// contain the torrent's files; refusing to overwrite avoids clobbering
+    /// user data when a path is misconfigured.
+    pub async fn move_to(&self, destination_dir: impl Into<PathBuf>) -> Result<Self> {
+        let destination = Self::new(self.meta.clone(), destination_dir);
+        if self.download_dir == destination.download_dir {
+            return Ok(destination);
+        }
+
+        for (index, file) in self.meta.files.iter().enumerate() {
+            let src = self.file_path(index)?;
+            let dst = destination.file_path(index)?;
+            if src == dst {
+                continue;
+            }
+            if path_exists(&dst).await? {
+                return Err(CoreError::Storage(format!(
+                    "destination file already exists while moving completed data: {}",
+                    dst.display()
+                )));
+            }
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent).await.map_err(CoreError::from)?;
+            }
+            if path_exists(&src).await? {
+                rename_or_copy(&src, &dst).await?;
+                cleanup_empty_parents(src.parent(), &self.download_dir).await;
+            } else if file.length == 0 {
+                fs::File::create(&dst).await.map_err(CoreError::from)?;
+            } else {
+                return Err(CoreError::Storage(format!(
+                    "source file missing while moving completed data: {}",
+                    src.display()
+                )));
+            }
+        }
+
+        let _ = fs::remove_file(self.resume_path()).await;
+        Ok(destination)
+    }
+
     /// Remove all torrent data files and the resume file.
     pub async fn remove_all(&self) -> Result<()> {
         for i in 0..self.meta.files.len() {
             let p = self.file_path(i)?;
             let _ = fs::remove_file(&p).await;
+            cleanup_empty_parents(p.parent(), &self.download_dir).await;
         }
         let _ = fs::remove_file(self.resume_path()).await;
         // For multi-file, remove the now-empty top-level directory.
@@ -344,6 +393,45 @@ fn validate_path_component(value: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+async fn path_exists(path: &Path) -> Result<bool> {
+    match fs::metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(CoreError::from(e)),
+    }
+}
+
+async fn rename_or_copy(src: &Path, dst: &Path) -> Result<()> {
+    match fs::rename(src, dst).await {
+        Ok(()) => Ok(()),
+        Err(rename_err) => match fs::copy(src, dst).await {
+            Ok(_) => {
+                fs::remove_file(src).await.map_err(CoreError::from)?;
+                Ok(())
+            }
+            Err(copy_err) => Err(CoreError::Storage(format!(
+                "failed to move {} to {}: rename failed ({rename_err}); copy fallback failed ({copy_err})",
+                src.display(),
+                dst.display()
+            ))),
+        },
+    }
+}
+
+async fn cleanup_empty_parents(parent: Option<&Path>, stop_at: &Path) {
+    let Some(mut current) = parent.map(PathBuf::from) else {
+        return;
+    };
+    while current != stop_at {
+        if fs::remove_dir(&current).await.is_err() {
+            break;
+        }
+        if !current.pop() {
+            break;
+        }
+    }
 }
 
 /// Build a [`FastResume`] from current piece/byte state.
@@ -612,6 +700,77 @@ mod tests {
         let block = store.read_block(0, 4, 8).await.unwrap();
         assert_eq!(block, b"456789ab");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn move_to_moves_data_and_resume_to_destination_root() {
+        let content = b"0123456789abcdef";
+        let bytes = build_single_file_torrent("move.bin", content, 8, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let active = unique_dir("move-active");
+        let complete = unique_dir("move-complete");
+        let store = StorageIo::new(meta.clone(), active.clone());
+        store.preallocate().await.unwrap();
+        store.write_block(0, 0, &content[..8]).await.unwrap();
+        store.write_block(1, 0, &content[8..]).await.unwrap();
+        let resume = build_resume(
+            meta.info_hash,
+            meta.name.clone(),
+            PieceBitfield::new(meta.piece_count()),
+            meta.piece_count(),
+            content.len() as u64,
+            0,
+            meta.total_length,
+            Some(active.display().to_string()),
+            1,
+            None,
+            &[crate::models::torrent::FilePriority::Normal],
+            &[8u64; 2],
+        );
+        store.save_resume(&resume).await.unwrap();
+
+        let complete_store = store.move_to(complete.clone()).await.unwrap();
+
+        assert!(!store.file_path(0).unwrap().exists());
+        assert!(!store.resume_path().exists());
+        assert_eq!(
+            std::fs::read(complete_store.file_path(0).unwrap()).unwrap(),
+            content
+        );
+        std::fs::remove_dir_all(&active).ok();
+        std::fs::remove_dir_all(&complete).ok();
+    }
+
+    #[tokio::test]
+    async fn move_to_preserves_multi_file_layout() {
+        let files = vec![
+            (vec!["a.txt".into()], 5u64),
+            (vec!["sub".into(), "b.bin".into()], 7u64),
+        ];
+        let contents: Vec<&[u8]> = vec![b"hello", b"world!!"];
+        let bytes = build_multi_file_torrent("dir", &files, &contents, 4, None);
+        let meta = parse_torrent(&bytes).unwrap();
+        let active = unique_dir("move-multi-active");
+        let complete = unique_dir("move-multi-complete");
+        let store = StorageIo::new(meta.clone(), active.clone());
+        store.preallocate().await.unwrap();
+        store.write_block(0, 0, b"hell").await.unwrap();
+        store.write_block(1, 0, b"owor").await.unwrap();
+        store.write_block(2, 0, b"ld!!").await.unwrap();
+
+        let complete_store = store.move_to(complete.clone()).await.unwrap();
+
+        assert!(!active.join("dir").join("a.txt").exists());
+        assert_eq!(
+            std::fs::read(complete_store.file_path(0).unwrap()).unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            std::fs::read(complete_store.file_path(1).unwrap()).unwrap(),
+            b"world!!"
+        );
+        std::fs::remove_dir_all(&active).ok();
+        std::fs::remove_dir_all(&complete).ok();
     }
 
     #[test]

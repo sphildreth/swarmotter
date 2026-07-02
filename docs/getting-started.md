@@ -42,6 +42,9 @@ allow_ipv6 = true
 utp_enabled = true
 ```
 
+With this layout, active downloads write partial data under `incomplete`.
+Completed torrents move to `downloads` only after all pieces verify.
+
 Save it as:
 
 ```text

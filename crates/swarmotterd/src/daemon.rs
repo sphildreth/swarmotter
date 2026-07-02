@@ -96,6 +96,17 @@ impl DaemonRuntime {
         })
     }
 
+    /// Resolve the active write directory for a torrent. Incomplete downloads
+    /// use the configured incomplete directory when present; otherwise they
+    /// write directly to the final download directory.
+    async fn resolve_incomplete_dir(&self, download_dir: &str) -> String {
+        let cfg = self.config.lock().await;
+        cfg.storage
+            .incomplete_dir
+            .clone()
+            .unwrap_or_else(|| download_dir.to_string())
+    }
+
     /// Start the live engine task for a torrent (downloading). No-op if the
     /// torrent is paused, queued, or already running.
     pub async fn start_engine(&self, hash: InfoHash) {
@@ -115,12 +126,13 @@ impl DaemonRuntime {
             return;
         }
 
-        let (meta, download_dir, listen_port, preallocate, magnet, needs_metadata) = {
+        let (meta, active_dir, complete_dir, listen_port, preallocate, magnet, needs_metadata) = {
             let reg = self.registry.lock().await;
             let Some(t) = reg.get(&hash) else {
                 return;
             };
-            let download_dir = self.resolve_download_dir(t).await;
+            let complete_dir = self.resolve_download_dir(t).await;
+            let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
             let magnet = if t.needs_metadata {
                 Some(crate::engine::MagnetParams {
                     info_hash: t.magnet_info_hash.unwrap_or(t.meta.info_hash),
@@ -133,7 +145,8 @@ impl DaemonRuntime {
             let preallocate = self.config.lock().await.storage.preallocate;
             (
                 t.meta.clone(),
-                download_dir,
+                active_dir,
+                complete_dir,
                 self.config.lock().await.torrent.listen_port,
                 preallocate,
                 magnet,
@@ -207,7 +220,7 @@ impl DaemonRuntime {
         };
         let mut engine = TorrentEngine::with_limiter(
             meta.clone(),
-            download_dir.clone().into(),
+            active_dir.clone().into(),
             peer_id,
             binder,
             state.clone(),
@@ -217,6 +230,7 @@ impl DaemonRuntime {
             limiter,
             magnet,
         )
+        .with_complete_dir(complete_dir.clone().into())
         .with_global_limiter(Some(self.global_limiter.clone()))
         .with_transport(utp_enabled, utp_prefer_tcp)
         .with_preallocate(preallocate);
@@ -312,8 +326,14 @@ impl DaemonRuntime {
         // completion) through the contained listener. Skip for magnets until
         // metadata is resolved (the placeholder has no real pieces to serve).
         if !needs_metadata {
-            self.start_seeder(hash, meta.clone(), download_dir.clone(), state.clone())
-                .await;
+            self.start_seeder(
+                hash,
+                meta.clone(),
+                active_dir.clone(),
+                complete_dir.clone(),
+                state.clone(),
+            )
+            .await;
         }
 
         // Mark the torrent as downloading.
@@ -348,7 +368,8 @@ impl DaemonRuntime {
         &self,
         hash: InfoHash,
         meta: swarmotter_core::meta::TorrentMeta,
-        download_dir: String,
+        active_dir: String,
+        complete_dir: String,
         state: Arc<Mutex<EngineState>>,
     ) {
         if self.seeder_handles.lock().await.contains_key(&hash) {
@@ -367,10 +388,18 @@ impl DaemonRuntime {
         let limiter = swarmotter_core::bandwidth::RateLimiter::new(dl_limit, ul_limit);
         let storage = Arc::new(swarmotter_core::storage::StorageIo::new(
             meta.clone(),
-            std::path::PathBuf::from(download_dir),
+            std::path::PathBuf::from(&active_dir),
         ));
+        let complete_storage = if active_dir == complete_dir {
+            None
+        } else {
+            Some(Arc::new(swarmotter_core::storage::StorageIo::new(
+                meta.clone(),
+                std::path::PathBuf::from(&complete_dir),
+            )))
+        };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let seeder = Seeder::with_limiter(
+        let mut seeder = Seeder::with_limiter(
             meta,
             storage,
             state,
@@ -381,6 +410,9 @@ impl DaemonRuntime {
             limiter,
         )
         .with_global_limiter(Some(self.global_limiter.clone()));
+        if let Some(complete_storage) = complete_storage {
+            seeder = seeder.with_complete_storage(complete_storage);
+        }
         self.seeder_shutdowns.lock().await.insert(hash, shutdown_tx);
         let hash_for_task = hash;
         let registry = self.registry.clone();
@@ -690,25 +722,16 @@ impl DaemonOps for DaemonRuntime {
                 .ok_or_else(|| CoreError::NotFound("torrent".into()))?
         };
         if delete_data {
-            let dir = removed.download_dir.clone().unwrap_or_else(|| {
-                std::env::temp_dir()
-                    .join("swarmotter-downloads")
-                    .display()
-                    .to_string()
-            });
-            let storage = swarmotter_core::storage::StorageIo::new(
-                removed.meta.clone(),
-                std::path::PathBuf::from(&dir),
-            );
-            // Best-effort removal of data files and resume metadata.
-            let _ = tokio::fs::remove_file(storage.resume_path()).await;
-            for i in 0..removed.meta.files.len() {
-                if let Ok(p) = storage.file_path(i) {
-                    let _ = tokio::fs::remove_file(&p).await;
-                }
-            }
-            if removed.meta.is_multi_file {
-                let _ = tokio::fs::remove_dir(&dir).await;
+            let complete_dir = self.resolve_download_dir(&removed).await;
+            let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
+            let mut dirs = vec![active_dir, complete_dir];
+            dirs.dedup();
+            for dir in dirs {
+                let storage = swarmotter_core::storage::StorageIo::new(
+                    removed.meta.clone(),
+                    std::path::PathBuf::from(&dir),
+                );
+                let _ = storage.remove_all().await;
             }
         }
         Ok(())
@@ -760,22 +783,22 @@ impl DaemonOps for DaemonRuntime {
             }
         }
         // Run a real storage recheck on disk.
-        let (meta, download_dir) = {
+        let (meta, storage_dir) = {
             let reg = self.registry.lock().await;
             let Some(t) = reg.get(hash) else {
                 return Err(CoreError::NotFound("torrent".into()));
             };
-            let dir = t.download_dir.clone().unwrap_or_else(|| {
-                std::env::temp_dir()
-                    .join("swarmotter-downloads")
-                    .display()
-                    .to_string()
-            });
-            (t.meta.clone(), dir)
+            let complete_dir = self.resolve_download_dir(t).await;
+            let storage_dir = if t.state == TorrentState::Completed {
+                complete_dir
+            } else {
+                self.resolve_incomplete_dir(&complete_dir).await
+            };
+            (t.meta.clone(), storage_dir)
         };
         let storage = swarmotter_core::storage::StorageIo::new(
             meta.clone(),
-            std::path::PathBuf::from(&download_dir),
+            std::path::PathBuf::from(&storage_dir),
         );
         match storage.recheck().await {
             Ok(bf) => {

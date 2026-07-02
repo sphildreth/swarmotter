@@ -39,8 +39,10 @@ SWARMOTTER_API__MAX_REQUEST_BODY_BYTES=16777216
   `GET /api/v1/settings` redacts the token. `max_request_body_bytes` bounds API
   request bodies, including torrent file uploads.
 - **Storage** (`storage`): `download_dir`, `incomplete_dir`, `preallocate`,
-  `sparse`. When `preallocate` is true, the engine sizes files before
-  downloading; when false, it creates directories and writes pieces as needed.
+  `sparse`. Incomplete data is written under `incomplete_dir` when configured
+  and moved to `download_dir` after all pieces verify. When `preallocate` is
+  true, the engine sizes files before downloading; when false, it creates
+  directories and writes pieces as needed.
 - **Network containment** (`network`): see `vpn-network-containment.md`
   (`mode`, `required_interface`, `required_source_ipv4`,
   `required_source_ipv6`, `required_network_namespace`, `allow_ipv6`,
@@ -104,6 +106,11 @@ validate_dns = true
 listen_port = 51413
 allow_ipv6 = true
 ```
+
+For this layout, `incomplete_dir` is the active write root for partial torrent
+data. Once all pieces verify, SwarmOtter moves the completed files to
+`download_dir`. If `incomplete_dir` is omitted, both active and completed data
+use `download_dir`.
 
 ## Validation rules
 

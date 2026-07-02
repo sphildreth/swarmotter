@@ -73,6 +73,10 @@ allow_ipv6 = true
 utp_enabled = true
 ```
 
+The service user needs write access to both storage directories. Incomplete
+torrents write to `incomplete_dir`; verified completed data is moved into
+`download_dir`.
+
 ## Container or VPN namespace
 
 For stronger isolation, run SwarmOtter inside a network namespace or container

@@ -212,6 +212,11 @@ status.
 
 ### Changed
 
+- Active downloads now write partial data and partial fast-resume metadata
+  under `[storage].incomplete_dir` when configured. After all pieces verify,
+  the engine moves completed data to `[storage].download_dir` and writes the
+  completed fast-resume metadata there. If `incomplete_dir` is unset, the
+  active and completed roots remain the same.
 - `[storage].preallocate` is now honored by the live engine. When disabled, the
   engine creates required directories and writes pieces as needed instead of
   pre-sizing all files.

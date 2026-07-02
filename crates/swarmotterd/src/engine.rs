@@ -93,7 +93,12 @@ pub enum EngineCommand {
 /// completes when the engine should terminate (remove).
 pub struct TorrentEngine {
     meta: TorrentMeta,
+    /// Active write directory. For daemon-managed downloads this is the
+    /// configured incomplete directory when present.
     download_dir: PathBuf,
+    /// Final completed-data directory. This defaults to `download_dir` for
+    /// tests and callers that do not configure an incomplete path.
+    complete_dir: PathBuf,
     peer_id: [u8; 20],
     binder: Arc<dyn NetworkBinder>,
     state: Arc<Mutex<EngineState>>,
@@ -156,6 +161,7 @@ impl TorrentEngine {
     ) -> Self {
         Self {
             meta,
+            complete_dir: download_dir.clone(),
             download_dir,
             peer_id,
             binder,
@@ -205,6 +211,14 @@ impl TorrentEngine {
         self
     }
 
+    /// Configure the final completed-data directory. The engine writes active
+    /// pieces under `download_dir` and atomically moves verified completed data
+    /// here before marking the torrent finished.
+    pub fn with_complete_dir(mut self, complete_dir: PathBuf) -> Self {
+        self.complete_dir = complete_dir;
+        self
+    }
+
     /// Main engine loop. Runs announce + peer download until complete or
     /// commanded to stop. Returns the final engine state.
     pub async fn run(mut self) -> Result<EngineState> {
@@ -239,6 +253,18 @@ impl TorrentEngine {
             return Ok(s.clone());
         }
 
+        let complete_storage = StorageIo::new(self.meta.clone(), self.complete_dir.clone());
+        if self.download_dir != self.complete_dir {
+            let complete_have = self.load_or_recheck(&complete_storage).await?;
+            if complete_have.count(piece_count) == piece_count {
+                self.update_progress(&complete_have).await;
+                self.mark_finished().await;
+                self.persist_resume(&complete_storage, &complete_have)
+                    .await?;
+                return Ok(self.state.lock().await.clone());
+            }
+        }
+
         let storage = StorageIo::new(self.meta.clone(), self.download_dir.clone());
         if self.preallocate {
             storage.preallocate().await?;
@@ -247,14 +273,11 @@ impl TorrentEngine {
         }
 
         // Load fast resume if present; otherwise recheck what's already on disk.
-        let mut have = if let Some(resume) = storage.load_resume(&self.meta.info_hash).await? {
-            resume.piece_bitfield
-        } else {
-            storage.recheck().await?
-        };
+        let mut have = self.load_or_recheck(&storage).await?;
         self.update_progress(&have).await;
 
         if have.count(piece_count) == piece_count {
+            let storage = self.complete_storage(&storage).await?;
             self.mark_finished().await;
             self.persist_resume(&storage, &have).await?;
             return Ok(self.state.lock().await.clone());
@@ -308,6 +331,7 @@ impl TorrentEngine {
             }
 
             if have.count(piece_count) == piece_count {
+                let storage = self.complete_storage(&storage).await?;
                 self.mark_finished().await;
                 self.persist_resume(&storage, &have).await?;
                 // Announce completion to trackers.
@@ -994,6 +1018,27 @@ impl TorrentEngine {
         s.finished = true;
     }
 
+    async fn load_or_recheck(&self, storage: &StorageIo) -> Result<PieceBitfield> {
+        if let Some(resume) = storage.load_resume(&self.meta.info_hash).await? {
+            Ok(resume.piece_bitfield)
+        } else {
+            storage.recheck().await
+        }
+    }
+
+    async fn complete_storage(&self, storage: &StorageIo) -> Result<StorageIo> {
+        if self.download_dir == self.complete_dir {
+            return Ok(storage.clone());
+        }
+        tracing::info!(
+            info_hash = %self.meta.info_hash,
+            active_dir = %self.download_dir.display(),
+            complete_dir = %self.complete_dir.display(),
+            "moving completed torrent data to download directory"
+        );
+        storage.move_to(self.complete_dir.clone()).await
+    }
+
     async fn persist_resume(&self, storage: &StorageIo, have: &PieceBitfield) -> Result<()> {
         let piece_byte_lengths: Vec<u64> = (0..self.meta.piece_count())
             .map(|i| self.piece_length(i))
@@ -1007,7 +1052,7 @@ impl TorrentEngine {
             s.downloaded,
             s.uploaded,
             s.total_length,
-            Some(self.download_dir.display().to_string()),
+            Some(storage.base_dir().display().to_string()),
             now_secs(),
             if s.finished { Some(now_secs()) } else { None },
             &vec![swarmotter_core::models::torrent::FilePriority::Normal; self.meta.files.len()],
@@ -1318,6 +1363,20 @@ mod tests {
     use super::*;
     use swarmotter_core::meta::build_single_file_torrent;
 
+    fn unique_dir(label: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "swarmotter-engine-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
     #[test]
     fn piece_length_last_is_shorter() {
         let bytes = build_single_file_torrent("f", b"0123456789abcdef", 8, None, false);
@@ -1364,5 +1423,56 @@ mod tests {
         have.set(1);
         let pick = engine.pick_piece(Some(&peer_bf), &have);
         assert_eq!(pick, Some(2));
+    }
+
+    #[tokio::test]
+    async fn completed_active_data_moves_to_complete_dir() {
+        let content = b"verified active data moves after completion";
+        let bytes = build_single_file_torrent("complete.bin", content, 8, None, false);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let active_dir = unique_dir("active");
+        let complete_dir = unique_dir("complete");
+        let active_storage = StorageIo::new(meta.clone(), active_dir.clone());
+        active_storage.preallocate().await.unwrap();
+        for piece in 0..meta.piece_count() {
+            let start = piece * 8;
+            let end = std::cmp::min(start + 8, content.len());
+            active_storage
+                .write_block(piece, 0, &content[start..end])
+                .await
+                .unwrap();
+        }
+
+        let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let engine = TorrentEngine::new(
+            meta.clone(),
+            active_dir.clone(),
+            [0u8; 20],
+            binder,
+            state,
+            rx,
+            vec![],
+            6881,
+        )
+        .with_complete_dir(complete_dir.clone());
+
+        let final_state = engine.run().await.unwrap();
+
+        assert!(final_state.finished);
+        assert!(!active_storage.file_path(0).unwrap().exists());
+        let complete_storage = StorageIo::new(meta.clone(), complete_dir.clone());
+        assert_eq!(
+            std::fs::read(complete_storage.file_path(0).unwrap()).unwrap(),
+            content
+        );
+        assert!(complete_storage
+            .load_resume(&meta.info_hash)
+            .await
+            .unwrap()
+            .is_some());
+        std::fs::remove_dir_all(&active_dir).ok();
+        std::fs::remove_dir_all(&complete_dir).ok();
     }
 }
