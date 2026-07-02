@@ -25,17 +25,22 @@ sparse = true
 # fails closed if that path is unavailable. See design/vpn-network-containment.md.
 [network]
 mode = "strict"
-required_interface = "tun0"
-required_source_ipv4 = "10.8.0.2"
-allow_ipv6 = false
+required_interface = "br0"
+# Optional for static-address deployments; omit for DHCP/SLAAC interfaces.
+# required_source_ipv4 = "192.0.2.10"
+# required_source_ipv6 = "2001:db8::10"
+allow_ipv6 = true
 fail_closed = true
 validate_route = true
-validate_dns = true
+# Set true only when DNS is constrained by a namespace/container or platform
+# probe. When false, strict mode blocks torrent hostname resolution rather than
+# resolving names through an unconstrained path.
+validate_dns = false
 
 # --- Torrent peer listener (data plane) ---
 [torrent]
 listen_port = 51413
-allow_ipv6 = false
+allow_ipv6 = true
 # Enable uTP (BEP 29) peer connections over the contained UDP socket. When
 # true, the engine attempts uTP alongside TCP (see utp_prefer_tcp). All uTP
 # traffic fail-closes with the rest of the data plane.

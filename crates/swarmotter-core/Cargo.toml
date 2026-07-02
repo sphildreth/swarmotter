@@ -19,6 +19,7 @@ sha1 = { workspace = true }
 hex = { workspace = true }
 url = { workspace = true }
 async-trait = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 

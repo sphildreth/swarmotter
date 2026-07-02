@@ -34,6 +34,10 @@ status.
   The torrent disappears from the API/UI torrent list after completion.
 - **API request body limit** (`api.max_request_body_bytes`, default
   `16777216`): caps JSON requests and raw `.torrent` uploads.
+- **Interface-bound containment for dynamic addresses:** strict mode can bind
+  torrent data-plane sockets to all current addresses on a configured interface
+  such as `br0`, avoiding fixed source IP configuration for DHCP/SLAAC
+  interfaces.
 - Repository scaffolding: governance documentation, ADR process, legal design
   docs, GitHub templates, and a minimal Rust workspace skeleton.
 - ADRs 0001 through 0008 recording foundational project decisions.
@@ -202,12 +206,13 @@ status.
 - `[storage].preallocate` is now honored by the live engine. When disabled, the
   engine creates required directories and writes pieces as needed instead of
   pre-sizing all files.
-- Strict fail-closed containment now requires an enforceable socket path
-  (`required_source_ipv4`, `required_source_ipv6`, or
-  `required_network_namespace`); interface-only strict configuration is
-  rejected.
+- Strict fail-closed containment now requires an enforceable socket path:
+  `required_interface`, `required_source_ipv4`, `required_source_ipv6`, or
+  `required_network_namespace`.
 - Tracker, UDP tracker, and DHT bootstrap hostname resolution now runs through
   `NetworkBinder::resolve_host()` after containment enforcement.
+- UDP tracker and uTP sockets now choose IPv4 or IPv6 binding from the remote
+  address family, so interface-bound containment can cover both families.
 - Restructured the repository from a single broken crate into a Rust
   workspace under `crates/` (`swarmotterd`, `swarmotter-core`,
   `swarmotter-api`, `swarmotter-web`).

@@ -49,8 +49,8 @@ unavailable, torrent networking must stop. Fail-closed conditions include:
 - Required interface exists but is down.
 - Required interface has no usable IP address.
 - Required source IP is no longer assigned.
-- Strict fail-closed configuration lacks an enforceable source address or
-  current network namespace.
+- Strict fail-closed configuration lacks an enforceable interface, source
+  address, or current network namespace.
 - Required route is missing or invalid.
 - VPN network namespace is unavailable.
 - DNS behavior cannot be constrained as configured.
@@ -75,7 +75,7 @@ Required states include `healthy`, `disabled`, `interface_missing`,
 ## Acceptance criteria
 
 - The daemon refuses to start torrent networking when strict mode is enabled and
-  the required source address or network namespace is unavailable.
+  the required interface, source address, or network namespace is unavailable.
 - The daemon blocks torrent traffic when the configured VPN/NIC path disappears
   while running.
 - Peer, tracker, DHT, and webseed traffic cannot fall back to the default
@@ -90,28 +90,30 @@ Required states include `healthy`, `disabled`, `interface_missing`,
 
 Live torrent sockets and data-plane name resolution are created exclusively
 through the `NetworkBinder` trait (`swarmotter-core::net::binder`),
-implemented by `ContainedBinder` in the daemon. The binder binds outbound TCP
-to the configured source address, re-evaluates containment before each
-connection, resolves hostnames through `resolve_host()` only after containment
-passes, and returns `CoreError::NetworkBlocked` in strict fail-closed mode when
-the path or DNS policy is unavailable. Strict interface-only configuration is
-invalid because the daemon cannot enforce it through socket binding alone.
+implemented by `ContainedBinder` in the daemon. The binder binds outbound TCP,
+UDP sockets, and inbound listeners to the configured source address or
+interface, re-evaluates containment before each connection, resolves hostnames
+through `resolve_host()` only after containment passes, and returns
+`CoreError::NetworkBlocked` in strict fail-closed mode when the path or DNS
+policy is unavailable. On Linux, interface binding uses `SO_BINDTODEVICE`, so
+`required_interface = "br0"` can constrain torrent sockets to all current
+addresses on `br0` without pinning DHCP/SLAAC source addresses.
 
 Tracker HTTP GETs are issued through the same binder, and tracker responses are
 bounded before buffering. HTTPS trackers (`https://`) perform TLS over the
 binder's contained TCP socket (`tokio-rustls` + `rustls` with system-root
 certificate validation); the TLS layer never creates an independent network
 path. UDP data-plane traffic (UDP trackers, DHT, and uTP) goes through the
-binder's `udp_socket()` method, which returns a source-bound contained UDP
-socket. uTP (BEP 29) is a live peer transport selected by the engine alongside
-TCP; all uTP peer traffic - SYN, DATA, STATE, FIN, RESET, and SACK - flows
-through the contained UDP socket and fail-closes when the path is unavailable
-(see ADR-0020). Inbound peer connections (seeding) go through
-`bind_peer_listener()`, which binds a contained TCP listener to the configured
-source address. A `LoopbackBinder` (test feature) lets integration tests
-exercise the full engine over loopback without the default route, and a
-`BlockedBinder` proves fail-closed behavior for TCP, UDP, uTP, and the
-listener. See ADR-0012 and ADR-0022.
+binder's `udp_socket()` / `udp_socket_for()` methods, which return contained
+UDP sockets for the requested address family. uTP (BEP 29) is a live peer
+transport selected by the engine alongside TCP; all uTP peer traffic - SYN,
+DATA, STATE, FIN, RESET, and SACK - flows through the contained UDP socket and
+fail-closes when the path is unavailable (see ADR-0020). Inbound peer
+connections (seeding) go through `bind_peer_listener()`, which binds contained
+TCP listeners to the configured interface/source path. A `LoopbackBinder`
+(test feature) lets integration tests exercise the full engine over loopback
+without the default route, and a `BlockedBinder` proves fail-closed behavior
+for TCP, UDP, uTP, and the listener. See ADR-0012, ADR-0022, and ADR-0023.
 
 ## Maintenance
 

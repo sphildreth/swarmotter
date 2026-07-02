@@ -15,9 +15,9 @@
 //! to the default route (see `design/vpn-network-containment.md`).
 //!
 //! The trait is defined in `swarmotter-core` (the contract) and implemented
-//! concretely in the daemon against real `tokio` sockets with source binding.
-//! Tests inject [`LoopbackBinder`] (or a custom fake) so the engine logic is
-//! exercised without real network hardware.
+//! concretely in the daemon against real `tokio` sockets with source or
+//! interface binding. Tests inject [`LoopbackBinder`] (or a custom fake) so the
+//! engine logic is exercised without real network hardware.
 
 use std::net::SocketAddr;
 
@@ -97,6 +97,16 @@ pub trait NetworkBinder: Send + Sync {
     /// configured source address/interface in the real binder). Used by UDP
     /// trackers and DHT. Never bypasses containment.
     async fn udp_socket(&self) -> Result<Box<dyn ContainedUdpSocket>>;
+
+    /// Create a contained UDP socket suitable for traffic to `remote`. Binders
+    /// that support multiple address families should use the remote address to
+    /// choose IPv4 vs IPv6 binding. The default preserves older test binders.
+    async fn udp_socket_for(
+        &self,
+        _remote: Option<SocketAddr>,
+    ) -> Result<Box<dyn ContainedUdpSocket>> {
+        self.udp_socket().await
+    }
 
     /// Create a contained TCP listener for inbound peers on the given port
     /// (and the configured source address/interface in the real binder). Used

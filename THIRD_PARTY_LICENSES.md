@@ -44,6 +44,8 @@ foundational dependency stack rationale.
 | futures-util | 0.3 | MIT/Apache-2.0 | Async stream utilities for SSE/WebSocket |
 | tokio-stream | 0.1 | MIT | Broadcast stream adapters for events |
 | clap | 4 | MIT/Apache-2.0 | CLI argument parsing |
+| libc | 0.2 | MIT/Apache-2.0 | Linux interface discovery and `SO_BINDTODEVICE` socket binding |
+| socket2 | 0.6 | MIT/Apache-2.0 | Constructing interface-bound TCP/UDP sockets before handing them to Tokio |
 | tokio-rustls | 0.26 | MIT/Apache-2.0 | TLS handshake over contained TCP sockets (HTTPS trackers) |
 | rustls | 0.23 | Apache-2.0/MIT/ISC | Rustls TLS implementation with the ring crypto provider (HTTPS trackers) |
 | webpki-roots | 0.26 | MPL-2.0 | Platform root CA trust store for HTTPS tracker certificate validation |

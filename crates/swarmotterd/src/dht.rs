@@ -55,7 +55,9 @@ impl DhtRunner {
 
     /// Open the contained UDP socket. Returns an error in fail-closed mode.
     pub async fn socket(&self) -> Result<Box<dyn ContainedUdpSocket>> {
-        self.binder.udp_socket().await
+        self.binder
+            .udp_socket_for(self.bootstrap.first().copied())
+            .await
     }
 
     /// Bootstrap: ping each configured bootstrap node so it learns about us

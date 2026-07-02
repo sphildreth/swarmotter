@@ -52,7 +52,8 @@ directly.
 
 ## Consequences
 
-- Torrent traffic cannot silently use the default route; every socket is gated.
+- Torrent traffic cannot silently use the default route; every socket is gated
+  and can be bound to the configured source address or interface.
 - Adding a new data-plane transport (uTP, DHT UDP) means extending the binder,
   not bypassing it.
 - DNS resolution for tracker, UDP tracker, and DHT bootstrap hostnames is
@@ -69,3 +70,4 @@ directly.
 - `design/vpn-network-containment.md`
 - ADR-0005 (strict VPN/NIC network containment)
 - ADR-0013 (peer protocol architecture)
+- ADR-0023 (interface-bound containment for dynamic addresses)

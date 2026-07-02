@@ -5,9 +5,10 @@
 //! The `InterfaceProbe` trait isolates platform-specific network interface
 //! discovery so the containment logic can be tested deterministically and so
 //! real socket creation stays centralized. The default `OsInterfaceProbe`
-//! performs best-effort discovery via `std::net` / `libc`-style helpers; full
-//! platform-specific source-binding is implemented in the socket binder.
+//! performs OS interface discovery where supported; full platform-specific
+//! source/interface binding is implemented in the socket binder.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use crate::net::NetworkConfig;
@@ -44,33 +45,29 @@ pub trait InterfaceProbe {
     fn namespace_available(&self, ns: &str) -> bool;
 }
 
-/// Best-effort OS-backed probe using `std::net`.
-///
-/// On Linux, full interface enumeration requires reading `/proc/net` or
-/// `getifaddrs`; the std library does not expose interfaces directly. This
-/// implementation resolves host addresses from the local hostname and treats
-/// the configured interface as present if it is referenced by name. For strict
-/// deployments, operators are expected to run inside the target namespace/VPN
-/// path so source binding suffices.
+/// OS-backed probe for interface status and addresses.
 pub struct OsInterfaceProbe;
 
 impl InterfaceProbe for OsInterfaceProbe {
     fn list(&self) -> Vec<InterfaceInfo> {
-        Vec::new()
+        os_interfaces()
     }
 
-    fn find(&self, _name: &str) -> Option<InterfaceInfo> {
-        // Best-effort: std does not enumerate interfaces. Real enumeration is
-        // platform-specific; this returns None so strict mode surfaces
-        // interface_missing unless overridden in tests/deployment.
-        None
+    fn find(&self, name: &str) -> Option<InterfaceInfo> {
+        self.list().into_iter().find(|iface| iface.name == name)
     }
 
-    fn source_assigned(&self, addr: &str, _iface: Option<&str>) -> bool {
+    fn source_assigned(&self, addr: &str, iface: Option<&str>) -> bool {
         let target: IpAddr = match addr.parse() {
             Ok(a) => a,
             Err(_) => return false,
         };
+        if let Some(iface) = iface {
+            return self
+                .find(iface)
+                .map(|info| info.addresses.contains(&target))
+                .unwrap_or(false);
+        }
         std::net::TcpListener::bind(std::net::SocketAddr::new(target, 0)).is_ok()
     }
 
@@ -88,6 +85,73 @@ impl InterfaceProbe for OsInterfaceProbe {
     fn namespace_available(&self, ns: &str) -> bool {
         namespace_is_current(ns)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn os_interfaces() -> Vec<InterfaceInfo> {
+    use std::ffi::CStr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+    if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
+        return Vec::new();
+    }
+
+    let mut interfaces: BTreeMap<String, InterfaceInfo> = BTreeMap::new();
+    let mut cur = addrs;
+    while !cur.is_null() {
+        let ifa = unsafe { &*cur };
+        if !ifa.ifa_name.is_null() {
+            let name = unsafe { CStr::from_ptr(ifa.ifa_name) }
+                .to_string_lossy()
+                .into_owned();
+            let is_up = (ifa.ifa_flags & libc::IFF_UP as u32) != 0;
+            let entry = interfaces
+                .entry(name.clone())
+                .or_insert_with(|| InterfaceInfo {
+                    name,
+                    status: if is_up {
+                        InterfaceStatus::Up
+                    } else {
+                        InterfaceStatus::Down
+                    },
+                    addresses: Vec::new(),
+                });
+            if is_up {
+                entry.status = InterfaceStatus::Up;
+            }
+            if !ifa.ifa_addr.is_null() {
+                let family = unsafe { (*ifa.ifa_addr).sa_family as i32 };
+                match family {
+                    libc::AF_INET => {
+                        let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+                        let octets = sin.sin_addr.s_addr.to_ne_bytes();
+                        let ip = IpAddr::V4(Ipv4Addr::from(octets));
+                        if !entry.addresses.contains(&ip) {
+                            entry.addresses.push(ip);
+                        }
+                    }
+                    libc::AF_INET6 => {
+                        let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+                        let ip = IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr));
+                        if !entry.addresses.contains(&ip) {
+                            entry.addresses.push(ip);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        cur = unsafe { (*cur).ifa_next };
+    }
+    unsafe { libc::freeifaddrs(addrs) };
+
+    interfaces.into_values().collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn os_interfaces() -> Vec<InterfaceInfo> {
+    Vec::new()
 }
 
 #[cfg(target_os = "linux")]
@@ -125,5 +189,11 @@ mod tests {
     fn source_assigned_bad_addr_false() {
         let probe = OsInterfaceProbe;
         assert!(!probe.source_assigned("not-an-ip", None));
+    }
+
+    #[test]
+    fn os_probe_list_is_safe() {
+        let probe = OsInterfaceProbe;
+        let _ = probe.list();
     }
 }

@@ -11,11 +11,12 @@
 //! See `design/vpn-network-containment.md` and ADR-0014 (network containment
 //! integration).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -107,12 +108,13 @@ impl ContainedBinder {
         }
         if cfg.mode == NetworkContainmentMode::Strict
             && cfg.fail_closed
+            && cfg.required_interface.is_none()
             && cfg.required_source_ipv4.is_none()
             && cfg.required_source_ipv6.is_none()
             && cfg.required_network_namespace.is_none()
         {
             return Err(CoreError::NetworkBlocked(
-                "torrent data plane blocked: strict containment requires source binding or a current network namespace".into(),
+                "torrent data plane blocked: strict containment requires an interface, source binding, or a current network namespace".into(),
             ));
         }
         let health = net::evaluate(&cfg, self.probe.as_ref());
@@ -123,18 +125,6 @@ impl ContainedBinder {
             )));
         }
         Ok(())
-    }
-
-    async fn source(&self) -> Option<std::net::IpAddr> {
-        let cfg = self.config.lock().await;
-        cfg.required_source_ipv4
-            .as_deref()
-            .and_then(|s| s.parse().ok())
-            .or_else(|| {
-                cfg.required_source_ipv6
-                    .as_deref()
-                    .and_then(|s| s.parse().ok())
-            })
     }
 
     /// Update the network configuration at runtime (e.g. when the daemon
@@ -150,15 +140,17 @@ impl ContainedBinder {
 impl NetworkBinder for ContainedBinder {
     async fn connect_peer(&self, addr: SocketAddr) -> Result<tokio::net::TcpStream> {
         self.guard().await?;
-        let source = self.source().await;
-        let stream = match source {
+        let cfg = self.config.lock().await.clone();
+        ensure_family_enforced(&cfg, addr)?;
+        let socket = tokio::net::TcpSocket::new_v4_or_v6_for(addr)?;
+        bind_socket_to_interface(&socket, cfg.required_interface.as_deref())?;
+        let stream = match source_for_addr(&cfg, addr) {
             Some(ip) => {
                 let bind = SocketAddr::new(ip, 0);
-                let socket = tokio::net::TcpSocket::new_v4_or_v6_for(ip)?;
                 socket.bind(bind)?;
                 socket.connect(addr).await?
             }
-            None => tokio::net::TcpStream::connect(addr).await?,
+            None => socket.connect(addr).await?,
         };
         Ok(stream)
     }
@@ -224,27 +216,62 @@ impl NetworkBinder for ContainedBinder {
     }
 
     async fn udp_socket(&self) -> Result<Box<dyn ContainedUdpSocket>> {
+        self.udp_socket_for(None).await
+    }
+
+    async fn udp_socket_for(
+        &self,
+        remote: Option<SocketAddr>,
+    ) -> Result<Box<dyn ContainedUdpSocket>> {
         self.guard().await?;
-        let source = self.source().await;
-        let socket = match source {
-            Some(ip) => {
-                let bind = SocketAddr::new(ip, 0);
-                tokio::net::UdpSocket::bind(bind).await?
-            }
-            None => tokio::net::UdpSocket::bind("0.0.0.0:0").await?,
-        };
+        let cfg = self.config.lock().await.clone();
+        if let Some(remote) = remote {
+            ensure_family_enforced(&cfg, remote)?;
+        }
+        let bind = udp_bind_addr(&cfg, remote);
+        let socket = create_udp_socket(bind, cfg.required_interface.as_deref())?;
         Ok(Box::new(ContainedUdpSocketImpl { socket }))
     }
 
     async fn bind_peer_listener(&self, port: u16) -> Result<Box<dyn PeerListener>> {
         self.guard().await?;
-        let source = self.source().await;
-        let bind = match source {
-            Some(ip) => SocketAddr::new(ip, port),
-            None => SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port),
+        let cfg = self.config.lock().await.clone();
+        let iface = cfg.required_interface.as_deref();
+        let v4_addr = cfg
+            .required_source_ipv4
+            .as_deref()
+            .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let v6_addr = cfg
+            .required_source_ipv6
+            .as_deref()
+            .and_then(|s| s.parse::<Ipv6Addr>().ok())
+            .map(IpAddr::V6)
+            .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+
+        let namespace_only = cfg.required_network_namespace.is_some()
+            && cfg.required_interface.is_none()
+            && cfg.required_source_ipv4.is_none()
+            && cfg.required_source_ipv6.is_none();
+        let has_interface = cfg.required_interface.is_some();
+        let v4 = if cfg.required_source_ipv6.is_some()
+            && cfg.required_source_ipv4.is_none()
+            && !has_interface
+            && !namespace_only
+        {
+            None
+        } else {
+            Some(create_tcp_listener(SocketAddr::new(v4_addr, port), iface)?)
         };
-        let listener = tokio::net::TcpListener::bind(bind).await?;
-        Ok(Box::new(ContainedPeerListener { listener }))
+        let v6 = if cfg.allow_ipv6
+            && (has_interface || namespace_only || cfg.required_source_ipv6.is_some())
+        {
+            Some(create_tcp_listener(SocketAddr::new(v6_addr, port), iface)?)
+        } else {
+            None
+        };
+        Ok(Box::new(ContainedPeerListener { v4, v6 }))
     }
 
     fn traffic_allowed(&self) -> bool {
@@ -291,33 +318,178 @@ impl ContainedUdpSocket for ContainedUdpSocketImpl {
 /// Real contained inbound peer listener backed by `tokio::net::TcpListener`,
 /// source-bound through the binder. Used for seeding/upload.
 struct ContainedPeerListener {
-    listener: tokio::net::TcpListener,
+    v4: Option<tokio::net::TcpListener>,
+    v6: Option<tokio::net::TcpListener>,
 }
 
 #[async_trait]
 impl PeerListener for ContainedPeerListener {
     async fn accept(&self) -> Result<tokio::net::TcpStream> {
-        let (stream, _addr) = self.listener.accept().await.map_err(CoreError::from)?;
+        let stream = match (&self.v4, &self.v6) {
+            (Some(v4), Some(v6)) => {
+                tokio::select! {
+                    res = v4.accept() => res.map(|(stream, _)| stream),
+                    res = v6.accept() => res.map(|(stream, _)| stream),
+                }
+            }
+            (Some(v4), None) => v4.accept().await.map(|(stream, _)| stream),
+            (None, Some(v6)) => v6.accept().await.map(|(stream, _)| stream),
+            (None, None) => {
+                return Err(CoreError::NetworkBlocked(
+                    "torrent data plane blocked: no peer listener socket was bound".into(),
+                ))
+            }
+        }
+        .map_err(CoreError::from)?;
         Ok(stream)
     }
 
     fn local_addr(&self) -> Result<SocketAddr> {
-        self.listener.local_addr().map_err(CoreError::from)
+        self.v4
+            .as_ref()
+            .or(self.v6.as_ref())
+            .ok_or_else(|| {
+                CoreError::NetworkBlocked(
+                    "torrent data plane blocked: no peer listener socket was bound".into(),
+                )
+            })?
+            .local_addr()
+            .map_err(CoreError::from)
     }
 }
 
 trait TcpSocketExt {
-    fn new_v4_or_v6_for(ip: std::net::IpAddr) -> Result<tokio::net::TcpSocket>;
+    fn new_v4_or_v6_for(addr: SocketAddr) -> Result<tokio::net::TcpSocket>;
 }
 
 impl TcpSocketExt for tokio::net::TcpSocket {
-    fn new_v4_or_v6_for(ip: std::net::IpAddr) -> Result<tokio::net::TcpSocket> {
-        let socket = match ip {
-            std::net::IpAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-            std::net::IpAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    fn new_v4_or_v6_for(addr: SocketAddr) -> Result<tokio::net::TcpSocket> {
+        let socket = match addr {
+            SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
         };
         Ok(socket)
     }
+}
+
+fn source_for_addr(cfg: &NetworkConfig, addr: SocketAddr) -> Option<IpAddr> {
+    match addr {
+        SocketAddr::V4(_) => cfg
+            .required_source_ipv4
+            .as_deref()
+            .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            .map(IpAddr::V4),
+        SocketAddr::V6(_) => cfg
+            .required_source_ipv6
+            .as_deref()
+            .and_then(|s| s.parse::<Ipv6Addr>().ok())
+            .map(IpAddr::V6),
+    }
+}
+
+fn ensure_family_enforced(cfg: &NetworkConfig, addr: SocketAddr) -> Result<()> {
+    if cfg.mode != NetworkContainmentMode::Strict || !cfg.fail_closed {
+        return Ok(());
+    }
+    if cfg.required_interface.is_some() || cfg.required_network_namespace.is_some() {
+        return Ok(());
+    }
+    if source_for_addr(cfg, addr).is_some() {
+        return Ok(());
+    }
+    Err(CoreError::NetworkBlocked(format!(
+        "torrent data plane blocked: no {} containment binding is configured",
+        if addr.is_ipv6() { "IPv6" } else { "IPv4" }
+    )))
+}
+
+fn udp_bind_addr(cfg: &NetworkConfig, remote: Option<SocketAddr>) -> SocketAddr {
+    let use_ipv6 = remote.map(|addr| addr.is_ipv6()).unwrap_or_else(|| {
+        cfg.required_source_ipv6.is_some() && cfg.required_source_ipv4.is_none()
+    });
+    if use_ipv6 {
+        let ip = cfg
+            .required_source_ipv6
+            .as_deref()
+            .and_then(|s| s.parse::<Ipv6Addr>().ok())
+            .unwrap_or(Ipv6Addr::UNSPECIFIED);
+        SocketAddr::new(IpAddr::V6(ip), 0)
+    } else {
+        let ip = cfg
+            .required_source_ipv4
+            .as_deref()
+            .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            .unwrap_or(Ipv4Addr::UNSPECIFIED);
+        SocketAddr::new(IpAddr::V4(ip), 0)
+    }
+}
+
+fn create_udp_socket(bind: SocketAddr, iface: Option<&str>) -> Result<tokio::net::UdpSocket> {
+    let socket = Socket::new(Domain::for_address(bind), Type::DGRAM, Some(Protocol::UDP))
+        .map_err(CoreError::from)?;
+    bind_socket_to_interface(&socket, iface)?;
+    socket
+        .bind(&SockAddr::from(bind))
+        .map_err(CoreError::from)?;
+    socket.set_nonblocking(true).map_err(CoreError::from)?;
+    let socket: std::net::UdpSocket = socket.into();
+    tokio::net::UdpSocket::from_std(socket).map_err(CoreError::from)
+}
+
+fn create_tcp_listener(bind: SocketAddr, iface: Option<&str>) -> Result<tokio::net::TcpListener> {
+    let socket = Socket::new(Domain::for_address(bind), Type::STREAM, Some(Protocol::TCP))
+        .map_err(CoreError::from)?;
+    socket.set_reuse_address(true).map_err(CoreError::from)?;
+    if bind.is_ipv6() {
+        socket.set_only_v6(true).map_err(CoreError::from)?;
+    }
+    bind_socket_to_interface(&socket, iface)?;
+    socket
+        .bind(&SockAddr::from(bind))
+        .map_err(CoreError::from)?;
+    socket.listen(1024).map_err(CoreError::from)?;
+    socket.set_nonblocking(true).map_err(CoreError::from)?;
+    let listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(listener).map_err(CoreError::from)
+}
+
+#[cfg(target_os = "linux")]
+fn bind_socket_to_interface<S: std::os::fd::AsRawFd>(
+    socket: &S,
+    iface: Option<&str>,
+) -> Result<()> {
+    let Some(iface) = iface else {
+        return Ok(());
+    };
+    let iface = std::ffi::CString::new(iface).map_err(|_| {
+        CoreError::InvalidConfig("network.required_interface must not contain NUL bytes".into())
+    })?;
+    let ret = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            iface.as_ptr().cast(),
+            iface.as_bytes_with_nul().len() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        return Err(CoreError::NetworkBlocked(format!(
+            "torrent data plane blocked: failed to bind socket to interface: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_socket_to_interface<S>(_socket: &S, iface: Option<&str>) -> Result<()> {
+    if iface.is_some() {
+        return Err(CoreError::NetworkBlocked(
+            "torrent data plane blocked: interface binding requires Linux SO_BINDTODEVICE".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -416,6 +588,46 @@ mod tests {
             .unwrap_err();
         assert!(err.is_network_blocked());
         assert!(binder.resolve_host("127.0.0.1", 80).await.is_ok());
+    }
+
+    #[test]
+    fn interface_only_config_enforces_both_address_families() {
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            required_interface: Some("br0".into()),
+            allow_ipv6: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        ensure_family_enforced(&cfg, "192.0.2.20:80".parse().unwrap()).unwrap();
+        ensure_family_enforced(&cfg, "[2001:db8::20]:80".parse().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn strict_source_config_blocks_unconfigured_family() {
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            required_source_ipv4: Some("192.0.2.10".into()),
+            allow_ipv6: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        ensure_family_enforced(&cfg, "192.0.2.20:80".parse().unwrap()).unwrap();
+        let err = ensure_family_enforced(&cfg, "[2001:db8::20]:80".parse().unwrap()).unwrap_err();
+        assert!(err.is_network_blocked());
+    }
+
+    #[test]
+    fn udp_bind_addr_follows_remote_family() {
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            required_interface: Some("br0".into()),
+            allow_ipv6: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        assert!(udp_bind_addr(&cfg, Some("192.0.2.20:80".parse().unwrap())).is_ipv4());
+        assert!(udp_bind_addr(&cfg, Some("[2001:db8::20]:80".parse().unwrap())).is_ipv6());
     }
 
     #[tokio::test]

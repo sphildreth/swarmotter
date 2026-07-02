@@ -21,8 +21,9 @@ integers, booleans, or strings as appropriate. Examples:
 SWARMOTTER_API__BIND_ADDRESS=0.0.0.0:9091
 SWARMOTTER_TORRENT__LISTEN_PORT=51414
 SWARMOTTER_NETWORK__MODE=strict
-SWARMOTTER_NETWORK__REQUIRED_INTERFACE=tun0
-SWARMOTTER_NETWORK__REQUIRED_SOURCE_IPV4=10.8.0.2
+SWARMOTTER_NETWORK__REQUIRED_INTERFACE=br0
+SWARMOTTER_NETWORK__ALLOW_IPV6=true
+SWARMOTTER_TORRENT__ALLOW_IPV6=true
 SWARMOTTER_API__MAX_REQUEST_BODY_BYTES=16777216
 ```
 
@@ -40,7 +41,10 @@ SWARMOTTER_API__MAX_REQUEST_BODY_BYTES=16777216
 - **Network containment** (`network`): see `vpn-network-containment.md`
   (`mode`, `required_interface`, `required_source_ipv4`,
   `required_source_ipv6`, `required_network_namespace`, `allow_ipv6`,
-  `fail_closed`, `validate_route`, `validate_dns`).
+  `fail_closed`, `validate_route`, `validate_dns`). `required_interface`
+  binds torrent data-plane sockets to all current addresses on that interface
+  on supported platforms, which is the DHCP/SLAAC-safe configuration. Source
+  address fields are optional refinements for static-address deployments.
 - **Torrent** (`torrent`): `listen_port`, `allow_ipv6`, `utp_enabled`,
   `utp_prefer_tcp`, `selfish`. When `utp_enabled` is true the engine attempts uTP
   (BEP 29) peer connections through the contained UDP socket alongside TCP; uTP
@@ -84,23 +88,27 @@ preallocate = false
 
 [network]
 mode = "strict"
-required_interface = "tun0"
-required_source_ipv4 = "10.8.0.2"
-allow_ipv6 = false
+required_interface = "br0"
+allow_ipv6 = true
 fail_closed = true
 validate_route = true
-validate_dns = true
+# Set true only when DNS is constrained by a namespace/container or platform
+# probe. When false, strict mode blocks torrent hostname resolution.
+validate_dns = false
 
 [torrent]
 listen_port = 51413
+allow_ipv6 = true
 ```
 
 ## Validation rules
 
 - Strict fail-closed network containment requires an enforceable torrent socket
-  path: `required_source_ipv4`, `required_source_ipv6`, or
-  `required_network_namespace`. Interface-only strict configuration is rejected
-  because socket binding cannot enforce it by itself.
+  path: `required_interface`, `required_source_ipv4`,
+  `required_source_ipv6`, or `required_network_namespace`.
+- `required_interface` means "bind torrent data-plane sockets to this
+  interface." On Linux this uses `SO_BINDTODEVICE`; if the daemon cannot enforce
+  the bind, torrent traffic fails closed.
 - `required_source_ipv6` requires `allow_ipv6 = true`.
 - `api.bind_address` must not be empty and must parse as a socket address.
 - `api.auth_token` must be set when `api.require_auth = true`.
@@ -110,3 +118,34 @@ listen_port = 51413
 
 Validation runs at load time and on env-override merge; failures abort startup
 with a clear error message.
+
+## DHCP/SLAAC Interface Binding
+
+For an interface whose IPv4 or IPv6 addresses can change, configure the
+interface name and omit fixed source addresses:
+
+```toml
+[network]
+mode = "strict"
+required_interface = "br0"
+allow_ipv6 = true
+fail_closed = true
+validate_route = true
+# Set true only when DNS is constrained by a namespace/container or platform
+# probe. When false, strict mode blocks torrent hostname resolution.
+validate_dns = false
+
+[torrent]
+listen_port = 51413
+allow_ipv6 = true
+```
+
+This constrains torrent peer TCP, uTP/UDP, UDP trackers, DHT UDP, and inbound
+peer listening to `br0` while allowing the kernel to choose the current source
+address for each address family. The API/Web UI control plane remains
+separate; `[api].bind_address` still takes a socket address, not an interface
+name.
+
+DNS containment is separate from socket binding. In strict fail-closed mode,
+hostname resolution for torrent operations is blocked unless DNS containment
+can be validated or supplied by the current network namespace.

@@ -74,6 +74,9 @@ fn compute_status(config: &NetworkConfig, probe: &dyn InterfaceProbe) -> Network
                 if info.status != InterfaceStatus::Up {
                     return NetworkContainmentStatus::InterfaceDown;
                 }
+                if !has_usable_interface_address(&info.addresses, config.allow_ipv6) {
+                    return NetworkContainmentStatus::NoInterfaceAddress;
+                }
             }
         }
     }
@@ -117,6 +120,13 @@ fn compute_status(config: &NetworkConfig, probe: &dyn InterfaceProbe) -> Network
     } else {
         NetworkContainmentStatus::Healthy
     }
+}
+
+fn has_usable_interface_address(addrs: &[std::net::IpAddr], allow_ipv6: bool) -> bool {
+    addrs.iter().any(|addr| match addr {
+        std::net::IpAddr::V4(ip) => !ip.is_unspecified(),
+        std::net::IpAddr::V6(ip) => allow_ipv6 && !ip.is_unspecified(),
+    })
 }
 
 fn detail_for(config: &NetworkConfig, status: NetworkContainmentStatus) -> String {
@@ -333,7 +343,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_no_interface_address_when_iface_up_but_no_addr_and_source_set() {
+    fn strict_no_interface_address_when_iface_up_but_no_addr() {
         let mut cfg = strict_cfg();
         cfg.required_source_ipv4 = None;
         let mut probe = FakeProbe::default();
@@ -347,12 +357,21 @@ mod tests {
         );
         probe.route_valid = true;
         probe.dns_ok = true;
-        // Without a source requirement and an up interface, we cannot detect
-        // "no usable address" without a source check. This documents that the
-        // no_interface_address state is surfaced when source binding fails at
-        // socket creation (handled by the binder), so here we expect healthy.
+        let h = evaluate(&cfg, &probe);
+        assert_eq!(h.status, NetworkContainmentStatus::NoInterfaceAddress);
+    }
+
+    #[test]
+    fn strict_interface_only_is_healthy_with_dynamic_addresses() {
+        let mut cfg = strict_cfg();
+        cfg.required_source_ipv4 = None;
+        let mut probe = FakeProbe::default();
+        probe
+            .interfaces
+            .insert("tun0".into(), up_iface("tun0", &["10.8.0.9"]));
+        probe.route_valid = true;
+        probe.dns_ok = true;
         let h = evaluate(&cfg, &probe);
         assert_eq!(h.status, NetworkContainmentStatus::Healthy);
-        let _ = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED); // import used
     }
 }

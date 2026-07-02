@@ -51,7 +51,7 @@ pub async fn udp_announce_with_iters(
     retries: u32,
 ) -> Result<AnnounceResponse> {
     let addr = resolve_udp_tracker(binder, &req.tracker_url).await?;
-    let socket = binder.udp_socket().await?;
+    let socket = binder.udp_socket_for(Some(addr)).await?;
 
     let mut last_err: Option<String> = None;
     for _ in 0..=retries {

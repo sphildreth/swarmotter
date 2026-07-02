@@ -341,6 +341,9 @@ honest platform-coverage limitation, not a missing capability.
 - ADR-0018: HTTPS tracker TLS over contained sockets
 - ADR-0019: DHT implementation strategy
 - ADR-0020: uTP (BEP 29) implementation strategy and scope
+- ADR-0021: Selfish completion policy
+- ADR-0022: API auth and contained resolution hardening
+- ADR-0023: Interface-bound containment for dynamic addresses
 
 ## Notes
 

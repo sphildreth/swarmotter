@@ -55,3 +55,5 @@ async-trait = "0.1"
 futures-util = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+socket2 = "0.6"

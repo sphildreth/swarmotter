@@ -169,7 +169,7 @@ impl UtpConnection {
     /// The peer's address is the UDP endpoint to connect to.
     pub async fn connect(binder: &dyn crate::net::NetworkBinder, peer: SocketAddr) -> Result<Self> {
         let socket: std::sync::Arc<dyn crate::net::ContainedUdpSocket> =
-            binder.udp_socket().await?.into();
+            binder.udp_socket_for(Some(peer)).await?.into();
         let send_conn_id: u16 = rand_conn_id();
         // Per BEP 29: the SYN carries the *receive* connection id the sender
         // wants the responder to use (= send_conn_id + 1), and the responder

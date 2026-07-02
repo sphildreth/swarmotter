@@ -14,10 +14,9 @@ The API already exposed configuration fields for authentication, but routes did
 not enforce them consistently and settings responses could expose the configured
 token. The torrent data plane also needed to ensure hostname resolution for
 trackers, UDP trackers, and DHT bootstrap nodes happened only after the
-`NetworkBinder` had enforced containment. In strict fail-closed mode,
-interface-only configuration is not enough for source-bound socket creation,
-so it must be rejected unless a source address or current network namespace is
-configured.
+`NetworkBinder` had enforced containment. At that point, source-bound sockets
+were the only enforced socket path; ADR-0023 later adds Linux interface-bound
+sockets for DHCP/SLAAC interfaces.
 
 ## Decision
 
@@ -29,9 +28,9 @@ configured.
 - Redact `api.auth_token` from `GET /api/v1/settings`.
 - Add `api.max_request_body_bytes` and apply it as the API request body limit.
 - Require strict fail-closed network configs to include an enforceable torrent
-  socket path: a required source IPv4/IPv6 address or a required network
-  namespace. Interface-only strict configuration is rejected because the daemon
-  cannot enforce it through socket binding alone.
+  socket path. ADR-0023 defines interface-bound sockets as an enforceable path
+  on supported platforms; source IPv4/IPv6 addresses and network namespaces
+  remain supported.
 - Add `NetworkBinder::resolve_host()` and route tracker, UDP tracker, and DHT
   bootstrap hostname resolution through it. Hostnames are blocked in strict
   fail-closed mode when DNS containment cannot be validated or provided by the
@@ -47,9 +46,9 @@ configured.
   configured bearer token.
 - Large or malicious API and tracker responses are rejected before unbounded
   allocation.
-- Strict containment starts from an enforceable socket-binding model; invalid
-  interface-only strict configs fail during validation instead of appearing
-  protected.
+- Strict containment starts from an enforceable socket-binding model. Interface
+  binding, source binding, and network namespace containment must fail closed
+  when they cannot be enforced.
 - Data-plane hostname resolution remains centralized in the binder, which makes
   new torrent networking features easier to audit for containment compliance.
 
@@ -67,3 +66,4 @@ configured.
 - `design/vpn-network-containment.md`
 - ADR-0005 (strict VPN/NIC network containment)
 - ADR-0012 (network binder centralized containment)
+- ADR-0023 (interface-bound containment for dynamic addresses)
