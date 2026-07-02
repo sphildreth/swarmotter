@@ -7,6 +7,8 @@ release artifacts, and project-hosted assets.
 SwarmOtter is a lawful, general-purpose BitTorrent client. See `lawful-use.md`
 for appropriate use cases and `legal.md` for project legal posture.
 
+For user-facing legal and content policy guidance, see `docs/legal.md`.
+
 ## Prohibited project content
 
 The repository must not include:
@@ -55,9 +57,3 @@ fixtures so the test suite does not depend on third-party content availability.
 Piracy-oriented features, indexers, or infringing-content examples are not
 accepted. Such contributions will be rejected. See `AGENTS.md` and
 `legal_content_report.md` for reporting concerns about project content.
-
-## TODO
-
-- Review all examples and screenshots against this policy before `v1.0.0`
-  release.
-- Keep this policy aligned with `AGENTS.md` and `legal.md`.

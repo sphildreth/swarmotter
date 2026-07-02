@@ -12,16 +12,26 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SeedingPolicy {
     /// Global ratio limit (uploaded/downloaded). `None` = seed forever.
+    #[serde(default = "default_global_ratio_limit")]
     pub global_ratio_limit: Option<f64>,
     /// Global idle seed limit in seconds. `None` = no idle stop.
+    #[serde(default = "default_global_idle_limit")]
     pub global_idle_limit: Option<u64>,
+}
+
+fn default_global_ratio_limit() -> Option<f64> {
+    Some(2.0)
+}
+
+fn default_global_idle_limit() -> Option<u64> {
+    Some(1800)
 }
 
 impl Default for SeedingPolicy {
     fn default() -> Self {
         Self {
-            global_ratio_limit: Some(2.0),
-            global_idle_limit: Some(1800),
+            global_ratio_limit: default_global_ratio_limit(),
+            global_idle_limit: default_global_idle_limit(),
         }
     }
 }

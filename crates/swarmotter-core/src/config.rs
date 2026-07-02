@@ -107,7 +107,7 @@ impl Default for StorageConfig {
 pub struct TorrentConfig {
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub allow_ipv6: bool,
     /// Whether uTP (BEP 29) peer connections are enabled. When true, the
     /// engine attempts uTP for peer candidates (with TCP fallback per
@@ -140,7 +140,7 @@ impl Default for TorrentConfig {
     fn default() -> Self {
         Self {
             listen_port: default_listen_port(),
-            allow_ipv6: false,
+            allow_ipv6: true,
             utp_enabled: default_utp_enabled(),
             utp_prefer_tcp: true,
             selfish: false,
@@ -358,7 +358,60 @@ mod tests {
         assert!(cfg.validate().is_ok());
         assert_eq!(cfg.torrent.listen_port, 51413);
         assert_eq!(cfg.api.bind_address, "127.0.0.1:9091");
+        assert!(cfg.network.allow_ipv6);
+        assert!(cfg.torrent.allow_ipv6);
+        assert!(cfg.torrent.utp_enabled);
         assert!(!cfg.torrent.selfish);
+    }
+
+    #[test]
+    fn partial_interface_network_config_defaults_to_strict_ipv6_enabled() {
+        let toml = r#"
+[api]
+bind_address = "0.0.0.0:9091"
+
+[storage]
+download_dir = "/mnt/incoming/swarmotter/downloads"
+incomplete_dir = "/mnt/incoming/swarmotter/incomplete"
+
+[network]
+required_interface = "br0"
+
+[torrent]
+listen_port = 51413
+selfish = true
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(
+            cfg.network.mode,
+            crate::models::network::NetworkContainmentMode::Strict
+        );
+        assert_eq!(cfg.network.required_interface.as_deref(), Some("br0"));
+        assert!(cfg.network.allow_ipv6);
+        assert!(cfg.torrent.allow_ipv6);
+        assert!(cfg.torrent.selfish);
+    }
+
+    #[test]
+    fn partial_runtime_limit_tables_use_defaults() {
+        let toml = r#"
+[bandwidth]
+global_download = 1024
+
+[queue]
+max_active_downloads = 2
+
+[seeding]
+global_ratio_limit = 1.5
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.bandwidth.global_download, 1024);
+        assert_eq!(cfg.bandwidth.global_upload, 0);
+        assert_eq!(cfg.queue.max_active_downloads, 2);
+        assert_eq!(cfg.queue.max_active_seeds, 5);
+        assert!(cfg.queue.auto_start);
+        assert_eq!(cfg.seeding.global_ratio_limit, Some(1.5));
+        assert_eq!(cfg.seeding.global_idle_limit, Some(1800));
     }
 
     #[test]

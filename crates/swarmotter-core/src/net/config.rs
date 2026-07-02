@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 /// Network containment configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
+    #[serde(default = "default_network_mode")]
     pub mode: NetworkContainmentMode,
     /// Required interface name (e.g. `tun0`).
     #[serde(default)]
@@ -22,8 +23,9 @@ pub struct NetworkConfig {
     /// Required Linux network namespace name.
     #[serde(default)]
     pub required_network_namespace: Option<String>,
-    /// Whether IPv6 torrent traffic is allowed (default false to reduce leaks).
-    #[serde(default)]
+    /// Whether IPv6 torrent traffic is allowed. Dual-stack is enabled by
+    /// default for throughput; strict mode still requires an enforceable path.
+    #[serde(default = "default_true")]
     pub allow_ipv6: bool,
     /// Fail closed in strict mode when the path is unavailable.
     #[serde(default = "default_true")]
@@ -40,6 +42,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_network_mode() -> NetworkContainmentMode {
+    NetworkContainmentMode::Strict
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
@@ -48,7 +54,7 @@ impl Default for NetworkConfig {
             required_source_ipv4: None,
             required_source_ipv6: None,
             required_network_namespace: None,
-            allow_ipv6: false,
+            allow_ipv6: true,
             fail_closed: true,
             validate_route: false,
             validate_dns: false,
@@ -129,6 +135,14 @@ mod tests {
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn strict_mode_defaults_for_partial_network_table() {
+        let cfg: NetworkConfig = toml::from_str(r#"required_interface = "br0""#).unwrap();
+        assert_eq!(cfg.mode, NetworkContainmentMode::Strict);
+        assert!(cfg.allow_ipv6);
+        assert_eq!(cfg.required_interface.as_deref(), Some("br0"));
     }
 
     #[test]

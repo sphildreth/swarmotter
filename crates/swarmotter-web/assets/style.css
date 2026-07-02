@@ -24,6 +24,8 @@ header {
   border-bottom: 1px solid var(--border);
 }
 header h1 { margin: 0; font-size: 1.2rem; }
+.brand { display: flex; align-items: center; gap: 0.5rem; }
+.brand img { display: block; width: 28px; height: 28px; }
 nav { display: flex; gap: 0.3rem; }
 .nav {
   background: transparent;
@@ -44,6 +46,21 @@ nav { display: flex; gap: 0.3rem; }
 }
 .badge.ok { background: var(--accent); color: #111; }
 .badge.bad { background: var(--danger); }
+#drop-status { min-width: 8rem; text-align: right; }
+#drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.72);
+  border: 2px dashed var(--accent);
+  color: var(--fg);
+  font-size: 1.1rem;
+  font-weight: 600;
+  pointer-events: none;
+}
+#drop-overlay.hidden { display: none; }
 main { padding: 1rem; max-width: 1200px; margin: 0 auto; }
 .view.hidden { display: none; }
 .toolbar { display: flex; gap: 1rem; align-items: center; margin-bottom: 0.8rem; }

@@ -198,10 +198,78 @@ $("#add-file-btn").addEventListener("click", async () => {
   try {
     const file = $("#torrent-file").files[0];
     if (!file) { $("#add-file-result").textContent = "Choose a file"; return; }
-    const buf = await file.arrayBuffer();
-    const h = await api("/torrents/file", { method: "POST", headers: { "content-type": "application/octet-stream" }, body: buf });
+    const h = await uploadTorrentFile(file);
     $("#add-file-result").textContent = "Added: " + h;
   } catch (e) { $("#add-file-result").textContent = "Error: " + e.message; }
+});
+
+async function uploadTorrentFile(file) {
+  const buf = await file.arrayBuffer();
+  return api("/torrents/file", {
+    method: "POST",
+    headers: { "content-type": "application/octet-stream" },
+    body: buf
+  });
+}
+
+function torrentFilesFromTransfer(items) {
+  return Array.from(items || []).filter(file => file.name.toLowerCase().endsWith(".torrent"));
+}
+
+async function uploadDroppedFiles(files) {
+  const torrents = torrentFilesFromTransfer(files);
+  const status = $("#drop-status");
+  if (torrents.length === 0) {
+    status.textContent = "No .torrent file found";
+    return;
+  }
+  status.textContent = `Adding ${torrents.length} file${torrents.length === 1 ? "" : "s"}...`;
+  let added = 0;
+  for (const file of torrents) {
+    try {
+      await uploadTorrentFile(file);
+      added++;
+    } catch (e) {
+      status.textContent = `Error adding ${file.name}: ${e.message}`;
+      log(`drop upload error (${file.name}): ${e.message}`);
+      return;
+    }
+  }
+  status.textContent = `Added ${added} file${added === 1 ? "" : "s"}`;
+  refreshTorrents();
+}
+
+let dragDepth = 0;
+function setDropActive(active) {
+  $("#drop-overlay").classList.toggle("hidden", !active);
+}
+
+function hasDroppedFiles(e) {
+  return e.dataTransfer && Array.from(e.dataTransfer.types || []).includes("Files");
+}
+
+document.addEventListener("dragenter", (e) => {
+  if (!hasDroppedFiles(e)) return;
+  e.preventDefault();
+  dragDepth++;
+  setDropActive(true);
+});
+document.addEventListener("dragover", (e) => {
+  if (!hasDroppedFiles(e)) return;
+  e.preventDefault();
+  e.dataTransfer.dropEffect = "copy";
+});
+document.addEventListener("dragleave", (e) => {
+  if (!hasDroppedFiles(e)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) setDropActive(false);
+});
+document.addEventListener("drop", (e) => {
+  if (!hasDroppedFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  setDropActive(false);
+  uploadDroppedFiles(e.dataTransfer.files);
 });
 
 // --- Network ---

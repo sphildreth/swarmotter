@@ -7,6 +7,8 @@ cases and user responsibilities.
 This document is project policy, not legal advice. It does not replace review
 by qualified legal counsel where needed.
 
+For user-facing lawful-use guidance, see `docs/lawful-use.md`.
+
 ## Appropriate lawful use cases
 
 SwarmOtter is intended for lawful downloading, sharing, and seeding of content
@@ -47,9 +49,3 @@ content, does not index content, and does not provide legal advice.
 VPN/NIC containment is a routing-correctness, privacy-preserving, and
 operational-safety feature. It is documented as network containment and
 fail-closed behavior — not as a way to hide piracy or evade enforcement.
-
-## TODO
-
-- Add links to example lawful torrent sources (e.g., official Linux
-  distribution torrent pages) as documentation matures.
-- Coordinate wording with `README.md` and `legal.md`.

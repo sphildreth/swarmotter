@@ -38,6 +38,13 @@ status.
   torrent data-plane sockets to all current addresses on a configured interface
   such as `br0`, avoiding fixed source IP configuration for DHCP/SLAAC
   interfaces.
+- **mdBook user guide:** `book.toml` now uses `docs/` as the mdBook source
+  root, with operator-facing documentation for getting started,
+  configuration, network containment, deployment, Web UI usage,
+  troubleshooting, lawful use, and legal/content policy.
+- **Web UI assets and upload ergonomics:** the embedded Web UI now serves the
+  favicon/app-manifest assets, displays the SwarmOtter icon in the header, and
+  accepts `.torrent` drag-and-drop uploads anywhere in the app window.
 - Repository scaffolding: governance documentation, ADR process, legal design
   docs, GitHub templates, and a minimal Rust workspace skeleton.
 - ADRs 0001 through 0008 recording foundational project decisions.
@@ -206,6 +213,14 @@ status.
 - `[storage].preallocate` is now honored by the live engine. When disabled, the
   engine creates required directories and writes pieces as needed instead of
   pre-sizing all files.
+- Partial `[network]` tables that specify a path such as
+  `required_interface = "br0"` now default to strict mode, so DHCP/SLAAC-safe
+  interface binding no longer requires a redundant `mode` field.
+- Partial `[bandwidth]`, `[queue]`, and `[seeding]` tables now apply documented
+  defaults for omitted fields instead of requiring every field in the table.
+- IPv6 torrent networking is enabled by default in both `[network]` and
+  `[torrent]`, while strict containment still blocks traffic unless the
+  configured path is enforceable.
 - Strict fail-closed containment now requires an enforceable socket path:
   `required_interface`, `required_source_ipv4`, `required_source_ipv6`, or
   `required_network_namespace`.

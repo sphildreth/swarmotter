@@ -4,11 +4,20 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SwarmOtter</title>
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48x48.png">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/site.webmanifest">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
   <header>
-    <h1>SwarmOtter</h1>
+    <div class="brand">
+      <img src="/swarmotter-icon-48x48.png" width="28" height="28" alt="">
+      <h1>SwarmOtter</h1>
+    </div>
     <nav>
       <button data-view="torrents" class="nav active">Torrents</button>
       <button data-view="add" class="nav">Add</button>
@@ -17,8 +26,13 @@
       <button data-view="watch" class="nav">Watch</button>
       <button data-view="logs" class="nav">Logs</button>
     </nav>
+    <div id="drop-status" class="muted" aria-live="polite"></div>
     <div id="health-badge" class="badge">unknown</div>
   </header>
+
+  <div id="drop-overlay" class="hidden" aria-hidden="true">
+    <div>Drop .torrent file to add</div>
+  </div>
 
   <main>
     <!-- Torrents view -->

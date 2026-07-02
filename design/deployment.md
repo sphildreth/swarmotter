@@ -4,6 +4,8 @@ This document describes SwarmOtter deployment. It covers Linux daemon,
 systemd, container, and VPN network-namespace deployment with strict network
 containment and fail-closed behavior.
 
+For operator-facing setup instructions, see `docs/deployment.md`.
+
 ## Supported deployment models
 
 - Linux daemon deployment.
@@ -102,7 +104,7 @@ the path without losing control of the daemon.
 
 ### Network health states
 
-See `design/vpn-network-containment.md` for the full list of health states
+See `docs/network-containment.md` for the full list of health states
 (`healthy`, `disabled`, `interface_missing`, `interface_down`,
 `no_interface_address`, `source_address_missing`, `route_invalid`,
 `socket_bind_failed`, `dns_not_constrained`,
@@ -176,8 +178,7 @@ See `config/swarmotter.toml.example` for a complete annotated configuration.
 
 SwarmOtter is a general-purpose BitTorrent client for lawful downloading,
 sharing, and seeding of content that users have the right to access and
-distribute. See `design/lawful-use.md`, `design/content-policy.md`, and
-`design/legal.md`.
+distribute. See `docs/lawful-use.md` and `docs/legal.md`.
 
 ## License and dependency licenses
 

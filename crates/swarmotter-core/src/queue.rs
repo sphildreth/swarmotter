@@ -13,19 +13,34 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueLimits {
     /// Max simultaneously downloading torrents (0 = unlimited).
+    #[serde(default = "default_max_active_downloads")]
     pub max_active_downloads: usize,
     /// Max simultaneously seeding torrents (0 = unlimited).
+    #[serde(default = "default_max_active_seeds")]
     pub max_active_seeds: usize,
     /// Whether newly added torrents auto-start or queue.
+    #[serde(default = "default_auto_start")]
     pub auto_start: bool,
+}
+
+fn default_max_active_downloads() -> usize {
+    5
+}
+
+fn default_max_active_seeds() -> usize {
+    5
+}
+
+fn default_auto_start() -> bool {
+    true
 }
 
 impl Default for QueueLimits {
     fn default() -> Self {
         Self {
-            max_active_downloads: 5,
-            max_active_seeds: 5,
-            auto_start: true,
+            max_active_downloads: default_max_active_downloads(),
+            max_active_seeds: default_max_active_seeds(),
+            auto_start: default_auto_start(),
         }
     }
 }

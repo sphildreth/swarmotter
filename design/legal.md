@@ -4,6 +4,8 @@ This document summarizes SwarmOtter's plain-language legal posture. It is
 project policy and documentation, **not legal advice**. It does not replace
 review by qualified legal counsel where needed.
 
+For user-facing legal and content policy guidance, see `docs/legal.md`.
+
 ## Project posture
 
 - SwarmOtter is a neutral, general-purpose BitTorrent client.
@@ -29,6 +31,8 @@ Lawful-use expectations are documented in:
 - `design/lawful-use.md`
 - `design/content-policy.md`
 - This document.
+- `docs/lawful-use.md`
+- `docs/legal.md`
 
 ## Branding and trademark
 
@@ -41,11 +45,3 @@ be stated clearly here or in a dedicated branding policy.
 
 SwarmOtter documentation does not provide legal advice. Where specific legal
 questions arise, users and contributors should consult qualified legal counsel.
-
-## TODO
-
-- Decide and document whether logo/brand assets are licensed under
-  Apache-2.0 or reserved under separate brand/trademark rules.
-- Add a `NOTICE.md` if required by the license or dependencies before
-  `v1.0.0`.
-- Coordinate wording with `README.md`, `lawful-use.md`, and `content-policy.md`.

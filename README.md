@@ -90,7 +90,7 @@ The daemon **fails closed** and never silently falls back to the default route
 if the configured path is unavailable. The Web UI/API control plane is separate
 from the torrent data plane.
 
-See [`design/vpn-network-containment.md`](design/vpn-network-containment.md).
+See [`docs/network-containment.md`](docs/network-containment.md).
 
 ## Lawful Use
 
@@ -108,9 +108,8 @@ legal advice.
 
 See:
 
-- [`design/lawful-use.md`](design/lawful-use.md)
-- [`design/content-policy.md`](design/content-policy.md)
-- [`design/legal.md`](design/legal.md)
+- [`docs/lawful-use.md`](docs/lawful-use.md)
+- [`docs/legal.md`](docs/legal.md)
 
 ## Developer Onboarding
 
@@ -160,7 +159,8 @@ swarmotter/
 │   ├── swarmotter-core/       # Core types and engine logic
 │   ├── swarmotter-api/        # API layer
 │   └── swarmotter-web/        # Embedded/static web support
-├── design/                    # Requirements, architecture, legal, ADRs
+├── docs/                      # User guide and operator documentation
+├── design/                    # Requirements, architecture, policy, ADRs
 │   ├── requirements.md
 │   ├── architecture.md
 │   ├── api.md
@@ -247,23 +247,31 @@ A conceptual Podman/Docker-style layout:
 ```
 
 An example Dockerfile is provided in `deploy/Dockerfile`; see
-[`design/deployment.md`](design/deployment.md) for container, VPN
+[`docs/deployment.md`](docs/deployment.md) for container, VPN
 network-namespace, and reverse-proxy setup.
 
-See [`design/deployment.md`](design/deployment.md).
+See [`docs/deployment.md`](docs/deployment.md).
 
 ## Documentation
 
+User-facing documentation:
+
+- [User guide](docs/index.md)
+- [Configuration](docs/configuration.md)
+- [Network containment](docs/network-containment.md)
+- [Deployment](docs/deployment.md)
+- [Troubleshooting](docs/troubleshooting.md)
+- [Lawful use](docs/lawful-use.md)
+- [Legal and content policy](docs/legal.md)
+
+Project design documentation:
+
 - [Requirements](design/requirements.md)
 - [Architecture](design/architecture.md)
-- [API](design/api.md)
-- [Configuration](design/configuration.md)
-- [VPN / network containment](design/vpn-network-containment.md)
-- [Deployment](design/deployment.md)
-- [Testing](design/testing.md)
-- [Lawful use](design/lawful-use.md)
-- [Content policy](design/content-policy.md)
-- [Legal posture](design/legal.md)
+- [API design](design/api.md)
+- [Configuration design](design/configuration.md)
+- [Network containment design](design/vpn-network-containment.md)
+- [Testing design](design/testing.md)
 - [ADRs](design/adr/README.md)
 
 ## Contributing
@@ -275,8 +283,7 @@ Contributions are welcome. To contribute:
 - Create or update an ADR in [`design/adr/`](design/adr/) for decisions with
   lasting architectural, legal, release, dependency, or containment impact.
 - Do **not** submit piracy-oriented features, indexers, infringing magnets, or
-  copyrighted-content examples — see
-  [`design/content-policy.md`](design/content-policy.md).
+  copyrighted-content examples; see [`docs/legal.md`](docs/legal.md).
 - Run `cargo fmt`, `cargo check`, and `cargo test` before considering work
   done.
 

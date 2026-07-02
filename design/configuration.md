@@ -3,6 +3,9 @@
 This document describes SwarmOtter's configuration model. The implementation
 lives in `swarmotter-core::config`.
 
+For operator-facing examples and option reference, see
+`docs/configuration.md`.
+
 ## Sources
 
 SwarmOtter is configured through a TOML configuration file plus environment

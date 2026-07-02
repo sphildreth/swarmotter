@@ -15,17 +15,24 @@ use std::time::Duration;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BandwidthLimits {
     /// Bytes/sec global download (0 = unlimited).
+    #[serde(default)]
     pub global_download: u64,
     /// Bytes/sec global upload (0 = unlimited).
+    #[serde(default)]
     pub global_upload: u64,
     /// Alternate speed limits (applied when enabled).
+    #[serde(default)]
     pub alt_download: u64,
+    #[serde(default)]
     pub alt_upload: u64,
     /// Whether alternate speed mode is active.
+    #[serde(default)]
     pub alt_enabled: bool,
     /// Max peers globally (0 = unlimited).
+    #[serde(default)]
     pub max_peers: usize,
     /// Max peers per torrent (0 = unlimited).
+    #[serde(default)]
     pub max_peers_per_torrent: usize,
 }
 

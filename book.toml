@@ -1,0 +1,12 @@
+[book]
+title = "SwarmOtter User Guide"
+authors = ["SwarmOtter contributors"]
+description = "User-facing documentation for configuring and operating SwarmOtter."
+src = "docs"
+language = "en"
+multilingual = false
+
+[output.html]
+git-repository-url = "https://github.com/sphildreth/swarmotter"
+edit-url-template = "https://github.com/sphildreth/swarmotter/edit/main/{path}"
+site-url = "/"
