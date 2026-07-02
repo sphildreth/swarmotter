@@ -1,0 +1,90 @@
+# VPN/NIC Network Containment
+
+This document defines SwarmOtter's network containment requirements. It is a
+core `v1.0.0` requirement (see ADR-0005 and `requirements.md`).
+
+This feature is documented as routing correctness, privacy-preserving network
+design, operational safety, container networking, and fail-closed behavior. It
+is **not** a piracy-evasion feature. See `content-policy.md` for prohibited
+wording.
+
+## Requirement
+
+All torrent-related traffic must be forced through a configured network path,
+such as a VPN interface, source IP address, network namespace, container
+network stack, or explicitly configured NIC.
+
+## Traffic covered
+
+Network containment applies to **all** torrent-related traffic, including:
+
+- Peer TCP connections.
+- Peer UDP/uTP traffic.
+- DHT UDP traffic.
+- PEX-discovered peer connections.
+- UDP tracker announces.
+- HTTP tracker announces.
+- HTTPS tracker announces.
+- Webseed HTTP/HTTPS traffic.
+- Magnet metadata fetching.
+- DNS resolution used for torrent, tracker, peer, and webseed operations.
+
+## Control plane vs data plane
+
+The control API and Web UI are separate from torrent data traffic. The API/Web
+UI may bind to localhost, a LAN address, or a reverse proxy listener. Torrent
+data traffic binds separately to the configured VPN/NIC path. Exposing the Web
+UI or API on LAN must not allow torrent peer, tracker, DHT, or webseed traffic
+to use the LAN/default network path.
+
+## Fail-closed behavior
+
+The application must fail closed and never silently fall back to the default
+route.
+
+If strict network containment is enabled and the configured network path is
+unavailable, torrent networking must stop. Fail-closed conditions include:
+
+- Required interface does not exist.
+- Required interface exists but is down.
+- Required interface has no usable IP address.
+- Required source IP is no longer assigned.
+- Required route is missing or invalid.
+- VPN network namespace is unavailable.
+- DNS behavior cannot be constrained as configured.
+- Socket binding fails.
+
+When a fail-closed condition occurs:
+
+- Existing torrent network sockets must be closed.
+- New torrent network connections must be blocked.
+- Torrents enter a clear network-blocked state.
+- The API must report the network containment failure.
+- The Web UI must show the network containment failure.
+- Logs must clearly identify the failed requirement.
+
+## Network health states
+
+Required states include `healthy`, `disabled`, `interface_missing`,
+`interface_down`, `no_interface_address`, `source_address_missing`,
+`route_invalid`, `socket_bind_failed`, `dns_not_constrained`,
+`network_namespace_unavailable`, and `blocked_fail_closed`.
+
+## Acceptance criteria
+
+- The daemon refuses to start torrent networking when strict mode is enabled and
+  the required interface is missing.
+- The daemon blocks torrent traffic when the configured VPN/NIC path disappears
+  while running.
+- Peer, tracker, DHT, and webseed traffic cannot fall back to the default
+  route.
+- DNS behavior is either constrained or explicitly disabled for unsafe
+  operations.
+- API/Web UI traffic remains independently configurable.
+
+## TODO
+
+- Specify the network binding abstraction API used by the engine.
+- Specify DNS containment strategy.
+- Add platform-specific interface/source discovery details.
+- Keep this document aligned with `architecture.md` and `configuration.md`.

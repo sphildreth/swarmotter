@@ -1,0 +1,10 @@
+[package]
+name = "swarmotter-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "API layer for SwarmOtter"
+
+[dependencies]

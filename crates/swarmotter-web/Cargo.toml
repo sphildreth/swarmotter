@@ -1,0 +1,10 @@
+[package]
+name = "swarmotter-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Embedded and static web support for SwarmOtter"
+
+[dependencies]
