@@ -1,0 +1,33 @@
+{
+  "$schema": "https://app.kilo.ai/config.json",
+
+  "model": "llamacpp/qwen3-coder-rust",
+
+  "provider": {
+    "llamacpp": {
+      "options": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "local",
+        "timeout": 600000
+      },
+      "models": {
+        "qwen3-coder-rust": {
+          "id": "qwen3-coder-rust",
+          "name": "Qwen3-Coder 30B-A3B UD-Q4_K_XL via llama.cpp",
+          "tool_call": true,
+          "reasoning": false,
+          "temperature": true,
+          "limit": {
+            "context": 131072,
+            "input": 98304,
+            "output": 8192
+          },
+          "modalities": {
+            "input": ["text"],
+            "output": ["text"]
+          }
+        }
+      }
+    }
+  }
+}
