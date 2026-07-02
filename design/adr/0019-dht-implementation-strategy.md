@@ -31,8 +31,9 @@ The engine integrates DHT for trackerless and supplemental discovery: for
 non-private torrents it asks the DHT for peers holding the info hash and
 merges results into the candidate pool; for trackerless magnets the metadata
 fetch falls back to DHT-discovered peers. Private torrents skip DHT entirely.
-Bootstrap node strings (`host:port`) are resolved via std, subject to DNS
-containment validation at the config layer.
+Bootstrap node strings (`host:port`) are resolved through
+`NetworkBinder::resolve_host()`, so hostname resolution follows the same
+containment and DNS validation policy as tracker resolution.
 
 ## Consequences
 

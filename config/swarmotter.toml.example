@@ -10,6 +10,8 @@ bind_address = "127.0.0.1:9091"
 # Set require_auth = true and auth_token to enable API authentication.
 require_auth = false
 # auth_token = "change-me"
+# Maximum API request body size in bytes.
+max_request_body_bytes = 16777216
 
 # --- Storage ---
 [storage]

@@ -115,7 +115,7 @@ impl DaemonRuntime {
             return;
         }
 
-        let (meta, download_dir, listen_port, magnet, needs_metadata) = {
+        let (meta, download_dir, listen_port, preallocate, magnet, needs_metadata) = {
             let reg = self.registry.lock().await;
             let Some(t) = reg.get(&hash) else {
                 return;
@@ -130,10 +130,12 @@ impl DaemonRuntime {
             } else {
                 None
             };
+            let preallocate = self.config.lock().await.storage.preallocate;
             (
                 t.meta.clone(),
                 download_dir,
                 self.config.lock().await.torrent.listen_port,
+                preallocate,
                 magnet,
                 t.needs_metadata,
             )
@@ -185,13 +187,18 @@ impl DaemonRuntime {
         // DHT runner for trackerless peer discovery. Gated by config and
         // containment; the engine disables DHT for private torrents.
         let dht_runner = {
-            let cfg = self.config.lock().await;
-            if cfg.dht.enabled && self.network_health.lock().await.traffic_allowed {
-                let bootstrap = crate::dht::resolve_bootstrap(&cfg.dht.bootstrap_nodes);
+            let (dht_enabled, bootstrap_nodes) = {
+                let cfg = self.config.lock().await;
+                (cfg.dht.enabled, cfg.dht.bootstrap_nodes.clone())
+            };
+            if dht_enabled && self.network_health.lock().await.traffic_allowed {
+                let bootstrap =
+                    crate::dht::resolve_bootstrap_with_binder(binder.as_ref(), &bootstrap_nodes)
+                        .await;
                 let self_id = crate::dht::DhtRunner::derive_from_peer_id(&peer_id);
                 Some(Arc::new(crate::dht::DhtRunner::new(
                     self_id,
-                    self.make_binder().await,
+                    binder.clone(),
                     bootstrap,
                 )))
             } else {
@@ -211,7 +218,8 @@ impl DaemonRuntime {
             magnet,
         )
         .with_global_limiter(Some(self.global_limiter.clone()))
-        .with_transport(utp_enabled, utp_prefer_tcp);
+        .with_transport(utp_enabled, utp_prefer_tcp)
+        .with_preallocate(preallocate);
         if let Some(dht) = dht_runner {
             engine = engine.with_dht(dht);
         }

@@ -88,6 +88,11 @@ pub trait NetworkBinder: Send + Sync {
     /// `vpn-network-containment.md`).
     async fn http_get(&self, url: &str) -> Result<HttpResponse>;
 
+    /// Resolve a torrent data-plane hostname through the contained path's DNS
+    /// policy. IP literals return directly; hostnames must not be resolved
+    /// before this binder has enforced containment.
+    async fn resolve_host(&self, host: &str, port: u16) -> Result<SocketAddr>;
+
     /// Create a contained UDP socket bound to a local ephemeral port (and the
     /// configured source address/interface in the real binder). Used by UDP
     /// trackers and DHT. Never bypasses containment.
@@ -149,6 +154,17 @@ impl NetworkBinder for LoopbackBinder {
             .await
             .map_err(CoreError::from)?;
         parse_http_response(&buf)
+    }
+
+    async fn resolve_host(&self, host: &str, port: u16) -> Result<SocketAddr> {
+        match host.parse() {
+            Ok(ip) => Ok(SocketAddr::new(ip, port)),
+            Err(_) => {
+                let mut iter = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))?;
+                iter.next()
+                    .ok_or_else(|| CoreError::Internal(format!("host {host} unresolvable")))
+            }
+        }
     }
 
     async fn udp_socket(&self) -> Result<Box<dyn ContainedUdpSocket>> {
@@ -235,6 +251,12 @@ impl NetworkBinder for BlockedBinder {
     }
 
     async fn http_get(&self, _url: &str) -> Result<HttpResponse> {
+        Err(CoreError::NetworkBlocked(
+            "torrent data plane blocked".into(),
+        ))
+    }
+
+    async fn resolve_host(&self, _host: &str, _port: u16) -> Result<SocketAddr> {
         Err(CoreError::NetworkBlocked(
             "torrent data plane blocked".into(),
         ))

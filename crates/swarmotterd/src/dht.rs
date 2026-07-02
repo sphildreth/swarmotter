@@ -188,6 +188,7 @@ impl DhtRunner {
 }
 
 /// Resolve configured bootstrap node strings ("host:port") to SocketAddrs.
+#[cfg(test)]
 pub fn resolve_bootstrap(specs: &[String]) -> Vec<SocketAddr> {
     let mut out = Vec::new();
     for s in specs {
@@ -201,6 +202,30 @@ pub fn resolve_bootstrap(specs: &[String]) -> Vec<SocketAddr> {
                     if let Some(addr) = iter.next() {
                         out.push(addr);
                     }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Resolve configured bootstrap node strings through the containment binder.
+/// IP literals are accepted directly; hostnames must pass the binder's DNS
+/// policy so DHT bootstrap cannot resolve outside fail-closed containment.
+pub async fn resolve_bootstrap_with_binder(
+    binder: &dyn NetworkBinder,
+    specs: &[String],
+) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    for s in specs {
+        if let Ok(addr) = s.parse::<SocketAddr>() {
+            out.push(addr);
+            continue;
+        }
+        if let Some((host, port)) = s.rsplit_once(':') {
+            if let Ok(port) = port.parse::<u16>() {
+                if let Ok(addr) = binder.resolve_host(host, port).await {
+                    out.push(addr);
                 }
             }
         }

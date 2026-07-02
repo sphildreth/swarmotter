@@ -67,15 +67,11 @@ impl InterfaceProbe for OsInterfaceProbe {
     }
 
     fn source_assigned(&self, addr: &str, _iface: Option<&str>) -> bool {
-        // Resolve local addresses via std and check membership.
         let target: IpAddr = match addr.parse() {
             Ok(a) => a,
             Err(_) => return false,
         };
-        if let Ok(addrs) = std::net::ToSocketAddrs::to_socket_addrs(&format!("{}:0", addr)) {
-            return addrs.map(|s| s.ip()).any(|ip| ip == target);
-        }
-        false
+        std::net::TcpListener::bind(std::net::SocketAddr::new(target, 0)).is_ok()
     }
 
     fn route_valid(&self, _config: &NetworkConfig) -> bool {
@@ -90,9 +86,28 @@ impl InterfaceProbe for OsInterfaceProbe {
     }
 
     fn namespace_available(&self, ns: &str) -> bool {
-        // /var/run/netns/<ns> existence on Linux.
-        std::path::Path::new("/var/run/netns").join(ns).exists()
+        namespace_is_current(ns)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn namespace_is_current(ns: &str) -> bool {
+    let configured = std::path::Path::new("/var/run/netns").join(ns);
+    if !configured.exists() {
+        return false;
+    }
+    let Ok(current) = std::fs::read_link("/proc/self/ns/net") else {
+        return false;
+    };
+    let Ok(configured) = std::fs::read_link(configured) else {
+        return false;
+    };
+    current == configured
+}
+
+#[cfg(not(target_os = "linux"))]
+fn namespace_is_current(_ns: &str) -> bool {
+    false
 }
 
 #[cfg(test)]

@@ -36,6 +36,10 @@ pub struct FakeDaemon {
 
 impl FakeDaemon {
     pub fn new() -> Self {
+        Self::with_config(Config::default())
+    }
+
+    pub fn with_config(config: Config) -> Self {
         let mut health = NetworkHealth::blocked(
             NetworkContainmentMode::Disabled,
             NetworkContainmentStatus::Disabled,
@@ -44,7 +48,7 @@ impl FakeDaemon {
         health.traffic_allowed = true;
         Self {
             registry: Arc::new(Mutex::new(TorrentRegistry::default())),
-            config: Arc::new(Mutex::new(Config::default())),
+            config: Arc::new(Mutex::new(config)),
             health: Arc::new(Mutex::new(health)),
             events: Arc::new(Mutex::new(Vec::new())),
             watch_imports: Arc::new(Mutex::new(Vec::new())),
@@ -364,10 +368,14 @@ fn now() -> u64 {
 
 /// Build a shared state backed by a fresh fake daemon.
 pub fn fake_state() -> swarmotter_api::state::SharedState {
+    fake_state_with_config(Config::default())
+}
+
+pub fn fake_state_with_config(config: Config) -> swarmotter_api::state::SharedState {
     use swarmotter_api::state::{AppState, BuildInfo};
     Arc::new(AppState {
-        daemon: Arc::new(FakeDaemon::new()),
-        config: Arc::new(Mutex::new(Config::default())),
+        daemon: Arc::new(FakeDaemon::with_config(config.clone())),
+        config: Arc::new(Mutex::new(config)),
         build: BuildInfo::default(),
         broker: swarmotter_api::handlers::events::EventBroker::default(),
     })

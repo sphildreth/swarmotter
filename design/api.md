@@ -41,6 +41,17 @@ HTTP status codes reflect the error class: 400 (bad input), 404 (not found),
 error codes are derived from the core error model
 (`swarmotter-core::error::CoreError`).
 
+## Authentication and Limits
+
+When `api.require_auth = true`, every `/api/v1` route requires the configured
+token via either `Authorization: Bearer <token>` or
+`X-SwarmOtter-Auth: <token>`. Startup validation rejects this mode unless
+`api.auth_token` is set. `GET /api/v1/settings` never returns the token value.
+
+API request bodies are capped by `api.max_request_body_bytes`; this applies to
+JSON requests and raw `.torrent` uploads. The root `/health` alias remains a
+control-plane health endpoint outside `/api/v1`.
+
 ## Endpoints
 
 All routes are prefixed with `/api/v1`. A root `/health` alias also exists.
@@ -111,7 +122,7 @@ All routes are prefixed with `/api/v1`. A root `/health` alias also exists.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/settings` | Get configuration |
+| GET | `/settings` | Get configuration (API auth token redacted) |
 | PATCH | `/settings` | Update safe runtime settings (bandwidth/queue/seeding) |
 
 ### Network

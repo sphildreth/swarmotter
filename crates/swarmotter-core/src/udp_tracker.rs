@@ -50,7 +50,7 @@ pub async fn udp_announce_with_iters(
     req: &AnnounceRequest,
     retries: u32,
 ) -> Result<AnnounceResponse> {
-    let addr = resolve_udp_tracker(&req.tracker_url)?;
+    let addr = resolve_udp_tracker(binder, &req.tracker_url).await?;
     let socket = binder.udp_socket().await?;
 
     let mut last_err: Option<String> = None;
@@ -70,9 +70,9 @@ pub async fn udp_announce_with_iters(
 }
 
 /// Resolve a `udp://host:port[/path]` tracker URL to a `SocketAddr`.
-/// Hostnames are resolved via std (subject to DNS containment validation at
-/// the config layer); IP-literal hosts require no resolution.
-fn resolve_udp_tracker(url: &str) -> Result<SocketAddr> {
+/// Hostnames are resolved through the binder after containment enforcement;
+/// IP-literal hosts require no external resolution.
+async fn resolve_udp_tracker(binder: &dyn NetworkBinder, url: &str) -> Result<SocketAddr> {
     let parsed = url::Url::parse(url)
         .map_err(|e| CoreError::Internal(format!("bad udp tracker url: {e}")))?;
     if parsed.scheme() != "udp" {
@@ -86,14 +86,7 @@ fn resolve_udp_tracker(url: &str) -> Result<SocketAddr> {
     let port = parsed
         .port()
         .ok_or_else(|| CoreError::Internal(format!("udp tracker url missing port: {url}")))?;
-    match host.parse::<IpAddr>() {
-        Ok(ip) => Ok(SocketAddr::new(ip, port)),
-        Err(_) => {
-            let mut iter = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))?;
-            iter.next()
-                .ok_or_else(|| CoreError::Internal(format!("udp tracker host {host} unresolvable")))
-        }
-    }
+    binder.resolve_host(host, port).await
 }
 
 /// One BEP 15 connect + announce attempt. Returns the parsed announce
@@ -396,11 +389,20 @@ mod tests {
         assert!(decode_announce(&buf).is_err());
     }
 
-    #[test]
-    fn resolve_udp_tracker_rejects_non_udp_and_missing_port() {
-        assert!(resolve_udp_tracker("http://h/announce").is_err());
-        assert!(resolve_udp_tracker("udp://h/announce").is_err());
-        assert!(resolve_udp_tracker("udp://127.0.0.1:6881/announce").is_ok());
+    #[tokio::test]
+    async fn resolve_udp_tracker_rejects_non_udp_and_missing_port() {
+        let binder = crate::net::binder::LoopbackBinder;
+        assert!(resolve_udp_tracker(&binder, "http://h/announce")
+            .await
+            .is_err());
+        assert!(resolve_udp_tracker(&binder, "udp://h/announce")
+            .await
+            .is_err());
+        assert!(
+            resolve_udp_tracker(&binder, "udp://127.0.0.1:6881/announce")
+                .await
+                .is_ok()
+        );
     }
 
     /// A real UDP tracker fixture: responds to a connect then an announce with

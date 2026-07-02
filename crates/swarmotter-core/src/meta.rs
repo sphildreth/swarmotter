@@ -122,6 +122,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta> {
     let name = get_str(info, b"name")
         .ok_or_else(|| CoreError::MalformedTorrent("missing 'name'".into()))?
         .to_string();
+    validate_path_component(&name, "torrent name")?;
     if name.is_empty() {
         return Err(CoreError::MalformedTorrent("empty 'name'".into()));
     }
@@ -194,6 +195,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta> {
                     let s = p.as_str_utf8().ok_or_else(|| {
                         CoreError::MalformedTorrent("path component not utf8".into())
                     })?;
+                    validate_path_component(s, "file path component")?;
                     full_path.push(s.to_string());
                 }
                 if path_vals.is_empty() {
@@ -280,6 +282,33 @@ fn get_int(dict: &[(Vec<u8>, Value)], key: &[u8]) -> Option<i64> {
     dict.iter()
         .find(|(k, _)| k == key)
         .and_then(|(_, v)| v.as_int())
+}
+
+fn validate_path_component(value: &str, kind: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(CoreError::MalformedTorrent(format!("{kind} is empty")));
+    }
+    if value == "." || value == ".." {
+        return Err(CoreError::MalformedTorrent(format!(
+            "{kind} cannot be relative traversal component"
+        )));
+    }
+    if value.starts_with('/') || value.starts_with('\\') {
+        return Err(CoreError::MalformedTorrent(format!(
+            "{kind} cannot be absolute"
+        )));
+    }
+    if value.contains('/') || value.contains('\\') {
+        return Err(CoreError::MalformedTorrent(format!(
+            "{kind} cannot contain path separators"
+        )));
+    }
+    if value.contains(':') {
+        return Err(CoreError::MalformedTorrent(format!(
+            "{kind} cannot contain windows-style prefix characters"
+        )));
+    }
+    Ok(())
 }
 
 mod hex_piece_hashes {
@@ -532,5 +561,46 @@ mod tests {
                 "http://c/announce"
             ]
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_torrent_name() {
+        assert!(parse_torrent(&build_single_file_torrent(
+            "../escape",
+            b"abc",
+            16,
+            None,
+            false
+        ))
+        .is_err());
+        assert!(parse_torrent(&build_single_file_torrent(
+            "/absolute",
+            b"abc",
+            16,
+            None,
+            false
+        ))
+        .is_err());
+        assert!(parse_torrent(&build_single_file_torrent("a/b", b"abc", 16, None, false)).is_err());
+        assert!(parse_torrent(&build_single_file_torrent(
+            "C:windows",
+            b"abc",
+            16,
+            None,
+            false
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_unsafe_file_path_components() {
+        let files = vec![
+            (vec!["a.txt".to_string(), "..".to_string()], 3u64),
+            (vec!["".to_string(), "ok".to_string()], 3u64),
+            (vec!["b.txt\\c".to_string()], 3u64),
+        ];
+        let contents: Vec<&[u8]> = vec![b"one", b"two", b"three"];
+        let bytes = build_multi_file_torrent("safe", &files, &contents, 8, None);
+        assert!(parse_torrent(&bytes).is_err());
     }
 }

@@ -51,7 +51,21 @@ impl PieceBitfield {
     }
 
     pub fn count(&self, total: usize) -> usize {
-        (0..total).filter(|&i| self.has(i)).count()
+        let full = total / 8;
+        let rem = total % 8;
+        let mut count = self
+            .0
+            .iter()
+            .take(full)
+            .map(|b| b.count_ones() as usize)
+            .sum();
+        if rem > 0 {
+            if let Some(b) = self.0.get(full) {
+                let mask = 0xFFu8 << (8 - rem);
+                count += (b & mask).count_ones() as usize;
+            }
+        }
+        count
     }
 
     pub fn as_bytes(&self) -> &[u8] {

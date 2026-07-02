@@ -55,8 +55,10 @@ directly.
 - Torrent traffic cannot silently use the default route; every socket is gated.
 - Adding a new data-plane transport (uTP, DHT UDP) means extending the binder,
   not bypassing it.
-- DNS resolution for tracker hostnames is performed inside the binder, subject
-  to DNS containment validation at the config layer.
+- DNS resolution for tracker, UDP tracker, and DHT bootstrap hostnames is
+  performed inside the binder after containment has been enforced. Strict
+  fail-closed mode blocks hostname resolution when DNS containment cannot be
+  validated or provided by the current network namespace.
 - The control plane (API/Web UI) remains independently bound and is unaffected.
 - Tests use `LoopbackBinder`, keeping the engine deterministic and offline.
 

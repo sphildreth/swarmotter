@@ -3,25 +3,37 @@
 //! API route definitions and the assembled router.
 
 use axum::{
+    body::Body,
+    extract::{DefaultBodyLimit, State},
+    http::{header, Request, StatusCode},
+    middleware::{from_fn_with_state, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use serde::Deserialize;
 use swarmotter_core::hash::InfoHash;
 
-use crate::handlers;
 use crate::state::SharedState;
+use crate::{envelope, handlers};
+
+const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 /// Build the full API router, mounted under `/api/v1`.
 pub fn app_router(state: SharedState) -> Router {
-    let v1 = api_v1_router(state.clone());
+    app_router_with_body_limit(state, DEFAULT_MAX_REQUEST_BODY_BYTES)
+}
+
+/// Build the full API router with an explicit request body limit.
+pub fn app_router_with_body_limit(state: SharedState, max_request_body_bytes: usize) -> Router {
+    let v1 = api_v1_router(state.clone(), max_request_body_bytes);
     Router::new()
         .route("/health", get(handlers::health::root_health))
         .nest("/api/v1", v1)
         .with_state(state)
 }
 
-fn api_v1_router(state: SharedState) -> Router<SharedState> {
+fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<SharedState> {
     Router::new()
         // Health & version
         .route("/health", get(handlers::health::health))
@@ -117,7 +129,66 @@ fn api_v1_router(state: SharedState) -> Router<SharedState> {
         .route("/events", get(handlers::events::sse_events))
         // WebSocket
         .route("/ws", get(handlers::events::ws_handler))
+        .layer(DefaultBodyLimit::max(max_request_body_bytes))
+        .layer(from_fn_with_state(state.clone(), require_api_auth))
         .with_state(state)
+}
+
+async fn require_api_auth(
+    State(state): State<SharedState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let cfg = state.daemon.get_config().await;
+    if !cfg.api.require_auth {
+        return next.run(req).await;
+    }
+    let Some(expected) = cfg.api.auth_token.as_deref() else {
+        return auth_error(
+            StatusCode::UNAUTHORIZED,
+            "api authentication is not configured",
+        );
+    };
+    if request_has_token(&req, expected) {
+        return next.run(req).await;
+    }
+    auth_error(StatusCode::UNAUTHORIZED, "missing or invalid API token")
+}
+
+fn request_has_token(req: &Request<Body>, expected: &str) -> bool {
+    let bearer = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let direct = req
+        .headers()
+        .get("x-swarmotter-auth")
+        .and_then(|v| v.to_str().ok());
+    bearer
+        .into_iter()
+        .chain(direct)
+        .any(|candidate| constant_time_eq(candidate.as_bytes(), expected.as_bytes()))
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn auth_error(status: StatusCode, message: &str) -> Response {
+    (
+        status,
+        [(header::CONTENT_TYPE, "application/json")],
+        envelope::error_to_json("unauthorized", message),
+    )
+        .into_response()
 }
 
 /// Query params for the delete-torrent endpoint.

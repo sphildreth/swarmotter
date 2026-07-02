@@ -13,10 +13,12 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::models::network::NetworkContainmentMode;
@@ -24,6 +26,9 @@ use swarmotter_core::net::{
     self, parse_http_response, ContainedUdpSocket, HttpResponse, InterfaceProbe, NetworkBinder,
     NetworkConfig, PeerListener,
 };
+
+const MAX_TRACKER_HTTP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const HTTP_TRACKER_IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Perform a TLS handshake over a contained TCP stream, validating the
 /// certificate against the platform root trust store. The `server_name`
@@ -52,14 +57,31 @@ async fn tls_connect(
 /// the response. Used for both plaintext (TCP) and TLS tracker connections.
 async fn http_over_stream<S>(mut stream: S, req: &[u8]) -> Result<HttpResponse>
 where
-    S: AsyncWriteExt + AsyncReadExt + Unpin,
+    S: AsyncRead + AsyncWrite + Unpin,
 {
-    stream.write_all(req).await.map_err(CoreError::from)?;
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
+    timeout(HTTP_TRACKER_IO_TIMEOUT, stream.write_all(req))
         .await
+        .map_err(|_| CoreError::Internal("tracker request write timed out".into()))?
         .map_err(CoreError::from)?;
+
+    let mut buf = Vec::with_capacity(8192);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = timeout(HTTP_TRACKER_IO_TIMEOUT, stream.read(&mut chunk))
+            .await
+            .map_err(|_| CoreError::Internal("tracker response read timed out".into()))?
+            .map_err(CoreError::from)?;
+        if n == 0 {
+            break;
+        }
+        if buf.len().saturating_add(n) > MAX_TRACKER_HTTP_RESPONSE_BYTES {
+            return Err(CoreError::Internal(format!(
+                "tracker response exceeded {} bytes",
+                MAX_TRACKER_HTTP_RESPONSE_BYTES
+            )));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
     parse_http_response(&buf)
 }
 
@@ -82,6 +104,16 @@ impl ContainedBinder {
         let cfg = self.config.lock().await.clone();
         if cfg.mode == NetworkContainmentMode::Disabled {
             return Ok(());
+        }
+        if cfg.mode == NetworkContainmentMode::Strict
+            && cfg.fail_closed
+            && cfg.required_source_ipv4.is_none()
+            && cfg.required_source_ipv6.is_none()
+            && cfg.required_network_namespace.is_none()
+        {
+            return Err(CoreError::NetworkBlocked(
+                "torrent data plane blocked: strict containment requires source binding or a current network namespace".into(),
+            ));
         }
         let health = net::evaluate(&cfg, self.probe.as_ref());
         if cfg.fail_closed && !health.traffic_allowed {
@@ -142,17 +174,9 @@ impl NetworkBinder for ContainedBinder {
         let port = parsed
             .port_or_known_default()
             .unwrap_or(if is_https { 443 } else { 80 });
-        // Resolve hostname via std (subject to DNS containment validation at
-        // the config layer). For IP-literal hosts this is a no-op.
-        let addr: SocketAddr = match host.parse() {
-            Ok(ip) => SocketAddr::new(ip, port),
-            Err(_) => {
-                let mut iter = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))?;
-                iter.next().ok_or_else(|| {
-                    CoreError::Internal(format!("tracker host {host} unresolvable"))
-                })?
-            }
-        };
+        // Resolve through the binder so hostname lookup is gated by the same
+        // containment and DNS policy as socket creation.
+        let addr: SocketAddr = self.resolve_host(host, port).await?;
         let stream = self.connect_peer(addr).await?;
         let path = parsed.path();
         let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
@@ -168,6 +192,35 @@ impl NetworkBinder for ContainedBinder {
         } else {
             http_over_stream(stream, req.as_bytes()).await
         }
+    }
+
+    async fn resolve_host(&self, host: &str, port: u16) -> Result<SocketAddr> {
+        self.guard().await?;
+        if let Ok(ip) = host.parse() {
+            return Ok(SocketAddr::new(ip, port));
+        }
+        let cfg = self.config.lock().await.clone();
+        if cfg.mode == NetworkContainmentMode::Strict
+            && cfg.fail_closed
+            && cfg.required_network_namespace.is_none()
+            && !cfg.validate_dns
+        {
+            return Err(CoreError::NetworkBlocked(
+                "torrent data plane blocked: hostname resolution requires DNS containment validation or a current network namespace".into(),
+            ));
+        }
+        if cfg.mode == NetworkContainmentMode::Strict
+            && cfg.fail_closed
+            && cfg.validate_dns
+            && !self.probe.dns_constrained()
+        {
+            return Err(CoreError::NetworkBlocked(
+                "torrent data plane blocked: DNS behavior is not constrained as configured".into(),
+            ));
+        }
+        let mut iter = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))?;
+        iter.next()
+            .ok_or_else(|| CoreError::Internal(format!("host {host} unresolvable")))
     }
 
     async fn udp_socket(&self) -> Result<Box<dyn ContainedUdpSocket>> {
@@ -271,6 +324,39 @@ impl TcpSocketExt for tokio::net::TcpSocket {
 mod tests {
     use super::*;
     use std::time::Duration;
+    use swarmotter_core::net::{InterfaceInfo, InterfaceProbe};
+
+    struct FakeProbe {
+        dns_ok: bool,
+        source_ok: bool,
+        namespace_ok: bool,
+    }
+
+    impl InterfaceProbe for FakeProbe {
+        fn list(&self) -> Vec<InterfaceInfo> {
+            Vec::new()
+        }
+
+        fn find(&self, _name: &str) -> Option<InterfaceInfo> {
+            None
+        }
+
+        fn source_assigned(&self, _addr: &str, _iface: Option<&str>) -> bool {
+            self.source_ok
+        }
+
+        fn route_valid(&self, _config: &NetworkConfig) -> bool {
+            true
+        }
+
+        fn dns_constrained(&self) -> bool {
+            self.dns_ok
+        }
+
+        fn namespace_available(&self, _ns: &str) -> bool {
+            self.namespace_ok
+        }
+    }
 
     #[tokio::test]
     async fn blocked_binder_blocks_https_tracker() {
@@ -281,6 +367,90 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.is_network_blocked());
+    }
+
+    #[tokio::test]
+    async fn strict_binder_requires_enforceable_socket_path() {
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            fail_closed: true,
+            ..Default::default()
+        };
+        let binder = ContainedBinder::new(
+            cfg,
+            Arc::new(FakeProbe {
+                dns_ok: false,
+                source_ok: false,
+                namespace_ok: false,
+            }),
+        );
+
+        let err = match binder.udp_socket().await {
+            Ok(_) => panic!("strict binder unexpectedly created a UDP socket"),
+            Err(err) => err,
+        };
+        assert!(err.is_network_blocked());
+    }
+
+    #[tokio::test]
+    async fn strict_binder_blocks_unvalidated_hostname_dns() {
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            required_source_ipv4: Some("127.0.0.1".into()),
+            fail_closed: true,
+            validate_dns: false,
+            ..Default::default()
+        };
+        let binder = ContainedBinder::new(
+            cfg,
+            Arc::new(FakeProbe {
+                dns_ok: false,
+                source_ok: true,
+                namespace_ok: false,
+            }),
+        );
+
+        let err = binder
+            .resolve_host("tracker.example", 80)
+            .await
+            .unwrap_err();
+        assert!(err.is_network_blocked());
+        assert!(binder.resolve_host("127.0.0.1", 80).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn http_over_stream_rejects_oversized_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let server_task = tokio::spawn(async move {
+            let mut req = [0u8; 256];
+            let _ = server.read(&mut req).await;
+
+            let header = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+            if server.write_all(header).await.is_err() {
+                return;
+            }
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut sent = header.len();
+            while sent <= MAX_TRACKER_HTTP_RESPONSE_BYTES + chunk.len() {
+                if server.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                sent += chunk.len();
+            }
+            let _ = server.shutdown().await;
+        });
+
+        let err = http_over_stream(
+            client,
+            b"GET /announce HTTP/1.1\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("tracker response exceeded"));
+        server_task.abort();
+        let _ = server_task.await;
     }
 
     /// Real local TLS fixture: a self-signed HTTPS tracker over a contained

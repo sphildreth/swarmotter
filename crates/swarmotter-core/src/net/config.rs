@@ -61,14 +61,23 @@ impl NetworkConfig {
     /// or invalid settings.
     pub fn validate(&self) -> Result<()> {
         if self.mode == NetworkContainmentMode::Strict {
-            // Strict mode requires some path constraint.
+            // Strict mode requires a configured path and an enforceable socket
+            // binding strategy.
             let has_path = self.required_interface.is_some()
                 || self.required_source_ipv4.is_some()
                 || self.required_source_ipv6.is_some()
                 || self.required_network_namespace.is_some();
             if !has_path {
                 return Err(CoreError::InvalidConfig(
-                    "strict network containment requires a configured path (interface, source address, or namespace)".into(),
+                    "strict network containment requires a configured network path".into(),
+                ));
+            }
+            let has_enforceable_socket_path = self.required_source_ipv4.is_some()
+                || self.required_source_ipv6.is_some()
+                || self.required_network_namespace.is_some();
+            if !has_enforceable_socket_path {
+                return Err(CoreError::InvalidConfig(
+                    "strict network containment requires a source address or network namespace; interface-only configuration cannot be enforced by socket binding".into(),
                 ));
             }
             if !self.allow_ipv6 && self.required_source_ipv6.is_some() {
@@ -113,9 +122,20 @@ mod tests {
         let cfg = NetworkConfig {
             mode: NetworkContainmentMode::Strict,
             required_interface: Some("tun0".into()),
+            required_source_ipv4: Some("10.8.0.2".into()),
             ..Default::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn strict_rejects_interface_only() {
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            required_interface: Some("tun0".into()),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

@@ -8,7 +8,18 @@ All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates. SwarmOtter's first release is `v1.0.0`; there is no
 MVP release.
 
-## [Unreleased]
+## [1.0.0] - unreleased
+
+This is the active `v1.0.0` initial-release branch. It records completed
+capabilities that are part of the first public release scope defined in
+`design/requirements.md` and `design/PRD.md`: live TCP and uTP (BEP 29) peer
+wire protocol, HTTP/HTTPS/UDP trackers, DHT (BEP 5), PEX (BEP 10/11), BEP 9
+magnet metadata fetch, inbound seeding/upload, endgame mode, live bandwidth
+shaping, real disk I/O with fast resume, watch folders, browser magnet
+submission, queue/ratio/seeding controls, fail-closed VPN/NIC network
+containment, the complete REST API with WebSocket/SSE events, and a practical
+Web UI. See `docs/v1-completion-tracker.md` for the capability-by-capability
+status.
 
 ### Added
 
@@ -21,21 +32,8 @@ MVP release.
   disabled, normal completion and seeding behavior is unchanged. Configurable
   via `[torrent] selfish` in the config file or `SWARMOTTER_TORRENT__SELFISH`.
   The torrent disappears from the API/UI torrent list after completion.
-
-## [1.0.0]
-
-This is the initial public release of SwarmOtter. It implements every required
-`v1.0.0` capability in `design/requirements.md` and `design/PRD.md`: live TCP
-and uTP (BEP 29) peer wire protocol, HTTP/HTTPS/UDP trackers, DHT (BEP 5), PEX
-(BEP 10/11), BEP 9 magnet metadata fetch, inbound seeding/upload, endgame mode,
-live bandwidth shaping, real disk I/O with fast resume, watch folders, browser
-magnet submission, queue/ratio/seeding controls, fail-closed VPN/NIC network
-containment, the complete REST API with WebSocket/SSE events, and a practical
-Web UI. See `docs/v1-completion-tracker.md` for the capability-by-capability
-status.
-
-### Added
-
+- **API request body limit** (`api.max_request_body_bytes`, default
+  `16777216`): caps JSON requests and raw `.torrent` uploads.
 - Repository scaffolding: governance documentation, ADR process, legal design
   docs, GitHub templates, and a minimal Rust workspace skeleton.
 - ADRs 0001 through 0008 recording foundational project decisions.
@@ -201,6 +199,15 @@ status.
 
 ### Changed
 
+- `[storage].preallocate` is now honored by the live engine. When disabled, the
+  engine creates required directories and writes pieces as needed instead of
+  pre-sizing all files.
+- Strict fail-closed containment now requires an enforceable socket path
+  (`required_source_ipv4`, `required_source_ipv6`, or
+  `required_network_namespace`); interface-only strict configuration is
+  rejected.
+- Tracker, UDP tracker, and DHT bootstrap hostname resolution now runs through
+  `NetworkBinder::resolve_host()` after containment enforcement.
 - Restructured the repository from a single broken crate into a Rust
   workspace under `crates/` (`swarmotterd`, `swarmotter-core`,
   `swarmotter-api`, `swarmotter-web`).
@@ -210,6 +217,14 @@ status.
   containment review notes.
 - Fixed `piece_file_ranges` to use the correct file index (it previously used
   the output-list length), affecting multi-file piece-to-file mapping.
+
+### Security
+
+- Enforced `api.require_auth` for `/api/v1` routes and require an auth token
+  when that mode is enabled.
+- Redacted `api.auth_token` from `GET /api/v1/settings`.
+- Bounded peer frames, peer bitfields, BEP 9 metadata, tracker HTTP responses,
+  and unsafe torrent/storage paths to reject malformed or oversized inputs.
 
 ### Notes
 

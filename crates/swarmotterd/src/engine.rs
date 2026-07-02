@@ -109,6 +109,7 @@ pub struct TorrentEngine {
     /// preferred over uTP. All transports go through the contained binder.
     utp_enabled: bool,
     utp_prefer_tcp: bool,
+    preallocate: bool,
 }
 
 impl TorrentEngine {
@@ -167,6 +168,7 @@ impl TorrentEngine {
             dht: None,
             utp_enabled: true,
             utp_prefer_tcp: true,
+            preallocate: true,
         }
     }
 
@@ -194,6 +196,12 @@ impl TorrentEngine {
     pub fn with_transport(mut self, utp_enabled: bool, utp_prefer_tcp: bool) -> Self {
         self.utp_enabled = utp_enabled;
         self.utp_prefer_tcp = utp_prefer_tcp;
+        self
+    }
+
+    /// Configure whether storage files are preallocated before download.
+    pub fn with_preallocate(mut self, preallocate: bool) -> Self {
+        self.preallocate = preallocate;
         self
     }
 
@@ -232,7 +240,11 @@ impl TorrentEngine {
         }
 
         let storage = StorageIo::new(self.meta.clone(), self.download_dir.clone());
-        storage.preallocate().await?;
+        if self.preallocate {
+            storage.preallocate().await?;
+        } else {
+            storage.ensure_dirs().await?;
+        }
 
         // Load fast resume if present; otherwise recheck what's already on disk.
         let mut have = if let Some(resume) = storage.load_resume(&self.meta.info_hash).await? {
@@ -946,16 +958,13 @@ impl TorrentEngine {
     async fn update_progress(&self, have: &PieceBitfield) {
         let mut s = self.state.lock().await;
         s.pieces_have = have.clone();
-        let completed = (0..s.piece_count)
-            .filter(|&i| have.has(i))
-            .map(|i| {
-                if i + 1 == s.piece_count {
-                    self.meta.last_piece_length()
-                } else {
-                    self.meta.piece_length
-                }
-            })
-            .sum::<u64>();
+        let complete_pieces = have.count(s.piece_count) as u64;
+        let mut completed = complete_pieces.saturating_mul(self.meta.piece_length);
+        if s.piece_count > 0 && have.has(s.piece_count - 1) {
+            completed =
+                completed.saturating_sub(self.meta.piece_length - self.meta.last_piece_length());
+        }
+        completed = completed.min(self.meta.total_length);
         s.bytes_completed = completed;
         s.downloaded = completed;
     }

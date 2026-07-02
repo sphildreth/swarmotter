@@ -71,6 +71,7 @@ async fn main() -> Result<()> {
         tracing::warn!(detail = %health.detail, "torrent data plane is NOT healthy; torrents will enter network_blocked state until the path is available");
     }
 
+    let max_request_body_bytes = config.api.max_request_body_bytes;
     let runtime = Arc::new(daemon::DaemonRuntime::new(config.clone(), health));
     let broker = swarmotter_api::handlers::events::EventBroker::default();
 
@@ -106,7 +107,7 @@ async fn main() -> Result<()> {
         tokio::net::TcpListener::bind(bind)
             .await
             .map_err(swarmotter_core::error::CoreError::from)?,
-        swarmotter_api::app_router(state.clone())
+        swarmotter_api::routes::app_router_with_body_limit(state.clone(), max_request_body_bytes)
             .merge(swarmotter_web::web_router())
             .into_make_service(),
     );

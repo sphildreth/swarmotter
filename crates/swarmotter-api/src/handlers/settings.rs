@@ -9,7 +9,9 @@ use crate::error::{err_response, into_response, ok_empty_response};
 use crate::state::{SettingsPatch, SharedState};
 
 pub async fn get_settings(State(state): State<SharedState>) -> Response {
-    into_response(Ok(state.daemon.get_config().await))
+    let mut cfg = state.daemon.get_config().await;
+    cfg.api.auth_token = None;
+    into_response(Ok(cfg))
 }
 
 pub async fn update_settings(

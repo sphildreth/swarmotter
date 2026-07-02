@@ -27,6 +27,8 @@ use swarmotter_core::meta::TorrentMeta;
 use swarmotter_core::net::NetworkBinder;
 use swarmotter_core::peer::{self, Bitfield, Handshake, Message, PeerAddr};
 
+const MAX_METADATA_SIZE: usize = 16 * 1024 * 1024;
+
 /// Fetch the torrent metadata (`info` dict) from a peer via `ut_metadata`.
 /// Returns the assembled, info-hash-verified `info` bytes.
 ///
@@ -110,9 +112,16 @@ pub async fn fetch_metadata(
     }
     let remote_id = remote_metadata_id
         .ok_or_else(|| CoreError::Internal("metadata peer does not support ut_metadata".into()))?;
-    let total = metadata_size
-        .ok_or_else(|| CoreError::Internal("metadata peer did not report metadata_size".into()))?
-        as usize;
+    let total_u64 = metadata_size
+        .ok_or_else(|| CoreError::Internal("metadata peer did not report metadata_size".into()))?;
+    let total = usize::try_from(total_u64).map_err(|_| {
+        CoreError::Internal("metadata peer reported size too large for this platform".into())
+    })?;
+    if total == 0 || total > MAX_METADATA_SIZE {
+        return Err(CoreError::Internal(format!(
+            "metadata size {total} exceeds maximum {MAX_METADATA_SIZE}"
+        )));
+    }
 
     // Request each metadata piece and assemble.
     let pieces = extensions::metadata_pieces(total).max(1);
@@ -143,7 +152,20 @@ pub async fn fetch_metadata(
                 }
                 match extensions::parse_metadata_message(&payload) {
                     Ok(m) if m.msg_type == MetadataMsgType::Data && m.piece as usize == piece => {
+                        let room = total - assembled.len();
+                        if m.data.len() > room {
+                            return Err(CoreError::Internal(
+                                "metadata piece data exceeds announced total size".into(),
+                            ));
+                        }
                         assembled.extend_from_slice(&m.data);
+                        if let Some(peer_total) = m.total_size {
+                            if peer_total != total_u64 {
+                                return Err(CoreError::Internal(
+                                    "metadata total_size mismatch".into(),
+                                ));
+                            }
+                        }
                         got_piece = true;
                         break;
                     }
@@ -351,6 +373,124 @@ mod tests {
         }
     }
 
+    async fn serve_metadata_peer_with_reported_size(
+        stream: tokio::net::TcpStream,
+        info_hash: InfoHash,
+        reported_size: u64,
+    ) -> swarmotter_core::Result<()> {
+        let (mut rd, mut wr) = tokio::io::split(stream);
+        let mut hs = [0u8; 68];
+        rd.read_exact(&mut hs).await?;
+        let their_hs = Handshake::decode(&hs)
+            .map_err(|e| swarmotter_core::error::CoreError::Internal(e.to_string()))?;
+        if their_hs.info_hash != info_hash {
+            return Err(swarmotter_core::error::CoreError::Internal(
+                "info hash mismatch".into(),
+            ));
+        }
+        let our_hs = Handshake {
+            info_hash,
+            peer_id: peer_id(b"-SD0090-"),
+            reserved: extensions::EXTENSION_RESERVED,
+        };
+        wr.write_all(&our_hs.encode()).await?;
+        let _ = read_one_message(&mut rd).await; // bitfield
+        let _ = read_one_message(&mut rd).await; // extension handshake
+        let local_metadata_id: u8 = 1u8;
+        let ext_hs = extensions::encode_extension_handshake(
+            &[(extensions::UT_METADATA_NAME, local_metadata_id)],
+            "MetaSeed/0.1",
+            Some(reported_size),
+        );
+        peer::write_message(
+            &mut wr,
+            &Message::Extended {
+                id: extensions::EXTENSION_HANDSHAKE_ID,
+                payload: ext_hs,
+            },
+        )
+        .await?;
+        wr.flush().await.ok();
+        Ok(())
+    }
+
+    async fn serve_metadata_peer_with_oversize_piece(
+        stream: tokio::net::TcpStream,
+        info_hash: InfoHash,
+        total: usize,
+        piece_payload: usize,
+    ) -> swarmotter_core::Result<()> {
+        let (mut rd, mut wr) = tokio::io::split(stream);
+        let mut hs = [0u8; 68];
+        rd.read_exact(&mut hs).await?;
+        let their_hs = Handshake::decode(&hs)
+            .map_err(|e| swarmotter_core::error::CoreError::Internal(e.to_string()))?;
+        if their_hs.info_hash != info_hash {
+            return Err(swarmotter_core::error::CoreError::Internal(
+                "info hash mismatch".into(),
+            ));
+        }
+        let our_hs = Handshake {
+            info_hash,
+            peer_id: peer_id(b"-SD0090-"),
+            reserved: extensions::EXTENSION_RESERVED,
+        };
+        wr.write_all(&our_hs.encode()).await?;
+        let _ = read_one_message(&mut rd).await; // bitfield
+        let local_metadata_id: u8 = 1u8;
+        let ext_hs = extensions::encode_extension_handshake(
+            &[(extensions::UT_METADATA_NAME, local_metadata_id)],
+            "MetaSeed/0.1",
+            Some(total as u64),
+        );
+        peer::write_message(
+            &mut wr,
+            &Message::Extended {
+                id: extensions::EXTENSION_HANDSHAKE_ID,
+                payload: ext_hs,
+            },
+        )
+        .await?;
+        wr.flush().await.ok();
+
+        let mut leecher_metadata_id: u8 = local_metadata_id;
+        loop {
+            let msg = match read_one_message(&mut rd).await {
+                Ok(Some(m)) => m,
+                _ => return Ok(()),
+            };
+            if let Message::Extended {
+                id: remote_id,
+                payload,
+            } = msg
+            {
+                if remote_id == extensions::EXTENSION_HANDSHAKE_ID {
+                    if let Ok(hs) = extensions::parse_extension_handshake(&payload) {
+                        if let Some(remote) = hs.id_for(extensions::UT_METADATA_NAME) {
+                            leecher_metadata_id = remote;
+                        }
+                    }
+                    continue;
+                }
+                if let Ok(m) = extensions::parse_metadata_message(&payload) {
+                    if m.msg_type == MetadataMsgType::Request {
+                        let data = vec![0xAA; piece_payload];
+                        let data_msg = extensions::encode_metadata_data(0, total as u64, &data);
+                        peer::write_message(
+                            &mut wr,
+                            &Message::Extended {
+                                id: leecher_metadata_id,
+                                payload: data_msg,
+                            },
+                        )
+                        .await?;
+                        wr.flush().await.ok();
+                    }
+                }
+            }
+        }
+    }
+
     async fn read_one_message<R: AsyncReadExt + Unpin>(
         rd: &mut R,
     ) -> std::io::Result<Option<Message>> {
@@ -440,5 +580,62 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.is_network_blocked());
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_rejects_oversized_reported_size() {
+        let content = b"meta metadata size cap test";
+        let bytes = build_single_file_torrent("meta.bin", content, 8, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let info_hash = meta.info_hash;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = serve_metadata_peer_with_reported_size(
+                    stream,
+                    info_hash,
+                    (MAX_METADATA_SIZE as u64) + 1,
+                )
+                .await;
+            }
+        });
+
+        let binder = Arc::new(LoopbackBinder);
+        let err = fetch_metadata(
+            binder.as_ref(),
+            info_hash,
+            peer_id(b"-SW0092-"),
+            PeerAddr::from_socket_addr(addr),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_rejects_piece_data_exceeding_announced_total() {
+        let content = b"metadata piece size cap test payload";
+        let bytes = build_single_file_torrent("meta.bin", content, 8, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let info_hash = meta.info_hash;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = serve_metadata_peer_with_oversize_piece(stream, info_hash, 8, 1024).await;
+            }
+        });
+
+        let binder = Arc::new(LoopbackBinder);
+        let err = fetch_metadata(
+            binder.as_ref(),
+            info_hash,
+            peer_id(b"-SW0093-"),
+            PeerAddr::from_socket_addr(addr),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeds announced total"));
     }
 }

@@ -26,6 +26,11 @@ pub const RESERVED: [u8; 8] = [0u8; 8];
 /// Block size used for piece requests (16 KiB), per BEP 3 convention.
 pub const BLOCK_SIZE: u32 = 16 * 1024;
 
+/// Maximum peer wire message size (length prefix + payload), in bytes.
+/// This blocks untrusted peers from forcing very large allocations during frame
+/// parsing while still leaving normal 16 KiB piece blocks fully supported.
+pub const MAX_MESSAGE_LEN: usize = 4 * 1024 * 1024;
+
 /// A peer handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handshake {
@@ -236,6 +241,11 @@ impl Message {
             return Err(CoreError::Parse("message frame too short".into()));
         }
         let len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+        if len > MAX_MESSAGE_LEN {
+            return Err(CoreError::Parse(format!(
+                "peer message too large: {len} bytes"
+            )));
+        }
         if frame.len() != 4 + len {
             return Err(CoreError::Parse(format!(
                 "message frame length mismatch: declared {len}, have {}",
@@ -335,12 +345,21 @@ impl Bitfield {
     }
 
     pub fn from_bytes(bits: Vec<u8>, piece_count: usize) -> Self {
+        let max_len = piece_count.div_ceil(8);
+        let bits = if bits.len() > max_len {
+            bits[..max_len].to_vec()
+        } else {
+            bits
+        };
         Self { bits, piece_count }
     }
 
     pub fn set(&mut self, index: usize) {
         if index < self.piece_count {
-            self.bits[index / 8] |= 0x80 >> (index % 8);
+            let byte = index / 8;
+            if byte < self.bits.len() {
+                self.bits[byte] |= 0x80 >> (index % 8);
+            }
         }
     }
 
@@ -348,11 +367,29 @@ impl Bitfield {
         if index >= self.piece_count {
             return false;
         }
-        self.bits[index / 8] & (0x80 >> (index % 8)) != 0
+        let byte = index / 8;
+        if byte >= self.bits.len() {
+            return false;
+        }
+        self.bits[byte] & (0x80 >> (index % 8)) != 0
     }
 
     pub fn count(&self) -> usize {
-        (0..self.piece_count).filter(|&i| self.has(i)).count()
+        let full = self.piece_count / 8;
+        let rem = self.piece_count % 8;
+        let mut count = self
+            .bits
+            .iter()
+            .take(full)
+            .map(|b| b.count_ones() as usize)
+            .sum();
+        if rem > 0 {
+            if let Some(b) = self.bits.get(full) {
+                let mask = 0xFFu8 << (8 - rem);
+                count += (b & mask).count_ones() as usize;
+            }
+        }
+        count
     }
 
     /// Encode as a bitfield message.
@@ -520,6 +557,11 @@ impl<S: tokio::io::AsyncRead + Unpin> PeerReader<S> {
             }
         }
         let len = u32::from_be_bytes(len_buf) as usize;
+        if len > MAX_MESSAGE_LEN {
+            return Err(CoreError::Parse(format!(
+                "peer message too large: {len} bytes"
+            )));
+        }
         if len == 0 {
             return Ok(Some(Message::Keepalive));
         }
@@ -557,6 +599,7 @@ pub async fn write_handshake<W: tokio::io::AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
     #[test]
     fn handshake_roundtrip() {
@@ -688,5 +731,39 @@ mod tests {
     fn block_requests_exact_piece() {
         let reqs = block_requests(BLOCK_SIZE);
         assert_eq!(reqs, vec![(0, BLOCK_SIZE)]);
+    }
+
+    #[test]
+    fn bitfield_set_and_has_are_safe_for_short_payloads() {
+        let mut bf = Bitfield::from_bytes(vec![0b1000_0000], 16);
+        assert!(bf.has(0));
+        assert!(!bf.has(15));
+        bf.set(15);
+        assert!(!bf.has(15));
+    }
+
+    #[test]
+    fn bitfield_from_bytes_truncates_oversized_payload() {
+        let bits = vec![0xFF, 0xFF, 0xFF];
+        let bf = Bitfield::from_bytes(bits.clone(), 8);
+        assert_eq!(bf.bits, vec![0xFF]);
+    }
+
+    #[tokio::test]
+    async fn read_message_rejects_excessive_length() {
+        let mut peer_reader = {
+            let (client, mut server) = tokio::io::duplex(8);
+            let frame = (MAX_MESSAGE_LEN as u32 + 1).to_be_bytes().to_vec();
+            server
+                .write_all(&frame)
+                .await
+                .expect("write oversized length prefix");
+            server.shutdown().await.expect("close peer");
+            PeerReader::new(client)
+        };
+        let err = peer_reader.read_message().await.unwrap_err();
+        assert!(matches!(err, CoreError::Parse(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("peer message too large"));
     }
 }

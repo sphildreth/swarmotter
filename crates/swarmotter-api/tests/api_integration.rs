@@ -6,6 +6,7 @@ mod fake_daemon;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use swarmotter_core::config::Config;
 use swarmotter_core::meta::build_single_file_torrent;
 use tower::ServiceExt;
 
@@ -353,4 +354,92 @@ async fn duplicate_torrent_returns_conflict() {
         .await
         .unwrap();
     assert_eq!(r2.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn api_auth_blocks_v1_without_token_and_accepts_bearer() {
+    let mut cfg = Config::default();
+    cfg.api.require_auth = true;
+    cfg.api.auth_token = Some("test-token".into());
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents")
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn settings_redacts_auth_token() {
+    let mut cfg = Config::default();
+    cfg.api.auth_token = Some("secret-token".into());
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["data"]["api"]["auth_token"].is_null());
+}
+
+#[tokio::test]
+async fn api_body_limit_rejects_oversized_upload() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::routes::app_router_with_body_limit(state, 8);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/file")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(vec![0u8; 16]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }

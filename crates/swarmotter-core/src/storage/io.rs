@@ -51,7 +51,7 @@ impl StorageIo {
             .files
             .get(index)
             .ok_or_else(|| CoreError::Storage(format!("file index {index} out of range")))?;
-        Ok(join(&self.download_dir, &file.path))
+        join(&self.download_dir, &file.path)
     }
 
     /// Ensure all parent directories for a file path exist.
@@ -313,15 +313,37 @@ fn byte_ranges_to_file_slices(meta: &TorrentMeta, start: u64, end: u64) -> Vec<F
 
 /// Join a base directory with a file's path components, guarding against path
 /// traversal.
-fn join(base: &Path, path_components: &[String]) -> PathBuf {
+fn join(base: &Path, path_components: &[String]) -> Result<PathBuf> {
+    for seg in path_components {
+        validate_path_component(seg)?;
+    }
     let mut p = PathBuf::from(base);
     for seg in path_components {
-        if seg == ".." || seg.is_empty() {
-            continue;
-        }
         p.push(seg);
     }
-    p
+    Ok(p)
+}
+
+fn validate_path_component(value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(CoreError::Storage("empty path component".into()));
+    }
+    if value == "." || value == ".." {
+        return Err(CoreError::Storage(format!(
+            "path component {value:?} is relative traversal"
+        )));
+    }
+    if value.starts_with('/') || value.starts_with('\\') {
+        return Err(CoreError::Storage(format!(
+            "path component {value:?} is absolute"
+        )));
+    }
+    if value.contains('/') || value.contains('\\') || value.contains(':') {
+        return Err(CoreError::Storage(format!(
+            "path component {value:?} contains forbidden path characters"
+        )));
+    }
+    Ok(())
 }
 
 /// Build a [`FastResume`] from current piece/byte state.
@@ -374,7 +396,9 @@ pub fn piece_file_mapping(meta: &TorrentMeta, piece_index: usize) -> Vec<(usize,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meta::{build_multi_file_torrent, build_single_file_torrent, parse_torrent};
+    use crate::meta::{
+        build_multi_file_torrent, build_single_file_torrent, parse_torrent, MetaFile,
+    };
 
     fn unique_dir(label: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -588,5 +612,53 @@ mod tests {
         let block = store.read_block(0, 4, 8).await.unwrap();
         assert_eq!(block, b"456789ab");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn storage_rejects_unsafe_path_components() {
+        let meta = TorrentMeta {
+            info_hash: InfoHash::from_bytes([1u8; 20]),
+            name: "safe-name".into(),
+            piece_length: 16,
+            pieces: vec![[0u8; 20]],
+            files: vec![MetaFile {
+                path: vec!["safe-name".into(), "../traversal".into()],
+                length: 1,
+            }],
+            total_length: 1,
+            private: false,
+            announce: None,
+            announce_list: vec![],
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            is_multi_file: true,
+        };
+        let store = StorageIo::new(meta, std::env::temp_dir());
+        assert!(store.file_path(0).is_err());
+    }
+
+    #[test]
+    fn storage_rejects_empty_path_components() {
+        let meta = TorrentMeta {
+            info_hash: InfoHash::from_bytes([2u8; 20]),
+            name: "safe".into(),
+            piece_length: 16,
+            pieces: vec![[0u8; 20]],
+            files: vec![MetaFile {
+                path: vec!["safe".into(), "".into()],
+                length: 1,
+            }],
+            total_length: 1,
+            private: false,
+            announce: None,
+            announce_list: vec![],
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            is_multi_file: true,
+        };
+        let store = StorageIo::new(meta, std::env::temp_dir());
+        assert!(store.file_path(0).is_err());
     }
 }

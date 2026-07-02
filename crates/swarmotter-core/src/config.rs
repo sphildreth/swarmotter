@@ -50,10 +50,17 @@ pub struct ApiConfig {
     /// Whether the API requires authentication.
     #[serde(default)]
     pub require_auth: bool,
+    /// Maximum accepted request body size for API requests.
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
 }
 
 fn default_api_bind() -> String {
     "127.0.0.1:9091".to_string()
+}
+
+fn default_max_request_body_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 impl Default for ApiConfig {
@@ -62,6 +69,7 @@ impl Default for ApiConfig {
             bind_address: default_api_bind(),
             auth_token: None,
             require_auth: false,
+            max_request_body_bytes: default_max_request_body_bytes(),
         }
     }
 }
@@ -281,6 +289,23 @@ impl Config {
                 "api.bind_address must not be empty".into(),
             ));
         }
+        if self.api.require_auth
+            && self
+                .api
+                .auth_token
+                .as_ref()
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+        {
+            return Err(CoreError::InvalidConfig(
+                "api.auth_token must be set when api.require_auth is true".into(),
+            ));
+        }
+        if self.api.max_request_body_bytes == 0 {
+            return Err(CoreError::InvalidConfig(
+                "api.max_request_body_bytes must be > 0".into(),
+            ));
+        }
         if self.torrent.listen_port == 0 {
             return Err(CoreError::InvalidConfig(
                 "torrent.listen_port must be > 0".into(),
@@ -417,6 +442,31 @@ selfish = true
     }
 
     #[test]
+    fn auth_requires_token() {
+        let toml = r#"
+[api]
+require_auth = true
+"#;
+        assert!(Config::from_toml_str(toml).is_err());
+
+        let toml = r#"
+[api]
+require_auth = true
+auth_token = "secret"
+"#;
+        assert!(Config::from_toml_str(toml).is_ok());
+    }
+
+    #[test]
+    fn request_body_limit_must_be_positive() {
+        let toml = r#"
+[api]
+max_request_body_bytes = 0
+"#;
+        assert!(Config::from_toml_str(toml).is_err());
+    }
+
+    #[test]
     fn env_override_strict_network() {
         let toml = r#"
 [network]
@@ -429,8 +479,16 @@ mode = "disabled"
                 "SWARMOTTER_NETWORK__REQUIRED_INTERFACE".into(),
                 "tun0".into(),
             ),
+            (
+                "SWARMOTTER_NETWORK__REQUIRED_SOURCE_IPV4".into(),
+                "10.8.0.2".into(),
+            ),
         ];
         let cfg = cfg.apply_env_overrides(&env).unwrap();
         assert_eq!(cfg.network.required_interface.as_deref(), Some("tun0"));
+        assert_eq!(
+            cfg.network.required_source_ipv4.as_deref(),
+            Some("10.8.0.2")
+        );
     }
 }
