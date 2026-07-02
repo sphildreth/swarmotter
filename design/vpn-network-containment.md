@@ -98,6 +98,10 @@ through `resolve_host()` only after containment passes, and returns
 policy is unavailable. On Linux, interface binding uses `SO_BINDTODEVICE`, so
 `required_interface = "br0"` can constrain torrent sockets to all current
 addresses on `br0` without pinning DHCP/SLAAC source addresses.
+Hostname resolution remains fail-closed: on Linux, interface-bound mode allows
+DNS only when the OS probe can tie DNS to the configured interface, such as
+systemd-resolved link DNS from `resolvectl dns br0`, or when static resolver
+routes go through the required interface.
 
 Tracker HTTP GETs are issued through the same binder, and tracker responses are
 bounded before buffering. HTTPS trackers (`https://`) perform TLS over the

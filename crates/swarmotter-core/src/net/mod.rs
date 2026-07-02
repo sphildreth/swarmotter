@@ -108,7 +108,7 @@ fn compute_status(config: &NetworkConfig, probe: &dyn InterfaceProbe) -> Network
     }
 
     // DNS containment.
-    if config.validate_dns && !probe.dns_constrained() {
+    if config.validate_dns && !probe.dns_constrained(config) {
         return NetworkContainmentStatus::DnsNotConstrained;
     }
 
@@ -203,7 +203,7 @@ mod tests {
         fn route_valid(&self, _config: &NetworkConfig) -> bool {
             self.route_valid
         }
-        fn dns_constrained(&self) -> bool {
+        fn dns_constrained(&self, _config: &NetworkConfig) -> bool {
             self.dns_ok
         }
         fn namespace_available(&self, _ns: &str) -> bool {

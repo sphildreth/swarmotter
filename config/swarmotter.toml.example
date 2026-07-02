@@ -32,10 +32,9 @@ required_interface = "br0"
 allow_ipv6 = true
 fail_closed = true
 validate_route = true
-# Set true only when DNS is constrained by a namespace/container or platform
-# probe. When false, strict mode blocks torrent hostname resolution rather than
-# resolving names through an unconstrained path.
-validate_dns = false
+# Linux/systemd-resolved interface DNS is validated against required_interface
+# before torrent hostname resolution is allowed.
+validate_dns = true
 
 # --- Torrent peer listener (data plane) ---
 [torrent]

@@ -97,9 +97,8 @@ required_interface = "br0"
 allow_ipv6 = true
 fail_closed = true
 validate_route = true
-# Set true only when DNS is constrained by a namespace/container or platform
-# probe. When false, strict mode blocks torrent hostname resolution.
-validate_dns = false
+# Reports dns_not_constrained if DNS cannot be proven on br0.
+validate_dns = true
 
 [torrent]
 listen_port = 51413
@@ -136,9 +135,8 @@ required_interface = "br0"
 allow_ipv6 = true
 fail_closed = true
 validate_route = true
-# Set true only when DNS is constrained by a namespace/container or platform
-# probe. When false, strict mode blocks torrent hostname resolution.
-validate_dns = false
+# Reports dns_not_constrained if DNS cannot be proven on br0.
+validate_dns = true
 
 [torrent]
 listen_port = 51413
@@ -153,4 +151,6 @@ name.
 
 DNS containment is separate from socket binding. In strict fail-closed mode,
 hostname resolution for torrent operations is blocked unless DNS containment
-can be validated or supplied by the current network namespace.
+can be validated or supplied by the current network namespace. Linux interface
+mode validates common systemd-resolved link DNS with `resolvectl dns <iface>`
+and static resolver routes that go through the required interface.

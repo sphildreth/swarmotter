@@ -99,17 +99,26 @@ allow_ipv6 = true
 This means strict containment was configured to validate DNS but DNS containment
 could not be proven.
 
-For interface-only configurations, use:
+For interface-bound configurations, first check whether Linux can see DNS on
+that interface:
+
+```bash
+resolvectl dns br0
+```
+
+If this reports DNS servers for `br0`, current SwarmOtter builds allow torrent
+hostname resolution through that constrained path.
+
+If DNS cannot be proven constrained and you still set:
 
 ```toml
 [network]
-validate_dns = false
+validate_dns = true
 ```
 
-With that setting, SwarmOtter blocks torrent hostname resolution unless DNS is
-otherwise constrained. Use a contained network namespace or container network
-when hostname trackers and DHT bootstrap hostnames must resolve through the
-contained path.
+network health reports `dns_not_constrained`. Use a contained network
+namespace, container network, or IP-literal trackers/bootstrap nodes when the
+host cannot prove DNS is on the contained path.
 
 ## IPv6 peers do not connect
 
@@ -178,6 +187,6 @@ Common causes:
 - Only WebTorrent `wss://` trackers are present; those are not BitTorrent TCP
   or UDP trackers.
 
-In strict interface-only mode, hostname trackers and DHT bootstrap hostnames
-need constrained DNS. Without that, SwarmOtter blocks hostname resolution
-instead of resolving through an unconstrained path.
+In strict interface mode, hostname trackers and DHT bootstrap hostnames need
+constrained DNS. On Linux, SwarmOtter accepts systemd-resolved link DNS for the
+required interface, for example DNS servers shown by `resolvectl dns br0`.

@@ -40,7 +40,7 @@ pub trait InterfaceProbe {
     /// Whether the configured route is valid.
     fn route_valid(&self, config: &NetworkConfig) -> bool;
     /// Whether DNS resolution is constrained as configured.
-    fn dns_constrained(&self) -> bool;
+    fn dns_constrained(&self, config: &NetworkConfig) -> bool;
     /// Whether a given network namespace is available.
     fn namespace_available(&self, ns: &str) -> bool;
 }
@@ -76,10 +76,8 @@ impl InterfaceProbe for OsInterfaceProbe {
         true
     }
 
-    fn dns_constrained(&self) -> bool {
-        // By default DNS is not constrained; strict configs with validate_dns
-        // will surface dns_not_constrained unless overridden.
-        false
+    fn dns_constrained(&self, config: &NetworkConfig) -> bool {
+        dns_constrained(config)
     }
 
     fn namespace_available(&self, ns: &str) -> bool {
@@ -155,6 +153,93 @@ fn os_interfaces() -> Vec<InterfaceInfo> {
 }
 
 #[cfg(target_os = "linux")]
+fn dns_constrained(config: &NetworkConfig) -> bool {
+    if config.required_network_namespace.is_some() {
+        return true;
+    }
+    let Some(iface) = config.required_interface.as_deref() else {
+        return false;
+    };
+
+    let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+    let nameservers = nameservers_from_resolv_conf(&resolv);
+    if nameservers.iter().any(IpAddr::is_loopback) {
+        return systemd_resolved_interface_has_dns(iface);
+    }
+    !nameservers.is_empty()
+        && nameservers
+            .iter()
+            .all(|ip| nameserver_route_uses_interface(*ip, iface))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn dns_constrained(config: &NetworkConfig) -> bool {
+    config.required_network_namespace.is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_resolved_interface_has_dns(iface: &str) -> bool {
+    let Ok(output) = std::process::Command::new("resolvectl")
+        .arg("dns")
+        .arg(iface)
+        .output()
+    else {
+        return false;
+    };
+    output.status.success() && output_has_dns_address(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(target_os = "linux")]
+fn nameserver_route_uses_interface(ip: IpAddr, iface: &str) -> bool {
+    let mut cmd = std::process::Command::new("ip");
+    if ip.is_ipv6() {
+        cmd.args(["-6", "route", "get"]);
+    } else {
+        cmd.args(["-4", "route", "get"]);
+    }
+    let Ok(output) = cmd.arg(ip.to_string()).output() else {
+        return false;
+    };
+    output.status.success()
+        && route_output_uses_interface(&String::from_utf8_lossy(&output.stdout), iface)
+}
+
+fn nameservers_from_resolv_conf(contents: &str) -> Vec<IpAddr> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.split_once('#').map(|(head, _)| head).unwrap_or(line);
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("nameserver"), Some(ip)) => ip.parse().ok(),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn output_has_dns_address(output: &str) -> bool {
+    output
+        .split_once(':')
+        .map(|(_, servers)| {
+            servers
+                .split_whitespace()
+                .any(|token| token.parse::<IpAddr>().is_ok())
+        })
+        .unwrap_or(false)
+}
+
+fn route_output_uses_interface(output: &str, iface: &str) -> bool {
+    let mut parts = output.split_whitespace();
+    while let Some(part) = parts.next() {
+        if part == "dev" && parts.next() == Some(iface) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
 fn namespace_is_current(ns: &str) -> bool {
     let configured = std::path::Path::new("/var/run/netns").join(ns);
     if !configured.exists() {
@@ -195,5 +280,39 @@ mod tests {
     fn os_probe_list_is_safe() {
         let probe = OsInterfaceProbe;
         let _ = probe.list();
+    }
+
+    #[test]
+    fn resolv_conf_nameserver_parser_extracts_ips() {
+        let ips = nameservers_from_resolv_conf(
+            r#"
+nameserver 127.0.0.53
+nameserver 2605:a601:afdc:2300:184b:24ff:fea3:9d85 # router
+search home.arpa
+"#,
+        );
+        assert_eq!(ips.len(), 2);
+        assert!(ips[0].is_loopback());
+        assert!(ips[1].is_ipv6());
+    }
+
+    #[test]
+    fn resolved_output_detects_link_dns() {
+        assert!(output_has_dns_address(
+            "Link 4 (br0): 192.168.1.1 2605:a601:afdc:2300::1"
+        ));
+        assert!(!output_has_dns_address("Link 4 (br0):"));
+    }
+
+    #[test]
+    fn route_output_matches_interface_token() {
+        assert!(route_output_uses_interface(
+            "8.8.8.8 via 192.168.1.1 dev br0 src 192.168.8.36",
+            "br0"
+        ));
+        assert!(!route_output_uses_interface(
+            "8.8.8.8 via 192.168.1.1 dev eth0 src 192.168.8.36",
+            "br0"
+        ));
     }
 }

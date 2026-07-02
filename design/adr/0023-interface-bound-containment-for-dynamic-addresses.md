@@ -44,7 +44,8 @@ its current addresses" without pinning transient addresses in configuration.
   rather than the only way to make strict mode enforceable.
 - DNS containment remains separate. Hostname resolution is still blocked in
   strict fail-closed mode unless DNS containment can be validated or provided by
-  the current network namespace.
+  the current network namespace. ADR-0024 records Linux interface DNS
+  validation for the common systemd-resolved and static resolver-route cases.
 
 ## Related Documents
 

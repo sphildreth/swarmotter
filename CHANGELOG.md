@@ -226,6 +226,9 @@ status.
 - Tracker diagnostics now preserve the concrete last announce error when a
   torrent stops after no peer discovery, instead of replacing it with only a
   generic no-peer message.
+- Linux interface-bound containment can now validate DNS for hostname trackers
+  and DHT bootstrap nodes when DNS is tied to the required interface, including
+  systemd-resolved link DNS such as `resolvectl dns br0`.
 - Strict fail-closed containment now requires an enforceable socket path:
   `required_interface`, `required_source_ipv4`, `required_source_ipv6`, or
   `required_network_namespace`.

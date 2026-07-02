@@ -54,15 +54,17 @@ required_interface = "br0"
 allow_ipv6 = true
 fail_closed = true
 validate_route = true
-validate_dns = false
+validate_dns = true
 
 [torrent]
 allow_ipv6 = true
 ```
 
-On Linux, SwarmOtter enforces this with device-bound sockets. IPv4 and IPv6
+On Linux, SwarmOtter enforces sockets with device-bound sockets. IPv4 and IPv6
 connections are both allowed when the interface has usable addresses and both
-`network.allow_ipv6` and `torrent.allow_ipv6` are true.
+`network.allow_ipv6` and `torrent.allow_ipv6` are true. Hostname resolution is
+allowed only when DNS is also proven constrained to the configured path, such
+as systemd-resolved link DNS reported by `resolvectl dns br0`.
 
 ## DNS policy
 
@@ -71,12 +73,15 @@ not escape through an unconstrained resolver.
 
 Use one of these patterns:
 
+- Bind to an interface whose DNS is visible to the Linux probe, such as
+  systemd-resolved link DNS from `resolvectl dns br0`.
 - Use a contained network namespace or container network where DNS is part of
   the contained path.
-- Use IP-literal peers, trackers, and bootstrap nodes when using
-  interface-only containment without DNS containment.
-- Enable `validate_dns = true` only when the host setup can validate constrained
-  DNS. Otherwise strict health reports `dns_not_constrained`.
+- Use IP-literal peers, trackers, and bootstrap nodes when DNS containment is
+  not available.
+- Set `validate_dns = true` when you want network health to report
+  `dns_not_constrained` proactively instead of discovering it at tracker/DHT
+  resolution time.
 
 ## Health states
 

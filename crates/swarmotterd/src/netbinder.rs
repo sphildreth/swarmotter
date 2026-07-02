@@ -195,19 +195,10 @@ impl NetworkBinder for ContainedBinder {
         if cfg.mode == NetworkContainmentMode::Strict
             && cfg.fail_closed
             && cfg.required_network_namespace.is_none()
-            && !cfg.validate_dns
+            && !self.probe.dns_constrained(&cfg)
         {
             return Err(CoreError::NetworkBlocked(
-                "torrent data plane blocked: hostname resolution requires DNS containment validation or a current network namespace".into(),
-            ));
-        }
-        if cfg.mode == NetworkContainmentMode::Strict
-            && cfg.fail_closed
-            && cfg.validate_dns
-            && !self.probe.dns_constrained()
-        {
-            return Err(CoreError::NetworkBlocked(
-                "torrent data plane blocked: DNS behavior is not constrained as configured".into(),
+                "torrent data plane blocked: hostname resolution requires DNS constrained to the configured network path or a current network namespace".into(),
             ));
         }
         let mut iter = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))?;
@@ -521,7 +512,7 @@ mod tests {
             true
         }
 
-        fn dns_constrained(&self) -> bool {
+        fn dns_constrained(&self, _config: &NetworkConfig) -> bool {
             self.dns_ok
         }
 
@@ -588,6 +579,27 @@ mod tests {
             .unwrap_err();
         assert!(err.is_network_blocked());
         assert!(binder.resolve_host("127.0.0.1", 80).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn strict_binder_allows_validated_hostname_dns() {
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            required_source_ipv4: Some("127.0.0.1".into()),
+            fail_closed: true,
+            validate_dns: false,
+            ..Default::default()
+        };
+        let binder = ContainedBinder::new(
+            cfg,
+            Arc::new(FakeProbe {
+                dns_ok: true,
+                source_ok: true,
+                namespace_ok: false,
+            }),
+        );
+
+        assert!(binder.resolve_host("localhost", 80).await.is_ok());
     }
 
     #[test]

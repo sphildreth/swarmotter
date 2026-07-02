@@ -62,15 +62,14 @@ UDP socket (see ADR-0020).
       listener + fail-closed) and `LoopbackBinder`/`BlockedBinder` for tests;
       UDP binder method powers UDP trackers, DHT, and uTP, inbound
       listener powers seeding upload (see ADR-0012)
-- [~] DNS containment strategy — `validate_dns` config + `dns_not_constrained`
+- [x] DNS containment strategy — `validate_dns` config + `dns_not_constrained`
       state implemented; tracker, UDP tracker, and DHT bootstrap hostname
       resolution is performed inside the binder after containment is enforced.
-      OS-level DNS enforcement (forcing the system resolver onto the contained
-      path) is platform-specific and not implemented in-process; the
+      Linux interface-bound mode validates common systemd-resolved link DNS
+      and static resolver routes before hostname resolution is allowed. The
       abstraction surfaces `dns_not_constrained` in strict mode when the OS
       probe cannot confirm DNS is constrained, which is correct fail-closed
-      behavior. This is an honest platform-coverage limitation, not a missing
-      application capability (see "Honest remaining limitation" below).
+      behavior.
 - [x] Network containment integration tests (fail-closed via daemon)
 
 ### Torrent Metadata
@@ -365,17 +364,14 @@ These are explicitly out of `v1.0.0` scope or are platform-coverage limitations.
 None is a release blocker and none contradicts a completed (`[x]`) capability
 above.
 
-- **DNS containment (OS-level enforcement):** the `validate_dns` config and
+- **DNS containment platform coverage:** the `validate_dns` config and
   the `dns_not_constrained` network state are implemented, and tracker,
   UDP tracker, and DHT bootstrap hostname resolution is performed inside the
-  binder after containment is enforced. OS-level DNS enforcement (forcing the
-  system resolver to use the contained path) is platform-specific and not
-  implemented in-process; the abstraction surfaces `dns_not_constrained` in
-  strict mode when the OS probe cannot confirm DNS is constrained, which is
-  correct fail-closed behavior. This is a platform-coverage limitation, not a
-  missing application capability. The tracker item remains `[~]` to reflect
-  this honestly.
-  Deployment docs recommend a container / network namespace / VPN-routed path
+  binder after containment is enforced. Linux interface-bound mode validates
+  common systemd-resolved link DNS and static resolver routes. Other platform
+  DNS mechanisms may still require a container / network namespace /
+  VPN-routed path, or IP-literal peers/trackers, so the daemon can fail closed
+  instead of using an unconstrained resolver.
   so the daemon's DNS follows the contained route.
 - **Outbound upload-slot rotation (optimistic unchoke):** choking/unchoking
   (a required `v1.0.0` capability) is implemented and tested in both

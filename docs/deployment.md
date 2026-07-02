@@ -65,7 +65,7 @@ required_interface = "br0"
 allow_ipv6 = true
 fail_closed = true
 validate_route = true
-validate_dns = false
+validate_dns = true
 
 [torrent]
 listen_port = 51413

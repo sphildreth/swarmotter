@@ -39,7 +39,7 @@ required_interface = "br0"
 allow_ipv6 = true
 fail_closed = true
 validate_route = true
-validate_dns = false
+validate_dns = true
 
 [torrent]
 listen_port = 51413
@@ -55,13 +55,12 @@ On Linux, this binds torrent data-plane sockets to the named interface using
 `SO_BINDTODEVICE`. The kernel may choose the current IPv4 or IPv6 source
 address from that interface, so address changes do not break the configuration.
 
-`validate_dns = false` is intentional for this interface-only example. It keeps
-strict mode from approving DNS unless DNS containment is separately available.
-When DNS is not constrained, SwarmOtter blocks torrent hostname resolution
-instead of resolving names through an unconstrained path. IP-literal peers and
-trackers can still be used. For hostname-heavy deployments, prefer a contained
-network namespace or container network where DNS is part of the constrained
-path.
+On Linux, SwarmOtter validates DNS for this interface mode before resolving
+torrent hostnames. The common systemd-resolved setup is accepted when
+`resolvectl dns br0` reports link DNS servers. Static nameservers in
+`/etc/resolv.conf` are accepted when their routes go through `br0`. If DNS
+cannot be proven constrained to the configured path, hostname tracker and DHT
+bootstrap resolution fails closed instead of using an unconstrained resolver.
 
 ## Static source address containment
 
@@ -75,7 +74,7 @@ required_source_ipv4 = "10.8.0.2"
 allow_ipv6 = false
 fail_closed = true
 validate_route = true
-validate_dns = false
+validate_dns = true
 ```
 
 For dual-stack static containment:
@@ -89,7 +88,7 @@ required_source_ipv6 = "fd00:8::2"
 allow_ipv6 = true
 fail_closed = true
 validate_route = true
-validate_dns = false
+validate_dns = true
 
 [torrent]
 allow_ipv6 = true
@@ -165,7 +164,7 @@ unlimited or high is better for raw transfer throughput.
 | `allow_ipv6` | `true` | Enables IPv6 torrent networking when the path is contained. |
 | `fail_closed` | `true` | Blocks torrent networking when strict containment is unhealthy. |
 | `validate_route` | `false` | Requires route validation when supported by the probe. |
-| `validate_dns` | `false` | Requires DNS containment validation when enabled. |
+| `validate_dns` | `false` | Reports `dns_not_constrained` in network health when DNS cannot be proven constrained. Hostname resolution is still fail-closed unless DNS is constrained or a network namespace is used. |
 
 Strict mode requires at least one enforceable path: interface, source address,
 or network namespace.
@@ -217,8 +216,7 @@ Omit a field to use its default.
 | `port` | `51413` | DHT UDP port. |
 | `bootstrap_nodes` | built-in public bootstrap hostnames | DHT bootstrap nodes. |
 
-In strict interface-only mode, bootstrap hostnames are subject to DNS
-containment policy.
+In strict mode, bootstrap hostnames are subject to DNS containment policy.
 
 ### `[pex]`
 
