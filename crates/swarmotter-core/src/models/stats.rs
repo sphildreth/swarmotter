@@ -2,6 +2,8 @@
 
 //! Statistics models.
 
+use crate::hash::InfoHash;
+use crate::models::torrent::TorrentState;
 use serde::{Deserialize, Serialize};
 
 /// Per-torrent statistics.
@@ -50,6 +52,32 @@ pub struct GlobalStats {
     pub total_uploaded: u64,
     pub free_space: Option<u64>,
     pub uptime_seconds: u64,
+}
+
+/// Per-torrent operational diagnostics for API/UI troubleshooting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TorrentDiagnostics {
+    pub info_hash: InfoHash,
+    pub name: String,
+    pub state: TorrentState,
+    pub total_length: u64,
+    pub bytes_completed: u64,
+    pub downloaded: u64,
+    pub uploaded: u64,
+    pub piece_count: usize,
+    pub pieces_have: usize,
+    pub piece_length: u64,
+    pub progress: f64,
+    pub rate_down: u64,
+    pub rate_up: u64,
+    pub download_limit: u64,
+    pub upload_limit: u64,
+    pub active_peer_workers: usize,
+    pub known_peers: usize,
+    pub tracker_ok: bool,
+    pub tracker_message: Option<String>,
+    pub last_announce: Option<u64>,
+    pub private: bool,
 }
 
 #[cfg(test)]

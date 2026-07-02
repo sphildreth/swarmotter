@@ -179,6 +179,21 @@ If torrents appear in the Web UI but stay at `0 B/s`, check tracker status:
 curl -sS http://127.0.0.1:9091/api/v1/torrents/<info_hash>/trackers
 ```
 
+Check live per-torrent counters and engine diagnostics:
+
+```bash
+curl -sS http://127.0.0.1:9091/api/v1/torrents/<info_hash>/stats
+```
+
+Useful fields:
+
+- `rate_down`, `rate_up`: smoothed transfer rates in bytes/sec.
+- `active_peer_workers`: current bounded peer download workers.
+- `known_peers`: peers currently discovered by trackers, DHT, PEX, or direct
+  input.
+- `tracker_ok`, `tracker_message`, `last_announce`: last tracker announce
+  status from the live engine.
+
 Common causes:
 
 - The torrent has no live seeders.

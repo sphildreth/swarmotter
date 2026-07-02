@@ -24,7 +24,7 @@ use swarmotter_core::magnet::Magnet;
 use swarmotter_core::meta;
 use swarmotter_core::models::network::{NetworkContainmentMode, NetworkHealth};
 use swarmotter_core::models::peer::Peer;
-use swarmotter_core::models::stats::GlobalStats;
+use swarmotter_core::models::stats::{GlobalStats, TorrentDiagnostics};
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{TrackerId, TrackerInfo, TrackerKind, TrackerStatus};
 use swarmotter_core::net::{self, OsInterfaceProbe};
@@ -66,6 +66,10 @@ pub struct DaemonRuntime {
 struct RateSample {
     downloaded: u64,
     uploaded: u64,
+    rate_down: u64,
+    rate_up: u64,
+    last_download_at: Option<Instant>,
+    last_upload_at: Option<Instant>,
     at: Instant,
 }
 
@@ -564,15 +568,31 @@ impl DaemonRuntime {
                     let elapsed = now.duration_since(prev.at);
                     if elapsed >= Duration::from_millis(250) {
                         let secs = elapsed.as_secs_f64();
-                        t.rate_down =
-                            ((s.downloaded.saturating_sub(prev.downloaded) as f64) / secs) as u64;
-                        t.rate_up =
-                            ((s.uploaded.saturating_sub(prev.uploaded) as f64) / secs) as u64;
+                        let down_delta = s.downloaded.saturating_sub(prev.downloaded);
+                        let up_delta = s.uploaded.saturating_sub(prev.uploaded);
+                        let inst_down = ((down_delta as f64) / secs) as u64;
+                        let inst_up = ((up_delta as f64) / secs) as u64;
+                        let last_download_at = if down_delta > 0 {
+                            Some(now)
+                        } else {
+                            prev.last_download_at
+                        };
+                        let last_upload_at = if up_delta > 0 {
+                            Some(now)
+                        } else {
+                            prev.last_upload_at
+                        };
+                        t.rate_down = smooth_rate(prev.rate_down, inst_down, last_download_at, now);
+                        t.rate_up = smooth_rate(prev.rate_up, inst_up, last_upload_at, now);
                         samples.insert(
                             *hash,
                             RateSample {
                                 downloaded: s.downloaded,
                                 uploaded: s.uploaded,
+                                rate_down: t.rate_down,
+                                rate_up: t.rate_up,
+                                last_download_at,
+                                last_upload_at,
                                 at: now,
                             },
                         );
@@ -583,6 +603,10 @@ impl DaemonRuntime {
                         RateSample {
                             downloaded: s.downloaded,
                             uploaded: s.uploaded,
+                            rate_down: t.rate_down,
+                            rate_up: t.rate_up,
+                            last_download_at: None,
+                            last_upload_at: None,
                             at: now,
                         },
                     );
@@ -1200,6 +1224,55 @@ impl DaemonOps for DaemonRuntime {
         }
     }
 
+    async fn torrent_stats(&self, hash: &InfoHash) -> Option<TorrentDiagnostics> {
+        self.reconcile_engine_progress().await;
+        let engine_state = self.engine_states.lock().await.get(hash).cloned();
+        let live = if let Some(state) = engine_state {
+            let s = state.lock().await;
+            Some((
+                s.active_peers,
+                s.peers.len(),
+                s.tracker_ok,
+                s.tracker_message.clone(),
+                s.last_announce,
+            ))
+        } else {
+            None
+        };
+        let reg = self.registry.lock().await;
+        let t = reg.get(hash)?;
+        let progress = if t.meta.total_length == 0 {
+            0.0
+        } else {
+            t.bytes_completed() as f64 / t.meta.total_length as f64
+        };
+        let (active_peer_workers, known_peers, tracker_ok, tracker_message, last_announce) =
+            live.unwrap_or((0, 0, false, None, None));
+        Some(TorrentDiagnostics {
+            info_hash: t.info_hash(),
+            name: t.name().to_string(),
+            state: t.state,
+            total_length: t.meta.total_length,
+            bytes_completed: t.bytes_completed(),
+            downloaded: t.downloaded,
+            uploaded: t.uploaded,
+            piece_count: t.meta.piece_count(),
+            pieces_have: t.pieces_have(),
+            piece_length: t.meta.piece_length,
+            progress,
+            rate_down: t.rate_down,
+            rate_up: t.rate_up,
+            download_limit: t.download_limit,
+            upload_limit: t.upload_limit,
+            active_peer_workers,
+            known_peers,
+            tracker_ok,
+            tracker_message,
+            last_announce,
+            private: t.meta.is_private(),
+        })
+    }
+
     async fn watch_scan(&self) -> Result<()> {
         self.scan_watch_folders().await
     }
@@ -1231,6 +1304,28 @@ async fn apply_network_state(t: &mut Torrent, health: &Arc<Mutex<NetworkHealth>>
     if !h.traffic_allowed && h.mode != NetworkContainmentMode::Disabled {
         t.state = TorrentState::NetworkBlocked;
         t.error = Some(h.detail.clone());
+    }
+}
+
+fn smooth_rate(
+    previous_rate: u64,
+    instantaneous_rate: u64,
+    last_activity_at: Option<Instant>,
+    now: Instant,
+) -> u64 {
+    if instantaneous_rate > 0 {
+        if previous_rate == 0 {
+            instantaneous_rate
+        } else {
+            ((previous_rate as f64 * 0.65) + (instantaneous_rate as f64 * 0.35)) as u64
+        }
+    } else if last_activity_at
+        .map(|at| now.duration_since(at) <= Duration::from_secs(20))
+        .unwrap_or(false)
+    {
+        ((previous_rate as f64) * 0.85) as u64
+    } else {
+        0
     }
 }
 
@@ -1281,6 +1376,10 @@ mod tests {
             RateSample {
                 downloaded: 1_000,
                 uploaded: 200,
+                rate_down: 0,
+                rate_up: 0,
+                last_download_at: None,
+                last_upload_at: None,
                 at: Instant::now() - Duration::from_secs(2),
             },
         );
@@ -1296,5 +1395,60 @@ mod tests {
         assert_eq!(stats.upload_rate, summary.rate_up);
         assert_eq!(stats.total_downloaded, 5_000);
         assert_eq!(stats.total_uploaded, 1_200);
+    }
+
+    #[tokio::test]
+    async fn torrent_stats_includes_live_engine_diagnostics() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "diag.bin",
+            b"0123456789abcdef",
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = meta.info_hash;
+        runtime
+            .registry
+            .lock()
+            .await
+            .add(Torrent::new(meta.clone(), 1))
+            .unwrap();
+        runtime.engine_states.lock().await.insert(
+            hash,
+            Arc::new(Mutex::new(EngineState {
+                piece_count: meta.piece_count(),
+                total_length: meta.total_length,
+                active_peers: 4,
+                peers: vec![
+                    swarmotter_core::peer::PeerAddr::from_socket_addr(
+                        "127.0.0.1:6881".parse().unwrap(),
+                    ),
+                    swarmotter_core::peer::PeerAddr::from_socket_addr(
+                        "127.0.0.1:6882".parse().unwrap(),
+                    ),
+                ],
+                tracker_ok: true,
+                tracker_message: Some("ok".into()),
+                last_announce: Some(123),
+                ..Default::default()
+            })),
+        );
+
+        let stats = runtime.torrent_stats(&hash).await.unwrap();
+
+        assert_eq!(stats.info_hash, hash);
+        assert_eq!(stats.active_peer_workers, 4);
+        assert_eq!(stats.known_peers, 2);
+        assert!(stats.tracker_ok);
+        assert_eq!(stats.tracker_message.as_deref(), Some("ok"));
+        assert_eq!(stats.last_announce, Some(123));
     }
 }

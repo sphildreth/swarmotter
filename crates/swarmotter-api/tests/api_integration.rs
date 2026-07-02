@@ -113,6 +113,25 @@ async fn add_and_list_torrents() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
+    // Get per-torrent diagnostics/stats.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/torrents/{hash}/stats"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["data"]["info_hash"], hash);
+    assert!(v["data"]["piece_count"].as_u64().unwrap() > 0);
+
     // 404 for unknown.
     let resp = app
         .clone()

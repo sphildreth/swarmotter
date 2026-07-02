@@ -10,6 +10,6 @@ pub mod tracker;
 
 pub use network::{NetworkContainmentMode, NetworkContainmentStatus, NetworkHealth};
 pub use peer::{Peer, PeerDirection, PeerFlags};
-pub use stats::{GlobalStats, TorrentStats};
+pub use stats::{GlobalStats, TorrentDiagnostics, TorrentStats};
 pub use torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 pub use tracker::{TrackerId, TrackerInfo, TrackerKind, TrackerStatus, TrackerTier};

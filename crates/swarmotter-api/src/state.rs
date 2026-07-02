@@ -13,7 +13,7 @@ use swarmotter_core::error::Result;
 use swarmotter_core::hash::InfoHash;
 use swarmotter_core::models::network::NetworkHealth;
 use swarmotter_core::models::peer::Peer;
-use swarmotter_core::models::stats::GlobalStats;
+use swarmotter_core::models::stats::{GlobalStats, TorrentDiagnostics};
 use swarmotter_core::models::torrent::TorrentFile;
 use swarmotter_core::models::torrent::TorrentSummary;
 use swarmotter_core::models::tracker::TrackerInfo;
@@ -113,6 +113,8 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn network_health(&self) -> NetworkHealth;
     /// Global stats.
     async fn global_stats(&self) -> GlobalStats;
+    /// Per-torrent diagnostics and stats.
+    async fn torrent_stats(&self, hash: &InfoHash) -> Option<TorrentDiagnostics>;
 
     /// Trigger a watch-folder scan.
     async fn watch_scan(&self) -> Result<()>;

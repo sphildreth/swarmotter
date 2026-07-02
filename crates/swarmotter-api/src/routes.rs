@@ -52,6 +52,7 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             "/torrents/:hash",
             get(handlers::torrents::get_torrent).delete(handlers::torrents::remove_torrent),
         )
+        .route("/torrents/:hash/stats", get(handlers::stats::torrent_stats))
         .route("/torrents/:hash/pause", post(handlers::torrents::pause))
         .route("/torrents/:hash/resume", post(handlers::torrents::resume))
         .route("/torrents/:hash/start", post(handlers::torrents::start_now))

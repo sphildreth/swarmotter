@@ -73,6 +73,7 @@ All routes are prefixed with `/api/v1`. A root `/health` alias also exists.
 | POST | `/torrents/magnet` | Add magnet (JSON `{ magnet, download_dir? }`) |
 | POST | `/torrents/file` | Upload `.torrent` (raw body) |
 | GET | `/torrents/:hash` | Torrent details |
+| GET | `/torrents/:hash/stats` | Per-torrent counters and live engine diagnostics |
 | DELETE | `/torrents/:hash?delete_data=bool` | Remove (optionally delete data) |
 | POST | `/torrents/:hash/pause` | Pause |
 | POST | `/torrents/:hash/resume` | Resume |

@@ -219,8 +219,12 @@ status.
   active and completed roots remain the same.
 - API/UI transfer rates are now calculated from live engine byte-counter
   deltas instead of remaining at zero while progress changes. Downloaded byte
-  counters now track received network bytes, while completed byte counters
-  continue to track verified pieces.
+  counters now track received network bytes, completed byte counters continue
+  to track verified pieces, and displayed rates decay smoothly across short
+  quiet samples instead of snapping immediately to zero.
+- Added `GET /api/v1/torrents/:hash/stats` for per-torrent troubleshooting and
+  performance diagnostics, including live rates, byte counters, active peer
+  workers, known peers, tracker status/message, and last announce time.
 - The normal download loop now uses bounded multi-peer piece downloading when
   more than one peer is known, with per-piece reservations to avoid duplicate
   normal-mode downloads. Tracker announces now request more peers so heavily

@@ -16,7 +16,7 @@ use swarmotter_core::models::network::{
     NetworkContainmentMode, NetworkContainmentStatus, NetworkHealth,
 };
 use swarmotter_core::models::peer::Peer;
-use swarmotter_core::models::stats::GlobalStats;
+use swarmotter_core::models::stats::{GlobalStats, TorrentDiagnostics};
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{
     TrackerId, TrackerInfo, TrackerKind, TrackerStatus, TrackerTier,
@@ -350,6 +350,39 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             torrent_count: reg.torrents.len(),
             ..Default::default()
         }
+    }
+    async fn torrent_stats(&self, hash: &InfoHash) -> Option<TorrentDiagnostics> {
+        let reg = self.registry.lock().await;
+        let t = reg.get(hash)?;
+        let total_length = t.meta.total_length;
+        let bytes_completed = t.bytes_completed();
+        Some(TorrentDiagnostics {
+            info_hash: t.info_hash(),
+            name: t.name().to_string(),
+            state: t.state,
+            total_length,
+            bytes_completed,
+            downloaded: t.downloaded,
+            uploaded: t.uploaded,
+            piece_count: t.meta.piece_count(),
+            pieces_have: t.pieces_have(),
+            piece_length: t.meta.piece_length,
+            progress: if total_length == 0 {
+                0.0
+            } else {
+                bytes_completed as f64 / total_length as f64
+            },
+            rate_down: t.rate_down,
+            rate_up: t.rate_up,
+            download_limit: t.download_limit,
+            upload_limit: t.upload_limit,
+            active_peer_workers: 0,
+            known_peers: 0,
+            tracker_ok: false,
+            tracker_message: None,
+            last_announce: None,
+            private: t.meta.is_private(),
+        })
     }
     async fn watch_scan(&self) -> Result<()> {
         Ok(())
