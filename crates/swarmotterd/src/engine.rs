@@ -230,10 +230,16 @@ impl TorrentEngine {
             }
         }
         // Trackerless / supplemental DHT discovery: for non-private torrents,
-        // ask the DHT for peers holding this info hash.
+        // ask the DHT for peers holding this info hash. Bounded by a hard
+        // total cap so unreachable bootstrap nodes cannot stall the download.
         if !self.meta.is_private() {
             if let Some(dht) = &self.dht {
-                if let Ok(peers) = dht.get_peers(self.meta.info_hash, 3).await {
+                let dht_result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    dht.get_peers(self.meta.info_hash, 3),
+                )
+                .await;
+                if let Ok(Ok(peers)) = dht_result {
                     for p in peers {
                         if !discovered.contains(&p) {
                             discovered.push(p);
@@ -832,7 +838,12 @@ impl TorrentEngine {
         // Trackerless magnet fallback: if no trackers/peers, discover via DHT.
         if candidates.is_empty() {
             if let Some(dht) = &self.dht {
-                if let Ok(peers) = dht.get_peers(magnet.info_hash, 3).await {
+                let dht_result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    dht.get_peers(magnet.info_hash, 3),
+                )
+                .await;
+                if let Ok(Ok(peers)) = dht_result {
                     candidates.extend(peers);
                 }
             }

@@ -40,10 +40,10 @@ SwarmOtter is a Rust async daemon with these layers:
 
 ```text
 crates/
-├── swarmotterd/      # daemon binary + lib (runtime, DaemonOps impl, live engine, seeder, metadata, netbinder)
+├── swarmotterd/      # daemon binary + lib (runtime, DaemonOps impl, live engine, seeder, metadata, dht, netbinder)
 ├── swarmotter-core/  # core types and engine logic
-│   └── src/ bencode, endgame, error, extensions, hash, magnet, meta, models/, net/ (binder, config, probe),
-│            peer, tracker, udp_tracker, queue, ratio, bandwidth, storage/ (io, layout, resume),
+│   └── src/ bencode, dht, endgame, error, extensions, hash, magnet, meta, models/, net/ (binder, config, probe),
+│            peer, tracker, udp_tracker, utp, queue, ratio, bandwidth, storage/ (io, layout, resume),
 │            torrent, watch, config
 ├── swarmotter-api/   # API layer (routes, handlers, envelope, events)
 └── swarmotter-web/   # embedded static Web UI

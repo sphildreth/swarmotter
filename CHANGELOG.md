@@ -120,7 +120,25 @@ MVP release.
   `http_get` path. Fail-closed blocks HTTPS; a local self-signed TLS fixture
   test proves the contained-socket HTTPS path with certificate validation.
   See ADR-0018.
-- Tests now total: core 138 unit + engine/daemon/seeder/endgame/bandwidth/metadata/tls/containment/api/web + 8 local
+- **Mainline DHT (BEP 5):** `swarmotter-core::dht` implements pure KRPC
+  encode/decode, node IDs with XOR distance, a bounded routing table, compact
+  node/peer parsing, and `ping`/`find_node`/`get_peers`/`announce_peer` query
+  builders (unit-tested). `swarmotterd::dht::DhtRunner` drives KRPC over the
+  binder's contained UDP socket: bootstrap, iterative `get_peers` merged into
+  the engine candidate pool for non-private torrents, trackerless magnet
+  fallback via DHT, `announce_peer`, node-count status, and fail-closed
+  blocking. The engine wraps DHT calls in hard time bounds so unreachable nodes
+  cannot stall downloads. A local KRPC fixture test proves `get_peers` peer
+  discovery. See ADR-0019.
+- **uTP (BEP 29) binder-ready subset:** `swarmotter-core::utp` implements the
+  uTP packet header encode/decode (BEP 29), packet types (DATA/FIN/STATE/RESET/
+  SYN), connection-id assignment, and a minimal reliable session with in-order
+  send/ACK/reassembly, running over the binder's contained UDP socket. A local
+  SYN/ACK/DATA exchange fixture and a fail-closed test prove the contained UDP
+  transport path. Full production uTP (LEDBAT congestion control, SACK, full
+  handshake/FIN, timestamp echo, TCP/uTP transport selection in the engine)
+  remains and is documented in ADR-0020 and the tracker.
+- Tests now total: core 152 unit + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 8 local
   swarm (HTTP tracker, UDP tracker, direct peer, inbound seeding, endgame, bandwidth, PEX, magnet) + 1 daemon download.
 - **Inbound peer listening and seeding/upload:** the daemon now spawns an
   inbound `Seeder` (`swarmotterd::seeder`) alongside each active torrent. It

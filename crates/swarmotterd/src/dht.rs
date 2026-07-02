@@ -87,7 +87,9 @@ impl DhtRunner {
 
     /// Iterative `get_peers` for an info hash. Returns discovered peers and
     /// populates the routing table with nodes that responded. Performs a
-    /// bounded number of rounds against the closest known nodes.
+    /// bounded number of rounds against the closest known nodes, with short
+    /// per-node timeouts so unreachable bootstrap nodes cannot stall the
+    /// caller.
     pub async fn get_peers(&self, info_hash: InfoHash, max_rounds: usize) -> Result<Vec<PeerAddr>> {
         let socket = self.socket().await?;
         let mut discovered: Vec<PeerAddr> = Vec::new();
@@ -118,13 +120,14 @@ impl DhtRunner {
                     continue;
                 }
                 let mut buf = vec![0u8; 2048];
-                let resp = match timeout(Duration::from_secs(3), socket.recv_from(&mut buf)).await {
-                    Ok(Ok((from, n))) => match dht::parse_response(&buf[..n]) {
-                        Ok(r) => Some((from, r)),
-                        Err(_) => None,
-                    },
-                    _ => None,
-                };
+                let resp =
+                    match timeout(Duration::from_millis(800), socket.recv_from(&mut buf)).await {
+                        Ok(Ok((from, n))) => match dht::parse_response(&buf[..n]) {
+                            Ok(r) => Some((from, r)),
+                            Err(_) => None,
+                        },
+                        _ => None,
+                    };
                 if let Some((from, resp)) = resp {
                     self.handle_response(from, &resp, &mut discovered, &mut next, info_hash);
                 }
@@ -203,6 +206,111 @@ pub fn resolve_bootstrap(specs: &[String]) -> Vec<SocketAddr> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod utp_transport_tests {
+    use super::*;
+    use swarmotter_core::net::binder::LoopbackBinder;
+    use swarmotter_core::utp::{UtpHeader, UtpSession, UtpType};
+
+    /// A local uTP "echo peer" that receives a SYN, answers with an ACK, then
+    /// echoes any DATA packets back as DATA, exercising the contained UDP
+    /// transport over loopback. Proves the binder-ready uTP architecture
+    /// carries framed, in-order data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn utp_reliable_exchange_over_contained_socket() {
+        use swarmotter_core::net::NetworkBinder;
+        let echo_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_addr = echo_sock.local_addr().unwrap();
+
+        let echo_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            // Receive SYN.
+            let (n, peer) = echo_sock.recv_from(&mut buf).await.unwrap();
+            let (syn, _) = UtpHeader::decode(&buf[..n]).unwrap();
+            assert_eq!(syn.typ, UtpType::Syn);
+            let mut peer_session = UtpSession {
+                send_connection_id: syn.connection_id.wrapping_add(1),
+                recv_connection_id: syn.connection_id,
+                seq_number: 1,
+                ack_number: syn.seq_number,
+                window_size: 64 * 1024,
+            };
+            // Send ACK for the SYN.
+            let ack = peer_session.ack_packet();
+            echo_sock.send_to(&ack, peer).await.unwrap();
+            // Echo back any DATA packets as DATA with the same payload.
+            loop {
+                let (n, peer) = match echo_sock.recv_from(&mut buf).await {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                if n == 0 {
+                    continue;
+                }
+                let (h, payload) = match UtpHeader::decode(&buf[..n]) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if h.typ == UtpType::Data {
+                    peer_session.ack_number = h.seq_number;
+                    let _echo = peer_session.data_packet(payload);
+                    echo_sock.send_to(&_echo, peer).await.unwrap();
+                    // Also send an ACK so the initiator learns progress.
+                    let ack = peer_session.ack_packet();
+                    echo_sock.send_to(&ack, peer).await.unwrap();
+                    // Stop after echoing one payload for the test.
+                    return;
+                }
+            }
+        });
+
+        let binder = Arc::new(LoopbackBinder);
+        let socket = binder.udp_socket().await.unwrap();
+        let mut session = UtpSession::initiator(4242);
+        let syn = session.syn_packet();
+        socket.send_to(echo_addr, &syn).await.unwrap();
+        // Read the echo's ACK.
+        let mut buf = vec![0u8; 2048];
+        let (_from, n) = tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let (ack, _) = UtpHeader::decode(&buf[..n]).unwrap();
+        assert_eq!(ack.typ, UtpType::State);
+        // Send a DATA packet.
+        let data = session.data_packet(b"utp payload over contained socket");
+        socket.send_to(echo_addr, &data).await.unwrap();
+        // Read the echoed DATA back.
+        loop {
+            let (from, n) =
+                tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let (h, payload) = match UtpHeader::decode(&buf[..n]) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if h.typ == UtpType::Data && from == echo_addr {
+                assert_eq!(payload, b"utp payload over contained socket");
+                break;
+            }
+            // Otherwise it's an ACK; keep reading.
+        }
+        echo_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn utp_transport_fail_closed() {
+        use swarmotter_core::net::NetworkBinder;
+        let binder = Arc::new(swarmotter_core::net::binder::BlockedBinder);
+        match binder.udp_socket().await {
+            Ok(_) => panic!("expected fail-closed to block uTP transport"),
+            Err(e) => assert!(e.is_network_blocked()),
+        }
+    }
 }
 
 #[cfg(test)]

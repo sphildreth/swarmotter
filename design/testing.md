@@ -76,7 +76,7 @@ feature completion and acceptance criteria, not by time estimates.
   download to a fresh leecher through the contained listener)
 - Daemon-driven download through `DaemonOps`: covered
 - Magnet metadata fetch: covered (BEP 9 ut_metadata, info-hash verified)
-- DHT-based peer discovery: pending live DHT engine
+- DHT-based peer discovery: covered (local KRPC `get_peers` fixture)
 - PEX-based peer exchange: covered (BEP 10/11, peer discovered via PEX)
 - Recheck after completion: covered via `StorageIo::recheck`
 

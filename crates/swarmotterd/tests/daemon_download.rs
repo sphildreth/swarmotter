@@ -208,8 +208,10 @@ async fn daemon_add_downloads_to_completion_via_engine() {
     spawn_tracker(tracker_addr, seed).await;
 
     // Daemon with default (disabled) network containment and a temp download dir.
+    // DHT is disabled to keep the test offline and deterministic.
     let mut cfg = Config::default();
     cfg.network.mode = swarmotter_core::models::network::NetworkContainmentMode::Disabled;
+    cfg.dht.enabled = false;
     let healthy = swarmotter_core::models::network::NetworkHealth::blocked(
         swarmotter_core::models::network::NetworkContainmentMode::Disabled,
         swarmotter_core::models::network::NetworkContainmentStatus::Disabled,

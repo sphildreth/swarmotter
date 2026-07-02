@@ -26,6 +26,7 @@ pub mod storage;
 pub mod torrent;
 pub mod tracker;
 pub mod udp_tracker;
+pub mod utp;
 pub mod watch;
 
 pub use error::{CoreError, Result};
