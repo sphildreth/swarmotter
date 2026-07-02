@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
@@ -58,6 +58,15 @@ pub struct DaemonRuntime {
     /// daemon keeps a clone (cheap: buckets are shared) so per-torrent limit
     /// changes apply live to a running engine.
     engine_limiters: Arc<Mutex<HashMap<InfoHash, swarmotter_core::bandwidth::RateLimiter>>>,
+    /// Last byte-counter samples used to calculate API/UI transfer rates.
+    rate_samples: Arc<Mutex<HashMap<InfoHash, RateSample>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RateSample {
+    downloaded: u64,
+    uploaded: u64,
+    at: Instant,
 }
 
 impl DaemonRuntime {
@@ -78,6 +87,7 @@ impl DaemonRuntime {
             seeder_handles: Arc::new(Mutex::new(HashMap::new())),
             global_limiter,
             engine_limiters: Arc::new(Mutex::new(HashMap::new())),
+            rate_samples: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -357,6 +367,7 @@ impl DaemonRuntime {
         self.stop_seeder(hash).await;
         self.engine_states.lock().await.remove(hash);
         self.engine_limiters.lock().await.remove(hash);
+        self.rate_samples.lock().await.remove(hash);
     }
 
     /// Spawn the inbound peer listener / seeder for a torrent. It shares the
@@ -543,10 +554,39 @@ impl DaemonRuntime {
     /// so API/UI summaries reflect real progress while downloading.
     async fn reconcile_engine_progress(&self) {
         let states = self.engine_states.lock().await.clone();
+        let now = Instant::now();
+        let mut samples = self.rate_samples.lock().await;
         let mut reg = self.registry.lock().await;
         for (hash, state) in &states {
             let s = state.lock().await;
             if let Some(t) = reg.get_mut(hash) {
+                if let Some(prev) = samples.get(hash).copied() {
+                    let elapsed = now.duration_since(prev.at);
+                    if elapsed >= Duration::from_millis(250) {
+                        let secs = elapsed.as_secs_f64();
+                        t.rate_down =
+                            ((s.downloaded.saturating_sub(prev.downloaded) as f64) / secs) as u64;
+                        t.rate_up =
+                            ((s.uploaded.saturating_sub(prev.uploaded) as f64) / secs) as u64;
+                        samples.insert(
+                            *hash,
+                            RateSample {
+                                downloaded: s.downloaded,
+                                uploaded: s.uploaded,
+                                at: now,
+                            },
+                        );
+                    }
+                } else {
+                    samples.insert(
+                        *hash,
+                        RateSample {
+                            downloaded: s.downloaded,
+                            uploaded: s.uploaded,
+                            at: now,
+                        },
+                    );
+                }
                 t.progress.have = (0..s.piece_count).map(|i| s.pieces_have.has(i)).collect();
                 t.downloaded = s.downloaded;
                 t.uploaded = s.uploaded;
@@ -734,6 +774,7 @@ impl DaemonOps for DaemonRuntime {
                 let _ = storage.remove_all().await;
             }
         }
+        self.rate_samples.lock().await.remove(hash);
         Ok(())
     }
 
@@ -1124,6 +1165,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn global_stats(&self) -> GlobalStats {
+        self.reconcile_engine_progress().await;
         let reg = self.registry.lock().await;
         let active_downloads = reg
             .torrents
@@ -1146,10 +1188,14 @@ impl DaemonOps for DaemonRuntime {
             .filter(|t| matches!(t.state, TorrentState::Paused))
             .count();
         GlobalStats {
+            download_rate: reg.torrents.values().map(|t| t.rate_down).sum(),
+            upload_rate: reg.torrents.values().map(|t| t.rate_up).sum(),
             torrent_count: reg.torrents.len(),
             active_downloads,
             active_seeds,
             paused,
+            total_downloaded: reg.torrents.values().map(|t| t.downloaded).sum(),
+            total_uploaded: reg.torrents.values().map(|t| t.uploaded).sum(),
             ..Default::default()
         }
     }
@@ -1185,5 +1231,70 @@ async fn apply_network_state(t: &mut Torrent, health: &Arc<Mutex<NetworkHealth>>
     if !h.traffic_allowed && h.mode != NetworkContainmentMode::Disabled {
         t.state = TorrentState::NetworkBlocked;
         t.error = Some(h.detail.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use swarmotter_api::state::DaemonOps;
+
+    #[tokio::test]
+    async fn reconcile_updates_transfer_rates_and_global_stats() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "rates.bin",
+            b"0123456789abcdef",
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = meta.info_hash;
+
+        runtime
+            .registry
+            .lock()
+            .await
+            .add(Torrent::new(meta.clone(), 1))
+            .unwrap();
+        let state = Arc::new(Mutex::new(EngineState {
+            piece_count: meta.piece_count(),
+            total_length: meta.total_length,
+            downloaded: 5_000,
+            uploaded: 1_200,
+            ..Default::default()
+        }));
+        runtime
+            .engine_states
+            .lock()
+            .await
+            .insert(hash, state.clone());
+        runtime.rate_samples.lock().await.insert(
+            hash,
+            RateSample {
+                downloaded: 1_000,
+                uploaded: 200,
+                at: Instant::now() - Duration::from_secs(2),
+            },
+        );
+
+        let summary = runtime.get_torrent(&hash).await.unwrap();
+        assert!(summary.rate_down > 0);
+        assert!(summary.rate_up > 0);
+        assert_eq!(summary.downloaded, 5_000);
+        assert_eq!(summary.uploaded, 1_200);
+
+        let stats = runtime.global_stats().await;
+        assert_eq!(stats.download_rate, summary.rate_down);
+        assert_eq!(stats.upload_rate, summary.rate_up);
+        assert_eq!(stats.total_downloaded, 5_000);
+        assert_eq!(stats.total_uploaded, 1_200);
     }
 }

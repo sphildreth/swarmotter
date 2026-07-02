@@ -217,6 +217,14 @@ status.
   the engine moves completed data to `[storage].download_dir` and writes the
   completed fast-resume metadata there. If `incomplete_dir` is unset, the
   active and completed roots remain the same.
+- API/UI transfer rates are now calculated from live engine byte-counter
+  deltas instead of remaining at zero while progress changes. Downloaded byte
+  counters now track received network bytes, while completed byte counters
+  continue to track verified pieces.
+- The normal download loop now uses bounded multi-peer piece downloading when
+  more than one peer is known, with per-piece reservations to avoid duplicate
+  normal-mode downloads. Tracker announces now request more peers so heavily
+  seeded torrents can fill the bounded peer worker set.
 - `[storage].preallocate` is now honored by the live engine. When disabled, the
   engine creates required directories and writes pieces as needed instead of
   pre-sizing all files.

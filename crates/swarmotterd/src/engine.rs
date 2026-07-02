@@ -314,7 +314,7 @@ impl TorrentEngine {
 
         // Download loop: connect to peers, request missing pieces, write and
         // verify. Bounded to a small number of concurrent peers.
-        let max_concurrent = 4usize;
+        let max_concurrent = 16usize;
         let mut bad_peers: HashSet<SocketAddr> = HashSet::new();
         let start = Instant::now();
         // Bounded consecutive no-peer rounds: if we never discover any peers
@@ -372,14 +372,33 @@ impl TorrentEngine {
                 }
             }
 
-            // Try peers until we make progress or exhaust the list.
-            let mut made_progress = false;
-            let mut to_try: Vec<PeerAddr> = discovered
+            let candidates: Vec<PeerAddr> = discovered
                 .iter()
                 .filter(|p| !bad_peers.contains(&p.socket_addr()))
                 .copied()
                 .take(max_concurrent * 2)
                 .collect();
+            let mut made_progress = false;
+
+            if candidates.len() > 1 {
+                made_progress = self
+                    .run_parallel_peer_round(
+                        &candidates[..candidates.len().min(max_concurrent)],
+                        &storage,
+                        &mut have,
+                        &mut bad_peers,
+                    )
+                    .await;
+            }
+
+            // Single-peer fallback and diagnostic path. This also preserves
+            // the PEX behavior where the only known peer can advertise more
+            // peers during the session.
+            let mut to_try = if made_progress {
+                Vec::new()
+            } else {
+                candidates
+            };
 
             while let Some(peer_addr) = to_try.pop() {
                 if have.count(piece_count) == piece_count {
@@ -467,22 +486,13 @@ impl TorrentEngine {
         &self,
         peer_addr: &PeerAddr,
     ) -> Result<(Box<dyn utp::PeerDuplex>, PeerTransport)> {
-        let addr = peer_addr.socket_addr();
-        if self.utp_enabled {
-            let (first, second) = if self.utp_prefer_tcp {
-                (PeerTransport::Tcp, PeerTransport::Utp)
-            } else {
-                (PeerTransport::Utp, PeerTransport::Tcp)
-            };
-            match utp::connect_peer_stream(self.binder.clone(), first, addr).await {
-                Ok(s) => return Ok(s),
-                Err(e) => {
-                    tracing::debug!(peer = %addr, transport = first.as_str(), error = %e, "preferred transport failed; trying fallback")
-                }
-            }
-            return utp::connect_peer_stream(self.binder.clone(), second, addr).await;
-        }
-        utp::connect_peer_stream(self.binder.clone(), PeerTransport::Tcp, addr).await
+        connect_peer_stream_with_transport(
+            self.binder.clone(),
+            *peer_addr,
+            self.utp_enabled,
+            self.utp_prefer_tcp,
+        )
+        .await
     }
 
     /// Attempt to download missing pieces from a single peer. Returns true if
@@ -620,6 +630,7 @@ impl TorrentEngine {
                                     && assembler.add_block(offset, &block).is_ok()
                                 {
                                     received_blocks += 1;
+                                    self.record_downloaded(block.len() as u64).await;
                                 }
                             }
                             Message::Choke => {
@@ -770,6 +781,7 @@ impl TorrentEngine {
             let outstanding = outstanding.clone();
             let made_progress = made_progress.clone();
             let download_dir = download_dir.clone();
+            let state = self.state.clone();
             let limiter = self.limiter.clone();
             let utp_enabled = self.utp_enabled;
             let utp_prefer_tcp = self.utp_prefer_tcp;
@@ -784,6 +796,7 @@ impl TorrentEngine {
                     download_dir,
                     deadline,
                     made_progress,
+                    state,
                     limiter,
                     utp_enabled,
                     utp_prefer_tcp,
@@ -825,6 +838,95 @@ impl TorrentEngine {
         progressed
     }
 
+    /// Normal-mode parallel download: several peers fetch distinct reserved
+    /// pieces concurrently. Unlike endgame, duplicate piece requests are
+    /// avoided; endgame remains responsible for deliberate duplicate requests
+    /// near completion.
+    async fn run_parallel_peer_round(
+        &self,
+        candidates: &[PeerAddr],
+        storage: &StorageIo,
+        have: &mut PieceBitfield,
+        bad_peers: &mut HashSet<SocketAddr>,
+    ) -> bool {
+        if candidates.len() < 2 {
+            return false;
+        }
+
+        const PARALLEL_STEP_DEADLINE: Duration = Duration::from_secs(20);
+        let shared = Arc::new(Mutex::new(ParallelPieceState::new(have.clone())));
+        let made_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let storage = Arc::new(storage.clone());
+        let deadline = Instant::now() + PARALLEL_STEP_DEADLINE;
+        let mut handles = Vec::with_capacity(candidates.len());
+
+        {
+            let mut s = self.state.lock().await;
+            s.active_peers = candidates.len();
+        }
+
+        for peer_addr in candidates {
+            let peer_addr = *peer_addr;
+            let meta = self.meta.clone();
+            let binder = self.binder.clone();
+            let peer_id = self.peer_id;
+            let shared = shared.clone();
+            let storage = storage.clone();
+            let state = self.state.clone();
+            let made_progress = made_progress.clone();
+            let limiter = self.limiter.clone();
+            let utp_enabled = self.utp_enabled;
+            let utp_prefer_tcp = self.utp_prefer_tcp;
+            handles.push(tokio::spawn(async move {
+                parallel_peer_session(
+                    binder,
+                    peer_addr,
+                    meta,
+                    peer_id,
+                    shared,
+                    storage,
+                    state,
+                    deadline,
+                    made_progress,
+                    limiter,
+                    utp_enabled,
+                    utp_prefer_tcp,
+                )
+                .await
+            }));
+        }
+
+        let mut any_progress = false;
+        for (peer_addr, handle) in candidates.iter().zip(handles) {
+            match handle.await {
+                Ok(Ok(progressed)) => {
+                    if progressed {
+                        any_progress = true;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(peer = %peer_addr.socket_addr(), error = %e, "parallel peer failed; suppressing");
+                    bad_peers.insert(peer_addr.socket_addr());
+                }
+                Err(_) => {
+                    bad_peers.insert(peer_addr.socket_addr());
+                }
+            }
+        }
+
+        let merged = shared.lock().await.have.clone();
+        let progressed = any_progress || made_progress.load(std::sync::atomic::Ordering::Relaxed);
+        if progressed {
+            *have = merged.clone();
+            self.update_progress(&merged).await;
+            if let Err(e) = self.persist_resume(storage.as_ref(), &merged).await {
+                tracing::warn!(error = %e, "parallel resume persist failed");
+            }
+        }
+        self.state.lock().await.active_peers = 0;
+        progressed
+    }
+
     /// Pick a piece we don't have that the peer has.
     fn pick_piece(&self, peer_bf: Option<&Bitfield>, have: &PieceBitfield) -> Option<usize> {
         let peer_bf = peer_bf?;
@@ -863,7 +965,7 @@ impl TorrentEngine {
                     downloaded,
                     left,
                     event,
-                    numwant: Some(50),
+                    numwant: Some(200),
                     compact: true,
                 };
                 let result = if url.starts_with("udp://") {
@@ -921,7 +1023,7 @@ impl TorrentEngine {
                     downloaded: 0,
                     left: 0,
                     event: AnnounceEvent::Started,
-                    numwant: Some(50),
+                    numwant: Some(200),
                     compact: true,
                 };
                 let result = if url.starts_with("udp://") {
@@ -950,7 +1052,7 @@ impl TorrentEngine {
                         downloaded: 0,
                         left: 0,
                         event: AnnounceEvent::Started,
-                        numwant: Some(50),
+                        numwant: Some(200),
                         compact: true,
                     };
                     let result = if url.starts_with("udp://") {
@@ -1000,22 +1102,16 @@ impl TorrentEngine {
     }
 
     async fn update_progress(&self, have: &PieceBitfield) {
-        let mut s = self.state.lock().await;
-        s.pieces_have = have.clone();
-        let complete_pieces = have.count(s.piece_count) as u64;
-        let mut completed = complete_pieces.saturating_mul(self.meta.piece_length);
-        if s.piece_count > 0 && have.has(s.piece_count - 1) {
-            completed =
-                completed.saturating_sub(self.meta.piece_length - self.meta.last_piece_length());
-        }
-        completed = completed.min(self.meta.total_length);
-        s.bytes_completed = completed;
-        s.downloaded = completed;
+        update_progress_state(&self.state, &self.meta, have).await;
     }
 
     async fn mark_finished(&self) {
         let mut s = self.state.lock().await;
         s.finished = true;
+    }
+
+    async fn record_downloaded(&self, bytes: u64) {
+        record_downloaded_state(&self.state, bytes).await;
     }
 
     async fn load_or_recheck(&self, storage: &StorageIo) -> Result<PieceBitfield> {
@@ -1087,6 +1183,56 @@ enum CommandOutcome {
     Stop,
 }
 
+async fn connect_peer_stream_with_transport(
+    binder: Arc<dyn NetworkBinder>,
+    peer_addr: PeerAddr,
+    utp_enabled: bool,
+    utp_prefer_tcp: bool,
+) -> Result<(Box<dyn utp::PeerDuplex>, PeerTransport)> {
+    let addr = peer_addr.socket_addr();
+    if utp_enabled {
+        let (first, second) = if utp_prefer_tcp {
+            (PeerTransport::Tcp, PeerTransport::Utp)
+        } else {
+            (PeerTransport::Utp, PeerTransport::Tcp)
+        };
+        match utp::connect_peer_stream(binder.clone(), first, addr).await {
+            Ok(s) => return Ok(s),
+            Err(e) => {
+                tracing::debug!(peer = %addr, transport = first.as_str(), error = %e, "preferred transport failed; trying fallback")
+            }
+        }
+        return utp::connect_peer_stream(binder, second, addr).await;
+    }
+    utp::connect_peer_stream(binder, PeerTransport::Tcp, addr).await
+}
+
+#[derive(Debug, Clone)]
+struct ParallelPieceState {
+    have: PieceBitfield,
+    reserved: HashSet<usize>,
+}
+
+impl ParallelPieceState {
+    fn new(have: PieceBitfield) -> Self {
+        Self {
+            have,
+            reserved: HashSet::new(),
+        }
+    }
+
+    fn reserve_piece(&mut self, peer_bf: &Bitfield, piece_count: usize) -> Option<usize> {
+        let piece = (0..piece_count)
+            .find(|&i| peer_bf.has(i) && !self.have.has(i) && !self.reserved.contains(&i))?;
+        self.reserved.insert(piece);
+        Some(piece)
+    }
+
+    fn release_piece(&mut self, piece: usize) {
+        self.reserved.remove(&piece);
+    }
+}
+
 /// A single endgame peer session: connect, handshake, and request the
 /// remaining pieces' blocks (bounded by the shared outstanding-request cap),
 /// writing and verifying any piece this peer delivers first. Duplicate
@@ -1103,6 +1249,7 @@ async fn endgame_peer_session(
     download_dir: PathBuf,
     deadline: Instant,
     made_progress: Arc<std::sync::atomic::AtomicBool>,
+    state: Arc<Mutex<EngineState>>,
     limiter: ShapedLimiter,
     utp_enabled: bool,
     utp_prefer_tcp: bool,
@@ -1250,6 +1397,7 @@ async fn endgame_peer_session(
                             && assembler.add_block(offset, &block).is_ok()
                         {
                             received += 1;
+                            record_downloaded_state(&state, block.len() as u64).await;
                             outstanding.lock().await.delivered(piece, offset);
                         } else if piece as usize != piece_index {
                             // A block for a piece we no longer need (completed
@@ -1351,11 +1499,264 @@ async fn endgame_peer_session(
     Ok(progressed)
 }
 
+/// A normal-mode peer session used by the bounded parallel downloader. Each
+/// session reserves one missing piece at a time from shared state, so peers
+/// work on distinct pieces until endgame takes over.
+#[allow(clippy::too_many_arguments)]
+async fn parallel_peer_session(
+    binder: Arc<dyn NetworkBinder>,
+    peer_addr: PeerAddr,
+    meta: TorrentMeta,
+    peer_id: [u8; 20],
+    shared: Arc<Mutex<ParallelPieceState>>,
+    storage: Arc<StorageIo>,
+    state: Arc<Mutex<EngineState>>,
+    deadline: Instant,
+    made_progress: Arc<std::sync::atomic::AtomicBool>,
+    limiter: ShapedLimiter,
+    utp_enabled: bool,
+    utp_prefer_tcp: bool,
+) -> Result<bool> {
+    if !binder.traffic_allowed() {
+        return Ok(false);
+    }
+
+    let (stream, transport) =
+        connect_peer_stream_with_transport(binder, peer_addr, utp_enabled, utp_prefer_tcp).await?;
+    tracing::debug!(peer = %peer_addr.socket_addr(), transport = transport.as_str(), "parallel peer connected");
+    let (read_half, mut write_half) = tokio::io::split(stream);
+
+    let hs = Handshake {
+        info_hash: meta.info_hash,
+        peer_id,
+        reserved: swarmotter_core::extensions::EXTENSION_RESERVED,
+    };
+    peer::write_handshake(&mut write_half, &hs).await?;
+    let mut reader = PeerReader::new(read_half);
+    let their_hs = timeout(Duration::from_secs(10), reader.read_handshake()).await??;
+    if their_hs.info_hash != meta.info_hash {
+        return Err(CoreError::Internal(
+            "peer handshake info hash mismatch".into(),
+        ));
+    }
+
+    let piece_count = meta.piece_count();
+    let mut our_bf = Bitfield::new(piece_count);
+    {
+        let work = shared.lock().await;
+        for i in 0..piece_count {
+            if work.have.has(i) {
+                our_bf.set(i);
+            }
+        }
+    }
+    peer::write_message(&mut write_half, &our_bf.encode_message()).await?;
+    let ext_payload = swarmotter_core::extensions::encode_extension_handshake(
+        &[(swarmotter_core::extensions::UT_PEX_NAME, 1u8)],
+        "SwarmOtter/0.1",
+        None,
+    );
+    peer::write_message(
+        &mut write_half,
+        &Message::Extended {
+            id: swarmotter_core::extensions::EXTENSION_HANDSHAKE_ID,
+            payload: ext_payload,
+        },
+    )
+    .await?;
+    peer::write_message(&mut write_half, &Message::Interested).await?;
+    write_half.flush().await.ok();
+
+    let mut peer_bf: Option<Bitfield> = None;
+    let mut peer_choking = true;
+    let mut progressed = false;
+
+    loop {
+        if Instant::now() > deadline {
+            break;
+        }
+        let complete = {
+            let work = shared.lock().await;
+            work.have.count(piece_count) == piece_count
+        };
+        if complete {
+            break;
+        }
+
+        if !peer_choking {
+            let Some(piece_index) = ({
+                let mut work = shared.lock().await;
+                let Some(peer_bf) = peer_bf.as_ref() else {
+                    return Ok(progressed);
+                };
+                work.reserve_piece(peer_bf, piece_count)
+            }) else {
+                peer::write_message(&mut write_half, &Message::NotInterested).await?;
+                break;
+            };
+
+            let piece_len = if piece_index + 1 == piece_count {
+                meta.last_piece_length()
+            } else {
+                meta.piece_length
+            } as u32;
+            let reqs = block_requests(piece_len);
+            for (off, len) in &reqs {
+                peer::write_message(
+                    &mut write_half,
+                    &Message::Request {
+                        piece: piece_index as u32,
+                        offset: *off,
+                        length: *len,
+                    },
+                )
+                .await?;
+            }
+            write_half.flush().await.ok();
+
+            let mut assembler = peer::PieceAssembler::new(piece_index as u32, piece_len as usize);
+            let mut received = 0usize;
+            let piece_deadline = Instant::now() + Duration::from_secs(20);
+            while received < reqs.len() {
+                let remaining = piece_deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let msg = match timeout(remaining, reader.read_message()).await {
+                    Ok(Ok(Some(m))) => m,
+                    _ => break,
+                };
+                match msg {
+                    Message::Piece {
+                        piece,
+                        offset,
+                        block,
+                    } => {
+                        if piece as usize == piece_index
+                            && assembler.add_block(offset, &block).is_ok()
+                        {
+                            received += 1;
+                            record_downloaded_state(&state, block.len() as u64).await;
+                        }
+                    }
+                    Message::Choke => {
+                        peer_choking = true;
+                        break;
+                    }
+                    Message::Unchoke => peer_choking = false,
+                    Message::Have { piece } => {
+                        if let Some(bf) = &mut peer_bf {
+                            bf.set(piece as usize);
+                        }
+                    }
+                    Message::Bitfield { bits } => {
+                        peer_bf = Some(Bitfield::from_bytes(bits, piece_count));
+                    }
+                    Message::Keepalive
+                    | Message::Interested
+                    | Message::NotInterested
+                    | Message::Request { .. }
+                    | Message::Cancel { .. }
+                    | Message::Extended { .. }
+                    | Message::Unknown { .. } => {}
+                }
+            }
+
+            if received == reqs.len() {
+                let data = assembler.data().to_vec();
+                if swarmotter_core::storage::verify_piece(&meta, piece_index, &data) {
+                    limiter
+                        .acquire(RateDirection::Download, data.len() as u64)
+                        .await;
+                    storage.write_block(piece_index, 0, &data).await?;
+                    let have_snapshot = {
+                        let mut work = shared.lock().await;
+                        if !work.have.has(piece_index) {
+                            work.have.set(piece_index);
+                            progressed = true;
+                            made_progress.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        work.release_piece(piece_index);
+                        work.have.clone()
+                    };
+                    update_progress_state(&state, &meta, &have_snapshot).await;
+                    peer::write_message(
+                        &mut write_half,
+                        &Message::Have {
+                            piece: piece_index as u32,
+                        },
+                    )
+                    .await?;
+                    write_half.flush().await.ok();
+                } else {
+                    tracing::warn!(piece = piece_index, "piece hash mismatch; rejecting");
+                    shared.lock().await.release_piece(piece_index);
+                }
+            } else {
+                shared.lock().await.release_piece(piece_index);
+            }
+            continue;
+        }
+
+        let msg = match timeout(Duration::from_secs(15), reader.read_message()).await {
+            Ok(Ok(Some(m))) => m,
+            _ => break,
+        };
+        match msg {
+            Message::Unchoke => peer_choking = false,
+            Message::Choke => peer_choking = true,
+            Message::Bitfield { bits } => {
+                peer_bf = Some(Bitfield::from_bytes(bits, piece_count));
+            }
+            Message::Have { piece } => {
+                if let Some(bf) = &mut peer_bf {
+                    bf.set(piece as usize);
+                }
+            }
+            Message::Keepalive
+            | Message::Interested
+            | Message::NotInterested
+            | Message::Request { .. }
+            | Message::Piece { .. }
+            | Message::Cancel { .. }
+            | Message::Extended { .. }
+            | Message::Unknown { .. } => {}
+        }
+    }
+
+    Ok(progressed)
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+async fn record_downloaded_state(state: &Arc<Mutex<EngineState>>, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    let mut s = state.lock().await;
+    s.downloaded = s.downloaded.saturating_add(bytes);
+}
+
+async fn update_progress_state(
+    state: &Arc<Mutex<EngineState>>,
+    meta: &TorrentMeta,
+    have: &PieceBitfield,
+) {
+    let mut s = state.lock().await;
+    s.pieces_have = have.clone();
+    let complete_pieces = have.count(s.piece_count) as u64;
+    let mut completed = complete_pieces.saturating_mul(meta.piece_length);
+    if s.piece_count > 0 && have.has(s.piece_count - 1) {
+        completed = completed.saturating_sub(meta.piece_length - meta.last_piece_length());
+    }
+    completed = completed.min(meta.total_length);
+    s.bytes_completed = completed;
+    s.downloaded = s.downloaded.max(completed);
 }
 
 #[cfg(test)]
