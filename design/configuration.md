@@ -31,6 +31,7 @@ SWARMOTTER_NETWORK__REQUIRED_INTERFACE=br0
 SWARMOTTER_NETWORK__ALLOW_IPV6=true
 SWARMOTTER_TORRENT__ALLOW_IPV6=true
 SWARMOTTER_API__MAX_REQUEST_BODY_BYTES=16777216
+SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED=true
 ```
 
 ## Configuration areas
@@ -43,6 +44,11 @@ SWARMOTTER_API__MAX_REQUEST_BODY_BYTES=16777216
   request bodies, including torrent file uploads. Full config updates through
   `PUT /api/v1/settings` preserve an existing `api.auth_token` if omitted in
   the request body.
+- **Compatibility** (`compatibility`): optional API compatibility adapters.
+  `[compatibility.transmission]` controls whether `/transmission/rpc` is enabled.
+  The adapter is off by default and uses `DaemonOps` semantics rather than a
+  separate torrent engine. Compatibility adapters are isolated so additional
+  surfaces can be added intentionally later.
 - **Storage** (`storage`): `download_dir`, `incomplete_dir`, `preallocate`,
   `sparse`. Incomplete data is written under `incomplete_dir` when configured
   and moved to `download_dir` after all pieces verify. When `preallocate` is
@@ -141,6 +147,10 @@ use `download_dir`.
 - `api.max_request_body_bytes` must be > 0.
 - `torrent.listen_port` must be > 0.
 - Watch folder paths must not be empty.
+- `compatibility.transmission.enabled` may only enable documented adapter features.
+  Mutating calls map to native daemon operations, including delete-data behavior
+  for `torrent-remove`. `torrent-add` inputs are constrained to magnet links and
+  base64 `metainfo`; remote HTTP/HTTPS torrent URLs are rejected.
 
 Validation runs at load time and on env-override merge; failures abort startup
 with a clear error message.

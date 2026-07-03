@@ -7,7 +7,10 @@
 //! the API router. The API never creates torrent network sockets directly; it
 //! issues commands to the daemon which enforces network containment.
 
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use swarmotter_core::config::Config;
 use swarmotter_core::error::Result;
 use swarmotter_core::hash::InfoHash;
@@ -152,6 +155,71 @@ pub struct AppState {
     pub config: Arc<Mutex<Config>>,
     pub build: BuildInfo,
     pub broker: crate::handlers::events::EventBroker,
+    pub transmission: TransmissionCompatState,
+}
+
+/// Process-local state for the Transmission RPC compatibility adapter.
+#[derive(Clone)]
+pub struct TransmissionCompatState {
+    pub(crate) session_id: Arc<String>,
+    pub(crate) ids: Arc<Mutex<TransmissionIdCache>>,
+}
+
+impl TransmissionCompatState {
+    pub fn new() -> Self {
+        Self {
+            session_id: Arc::new(generate_session_id()),
+            ids: Arc::new(Mutex::new(TransmissionIdCache::default())),
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.session_id.as_str()
+    }
+}
+
+impl Default for TransmissionCompatState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Process-local Transmission integer ID mapping over SwarmOtter info hashes.
+#[derive(Debug, Default)]
+pub struct TransmissionIdCache {
+    next_id: i64,
+    hash_to_id: BTreeMap<InfoHash, i64>,
+    id_to_hash: BTreeMap<i64, InfoHash>,
+}
+
+impl TransmissionIdCache {
+    pub fn id_for(&mut self, hash: InfoHash) -> i64 {
+        if let Some(id) = self.hash_to_id.get(&hash) {
+            return *id;
+        }
+        self.next_id += 1;
+        let id = self.next_id;
+        self.hash_to_id.insert(hash, id);
+        self.id_to_hash.insert(id, hash);
+        id
+    }
+
+    pub fn hash_for_id(&self, id: i64) -> Option<InfoHash> {
+        self.id_to_hash.get(&id).copied()
+    }
+}
+
+fn generate_session_id() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let marker = 0u8;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    now.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    (&marker as *const u8 as usize).hash(&mut hasher);
+    format!("swarmotter-{:016x}", hasher.finish())
 }
 
 /// Build/version metadata.

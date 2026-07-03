@@ -13,4 +13,5 @@ pub mod settings;
 pub mod stats;
 pub mod torrents;
 pub mod trackers;
+pub mod transmission;
 pub mod watch;

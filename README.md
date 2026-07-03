@@ -15,20 +15,6 @@
 
 ---
 
-## Status
-
-SwarmOtter's first release is `v1.0.0`. The live torrent data-plane engine
-(real TCP and uTP peer wire protocol, HTTP/HTTPS/UDP trackers, DHT, PEX, BEP 9
-metadata fetch, endgame, live bandwidth shaping, real disk I/O with fast
-resume, inbound seeding/upload), fail-closed VPN/NIC network containment, the
-complete REST API with WebSocket/SSE events, and the Web UI are implemented and
-exercised end to end against local fixtures.
-
-The project does **not** use an MVP release model. The first product release is
-`v1.0.0`, and that release is complete only when all required features in
-[`design/requirements.md`](design/requirements.md) are implemented, tested,
-documented, and usable.
-
 ## What SwarmOtter Is
 
 - A **Rust BitTorrent daemon** built for Linux/server and homelab deployments.
@@ -51,21 +37,24 @@ It does not include bundled torrent indexes, infringing magnet links,
 copyrighted media examples, or documentation encouraging copyright
 infringement.
 
-## Core Goals
+## Features
 
-- Performance-first Rust daemon
-- Complete API
-- Practical Web UI (function over form)
-- Full magnet and `.torrent` support
-- DHT, PEX, HTTP/HTTPS trackers, UDP trackers
-- Watch-folder import
-- Fast resume and forced recheck
-- File selection and prioritization
-- Queue, bandwidth, ratio, and seeding controls
-- Strict VPN/NIC traffic containment
-- Fail-closed behavior
-- Container/homelab-friendly deployment
-- Lawful-use project posture
+- Performance-first Rust daemon with a live BitTorrent data plane.
+- Native REST API with WebSocket and Server-Sent Events.
+- Optional Transmission RPC compatibility endpoint at `/transmission/rpc` for
+  Transmission-style tools and scripts.
+- Practical Web UI that uses the same API exposed to external automation.
+- Magnet links and `.torrent` file intake.
+- TCP and uTP peer wire protocol support.
+- DHT, PEX, HTTP/HTTPS trackers, UDP trackers, and webseeds.
+- BEP 9 magnet metadata fetching.
+- Fast resume and forced recheck.
+- Watch-folder import.
+- File selection, file prioritization, and path rename controls.
+- Queue, bandwidth, ratio, and seeding controls.
+- Strict VPN/NIC traffic containment with fail-closed behavior.
+- Container and homelab-friendly deployment.
+- Lawful-use project posture.
 
 ## Network Containment
 
@@ -178,18 +167,13 @@ swarmotter/
 
 ## ADRs and Decision Records
 
-Important technical, legal, release, operational, and dependency decisions are
-recorded as Architecture Decision Records (ADRs) in
+Important technical, legal, operational, and dependency decisions are recorded
+as Architecture Decision Records (ADRs) in
 [`design/adr/`](design/adr/).
 
-New architecture, legal, release, dependency, or network-containment decisions
-require ADRs. When in doubt, create one. See
+New architecture, legal, dependency, or network-containment decisions require
+ADRs. When in doubt, create one. See
 [`design/adr/README.md`](design/adr/README.md) for the format and lifecycle.
-
-Current decisions include the v1.0.0-only release model, the Rust/daemon
-choice, API-first architecture, strict VPN/NIC containment, the function-over-
-form UI philosophy, the Apache-2.0 license, and the lawful-use / no-piracy
-posture.
 
 ## Simple Homelab Deployment
 
@@ -281,7 +265,7 @@ Contributions are welcome. To contribute:
 - Read [`AGENTS.md`](AGENTS.md) for coding-agent and contributor governance.
 - Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for workflow and conventions.
 - Create or update an ADR in [`design/adr/`](design/adr/) for decisions with
-  lasting architectural, legal, release, dependency, or containment impact.
+  lasting architectural, legal, dependency, or containment impact.
 - Do **not** submit piracy-oriented features, indexers, infringing magnets, or
   copyrighted-content examples; see [`docs/legal.md`](docs/legal.md).
 - Run `cargo fmt`, `cargo check`, and `cargo test` before considering work

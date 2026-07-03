@@ -105,3 +105,32 @@ or:
 ```text
 X-SwarmOtter-Auth: <token>
 ```
+
+## Optional Transmission-compatible endpoint
+
+SwarmOtter can expose an optional compatibility endpoint at
+`/transmission/rpc` for existing Transmission-style clients and scripts when
+`compatibility.transmission.enabled = true`.
+
+```toml
+[compatibility.transmission]
+enabled = true
+```
+
+Auth mapping uses the same API token flow as the native API:
+
+- `Authorization` and `X-SwarmOtter-Auth` are accepted by the daemon.
+- If a client uses HTTP Basic auth, the username is ignored and the password must
+  equal `api.auth_token`.
+
+The adapter supports `torrent-add` for:
+
+- magnet links via `filename`
+- base64-encoded `.torrent` metadata via `metainfo`
+
+It also supports common Transmission session, torrent lifecycle, queue, and
+helper calls. Mutating calls map to native SwarmOtter operations; for example,
+`torrent-remove` with `delete-local-data` / `delete_local_data` can delete
+payload data.
+
+Remote HTTP/HTTPS torrent URL fetching is not supported through this endpoint.

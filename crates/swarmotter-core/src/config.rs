@@ -20,6 +20,8 @@ pub struct Config {
     #[serde(default)]
     pub api: ApiConfig,
     #[serde(default)]
+    pub compatibility: CompatibilityConfig,
+    #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
     pub network: NetworkConfig,
@@ -39,6 +41,19 @@ pub struct Config {
     pub watch: Vec<WatchFolderConfig>,
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CompatibilityConfig {
+    #[serde(default)]
+    pub transmission: TransmissionCompatibilityConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TransmissionCompatibilityConfig {
+    /// Enable the Transmission RPC compatibility adapter at `/transmission/rpc`.
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,6 +421,7 @@ mod tests {
         assert_eq!(cfg.logging.level, "info");
         assert!(cfg.logging.file);
         assert!(!cfg.torrent.selfish);
+        assert!(!cfg.compatibility.transmission.enabled);
     }
 
     #[test]
@@ -484,6 +500,24 @@ listen_port = 51413
         assert_eq!(cfg.api.bind_address, "0.0.0.0:9091");
         assert_eq!(cfg.network.required_interface.as_deref(), Some("tun0"));
         assert!(cfg.storage.download_dir.as_deref() == Some("/data/downloads"));
+    }
+
+    #[test]
+    fn transmission_compatibility_parses_and_env_overrides() {
+        let toml = r#"
+[compatibility.transmission]
+enabled = true
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert!(cfg.compatibility.transmission.enabled);
+
+        let cfg = Config::default();
+        let env = vec![(
+            "SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED".into(),
+            "true".into(),
+        )];
+        let cfg = cfg.apply_env_overrides(&env).unwrap();
+        assert!(cfg.compatibility.transmission.enabled);
     }
 
     #[test]

@@ -19,6 +19,7 @@ SWARMOTTER_API__AUTH_TOKEN=replace-with-a-long-random-token
 SWARMOTTER_NETWORK__MODE=strict
 SWARMOTTER_NETWORK__REQUIRED_INTERFACE=br0
 SWARMOTTER_TORRENT__LISTEN_PORT=51413
+SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED=true
 ```
 
 ## Runtime configuration editing
@@ -153,6 +154,30 @@ unlimited or high is better for raw transfer throughput.
 | `require_auth` | `false` | Requires API/Web UI token auth when true. |
 | `auth_token` | unset | Required when `require_auth = true`. |
 | `max_request_body_bytes` | `16777216` | Maximum API request body size, including `.torrent` uploads. |
+
+### `[compatibility.transmission]`
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Enable the optional Transmission RPC compatibility endpoint at `/transmission/rpc`. |
+
+When enabled, SwarmOtter maps compatible requests to existing daemon operations.
+Auth mapping follows `api.require_auth`: when auth is required, Transmission
+Basic auth password must match `api.auth_token`; username is not security-
+significant.
+
+The adapter supports common Transmission session, torrent lifecycle, queue, and
+helper calls, including mutating calls such as `torrent-remove`, `torrent-set`,
+`torrent-set-location`, and `torrent-rename-path`. `torrent-remove` maps
+`delete-local-data` / `delete_local_data` to SwarmOtter's native delete-data
+behavior, so clients using that flag can delete payload data.
+
+`torrent-add` accepts only:
+
+- magnet links (`filename`)
+- base64-encoded metainfo (`metainfo`)
+
+Remote HTTP/HTTPS URLs for torrent metadata are rejected by this adapter.
 
 ### `[storage]`
 

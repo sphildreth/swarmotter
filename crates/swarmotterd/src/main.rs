@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
             target: std::env::consts::ARCH,
         },
         broker,
+        transmission: swarmotter_api::state::TransmissionCompatState::default(),
     });
 
     let bind: std::net::SocketAddr =

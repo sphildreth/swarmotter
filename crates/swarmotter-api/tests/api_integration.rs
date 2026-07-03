@@ -6,6 +6,7 @@ mod fake_daemon;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::Router;
 use serde::de::DeserializeOwned;
 use swarmotter_core::config::{Config, StartBehavior, WatchFolderConfig};
 use swarmotter_core::meta::build_single_file_torrent;
@@ -17,6 +18,80 @@ use tower::ServiceExt;
 
 fn known_magnet() -> String {
     "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062ba1f7a4e&dn=test".to_string()
+}
+
+async fn transmission_session(app: Router, auth: Option<&str>) -> String {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/transmission/rpc")
+        .header("content-type", "application/json");
+    if let Some(auth) = auth {
+        builder = builder.header("authorization", auth);
+    }
+    let resp = app
+        .oneshot(
+            builder
+                .body(Body::from(r#"{"method":"session_get"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    resp.headers()
+        .get("x-transmission-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("session header")
+        .to_string()
+}
+
+async fn transmission_rpc(
+    app: Router,
+    session: &str,
+    payload: serde_json::Value,
+    auth: Option<&str>,
+) -> (StatusCode, serde_json::Value) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/transmission/rpc")
+        .header("content-type", "application/json")
+        .header("x-transmission-session-id", session);
+    if let Some(auth) = auth {
+        builder = builder.header("authorization", auth);
+    }
+    let resp = app
+        .oneshot(builder.body(Body::from(payload.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    (status, value)
+}
+
+fn test_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut chunks = bytes.chunks(3);
+    for chunk in &mut chunks {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn parse_api_data<T: DeserializeOwned>(body: &[u8]) -> T {
@@ -548,6 +623,270 @@ async fn api_auth_blocks_v1_without_token_and_accepts_bearer() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn transmission_rpc_is_disabled_by_default() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/transmission/rpc")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"method":"session_get"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn transmission_rpc_session_handshake_and_legacy_envelope() {
+    let mut cfg = Config::default();
+    cfg.compatibility.transmission.enabled = true;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+    let session = transmission_session(app.clone(), None).await;
+
+    let payload = serde_json::json!({
+        "method": "session-get",
+        "arguments": { "fields": ["version", "session-id"] },
+        "tag": 7
+    });
+    let (status, body) = transmission_rpc(app.clone(), &session, payload, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"], "success");
+    assert_eq!(body["tag"], 7);
+    assert!(body["arguments"]["version"]
+        .as_str()
+        .unwrap()
+        .contains("SwarmOtter"));
+    assert_eq!(body["arguments"]["session-id"], session);
+
+    let payload = serde_json::json!({
+        "method": "session-get",
+        "arguments": {},
+        "tag": 8
+    });
+    let (status, body) = transmission_rpc(app.clone(), &session, payload, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["arguments"]["rpc-version"].is_number());
+    assert!(body["arguments"]["download-dir"].is_string());
+    assert!(body["arguments"]["rpc_version"].is_null());
+
+    let add = serde_json::json!({
+        "method": "torrent-add",
+        "arguments": { "filename": known_magnet() },
+        "tag": 9
+    });
+    let (status, body) = transmission_rpc(app.clone(), &session, add, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"], "success");
+    assert!(
+        body["arguments"]["torrent-added"]["hashString"]
+            .as_str()
+            .unwrap()
+            .len()
+            == 40
+    );
+
+    let get = serde_json::json!({
+        "method": "torrent-get",
+        "arguments": {},
+        "tag": 10
+    });
+    let (status, body) = transmission_rpc(app, &session, get, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let torrents = body["arguments"]["torrents"].as_array().unwrap();
+    assert!(torrents[0]["hashString"].as_str().unwrap().len() == 40);
+    assert!(torrents[0]["hash_string"].is_null());
+}
+
+#[tokio::test]
+async fn transmission_rpc_reuses_api_token_for_basic_auth() {
+    let mut cfg = Config::default();
+    cfg.compatibility.transmission.enabled = true;
+    cfg.api.require_auth = true;
+    cfg.api.auth_token = Some("test-token".into());
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/transmission/rpc")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"method":"session_get"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/transmission/rpc")
+                .header("content-type", "application/json")
+                .header("authorization", "Basic dXNlcjp3cm9uZw==")
+                .body(Body::from(r#"{"method":"session_get"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let auth = "Basic dXNlcjp0ZXN0LXRva2Vu";
+    let session = transmission_session(app.clone(), Some(auth)).await;
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "session_get",
+        "params": { "fields": ["rpc_version_semver", "session_id"] },
+        "id": "webui"
+    });
+    let (status, body) = transmission_rpc(app, &session, payload, Some(auth)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["jsonrpc"], "2.0");
+    assert_eq!(body["result"]["rpc_version_semver"], "6.0.0");
+    assert_eq!(body["result"]["session_id"], session);
+}
+
+#[tokio::test]
+async fn transmission_rpc_add_get_action_and_remove_torrent() {
+    let mut cfg = Config::default();
+    cfg.compatibility.transmission.enabled = true;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+    let session = transmission_session(app.clone(), None).await;
+
+    let add = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "torrent_add",
+        "params": {
+            "filename": known_magnet(),
+            "labels": ["linux"],
+            "paused": true
+        },
+        "id": 1
+    });
+    let (status, body) = transmission_rpc(app.clone(), &session, add, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let torrent_id = body["result"]["torrent_added"]["id"].as_i64().unwrap();
+    assert_eq!(body["result"]["torrent_added"]["name"], "test");
+    assert_eq!(
+        body["result"]["torrent_added"]["hash_string"]
+            .as_str()
+            .unwrap()
+            .len(),
+        40
+    );
+
+    let get_table = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "torrent_get",
+        "params": {
+            "fields": ["id", "name", "hashString", "status", "labels", "percentDone"],
+            "format": "table"
+        },
+        "id": 2
+    });
+    let (status, body) = transmission_rpc(app.clone(), &session, get_table, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["result"]["torrents"].as_array().unwrap();
+    assert_eq!(rows[0][0], "id");
+    assert_eq!(rows[1][0], torrent_id);
+    assert_eq!(rows[1][3], 0);
+    assert_eq!(rows[1][4], serde_json::json!(["linux"]));
+
+    let start = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "torrent_start",
+        "params": { "ids": [torrent_id] },
+        "id": 3
+    });
+    let (status, body) = transmission_rpc(app.clone(), &session, start, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_object());
+
+    let get_object = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "torrent_get",
+        "params": {
+            "ids": [torrent_id],
+            "fields": ["id", "status", "metadataPercentComplete"]
+        },
+        "id": 4
+    });
+    let (status, body) = transmission_rpc(app.clone(), &session, get_object, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let torrents = body["result"]["torrents"].as_array().unwrap();
+    assert_eq!(torrents[0]["id"], torrent_id);
+    assert_eq!(torrents[0]["status"], 4);
+    assert_eq!(torrents[0]["metadataPercentComplete"], 1.0);
+
+    let remove = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "torrent_remove",
+        "params": {
+            "ids": [torrent_id],
+            "delete_local_data": true
+        },
+        "id": 5
+    });
+    let (status, _) = transmission_rpc(app.clone(), &session, remove, None).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let get_after_remove = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "torrent_get",
+        "params": { "fields": ["id"] },
+        "id": 6
+    });
+    let (status, body) = transmission_rpc(app, &session, get_after_remove, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"]["torrents"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn transmission_rpc_adds_base64_metainfo_and_rejects_remote_urls() {
+    let mut cfg = Config::default();
+    cfg.compatibility.transmission.enabled = true;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+    let session = transmission_session(app.clone(), None).await;
+
+    let metainfo = build_single_file_torrent("local-linux.iso", b"local payload", 8, None, false);
+    let add_metainfo = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "torrent_add",
+        "params": { "metainfo": test_base64(&metainfo) },
+        "id": 1
+    });
+    let (status, body) = transmission_rpc(app.clone(), &session, add_metainfo, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["torrent_added"]["name"], "local-linux.iso");
+
+    let add_url = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "torrent_add",
+        "params": { "filename": "https://example.invalid/linux.torrent" },
+        "id": 2
+    });
+    let (status, body) = transmission_rpc(app, &session, add_url, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["error"]["code"], -32602);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("remote torrent URL fetching is not supported"));
 }
 
 #[tokio::test]

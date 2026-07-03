@@ -29,6 +29,8 @@ pub fn app_router_with_body_limit(state: SharedState, max_request_body_bytes: us
     let v1 = api_v1_router(state.clone(), max_request_body_bytes);
     Router::new()
         .route("/health", get(handlers::health::root_health))
+        .route("/transmission/rpc", post(handlers::transmission::rpc))
+        .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .nest("/api/v1", v1)
         .with_state(state)
 }
@@ -166,7 +168,7 @@ async fn require_api_auth(
     auth_error(StatusCode::UNAUTHORIZED, "missing or invalid API token")
 }
 
-fn request_has_token(req: &Request<Body>, expected: &str) -> bool {
+pub(crate) fn request_has_token(req: &Request<Body>, expected: &str) -> bool {
     let bearer = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -182,7 +184,7 @@ fn request_has_token(req: &Request<Body>, expected: &str) -> bool {
         .any(|candidate| constant_time_eq(candidate.as_bytes(), expected.as_bytes()))
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

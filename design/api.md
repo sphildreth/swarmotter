@@ -52,6 +52,21 @@ API request bodies are capped by `api.max_request_body_bytes`; this applies to
 JSON requests and raw `.torrent` uploads. The root `/health` alias remains a
 control-plane health endpoint outside `/api/v1`.
 
+Optional Transmission compatibility is intentionally isolated from the native API:
+when enabled, `POST /transmission/rpc` is a compatibility adapter over existing
+`DaemonOps`, not a second torrent engine. Authentication and failure behavior
+for this endpoint must match SwarmOtter policy:
+
+- When `api.require_auth = true`, HTTP Basic auth is accepted and maps to API auth.
+  The Basic password must equal `api.auth_token`; the username is not security-
+  significant.
+- When `api.require_auth = false`, auth headers are not required for this endpoint.
+- The endpoint participates in `X-Transmission-Session-Id` enforcement:
+  requests without a current session ID header are rejected and return a session
+  mismatch response with a new `X-Transmission-Session-Id` header.
+- Only Transmission RPC is in scope. No qBittorrent API compatibility is added in
+  this phase.
+
 ## Endpoints
 
 All routes are prefixed with `/api/v1`. A root `/health` alias also exists.
@@ -63,6 +78,38 @@ All routes are prefixed with `/api/v1`. A root `/health` alias also exists.
 | GET | `/health` | Daemon + network health |
 | GET | `/version` | Version/build info |
 | GET | `/stats` | Global stats |
+
+### Compatibility endpoints
+
+Optional adapters that are not part of the native API are served in this section:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| POST | `/transmission/rpc` | Transmission RPC compatibility endpoint when enabled |
+
+The Transmission adapter currently supports:
+
+- session reads/writes for mapped live-safe settings: `session-get`,
+  `session-set`, `session-stats`, `session-close`
+- torrent reads and lifecycle actions: `torrent-get`, `torrent-start`,
+  `torrent-start-now`, `torrent-stop`, `torrent-verify`, `torrent-reannounce`
+- torrent mutation: `torrent-add`, `torrent-remove`, `torrent-set`,
+  `torrent-set-location`, `torrent-rename-path`
+- queue movement: `queue-move-top`, `queue-move-up`, `queue-move-down`,
+  `queue-move-bottom`
+- compatibility helpers: `free-space`, `port-test`, `blocklist-update`
+
+`torrent-remove` maps `delete-local-data` / `delete_local_data` to the native
+delete-data option, so clients using that flag can delete payload data.
+
+`torrent-add` supports:
+
+- magnet links via `filename`
+- base64 torrent metadata via `metainfo`
+
+For `torrent-add`, remote HTTP/HTTPS URLs are explicitly rejected to preserve
+containment while retaining local metadata intake through existing engine-backed
+operations.
 
 ### Torrent management
 

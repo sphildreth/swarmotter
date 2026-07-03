@@ -548,6 +548,7 @@ pub fn fake_state_with_config(config: Config) -> swarmotter_api::state::SharedSt
         config: Arc::new(Mutex::new(config)),
         build: BuildInfo::default(),
         broker: swarmotter_api::handlers::events::EventBroker::default(),
+        transmission: swarmotter_api::state::TransmissionCompatState::default(),
     })
 }
 
