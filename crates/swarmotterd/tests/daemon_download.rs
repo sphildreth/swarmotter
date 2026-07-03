@@ -18,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use swarmotter_api::state::DaemonOps;
 use swarmotter_core::config::Config;
-use swarmotter_core::meta::{build_single_file_torrent, parse_torrent};
+use swarmotter_core::meta::{build_multi_file_torrent, build_single_file_torrent, parse_torrent};
 use swarmotter_core::peer::{self, Bitfield, Handshake, Message, PeerAddr};
 use swarmotterd::daemon::DaemonRuntime;
 
@@ -310,6 +310,59 @@ async fn daemon_remove_active_torrent_delete_data_returns_promptly() {
     );
 
     std::fs::remove_dir_all(&download_dir).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_remove_delete_data_preserves_storage_root_directories() {
+    let files = vec![
+        (vec!["a.txt".into()], 5u64),
+        (vec!["sub".into(), "b.bin".into()], 7u64),
+    ];
+    let contents: Vec<&[u8]> = vec![b"hello", b"world!!"];
+    let torrent_bytes = build_multi_file_torrent("dir", &files, &contents, 4, None);
+    let meta = parse_torrent(&torrent_bytes).unwrap();
+
+    let active_dir = unique_dir("daemon-remove-preserve-active-root");
+    let complete_dir = unique_dir("daemon-remove-preserve-complete-root");
+    let mut cfg = Config::default();
+    cfg.network.mode = swarmotter_core::models::network::NetworkContainmentMode::Disabled;
+    cfg.dht.enabled = false;
+    cfg.queue.auto_start = false;
+    cfg.storage.incomplete_dir = Some(active_dir.display().to_string());
+    cfg.storage.download_dir = Some(complete_dir.display().to_string());
+    let healthy = swarmotter_core::models::network::NetworkHealth::blocked(
+        swarmotter_core::models::network::NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = std::sync::Arc::new(DaemonRuntime::new(cfg, healthy));
+
+    let hash = runtime.add_torrent_file(torrent_bytes, None).await.unwrap();
+
+    for root in [&active_dir, &complete_dir] {
+        let storage = swarmotter_core::storage::StorageIo::new(meta.clone(), root.clone());
+        storage.preallocate().await.unwrap();
+        storage.write_block(0, 0, b"hell").await.unwrap();
+        storage.write_block(1, 0, b"owor").await.unwrap();
+        storage.write_block(2, 0, b"ld!!").await.unwrap();
+        assert!(root.join("dir").exists());
+    }
+
+    runtime.remove_torrent(&hash, true).await.unwrap();
+
+    assert!(
+        active_dir.exists(),
+        "delete_data removal must preserve incomplete_dir"
+    );
+    assert!(
+        complete_dir.exists(),
+        "delete_data removal must preserve download_dir"
+    );
+    assert!(!active_dir.join("dir").exists());
+    assert!(!complete_dir.join("dir").exists());
+
+    std::fs::remove_dir_all(&active_dir).ok();
+    std::fs::remove_dir_all(&complete_dir).ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

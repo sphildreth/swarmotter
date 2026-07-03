@@ -453,10 +453,6 @@ impl StorageIo {
             cleanup_empty_parents(p.parent(), &self.download_dir).await;
         }
         self.remove_resume().await?;
-        // For multi-file, remove the now-empty top-level directory.
-        if self.meta.is_multi_file {
-            let _ = fs::remove_dir(&self.download_dir).await;
-        }
         Ok(())
     }
 }
@@ -765,6 +761,35 @@ mod tests {
         assert!(store.verify_piece_on_disk(0).await.unwrap());
         assert!(store.verify_piece_on_disk(1).await.unwrap());
         assert!(store.verify_piece_on_disk(2).await.unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn remove_all_preserves_configured_base_directory() {
+        let files = vec![
+            (vec!["a.txt".into()], 5u64),
+            (vec!["sub".into(), "b.bin".into()], 7u64),
+        ];
+        let contents: Vec<&[u8]> = vec![b"hello", b"world!!"];
+        let bytes = build_multi_file_torrent("dir", &files, &contents, 4, None);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("remove-all-preserves-base");
+        let store = StorageIo::new(meta.clone(), dir.clone());
+        store.preallocate().await.unwrap();
+        store.write_block(0, 0, b"hell").await.unwrap();
+        store.write_block(1, 0, b"owor").await.unwrap();
+        store.write_block(2, 0, b"ld!!").await.unwrap();
+
+        store.remove_all().await.unwrap();
+
+        assert!(
+            dir.exists(),
+            "remove_all must preserve the configured storage base directory"
+        );
+        assert!(
+            !dir.join("dir").exists(),
+            "remove_all should remove the torrent payload root when empty"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -270,6 +270,12 @@ status.
   served to a fresh leecher over the real protocol with uploaded-byte
   accounting.
 
+### Fixed
+
+- **Delete-data storage cleanup:** removing a torrent with delete-data enabled
+  now removes only the torrent payload and fast-resume metadata while preserving
+  the configured `download_dir` and `incomplete_dir` root directories.
+
 ### Changed
 
 - Active downloads now write partial data and partial fast-resume metadata
