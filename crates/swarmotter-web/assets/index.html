@@ -26,9 +26,10 @@
       <button data-view="watch" class="nav">Watch</button>
       <button data-view="logs" class="nav">Logs</button>
     </nav>
-    <div id="drop-status" class="muted" aria-live="polite"></div>
-    <div id="health-badge" class="badge">unknown</div>
+    <div id="health-badge" class="badge"></div>
   </header>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
 
   <div id="drop-overlay" class="hidden" aria-hidden="true">
     <div>Drop .torrent file to add</div>
@@ -61,20 +62,18 @@
         <textarea id="magnet-input" rows="3" placeholder="magnet:?xt=urn:btih:..."></textarea>
         <input id="magnet-dir" type="text" placeholder="Download directory (optional)">
         <button id="add-magnet-btn">Add Magnet</button>
-        <p id="add-magnet-result" class="muted"></p>
       </div>
       <div class="card">
         <h3>Upload .torrent</h3>
         <input id="torrent-file" type="file" accept=".torrent">
         <button id="add-file-btn">Upload</button>
-        <p id="add-file-result" class="muted"></p>
       </div>
     </section>
 
     <!-- Details view -->
     <section id="view-details" class="view hidden">
       <button id="back-btn">Back</button>
-      <h2 id="details-title">Torrent Details</h2>
+      <h2 id="details-title"></h2>
       <div id="details-health" class="card"></div>
       <div id="details-summary"></div>
       <div class="tabs">
@@ -104,11 +103,15 @@
       <h2>Settings</h2>
       <div class="card">
         <h3>Bandwidth</h3>
-        <label>Global download limit (B/s, 0=unlimited) <input id="bw-dl" type="number" value="0"></label>
-        <label>Global upload limit (B/s, 0=unlimited) <input id="bw-ul" type="number" value="0"></label>
+        <label>Global download limit (B/s, 0=unlimited) <input id="bw-dl" type="number"></label>
+        <label>Global upload limit (B/s, 0=unlimited) <input id="bw-ul" type="number"></label>
         <label>Alternate speed mode <input id="bw-alt" type="checkbox"></label>
         <button id="save-bw-btn">Save Bandwidth</button>
-        <p id="save-bw-result" class="muted"></p>
+      </div>
+      <div class="card">
+        <h3>Notifications</h3>
+        <label>Toast display time (seconds) <input id="toast-seconds" type="number" min="1" max="60" step="1"></label>
+        <button id="save-toast-btn">Save Notifications</button>
       </div>
     </section>
 

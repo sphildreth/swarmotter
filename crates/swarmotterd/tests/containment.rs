@@ -142,3 +142,49 @@ async fn watch_folder_imports_torrent() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn watch_folder_moves_failed_import_to_failure_dir() {
+    use swarmotter_core::config::{StartBehavior, WatchFolderConfig};
+    let mut cfg = Config::default();
+    cfg.network.mode = swarmotter_core::models::network::NetworkContainmentMode::Disabled;
+    let healthy = NetworkHealth::blocked(
+        swarmotter_core::models::network::NetworkContainmentMode::Disabled,
+        NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "swarmotter-watch-fail-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let failure_dir = dir.join("failed");
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad_file = dir.join("bad.torrent");
+    std::fs::write(&bad_file, b"not bencoded torrent data").unwrap();
+
+    cfg.watch = vec![WatchFolderConfig {
+        path: dir.display().to_string(),
+        recursive: false,
+        download_dir: None,
+        label: None,
+        start_behavior: StartBehavior::Start,
+        archive_dir: None,
+        failure_dir: Some(failure_dir.display().to_string()),
+        delete_after_import: true,
+    }];
+
+    let runtime = Arc::new(DaemonRuntime::new(cfg, healthy));
+    runtime.watch_scan().await.unwrap();
+
+    assert!(!bad_file.exists());
+    assert!(failure_dir.join("bad.torrent").exists());
+    let hist = runtime.watch_history().await;
+    assert_eq!(hist.len(), 1);
+    assert!(!hist[0].success);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

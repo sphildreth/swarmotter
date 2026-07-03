@@ -36,7 +36,17 @@ The app refreshes the torrent list after successful upload.
 The Peers column shows active peer workers / known peers from the torrent
 summary response. The main UI area uses the available browser width so wide
 tables can show operational details without being capped to a narrow centered
-column.
+column. Per-row torrent actions are icon buttons with accessible labels.
+
+## Notifications
+
+Transient operation feedback is shown as toast notifications instead of inline
+status text. This includes torrent add/upload results, user-initiated torrent
+removal, removals observed from automatic completion policy, bandwidth setting
+saves, and watch-folder scan results.
+
+Toasts display for 5 seconds by default. The display time is a browser-local UI
+preference that can be changed in Settings > Notifications.
 
 ## Network health
 

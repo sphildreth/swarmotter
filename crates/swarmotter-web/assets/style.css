@@ -46,7 +46,40 @@ nav { display: flex; gap: 0.3rem; }
 }
 .badge.ok { background: var(--accent); color: #111; }
 .badge.bad { background: var(--danger); }
-#drop-status { min-width: 8rem; text-align: right; }
+.toast-region {
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  z-index: 40;
+  display: grid;
+  gap: 0.5rem;
+  width: min(24rem, calc(100vw - 2rem));
+  pointer-events: none;
+}
+.toast {
+  display: grid;
+  gap: 0.15rem;
+  padding: 0.7rem 0.85rem;
+  color: var(--fg);
+  background: #202020;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--accent);
+  border-radius: 4px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  pointer-events: auto;
+}
+.toast.success { border-left-color: #3c8; }
+.toast.warning { border-left-color: #da3; }
+.toast.error { border-left-color: var(--danger); }
+.toast-title {
+  font-weight: 600;
+  line-height: 1.25;
+}
+.toast-message {
+  color: var(--muted);
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
 #drop-overlay {
   position: fixed;
   inset: 0;
@@ -101,6 +134,48 @@ button {
 }
 button:hover { opacity: 0.9; }
 button.danger { background: var(--danger); color: #fff; }
+.torrent-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  white-space: nowrap;
+}
+button.icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
+}
+button.icon-button:hover {
+  background: #333;
+  opacity: 1;
+}
+button.icon-button.danger {
+  background: transparent;
+  color: var(--danger);
+  border-color: #633;
+}
+button.icon-button.danger:hover {
+  background: var(--danger);
+  color: #fff;
+}
+button.icon-button svg {
+  width: 1rem;
+  height: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+button.icon-button[data-act="resume"] svg {
+  fill: currentColor;
+  stroke: none;
+}
 .tabs { display: flex; gap: 0.3rem; margin: 0.8rem 0; }
 .tab {
   background: transparent;

@@ -20,6 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,12 @@ use swarmotter_core::storage::StorageIo;
 use swarmotter_core::tracker::{self, AnnounceEvent, AnnounceRequest};
 use swarmotter_core::udp_tracker;
 use swarmotter_core::utp::{self, PeerTransport};
+
+/// Default simultaneous peer download workers when no per-torrent peer cap is
+/// configured. Trackers commonly return far more than 16 usable peers for
+/// public Linux distribution torrents, so the default should be high enough to
+/// keep several useful peers busy without requiring operator tuning.
+pub const DEFAULT_PEER_WORKER_LIMIT: usize = 64;
 
 /// Magnet parameters for a torrent that still needs its metadata fetched
 /// (BEP 9). The placeholder `TorrentMeta` in the engine has a dummy info hash;
@@ -106,6 +113,7 @@ pub enum EngineCommand {
     Resume,
     Reannounce,
     Recheck,
+    UpdatePeerWorkerLimit(usize),
     Stop,
 }
 
@@ -140,6 +148,11 @@ pub struct TorrentEngine {
     utp_enabled: bool,
     utp_prefer_tcp: bool,
     preallocate: bool,
+    sparse: bool,
+    max_peer_workers: Arc<AtomicUsize>,
+    allow_ipv6: bool,
+    pex_enabled: bool,
+    pex_max_peers: usize,
 }
 
 impl TorrentEngine {
@@ -200,6 +213,11 @@ impl TorrentEngine {
             utp_enabled: true,
             utp_prefer_tcp: true,
             preallocate: true,
+            sparse: true,
+            max_peer_workers: Arc::new(AtomicUsize::new(DEFAULT_PEER_WORKER_LIMIT)),
+            allow_ipv6: true,
+            pex_enabled: true,
+            pex_max_peers: 0,
         }
     }
 
@@ -234,6 +252,48 @@ impl TorrentEngine {
     pub fn with_preallocate(mut self, preallocate: bool) -> Self {
         self.preallocate = preallocate;
         self
+    }
+
+    /// Configure sparse-file behavior. When sparse is disabled, active files
+    /// are sized up front even if full preallocation is disabled.
+    pub fn with_sparse(mut self, sparse: bool) -> Self {
+        self.sparse = sparse;
+        self
+    }
+
+    /// Configure the maximum simultaneous peer download workers. A value of 0
+    /// means no operator cap was configured, so the engine uses its operational
+    /// default.
+    pub fn with_peer_worker_limit(self, max_peer_workers: usize) -> Self {
+        self.set_peer_worker_limit(max_peer_workers);
+        self
+    }
+
+    /// Configure whether IPv6 peer addresses are eligible for torrent
+    /// connections.
+    pub fn with_allow_ipv6(mut self, allow_ipv6: bool) -> Self {
+        self.allow_ipv6 = allow_ipv6;
+        self
+    }
+
+    /// Configure PEX discovery. `max_peers = 0` means no PEX import cap.
+    pub fn with_pex(mut self, enabled: bool, max_peers: usize) -> Self {
+        self.pex_enabled = enabled;
+        self.pex_max_peers = max_peers;
+        self
+    }
+
+    fn set_peer_worker_limit(&self, max_peer_workers: usize) {
+        let limit = if max_peer_workers == 0 {
+            DEFAULT_PEER_WORKER_LIMIT
+        } else {
+            max_peer_workers
+        };
+        self.max_peer_workers.store(limit.max(1), Ordering::Relaxed);
+    }
+
+    fn current_peer_worker_limit(&self) -> usize {
+        self.max_peer_workers.load(Ordering::Relaxed).max(1)
     }
 
     /// Configure the final completed-data directory. The engine writes active
@@ -291,10 +351,10 @@ impl TorrentEngine {
         }
 
         let storage = StorageIo::new(self.meta.clone(), self.download_dir.clone());
-        if self.preallocate {
+        if self.preallocate || !self.sparse {
             storage.preallocate().await?;
         } else {
-            storage.ensure_dirs().await?;
+            storage.ensure_active_layout().await?;
         }
 
         // Load fast resume if present; otherwise recheck what's already on disk.
@@ -309,10 +369,10 @@ impl TorrentEngine {
         }
 
         // Discover peers via tracker announce (HTTP/UDP) on each tier.
-        let mut discovered = self.announce(AnnounceEvent::Started).await;
+        let mut discovered = self.filter_allowed_peers(self.announce(AnnounceEvent::Started).await);
         // Merge any directly-supplied seed peers (local swarm / PEX / DHT).
         for p in &self.seed_peers {
-            if !discovered.contains(p) {
+            if self.peer_allowed(p) && !discovered.contains(p) {
                 discovered.push(*p);
             }
         }
@@ -328,7 +388,7 @@ impl TorrentEngine {
                 .await;
                 if let Ok(Ok(peers)) = dht_result {
                     for p in peers {
-                        if !discovered.contains(&p) {
+                        if self.peer_allowed(&p) && !discovered.contains(&p) {
                             discovered.push(p);
                         }
                     }
@@ -338,8 +398,7 @@ impl TorrentEngine {
         self.state.lock().await.peers = discovered.clone();
 
         // Download loop: connect to peers, request missing pieces, write and
-        // verify. Bounded to a small number of concurrent peers.
-        let max_concurrent = 16usize;
+        // verify. Bounded by the configured per-torrent worker limit.
         let mut bad_peers: HashSet<SocketAddr> = HashSet::new();
         let start = Instant::now();
         // Bounded consecutive no-peer rounds: if we never discover any peers
@@ -354,6 +413,7 @@ impl TorrentEngine {
             if self.poll_commands().await == CommandOutcome::Stop {
                 break;
             }
+            let max_concurrent = self.current_peer_worker_limit();
 
             if have.count(piece_count) == piece_count {
                 let storage = self.complete_storage(&storage).await?;
@@ -366,7 +426,8 @@ impl TorrentEngine {
 
             // Periodically re-announce to refresh peers.
             if start.elapsed() > Duration::from_secs(30) {
-                let refreshed = self.announce(AnnounceEvent::Empty).await;
+                let refreshed =
+                    self.filter_allowed_peers(self.announce(AnnounceEvent::Empty).await);
                 for p in refreshed {
                     if !discovered.contains(&p) {
                         discovered.push(p);
@@ -383,6 +444,7 @@ impl TorrentEngine {
             if swarmotter_core::endgame::is_endgame(remaining) {
                 let candidates: Vec<PeerAddr> = discovered
                     .iter()
+                    .filter(|p| self.peer_allowed(p))
                     .filter(|p| !bad_peers.contains(&p.socket_addr()))
                     .copied()
                     .take(max_concurrent)
@@ -399,9 +461,10 @@ impl TorrentEngine {
 
             let candidates: Vec<PeerAddr> = discovered
                 .iter()
+                .filter(|p| self.peer_allowed(p))
                 .filter(|p| !bad_peers.contains(&p.socket_addr()))
                 .copied()
-                .take(max_concurrent * 2)
+                .take(max_concurrent.saturating_mul(2))
                 .collect();
             let mut made_progress = false;
 
@@ -455,7 +518,8 @@ impl TorrentEngine {
                 if discovered.is_empty() || bad_peers.len() >= discovered.len() {
                     // No usable peers; back off briefly and retry announce.
                     self.sleep_or_stop(Duration::from_secs(2)).await;
-                    let refreshed = self.announce(AnnounceEvent::Empty).await;
+                    let refreshed =
+                        self.filter_allowed_peers(self.announce(AnnounceEvent::Empty).await);
                     for p in refreshed {
                         if !discovered.contains(&p) {
                             discovered.push(p);
@@ -502,6 +566,17 @@ impl TorrentEngine {
         Ok(self.state.lock().await.clone())
     }
 
+    fn peer_allowed(&self, peer: &PeerAddr) -> bool {
+        self.allow_ipv6 || !peer.ip.is_ipv6()
+    }
+
+    fn filter_allowed_peers(&self, peers: Vec<PeerAddr>) -> Vec<PeerAddr> {
+        peers
+            .into_iter()
+            .filter(|peer| self.peer_allowed(peer))
+            .collect()
+    }
+
     /// Open a peer byte stream with transport selection. Tries the preferred
     /// transport first, then falls back to the other if it is available and
     /// the preferred fails. Returns the connected duplex stream and the
@@ -531,6 +606,9 @@ impl TorrentEngine {
         discovered: &mut Vec<PeerAddr>,
     ) -> Result<bool> {
         if !self.binder.traffic_allowed() {
+            return Ok(false);
+        }
+        if !self.peer_allowed(peer_addr) {
             return Ok(false);
         }
         let (stream, transport) = self.connect_peer(peer_addr).await?;
@@ -577,19 +655,19 @@ impl TorrentEngine {
                 .last_seen = Some(Instant::now());
         }
 
-        // Send a BEP 10 extension handshake advertising ut_pex (and
-        // ut_metadata for the magnet metadata path). PEX is honored only for
-        // non-private torrents; private torrents skip PEX entirely.
+        // Send a BEP 10 extension handshake advertising configured extensions.
+        // PEX is honored only for non-private torrents and only when enabled.
         let local_pex_id: u8 = 1u8;
         let local_metadata_id: u8 = 2u8;
+        let mut extensions = vec![(
+            swarmotter_core::extensions::UT_METADATA_NAME,
+            local_metadata_id,
+        )];
+        if self.pex_enabled && !self.meta.is_private() {
+            extensions.push((swarmotter_core::extensions::UT_PEX_NAME, local_pex_id));
+        }
         let ext_payload = swarmotter_core::extensions::encode_extension_handshake(
-            &[
-                (swarmotter_core::extensions::UT_PEX_NAME, local_pex_id),
-                (
-                    swarmotter_core::extensions::UT_METADATA_NAME,
-                    local_metadata_id,
-                ),
-            ],
+            &extensions,
             "SwarmOtter/0.1",
             None,
         );
@@ -786,20 +864,22 @@ impl TorrentEngine {
                         if let Ok(hs) =
                             swarmotter_core::extensions::parse_extension_handshake(&payload)
                         {
-                            remote_pex_id = hs.id_for(swarmotter_core::extensions::UT_PEX_NAME);
+                            if self.pex_enabled && !self.meta.is_private() {
+                                remote_pex_id = hs.id_for(swarmotter_core::extensions::UT_PEX_NAME);
+                            }
                         }
-                    } else if Some(id) == remote_pex_id && !self.meta.is_private() {
+                    } else if self.pex_enabled
+                        && Some(id) == remote_pex_id
+                        && !self.meta.is_private()
+                    {
                         if let Ok(pex) = swarmotter_core::extensions::parse_pex(&payload) {
-                            for p in pex.added {
-                                if !discovered.contains(&p) {
-                                    discovered.push(p);
-                                }
-                            }
-                            for p in pex.added6 {
-                                if !discovered.contains(&p) {
-                                    discovered.push(p);
-                                }
-                            }
+                            let max_peers = self.pex_max_peers;
+                            add_pex_peers(
+                                discovered,
+                                pex.added.into_iter().chain(pex.added6.into_iter()),
+                                self.allow_ipv6,
+                                max_peers,
+                            );
                         }
                     }
                 }
@@ -944,6 +1024,7 @@ impl TorrentEngine {
             let limiter = self.limiter.clone();
             let utp_enabled = self.utp_enabled;
             let utp_prefer_tcp = self.utp_prefer_tcp;
+            let pex_enabled = self.pex_enabled && !self.meta.is_private();
             handles.push(tokio::spawn(async move {
                 parallel_peer_session(
                     binder,
@@ -958,6 +1039,7 @@ impl TorrentEngine {
                     limiter,
                     utp_enabled,
                     utp_prefer_tcp,
+                    pex_enabled,
                 )
                 .await
             }));
@@ -1234,6 +1316,10 @@ impl TorrentEngine {
             Ok(EngineCommand::Resume) => CommandOutcome::Continue,
             Ok(EngineCommand::Reannounce) => CommandOutcome::Continue,
             Ok(EngineCommand::Recheck) => CommandOutcome::Continue,
+            Ok(EngineCommand::UpdatePeerWorkerLimit(limit)) => {
+                self.set_peer_worker_limit(limit);
+                CommandOutcome::Continue
+            }
             Err(_) => CommandOutcome::Continue,
         }
     }
@@ -1248,6 +1334,23 @@ enum CommandOutcome {
     Continue,
     Pause,
     Stop,
+}
+
+fn add_pex_peers<I>(discovered: &mut Vec<PeerAddr>, peers: I, allow_ipv6: bool, max_peers: usize)
+where
+    I: IntoIterator<Item = PeerAddr>,
+{
+    for peer in peers {
+        if !allow_ipv6 && peer.ip.is_ipv6() {
+            continue;
+        }
+        if max_peers > 0 && discovered.len() >= max_peers {
+            break;
+        }
+        if !discovered.contains(&peer) {
+            discovered.push(peer);
+        }
+    }
 }
 
 async fn connect_peer_stream_with_transport(
@@ -1593,6 +1696,7 @@ async fn parallel_peer_session(
     limiter: ShapedLimiter,
     utp_enabled: bool,
     utp_prefer_tcp: bool,
+    pex_enabled: bool,
 ) -> Result<bool> {
     if !binder.traffic_allowed() {
         return Ok(false);
@@ -1628,19 +1732,21 @@ async fn parallel_peer_session(
         }
     }
     peer::write_message(&mut write_half, &our_bf.encode_message()).await?;
-    let ext_payload = swarmotter_core::extensions::encode_extension_handshake(
-        &[(swarmotter_core::extensions::UT_PEX_NAME, 1u8)],
-        "SwarmOtter/0.1",
-        None,
-    );
-    peer::write_message(
-        &mut write_half,
-        &Message::Extended {
-            id: swarmotter_core::extensions::EXTENSION_HANDSHAKE_ID,
-            payload: ext_payload,
-        },
-    )
-    .await?;
+    if pex_enabled {
+        let ext_payload = swarmotter_core::extensions::encode_extension_handshake(
+            &[(swarmotter_core::extensions::UT_PEX_NAME, 1u8)],
+            "SwarmOtter/0.1",
+            None,
+        );
+        peer::write_message(
+            &mut write_half,
+            &Message::Extended {
+                id: swarmotter_core::extensions::EXTENSION_HANDSHAKE_ID,
+                payload: ext_payload,
+            },
+        )
+        .await?;
+    }
     peer::write_message(&mut write_half, &Message::Interested).await?;
     write_half.flush().await.ok();
 
@@ -1914,6 +2020,98 @@ mod tests {
         assert_eq!(pick, Some(2));
     }
 
+    #[test]
+    fn peer_worker_limit_uses_default_when_uncapped() {
+        let bytes = build_single_file_torrent("f", b"0123456789abcdef", 8, None, false);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let engine = TorrentEngine::new(
+            meta,
+            PathBuf::from("/tmp"),
+            [0u8; 20],
+            binder,
+            state,
+            rx,
+            vec![],
+            6881,
+        )
+        .with_peer_worker_limit(0);
+
+        assert_eq!(
+            engine.current_peer_worker_limit(),
+            DEFAULT_PEER_WORKER_LIMIT
+        );
+    }
+
+    #[test]
+    fn peer_worker_limit_accepts_operator_cap() {
+        let bytes = build_single_file_torrent("f", b"0123456789abcdef", 8, None, false);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let engine = TorrentEngine::new(
+            meta,
+            PathBuf::from("/tmp"),
+            [0u8; 20],
+            binder,
+            state,
+            rx,
+            vec![],
+            6881,
+        )
+        .with_peer_worker_limit(12);
+
+        assert_eq!(engine.current_peer_worker_limit(), 12);
+    }
+
+    #[test]
+    fn pex_import_respects_ipv6_and_cap() {
+        let mut peers = Vec::new();
+        add_pex_peers(
+            &mut peers,
+            [
+                "127.0.0.1:6001".parse::<SocketAddr>().unwrap(),
+                "[::1]:6002".parse::<SocketAddr>().unwrap(),
+                "127.0.0.1:6003".parse::<SocketAddr>().unwrap(),
+            ]
+            .into_iter()
+            .map(PeerAddr::from_socket_addr),
+            false,
+            1,
+        );
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].socket_addr(), "127.0.0.1:6001".parse().unwrap());
+    }
+
+    #[test]
+    fn peer_allowed_respects_ipv6_config() {
+        let bytes = build_single_file_torrent("f", b"0123456789abcdef", 8, None, false);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let engine = TorrentEngine::new(
+            meta,
+            PathBuf::from("/tmp"),
+            [0u8; 20],
+            binder,
+            state,
+            rx,
+            vec![],
+            6881,
+        )
+        .with_allow_ipv6(false);
+
+        assert!(engine.peer_allowed(&PeerAddr::from_socket_addr(
+            "127.0.0.1:6881".parse().unwrap()
+        )));
+        assert!(!engine.peer_allowed(&PeerAddr::from_socket_addr("[::1]:6881".parse().unwrap())));
+    }
+
     #[tokio::test]
     async fn completed_active_data_moves_to_complete_dir() {
         let content = b"verified active data moves after completion";
@@ -1963,5 +2161,70 @@ mod tests {
             .is_some());
         std::fs::remove_dir_all(&active_dir).ok();
         std::fs::remove_dir_all(&complete_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn engine_start_creates_active_single_file_placeholder() {
+        let bytes =
+            build_single_file_torrent("started.bin", b"payload waits for peers", 8, None, false);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let active_dir = unique_dir("started-active");
+        let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(EngineCommand::Stop).await.unwrap();
+        let engine = TorrentEngine::new(
+            meta.clone(),
+            active_dir.clone(),
+            [0u8; 20],
+            binder,
+            state,
+            rx,
+            vec![],
+            6881,
+        )
+        .with_preallocate(false);
+
+        let final_state = engine.run().await.unwrap();
+
+        assert!(!final_state.finished);
+        let storage = StorageIo::new(meta, active_dir.clone());
+        let path = storage.file_path(0).unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+        std::fs::remove_dir_all(&active_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn engine_start_sizes_file_when_sparse_disabled() {
+        let payload = b"payload waits for peers but file is sized";
+        let bytes = build_single_file_torrent("sized.bin", payload, 8, None, false);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let active_dir = unique_dir("sized-active");
+        let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(EngineCommand::Stop).await.unwrap();
+        let engine = TorrentEngine::new(
+            meta.clone(),
+            active_dir.clone(),
+            [0u8; 20],
+            binder,
+            state,
+            rx,
+            vec![],
+            6881,
+        )
+        .with_preallocate(false)
+        .with_sparse(false);
+
+        let final_state = engine.run().await.unwrap();
+
+        assert!(!final_state.finished);
+        let storage = StorageIo::new(meta, active_dir.clone());
+        let path = storage.file_path(0).unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::metadata(path).unwrap().len(), payload.len() as u64);
+        std::fs::remove_dir_all(&active_dir).ok();
     }
 }

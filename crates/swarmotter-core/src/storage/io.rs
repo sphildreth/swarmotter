@@ -81,6 +81,29 @@ impl StorageIo {
         Ok(())
     }
 
+    /// Create the visible on-disk layout for an active torrent without
+    /// pre-sizing payload files. This gives operators immediate evidence that
+    /// a just-started torrent has claimed its incomplete path while preserving
+    /// the `preallocate = false` behavior.
+    pub async fn ensure_active_layout(&self) -> Result<()> {
+        self.ensure_dirs().await?;
+        if self.meta.files.is_empty() {
+            return Ok(());
+        }
+        self.ensure_file_dirs(0).await?;
+        if !self.meta.is_multi_file {
+            let path = self.file_path(0)?;
+            fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)
+                .await
+                .map_err(CoreError::from)?;
+        }
+        Ok(())
+    }
+
     /// Preallocate (truncate to full length) all files so random writes land at
     /// the right offsets. Uses sparse truncation by default.
     pub async fn preallocate(&self) -> Result<()> {
@@ -552,6 +575,41 @@ mod tests {
         assert!(store.verify_piece_on_disk(2).await.unwrap());
         let all = store.read_piece(0).await.unwrap();
         assert_eq!(all, p0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn active_layout_creates_single_file_placeholder_without_preallocating() {
+        let content = b"placeholder appears before first piece";
+        let bytes = build_single_file_torrent("visible.bin", content, 16, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("active-visible-single");
+        let store = StorageIo::new(meta.clone(), dir.clone());
+
+        store.ensure_active_layout().await.unwrap();
+
+        let path = store.file_path(0).unwrap();
+        assert!(path.exists());
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn active_layout_creates_multi_file_top_directory() {
+        let files = vec![
+            (vec!["a.txt".into()], 5u64),
+            (vec!["sub".into(), "b.bin".into()], 7u64),
+        ];
+        let contents: Vec<&[u8]> = vec![b"hello", b"world!!"];
+        let bytes = build_multi_file_torrent("visible-dir", &files, &contents, 4, None);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("active-visible-multi");
+        let store = StorageIo::new(meta.clone(), dir.clone());
+
+        store.ensure_active_layout().await.unwrap();
+
+        assert!(dir.join("visible-dir").exists());
+        assert!(!store.file_path(0).unwrap().exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

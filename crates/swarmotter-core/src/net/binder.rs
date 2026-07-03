@@ -108,6 +108,17 @@ pub trait NetworkBinder: Send + Sync {
         self.udp_socket().await
     }
 
+    /// Create a contained UDP socket bound to `local_port` when nonzero.
+    /// Used by DHT so the configured DHT port is the actual local UDP port.
+    async fn udp_socket_on(
+        &self,
+        remote: Option<SocketAddr>,
+        local_port: u16,
+    ) -> Result<Box<dyn ContainedUdpSocket>> {
+        let _ = local_port;
+        self.udp_socket_for(remote).await
+    }
+
     /// Create a contained TCP listener for inbound peers on the given port
     /// (and the configured source address/interface in the real binder). Used
     /// for seeding/upload. Never bypasses containment.
@@ -179,6 +190,17 @@ impl NetworkBinder for LoopbackBinder {
 
     async fn udp_socket(&self) -> Result<Box<dyn ContainedUdpSocket>> {
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .map_err(CoreError::from)?;
+        Ok(Box::new(LoopbackUdpSocket { socket }))
+    }
+
+    async fn udp_socket_on(
+        &self,
+        _remote: Option<SocketAddr>,
+        local_port: u16,
+    ) -> Result<Box<dyn ContainedUdpSocket>> {
+        let socket = tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], local_port)))
             .await
             .map_err(CoreError::from)?;
         Ok(Box::new(LoopbackUdpSocket { socket }))

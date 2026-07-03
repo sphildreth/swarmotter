@@ -224,6 +224,22 @@ impl NetworkBinder for ContainedBinder {
         Ok(Box::new(ContainedUdpSocketImpl { socket }))
     }
 
+    async fn udp_socket_on(
+        &self,
+        remote: Option<SocketAddr>,
+        local_port: u16,
+    ) -> Result<Box<dyn ContainedUdpSocket>> {
+        self.guard().await?;
+        let cfg = self.config.lock().await.clone();
+        if let Some(remote) = remote {
+            ensure_family_enforced(&cfg, remote)?;
+        }
+        let mut bind = udp_bind_addr(&cfg, remote);
+        bind.set_port(local_port);
+        let socket = create_udp_socket(bind, cfg.required_interface.as_deref())?;
+        Ok(Box::new(ContainedUdpSocketImpl { socket }))
+    }
+
     async fn bind_peer_listener(&self, port: u16) -> Result<Box<dyn PeerListener>> {
         self.guard().await?;
         let cfg = self.config.lock().await.clone();

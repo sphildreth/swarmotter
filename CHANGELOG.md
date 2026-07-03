@@ -39,7 +39,29 @@ status.
 - **Web UI layout and peer counts:** the main Web UI content now uses the
   available window width instead of a centered 1200px cap, and the torrent
   list Peers column shows active peer workers / known peers from the summary
-  API instead of a placeholder.
+  API instead of a placeholder. Torrent row actions now use compact icon
+  buttons with accessible labels, and dynamic data regions start empty until
+  API data is loaded. Transient Web UI operation feedback now uses toast
+  notifications with a configurable browser-local display time defaulting to
+  5 seconds, including add/upload results and torrent removal notices.
+- **Visible incomplete storage layout:** active torrents now create their
+  incomplete storage layout as soon as the engine starts even when
+  `preallocate = false`; single-file torrents create a zero-length placeholder
+  file and multi-file torrents create the top directory before the first piece
+  is written.
+- **Configurable torrent peer worker cap:** the download engine now uses
+  `bandwidth.max_peers_per_torrent` instead of a fixed 16-worker limit. When
+  unset (`0`), the daemon uses its default 64-worker pool so popular public
+  torrents can use more discovered peers without extra configuration.
+- **Configuration enforcement pass:** previously modeled runtime settings are
+  now wired into daemon behavior: `bandwidth.max_peers` participates in live
+  peer worker caps, `queue.max_active_downloads`/`auto_start`/queue move
+  operations drive the real scheduler, `queue.max_active_seeds` and global
+  seeding ratio/idle policy control completed seeders, `torrent.allow_ipv6`
+  filters IPv6 peer candidates, `pex.enabled`/`pex.max_peers` control peer
+  exchange, `dht.port` is bound by the shared DHT runner, and `storage.sparse`
+  controls whether active files are sized up front when preallocation is off.
+  Watch-folder `failure_dir` now receives failed `.torrent` imports.
 - **Selfish completion policy** (`torrent.selfish`, default `false`): an
   optional completion policy that removes a torrent from SwarmOtter
   immediately after its download completes. When enabled, on completion the

@@ -29,6 +29,8 @@ use swarmotter_core::models::stats::{GlobalStats, TorrentDiagnostics};
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{TrackerId, TrackerInfo, TrackerKind, TrackerStatus};
 use swarmotter_core::net::{self, OsInterfaceProbe};
+use swarmotter_core::queue::QueueState;
+use swarmotter_core::ratio::{self, SeedDecision, TorrentAccounting, TorrentSeeding};
 use swarmotter_core::torrent::{Torrent, TorrentRegistry};
 use swarmotter_core::watch;
 
@@ -61,6 +63,11 @@ pub struct DaemonRuntime {
     engine_limiters: Arc<Mutex<HashMap<InfoHash, swarmotter_core::bandwidth::RateLimiter>>>,
     /// Last byte-counter samples used to calculate API/UI transfer rates.
     rate_samples: Arc<Mutex<HashMap<InfoHash, RateSample>>>,
+    /// Runtime queue state backing queue positions and queue move operations.
+    queue: Arc<Mutex<QueueState>>,
+    /// Shared DHT runner so the configured DHT port is bound by one runner
+    /// instead of once per active torrent.
+    dht_runner: Arc<Mutex<Option<Arc<crate::dht::DhtRunner>>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +93,7 @@ impl DaemonRuntime {
         );
         Self {
             registry: Arc::new(Mutex::new(TorrentRegistry::default())),
+            queue: Arc::new(Mutex::new(QueueState::new(config.queue.clone()))),
             config: Arc::new(Mutex::new(config)),
             network_health: Arc::new(Mutex::new(startup_health)),
             watch_imports: Arc::new(Mutex::new(Vec::new())),
@@ -97,6 +105,7 @@ impl DaemonRuntime {
             global_limiter,
             engine_limiters: Arc::new(Mutex::new(HashMap::new())),
             rate_samples: Arc::new(Mutex::new(HashMap::new())),
+            dht_runner: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -126,6 +135,133 @@ impl DaemonRuntime {
             .unwrap_or_else(|| download_dir.to_string())
     }
 
+    async fn configured_peer_worker_limit(&self, active_downloads: usize) -> usize {
+        let cfg = self.config.lock().await;
+        effective_peer_worker_limit(
+            cfg.bandwidth.max_peers,
+            cfg.bandwidth.max_peers_per_torrent,
+            active_downloads,
+        )
+    }
+
+    async fn apply_peer_worker_limits(&self) {
+        let active_downloads = self.active_download_hashes().await.len().max(1);
+        let limit = self.configured_peer_worker_limit(active_downloads).await;
+        let senders: Vec<tokio::sync::mpsc::Sender<EngineCommand>> =
+            self.engine_cmds.lock().await.values().cloned().collect();
+        for tx in senders {
+            let _ = tx.send(EngineCommand::UpdatePeerWorkerLimit(limit)).await;
+        }
+    }
+
+    async fn active_download_hashes(&self) -> Vec<InfoHash> {
+        let reg = self.registry.lock().await;
+        reg.torrents
+            .iter()
+            .filter_map(|(hash, t)| {
+                if matches!(
+                    t.state,
+                    TorrentState::Downloading | TorrentState::DownloadingMetadata
+                ) {
+                    Some(*hash)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    async fn desired_download_hashes(&self) -> Vec<InfoHash> {
+        let cfg = self.config.lock().await.clone();
+        let mut queue = self.queue.lock().await;
+        queue.limits = cfg.queue.clone();
+        let reg = self.registry.lock().await;
+        queue.order.retain(|hash| reg.contains(hash));
+        queue.bypass.retain(|hash| reg.contains(hash));
+
+        let limit = queue.limits.max_active_downloads;
+        let mut active = Vec::new();
+        for hash in queue.bypass.iter().chain(queue.order.iter()) {
+            if limit > 0 && active.len() >= limit {
+                break;
+            }
+            if active.contains(hash) {
+                continue;
+            }
+            let Some(t) = reg.get(hash) else {
+                continue;
+            };
+            let bypass = queue.bypass.contains(hash);
+            let already_active = matches!(
+                t.state,
+                TorrentState::Downloading | TorrentState::DownloadingMetadata
+            );
+            let auto_startable = queue.limits.auto_start || bypass || already_active;
+            if auto_startable
+                && matches!(
+                    t.state,
+                    TorrentState::Queued
+                        | TorrentState::Downloading
+                        | TorrentState::DownloadingMetadata
+                )
+            {
+                active.push(*hash);
+            }
+        }
+        active
+    }
+
+    async fn reconcile_queue(&self) {
+        let desired = self.desired_download_hashes().await;
+        let current = self.active_download_hashes().await;
+
+        for hash in current {
+            if !desired.contains(&hash) {
+                self.stop_engine(&hash).await;
+                let mut reg = self.registry.lock().await;
+                if let Some(t) = reg.get_mut(&hash) {
+                    if !matches!(t.state, TorrentState::Paused | TorrentState::Completed) {
+                        t.state = TorrentState::Queued;
+                    }
+                }
+            }
+        }
+
+        for hash in desired {
+            self.start_engine(hash).await;
+        }
+        self.apply_peer_worker_limits().await;
+    }
+
+    async fn shared_dht_runner(
+        &self,
+        binder: Arc<dyn swarmotter_core::net::NetworkBinder>,
+        peer_id: [u8; 20],
+    ) -> Option<Arc<crate::dht::DhtRunner>> {
+        let (dht_enabled, bootstrap_nodes, dht_port) = {
+            let cfg = self.config.lock().await;
+            (
+                cfg.dht.enabled,
+                cfg.dht.bootstrap_nodes.clone(),
+                cfg.dht.port,
+            )
+        };
+        if !dht_enabled || !self.network_health.lock().await.traffic_allowed {
+            return None;
+        }
+        if let Some(existing) = self.dht_runner.lock().await.clone() {
+            return Some(existing);
+        }
+        let bootstrap =
+            crate::dht::resolve_bootstrap_with_binder(binder.as_ref(), &bootstrap_nodes).await;
+        let self_id = crate::dht::DhtRunner::derive_from_peer_id(&peer_id);
+        let runner = Arc::new(crate::dht::DhtRunner::new(
+            self_id, binder, bootstrap, dht_port,
+        ));
+        *self.dht_runner.lock().await = Some(runner.clone());
+        Some(runner)
+    }
+
     /// Start the live engine task for a torrent (downloading). No-op if the
     /// torrent is paused, queued, or already running.
     pub async fn start_engine(&self, hash: InfoHash) {
@@ -145,7 +281,20 @@ impl DaemonRuntime {
             return;
         }
 
-        let (meta, active_dir, complete_dir, listen_port, preallocate, magnet, needs_metadata) = {
+        let (
+            meta,
+            active_dir,
+            complete_dir,
+            listen_port,
+            preallocate,
+            sparse,
+            max_peer_workers,
+            allow_ipv6,
+            pex_enabled,
+            pex_max_peers,
+            magnet,
+            needs_metadata,
+        ) = {
             let reg = self.registry.lock().await;
             let Some(t) = reg.get(&hash) else {
                 return;
@@ -161,13 +310,28 @@ impl DaemonRuntime {
             } else {
                 None
             };
-            let preallocate = self.config.lock().await.storage.preallocate;
+            let cfg = self.config.lock().await;
+            let preallocate = cfg.storage.preallocate;
+            let sparse = cfg.storage.sparse;
+            let allow_ipv6 = cfg.torrent.allow_ipv6 && cfg.network.allow_ipv6;
+            let pex_enabled = cfg.pex.enabled;
+            let pex_max_peers = cfg.pex.max_peers;
+            let max_peer_workers = effective_peer_worker_limit(
+                cfg.bandwidth.max_peers,
+                cfg.bandwidth.max_peers_per_torrent,
+                1,
+            );
             (
                 t.meta.clone(),
                 active_dir,
                 complete_dir,
-                self.config.lock().await.torrent.listen_port,
+                cfg.torrent.listen_port,
                 preallocate,
+                sparse,
+                max_peer_workers,
+                allow_ipv6,
+                pex_enabled,
+                pex_max_peers,
                 magnet,
                 t.needs_metadata,
             )
@@ -218,25 +382,7 @@ impl DaemonRuntime {
         let seeder_handles_arc = self.seeder_handles.clone();
         // DHT runner for trackerless peer discovery. Gated by config and
         // containment; the engine disables DHT for private torrents.
-        let dht_runner = {
-            let (dht_enabled, bootstrap_nodes) = {
-                let cfg = self.config.lock().await;
-                (cfg.dht.enabled, cfg.dht.bootstrap_nodes.clone())
-            };
-            if dht_enabled && self.network_health.lock().await.traffic_allowed {
-                let bootstrap =
-                    crate::dht::resolve_bootstrap_with_binder(binder.as_ref(), &bootstrap_nodes)
-                        .await;
-                let self_id = crate::dht::DhtRunner::derive_from_peer_id(&peer_id);
-                Some(Arc::new(crate::dht::DhtRunner::new(
-                    self_id,
-                    binder.clone(),
-                    bootstrap,
-                )))
-            } else {
-                None
-            }
-        };
+        let dht_runner = self.shared_dht_runner(binder.clone(), peer_id).await;
         let mut engine = TorrentEngine::with_limiter(
             meta.clone(),
             active_dir.clone().into(),
@@ -252,7 +398,11 @@ impl DaemonRuntime {
         .with_complete_dir(complete_dir.clone().into())
         .with_global_limiter(Some(self.global_limiter.clone()))
         .with_transport(utp_enabled, utp_prefer_tcp)
-        .with_preallocate(preallocate);
+        .with_preallocate(preallocate)
+        .with_sparse(sparse)
+        .with_peer_worker_limit(max_peer_workers)
+        .with_allow_ipv6(allow_ipv6)
+        .with_pex(pex_enabled, pex_max_peers);
         if let Some(dht) = dht_runner {
             engine = engine.with_dht(dht);
         }
@@ -359,7 +509,11 @@ impl DaemonRuntime {
         let mut reg = self.registry.lock().await;
         if let Some(t) = reg.get_mut(&hash) {
             if t.state == TorrentState::Queued || t.state == TorrentState::NetworkBlocked {
-                t.state = TorrentState::Downloading;
+                t.state = if needs_metadata {
+                    TorrentState::DownloadingMetadata
+                } else {
+                    TorrentState::Downloading
+                };
                 t.error = None;
             }
         }
@@ -452,6 +606,96 @@ impl DaemonRuntime {
         }
         if let Some(handle) = self.seeder_handles.lock().await.remove(hash) {
             let _ = handle.await;
+        }
+    }
+
+    async fn reconcile_seeders(&self) {
+        let now_secs = now();
+        let cfg = self.config.lock().await.clone();
+        let seeding_limit = cfg.queue.max_active_seeds;
+        let samples = self.rate_samples.lock().await.clone();
+        let running_seeders: Vec<InfoHash> =
+            self.seeder_handles.lock().await.keys().copied().collect();
+
+        let completed: Vec<(
+            InfoHash,
+            swarmotter_core::meta::TorrentMeta,
+            u64,
+            u64,
+            u64,
+            u64,
+        )> = {
+            let reg = self.registry.lock().await;
+            reg.torrents
+                .iter()
+                .filter_map(|(hash, t)| {
+                    if t.state == TorrentState::Completed {
+                        Some((
+                            *hash,
+                            t.meta.clone(),
+                            t.downloaded,
+                            t.uploaded,
+                            t.date_completed.unwrap_or(t.date_added),
+                            t.date_added,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+
+        let mut allowed = Vec::new();
+        for (hash, _meta, downloaded, uploaded, completed_at, _date_added) in &completed {
+            let idle_seconds = samples
+                .get(hash)
+                .and_then(|sample| sample.last_upload_at)
+                .map(|at| Instant::now().saturating_duration_since(at).as_secs())
+                .unwrap_or_else(|| now_secs.saturating_sub(*completed_at));
+            let accounting = TorrentAccounting {
+                downloaded: *downloaded,
+                uploaded: *uploaded,
+                idle_seconds,
+            };
+            if ratio::evaluate_seeding(&accounting, &cfg.seeding, &TorrentSeeding::default())
+                != SeedDecision::Continue
+            {
+                continue;
+            }
+            if seeding_limit > 0 && allowed.len() >= seeding_limit {
+                break;
+            }
+            allowed.push(*hash);
+        }
+
+        for hash in running_seeders {
+            let completed_running = completed.iter().any(|(h, ..)| *h == hash);
+            if completed_running && !allowed.contains(&hash) {
+                self.stop_seeder(&hash).await;
+            }
+        }
+
+        for hash in allowed {
+            if self.seeder_handles.lock().await.contains_key(&hash) {
+                continue;
+            }
+            let Some((_, meta, ..)) = completed.iter().find(|(h, ..)| *h == hash).cloned() else {
+                continue;
+            };
+            let torrent_for_dir = {
+                let reg = self.registry.lock().await;
+                let Some(t) = reg.get(&hash) else {
+                    continue;
+                };
+                t.clone()
+            };
+            let complete_dir = self.resolve_download_dir(&torrent_for_dir).await;
+            let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
+            let Some(state) = self.engine_states.lock().await.get(&hash).cloned() else {
+                continue;
+            };
+            self.start_seeder(hash, meta, active_dir, complete_dir, state)
+                .await;
         }
     }
 
@@ -555,6 +799,8 @@ impl DaemonRuntime {
                         t.error = None;
                     }
                 }
+                drop(reg);
+                self.reconcile_queue().await;
             }
         }
     }
@@ -663,6 +909,9 @@ impl DaemonRuntime {
                 t.health = calc.compute(&health_input);
             }
         }
+        drop(reg);
+        drop(samples);
+        self.reconcile_seeders().await;
     }
 
     /// Watch-folder scan loop: periodically scans configured folders and imports
@@ -683,6 +932,9 @@ impl DaemonRuntime {
                 let res = self
                     .import_one(&file, folder, cfg.storage.download_dir.as_deref())
                     .await;
+                if res.is_err() {
+                    move_failed_watch_file(folder, &file);
+                }
                 let info_hash_hex = res.as_ref().ok().map(|h| h.to_hex());
                 let result = watch::ImportResult {
                     path: file.display().to_string(),
@@ -726,11 +978,42 @@ impl DaemonRuntime {
     }
 }
 
+fn move_failed_watch_file(
+    folder: &swarmotter_core::config::WatchFolderConfig,
+    file: &std::path::Path,
+) {
+    let Some(failure_dir) = &folder.failure_dir else {
+        return;
+    };
+    let mut dest = std::path::PathBuf::from(failure_dir);
+    dest.push(file.file_name().unwrap_or_default());
+    let _ = std::fs::create_dir_all(dest.parent().unwrap_or(std::path::Path::new(".")));
+    let _ = std::fs::rename(file, dest);
+}
+
 fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn effective_peer_worker_limit(
+    global_max_peers: usize,
+    max_peers_per_torrent: usize,
+    active_downloads: usize,
+) -> usize {
+    let per_torrent = if max_peers_per_torrent == 0 {
+        crate::engine::DEFAULT_PEER_WORKER_LIMIT
+    } else {
+        max_peers_per_torrent
+    };
+    if global_max_peers == 0 {
+        return per_torrent.max(1);
+    }
+    let active = active_downloads.max(1);
+    let global_share = global_max_peers.div_ceil(active);
+    per_torrent.min(global_share).max(1)
 }
 
 /// Generate a stable per-daemon peer id (`-SW0001-` + 12 bytes of zeros).
@@ -744,22 +1027,36 @@ fn make_peer_id() -> [u8; 20] {
 impl DaemonOps for DaemonRuntime {
     async fn list_torrents(&self) -> Vec<TorrentSummary> {
         self.reconcile_engine_progress().await;
+        let positions: HashMap<InfoHash, usize> = self
+            .queue
+            .lock()
+            .await
+            .order
+            .iter()
+            .enumerate()
+            .map(|(i, hash)| (*hash, i + 1))
+            .collect();
         self.registry
             .lock()
             .await
             .list()
             .iter()
-            .map(|t| t.to_summary())
+            .map(|t| {
+                let mut summary = t.to_summary();
+                summary.queue_position = positions.get(&t.info_hash()).copied();
+                summary
+            })
             .collect()
     }
 
     async fn get_torrent(&self, hash: &InfoHash) -> Option<TorrentSummary> {
         self.reconcile_engine_progress().await;
-        self.registry
-            .lock()
-            .await
-            .get(hash)
-            .map(Torrent::to_summary)
+        let position = self.queue.lock().await.position(hash);
+        self.registry.lock().await.get(hash).map(|t| {
+            let mut summary = t.to_summary();
+            summary.queue_position = position;
+            summary
+        })
     }
 
     async fn add_torrent_file(
@@ -780,8 +1077,9 @@ impl DaemonOps for DaemonRuntime {
             reg.add(t)
                 .map_err(|_| CoreError::DuplicateTorrent(hash.to_hex()))?;
         }
+        self.queue.lock().await.add(hash);
         if !blocked {
-            self.start_engine(hash).await;
+            self.reconcile_queue().await;
         }
         Ok(hash)
     }
@@ -802,7 +1100,6 @@ impl DaemonOps for DaemonRuntime {
         );
         let parsed = meta::parse_torrent(&bytes)?;
         let mut t = Torrent::new(parsed, now());
-        t.state = TorrentState::DownloadingMetadata;
         t.needs_metadata = true;
         t.magnet_info_hash = Some(hash);
         t.magnet_name = Some(name);
@@ -811,9 +1108,16 @@ impl DaemonOps for DaemonRuntime {
             t.download_dir = Some(d);
         }
         apply_network_state(&mut t, &self.network_health).await;
-        let mut reg = self.registry.lock().await;
-        reg.add(t)
-            .map_err(|_| CoreError::DuplicateTorrent(hash.to_hex()))?;
+        let blocked = t.state == TorrentState::NetworkBlocked;
+        {
+            let mut reg = self.registry.lock().await;
+            reg.add(t)
+                .map_err(|_| CoreError::DuplicateTorrent(hash.to_hex()))?;
+        }
+        self.queue.lock().await.add(hash);
+        if !blocked {
+            self.reconcile_queue().await;
+        }
         Ok(hash)
     }
 
@@ -838,21 +1142,27 @@ impl DaemonOps for DaemonRuntime {
                 let _ = storage.remove_all().await;
             }
         }
+        self.queue.lock().await.remove(hash);
         self.rate_samples.lock().await.remove(hash);
+        self.reconcile_queue().await;
         Ok(())
     }
 
     async fn pause(&self, hash: &InfoHash) -> Result<()> {
         // Stop the live engine; the torrent stays in the registry as paused.
         self.stop_engine(hash).await;
-        let mut reg = self.registry.lock().await;
-        match reg.get_mut(hash) {
-            Some(t) => {
-                t.state = TorrentState::Paused;
-                Ok(())
+        {
+            let mut reg = self.registry.lock().await;
+            match reg.get_mut(hash) {
+                Some(t) => {
+                    t.state = TorrentState::Paused;
+                }
+                None => return Err(CoreError::NotFound("torrent".into())),
             }
-            None => Err(CoreError::NotFound("torrent".into())),
         }
+        self.queue.lock().await.clear_bypass(hash);
+        self.reconcile_queue().await;
+        Ok(())
     }
 
     async fn resume(&self, hash: &InfoHash) -> Result<()> {
@@ -860,18 +1170,35 @@ impl DaemonOps for DaemonRuntime {
             let mut reg = self.registry.lock().await;
             match reg.get_mut(hash) {
                 Some(t) => {
-                    t.state = TorrentState::Downloading;
+                    t.state = TorrentState::Queued;
                     t.error = None;
                 }
                 None => return Err(CoreError::NotFound("torrent".into())),
             }
         }
-        self.start_engine(*hash).await;
+        {
+            let mut queue = self.queue.lock().await;
+            queue.add(*hash);
+            queue.start_now(hash);
+        }
+        self.reconcile_queue().await;
         Ok(())
     }
 
     async fn start_now(&self, hash: &InfoHash) -> Result<()> {
-        self.resume(hash).await
+        {
+            let reg = self.registry.lock().await;
+            if reg.get(hash).is_none() {
+                return Err(CoreError::NotFound("torrent".into()));
+            }
+        }
+        {
+            let mut queue = self.queue.lock().await;
+            queue.add(*hash);
+            queue.start_now(hash);
+        }
+        self.reconcile_queue().await;
+        Ok(())
     }
 
     async fn stop(&self, hash: &InfoHash) -> Result<()> {
@@ -1179,16 +1506,48 @@ impl DaemonOps for DaemonRuntime {
         Some(peers)
     }
 
-    async fn queue_move_up(&self, _hash: &InfoHash) -> Result<()> {
+    async fn queue_move_up(&self, hash: &InfoHash) -> Result<()> {
+        {
+            let reg = self.registry.lock().await;
+            if reg.get(hash).is_none() {
+                return Err(CoreError::NotFound("torrent".into()));
+            }
+        }
+        self.queue.lock().await.move_up(hash);
+        self.reconcile_queue().await;
         Ok(())
     }
-    async fn queue_move_down(&self, _hash: &InfoHash) -> Result<()> {
+    async fn queue_move_down(&self, hash: &InfoHash) -> Result<()> {
+        {
+            let reg = self.registry.lock().await;
+            if reg.get(hash).is_none() {
+                return Err(CoreError::NotFound("torrent".into()));
+            }
+        }
+        self.queue.lock().await.move_down(hash);
+        self.reconcile_queue().await;
         Ok(())
     }
-    async fn queue_move_to_top(&self, _hash: &InfoHash) -> Result<()> {
+    async fn queue_move_to_top(&self, hash: &InfoHash) -> Result<()> {
+        {
+            let reg = self.registry.lock().await;
+            if reg.get(hash).is_none() {
+                return Err(CoreError::NotFound("torrent".into()));
+            }
+        }
+        self.queue.lock().await.move_to_top(hash);
+        self.reconcile_queue().await;
         Ok(())
     }
-    async fn queue_move_to_bottom(&self, _hash: &InfoHash) -> Result<()> {
+    async fn queue_move_to_bottom(&self, hash: &InfoHash) -> Result<()> {
+        {
+            let reg = self.registry.lock().await;
+            if reg.get(hash).is_none() {
+                return Err(CoreError::NotFound("torrent".into()));
+            }
+        }
+        self.queue.lock().await.move_to_bottom(hash);
+        self.reconcile_queue().await;
         Ok(())
     }
 
@@ -1199,6 +1558,7 @@ impl DaemonOps for DaemonRuntime {
     async fn update_settings(&self, patch: swarmotter_api::state::SettingsPatch) -> Result<()> {
         let eff_dl;
         let eff_ul;
+        let queue_limits;
         {
             let mut cfg = self.config.lock().await;
             if let Some(b) = patch.bandwidth {
@@ -1212,7 +1572,9 @@ impl DaemonOps for DaemonRuntime {
             }
             eff_dl = cfg.bandwidth.effective_download();
             eff_ul = cfg.bandwidth.effective_upload();
+            queue_limits = cfg.queue.clone();
         }
+        self.queue.lock().await.limits = queue_limits;
         // Apply the new global limits live to the shared limiter (and therefore
         // to all running engines/seeders, which share its buckets).
         self.global_limiter
@@ -1221,6 +1583,9 @@ impl DaemonOps for DaemonRuntime {
         self.global_limiter
             .set_capacity(swarmotter_core::bandwidth::RateDirection::Upload, eff_ul)
             .await;
+        self.reconcile_queue().await;
+        self.apply_peer_worker_limits().await;
+        self.reconcile_seeders().await;
         Ok(())
     }
 
@@ -1613,6 +1978,72 @@ mod tests {
         let summary = runtime.get_torrent(&hash).await.unwrap();
         assert_eq!(summary.active_peer_workers, 4);
         assert_eq!(summary.known_peers, 2);
+    }
+
+    #[test]
+    fn effective_peer_worker_limit_uses_global_and_per_torrent_caps() {
+        assert_eq!(
+            effective_peer_worker_limit(0, 0, 3),
+            crate::engine::DEFAULT_PEER_WORKER_LIMIT
+        );
+        assert_eq!(effective_peer_worker_limit(120, 0, 3), 40);
+        assert_eq!(effective_peer_worker_limit(120, 24, 3), 24);
+        assert_eq!(effective_peer_worker_limit(2, 64, 5), 1);
+    }
+
+    #[tokio::test]
+    async fn queue_scheduler_respects_auto_start_and_moves() {
+        let mut cfg = Config::default();
+        cfg.queue.max_active_downloads = 1;
+        cfg.queue.auto_start = false;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let first_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "q1.bin",
+            b"queue-one",
+            4,
+            None,
+            false,
+        );
+        let second_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "q2.bin",
+            b"queue-two",
+            4,
+            None,
+            false,
+        );
+        let first = swarmotter_core::meta::parse_torrent(&first_bytes).unwrap();
+        let second = swarmotter_core::meta::parse_torrent(&second_bytes).unwrap();
+        let first_hash = first.info_hash;
+        let second_hash = second.info_hash;
+
+        {
+            let mut reg = runtime.registry.lock().await;
+            reg.add(Torrent::new(first, 1)).unwrap();
+            reg.add(Torrent::new(second, 2)).unwrap();
+        }
+        {
+            let mut queue = runtime.queue.lock().await;
+            queue.add(first_hash);
+            queue.add(second_hash);
+        }
+
+        assert!(runtime.desired_download_hashes().await.is_empty());
+
+        runtime.queue.lock().await.start_now(&second_hash);
+        assert_eq!(runtime.desired_download_hashes().await, vec![second_hash]);
+
+        {
+            let mut queue = runtime.queue.lock().await;
+            queue.clear_bypass(&second_hash);
+            queue.move_to_top(&first_hash);
+        }
+        runtime.config.lock().await.queue.auto_start = true;
+        assert_eq!(runtime.desired_download_hashes().await, vec![first_hash]);
     }
 
     #[test]

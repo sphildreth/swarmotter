@@ -186,14 +186,96 @@ mod tests {
             "function renderHealth(",
             "function renderDetailsHealth(",
             "function healthLabelName(",
-            "torrent-health health-",
+            "torrent-health${healthClass}",
             "<th>Health</th>",
             "function renderPeerCount(",
             "${renderPeerCount(t)}",
+            "function renderTorrentActions(",
         ] {
             assert!(
                 APP_JS.contains(needle) || INDEX_HTML.contains(needle),
                 "Web UI is missing health markup {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_uses_icon_torrent_actions() {
+        for needle in [
+            "const TORRENT_ACTIONS",
+            "data-act=\"${action.act}\"",
+            "class=\"icon-button${danger}\"",
+            "aria-label=\"${action.label}\"",
+            "title=\"${action.label}\"",
+            ".torrent-actions",
+            "button.icon-button svg",
+        ] {
+            assert!(
+                APP_JS.contains(needle) || STYLE_CSS.contains(needle),
+                "Web UI is missing icon action support {needle}"
+            );
+        }
+        for old_button in [
+            "<button data-act=\"pause\">Pause</button>",
+            "<button data-act=\"resume\">Resume</button>",
+            "<button data-act=\"recheck\">Recheck</button>",
+            "<button data-act=\"remove\" class=\"danger\">Remove</button>",
+        ] {
+            assert!(
+                !APP_JS.contains(old_button),
+                "Web UI still contains text action button {old_button}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_uses_toast_notifications() {
+        for needle in [
+            "const DEFAULT_TOAST_DISPLAY_MS = 5000",
+            "function showToast(",
+            "function setToastDisplaySeconds(",
+            "swarmotter.toastDisplayMs",
+            "expectedRemovedTorrents",
+            "showToast(\"Torrent removed\"",
+            "showToast(`Added ${added} file",
+            "id=\"toast-region\"",
+            "id=\"toast-seconds\"",
+            ".toast-region",
+            ".toast.success",
+            ".toast.error",
+        ] {
+            assert!(
+                APP_JS.contains(needle)
+                    || INDEX_HTML.contains(needle)
+                    || STYLE_CSS.contains(needle),
+                "Web UI is missing toast notification support {needle}"
+            );
+        }
+        for old_message_surface in [
+            "alert(",
+            "id=\"drop-status\"",
+            "id=\"add-magnet-result\"",
+            "id=\"add-file-result\"",
+            "id=\"save-bw-result\"",
+        ] {
+            assert!(
+                !APP_JS.contains(old_message_surface) && !INDEX_HTML.contains(old_message_surface),
+                "Web UI still contains old message surface {old_message_surface}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_dynamic_data_regions_start_empty() {
+        for placeholder in [
+            "badge\">unknown",
+            "value=\"0\"",
+            ">Torrent Details</h2>",
+            "Added 1 file",
+        ] {
+            assert!(
+                !INDEX_HTML.contains(placeholder),
+                "Web UI contains hardcoded data placeholder {placeholder}"
             );
         }
     }
@@ -214,7 +296,7 @@ mod tests {
                 ));
             }
             format!(
-                "<div class=\"torrent-health health-{label}\" title=\"{label} — {score}/100: {reasons_str}\">\
+                "<div class=\"torrent-health health-{label}\" title=\"{label} - {score}/100: {reasons_str}\">\
 <span class=\"sr-only\">{sr_text}</span>\
 <span class=\"health-bars\" aria-hidden=\"true\">{bars_html}</span>\
 <span class=\"health-label\">{label}</span>\

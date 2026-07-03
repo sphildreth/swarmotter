@@ -1,19 +1,122 @@
 // SPDX-License-Identifier: Apache-2.0
 // SwarmOtter Web UI controller. Consumes the same REST API as external tools.
 const API = "/api/v1";
+const DEFAULT_TOAST_DISPLAY_MS = 5000;
+const TOAST_DISPLAY_STORAGE_KEY = "swarmotter.toastDisplayMs";
 let currentHash = null;
+let toastDisplayMs = loadToastDisplayMs();
+let torrentsLoaded = false;
+let knownTorrents = new Map();
+let expectedRemovedTorrents = new Map();
+
+const TORRENT_ACTIONS = [
+  {
+    act: "pause",
+    label: "Pause",
+    icon: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 5v14M16 5v14"/></svg>`,
+  },
+  {
+    act: "resume",
+    label: "Resume",
+    icon: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 5v14l11-7-11-7z"/></svg>`,
+  },
+  {
+    act: "recheck",
+    label: "Recheck",
+    icon: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M20 6v6h-6"/><path d="M4 18v-6h6"/><path d="M19 9a7 7 0 0 0-11.9-4.9L4 7"/><path d="M5 15a7 7 0 0 0 11.9 4.9L20 17"/></svg>`,
+  },
+  {
+    act: "remove",
+    label: "Remove",
+    danger: true,
+    icon: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 15h10l1-15"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>`,
+  },
+];
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
+function loadToastDisplayMs() {
+  try {
+    const raw = window.localStorage.getItem(TOAST_DISPLAY_STORAGE_KEY);
+    const ms = Number(raw);
+    return Number.isFinite(ms) && ms >= 1000 ? ms : DEFAULT_TOAST_DISPLAY_MS;
+  } catch {
+    return DEFAULT_TOAST_DISPLAY_MS;
+  }
+}
+
+function setToastDisplaySeconds(seconds) {
+  const n = Number(seconds);
+  const ms = Number.isFinite(n)
+    ? Math.max(1000, Math.min(60000, Math.round(n * 1000)))
+    : DEFAULT_TOAST_DISPLAY_MS;
+  toastDisplayMs = ms;
+  try { window.localStorage.setItem(TOAST_DISPLAY_STORAGE_KEY, String(ms)); } catch {}
+  return ms;
+}
+
+function showToast(title, message = "", type = "info", durationMs = toastDisplayMs) {
+  const region = $("#toast-region");
+  if (!region) return;
+  const toast = document.createElement("div");
+  toast.className = "toast " + cssToken(type || "info");
+  toast.setAttribute("role", type === "error" ? "alert" : "status");
+  toast.innerHTML = `
+    <div class="toast-title">${escapeHtml(title)}</div>
+    ${message ? `<div class="toast-message">${escapeHtml(message)}</div>` : ""}`;
+  region.appendChild(toast);
+  window.setTimeout(() => toast.remove(), durationMs);
+}
+
+function showError(title, error) {
+  showToast(title, error && error.message ? error.message : String(error || ""), "error");
+}
+
+function finiteNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function fmtCount(value) {
+  const n = finiteNumber(value);
+  return n === null ? "" : String(n);
+}
+
 function fmtBytes(n) {
-  if (!n || n <= 0) return "0 B";
+  n = finiteNumber(n);
+  if (n === null) return "";
+  if (n <= 0) return "0 B";
   const u = ["B","KB","MB","GB","TB"];
   let i = 0;
   while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
   return n.toFixed(i === 0 ? 0 : 1) + " " + u[i];
 }
-function fmtRate(n) { return fmtBytes(n) + "/s"; }
+function fmtRate(n) {
+  const bytes = fmtBytes(n);
+  return bytes ? bytes + "/s" : "";
+}
+function fmtRatio(n) {
+  n = finiteNumber(n);
+  return n === null ? "" : n.toFixed(2);
+}
+function fmtPercentFromFraction(n, digits = 1) {
+  n = finiteNumber(n);
+  return n === null ? "" : (n * 100).toFixed(digits) + "%";
+}
+function fmtProgress(bytesCompleted, totalLength) {
+  const completed = finiteNumber(bytesCompleted);
+  const total = finiteNumber(totalLength);
+  if (completed === null || total === null || total <= 0) return "";
+  return (completed / total * 100).toFixed(1) + "%";
+}
+function renderProgressCell(bytesCompleted, totalLength) {
+  const completed = finiteNumber(bytesCompleted);
+  const total = finiteNumber(totalLength);
+  if (completed === null || total === null || total <= 0) return "";
+  return `<progress value="${completed}" max="${total}"></progress> ${fmtProgress(completed, total)}`;
+}
 
 async function api(path, opts = {}) {
   const res = await fetch(API + path, opts);
@@ -48,47 +151,79 @@ async function refreshTorrents() {
   try {
     const list = await api("/torrents");
     const stats = await api("/stats");
+    observeTorrentRemovals(list);
     const tbody = $("#torrent-table tbody");
     tbody.innerHTML = "";
     const filter = $("#search").value.toLowerCase();
-    list.filter(t => t.name.toLowerCase().includes(filter)).forEach(t => {
+    list.filter(t => String(t.name || "").toLowerCase().includes(filter)).forEach(t => {
       const tr = document.createElement("tr");
       tr.className = "torrent";
       tr.dataset.hash = t.info_hash;
       tr.innerHTML = `
         <td>${escapeHtml(t.name)}</td>
         <td>${fmtBytes(t.total_length)}</td>
-        <td><progress value="${t.bytes_completed}" max="${t.total_length}"></progress> ${((t.total_length ? t.bytes_completed / t.total_length : 0) * 100).toFixed(1)}%</td>
-        <td>${t.state}</td>
+        <td>${renderProgressCell(t.bytes_completed, t.total_length)}</td>
+        <td>${escapeHtml(t.state)}</td>
         <td>${renderHealth(t.health)}</td>
         <td>${fmtRate(t.rate_down)}</td>
         <td>${fmtRate(t.rate_up)}</td>
-        <td>${t.ratio.toFixed(2)}</td>
+        <td>${fmtRatio(t.ratio)}</td>
         <td>${renderPeerCount(t)}</td>
-        <td>
-          <button data-act="pause">Pause</button>
-          <button data-act="resume">Resume</button>
-          <button data-act="recheck">Recheck</button>
-          <button data-act="remove" class="danger">Remove</button>
-        </td>`;
+        <td>${renderTorrentActions()}</td>`;
       tr.addEventListener("click", (e) => {
-        if (e.target.tagName === "BUTTON") return;
+        if (e.target.closest("button")) return;
         openDetails(t.info_hash);
       });
       tbody.appendChild(tr);
     });
-    $("#stats-summary").textContent = `${stats.torrent_count} torrents · ${fmtRate(stats.download_rate)} down · ${fmtRate(stats.upload_rate)} up`;
+    $("#stats-summary").textContent = renderStatsSummary(stats);
     bindActionButtons();
   } catch (e) {
     log("torrent list error: " + e.message);
   }
 }
 
+function observeTorrentRemovals(list) {
+  const current = new Map((list || []).map(t => [t.info_hash, String(t.name || t.info_hash || "")]));
+  if (torrentsLoaded) {
+    for (const [hash, name] of knownTorrents.entries()) {
+      if (current.has(hash)) continue;
+      if (expectedRemovedTorrents.has(hash)) {
+        expectedRemovedTorrents.delete(hash);
+        continue;
+      }
+      showToast("Torrent removed", name, "info");
+    }
+  }
+  knownTorrents = current;
+  torrentsLoaded = true;
+}
+
 function renderPeerCount(t) {
-  const active = Number.isFinite(t.active_peer_workers) ? t.active_peer_workers : 0;
-  const known = Number.isFinite(t.known_peers) ? t.known_peers : 0;
-  if (known === 0) return String(active);
+  const active = finiteNumber(t.active_peer_workers);
+  const known = finiteNumber(t.known_peers);
+  if (active === null && known === null) return "";
+  if (known === null) return String(active);
+  if (active === null) return String(known);
   return `${active}/${known}`;
+}
+
+function renderStatsSummary(stats) {
+  const parts = [];
+  const torrentCount = fmtCount(stats.torrent_count);
+  const down = fmtRate(stats.download_rate);
+  const up = fmtRate(stats.upload_rate);
+  if (torrentCount) parts.push(`${torrentCount} torrents`);
+  if (down) parts.push(`${down} down`);
+  if (up) parts.push(`${up} up`);
+  return parts.join(" · ");
+}
+
+function renderTorrentActions() {
+  return `<div class="torrent-actions">${TORRENT_ACTIONS.map(action => {
+    const danger = action.danger ? " danger" : "";
+    return `<button type="button" data-act="${action.act}" class="icon-button${danger}" aria-label="${action.label}" title="${action.label}">${action.icon}</button>`;
+  }).join("")}</div>`;
 }
 
 function bindActionButtons() {
@@ -97,6 +232,7 @@ function bindActionButtons() {
       e.stopPropagation();
       const tr = btn.closest("tr");
       const hash = tr.dataset.hash;
+      const name = tr.querySelector("td")?.textContent || hash;
       const act = btn.dataset.act;
       try {
         if (act === "pause") await api(`/torrents/${hash}/pause`, { method: "POST" });
@@ -105,9 +241,11 @@ function bindActionButtons() {
         else if (act === "remove") {
           if (confirm("Remove torrent? Delete data too?")) await api(`/torrents/${hash}?delete_data=true`, { method: "DELETE" });
           else await api(`/torrents/${hash}`, { method: "DELETE" });
+          expectedRemovedTorrents.set(hash, name);
+          showToast("Torrent removed", name, "info");
         }
         refreshTorrents();
-      } catch (e) { alert(e.message); }
+      } catch (e) { showError("Torrent action failed", e); }
     });
   });
 }
@@ -128,6 +266,7 @@ async function openDetails(hash) {
 
 function healthLabelName(label) {
   switch (label) {
+    case "unknown": return "Unknown";
     case "excellent": return "Excellent";
     case "good": return "Good";
     case "fair": return "Fair";
@@ -137,53 +276,66 @@ function healthLabelName(label) {
     case "network_blocked": return "Blocked";
     case "paused": return "Paused";
     case "complete": return "Complete";
-    default: return "Unknown";
+    default: return String(label || "").replace(/_/g, " ");
   }
 }
 
 function renderHealth(h) {
   if (!h) return "";
-  const label = h.label || "unknown";
-  const score = h.score == null ? 0 : h.score;
-  const bars = Math.max(0, Math.min(5, h.bars || 0));
+  const label = h.label;
+  const labelName = healthLabelName(label);
+  const score = fmtCount(h.score);
+  const rawBars = finiteNumber(h.bars);
+  const bars = rawBars === null ? null : Math.max(0, Math.min(5, rawBars));
   const reasons = (h.reasons || []).join("; ");
-  const tooltip = `${healthLabelName(label)} — ${score}/100${reasons ? ": " + reasons : ""}`;
-  const srText = `Health: ${healthLabelName(label)}, ${score} out of 100`;
+  const tooltip = `${labelName}${score ? " - " + score + "/100" : ""}${reasons ? ": " + reasons : ""}`;
+  const srText = `Health: ${labelName}${score ? ", " + score + " out of 100" : ""}`;
   let barsHtml = "";
-  for (let i = 0; i < 5; i++) {
-    barsHtml += `<span class="bar${i < bars ? " active" : ""}"></span>`;
+  if (bars !== null) {
+    for (let i = 0; i < 5; i++) {
+      barsHtml += `<span class="bar${i < bars ? " active" : ""}"></span>`;
+    }
   }
-  return `<div class="torrent-health health-${escapeHtml(label)}" title="${escapeHtml(tooltip)}">`
+  const healthClass = label ? " health-" + cssToken(label) : "";
+  return `<div class="torrent-health${healthClass}" title="${escapeHtml(tooltip)}">`
     + `<span class="sr-only">${escapeHtml(srText)}</span>`
     + `<span class="health-bars" aria-hidden="true">${barsHtml}</span>`
-    + `<span class="health-label">${escapeHtml(healthLabelName(label))}</span>`
+    + `<span class="health-label">${escapeHtml(labelName)}</span>`
     + `</div>`;
 }
 
 function renderDetailsHealth(h) {
   if (!h) { $("#details-health").innerHTML = ""; return; }
-  const label = h.label || "unknown";
-  const score = h.score == null ? 0 : h.score;
-  const bars = Math.max(0, Math.min(5, h.bars || 0));
   const reasons = (h.reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join("");
+  const reasonsHtml = reasons ? `<ul class="health-list">${reasons}</ul>` : "";
   const subs = `
     <table class="health-subscores">
       <thead><tr><th>Component</th><th>Score</th></tr></thead>
       <tbody>
-        <tr><td>Availability</td><td>${h.availability_score == null ? 0 : h.availability_score}/100</td></tr>
-        <tr><td>Throughput</td><td>${h.throughput_score == null ? 0 : h.throughput_score}/100</td></tr>
-        <tr><td>Peers</td><td>${h.peer_score == null ? 0 : h.peer_score}/100</td></tr>
-        <tr><td>Stability</td><td>${h.stability_score == null ? 0 : h.stability_score}/100</td></tr>
-        <tr><td>Discovery</td><td>${h.discovery_score == null ? 0 : h.discovery_score}/100</td></tr>
+        <tr><td>Availability</td><td>${fmtScore(h.availability_score)}</td></tr>
+        <tr><td>Throughput</td><td>${fmtScore(h.throughput_score)}</td></tr>
+        <tr><td>Peers</td><td>${fmtScore(h.peer_score)}</td></tr>
+        <tr><td>Stability</td><td>${fmtScore(h.stability_score)}</td></tr>
+        <tr><td>Discovery</td><td>${fmtScore(h.discovery_score)}</td></tr>
       </tbody>
     </table>`;
   $("#details-health").innerHTML = `
     <h3>Health</h3>
     ${renderHealth(h)}
-    <p class="muted">Score ${score}/100. Health answers: can this torrent complete, and is it downloading well right now?</p>
-    <ul class="health-list">${reasons}</ul>
+    <p class="muted">${renderHealthSummary(h)}</p>
+    ${reasonsHtml}
     ${subs}
   `;
+}
+
+function fmtScore(value) {
+  const score = fmtCount(value);
+  return score ? `${score}/100` : "";
+}
+
+function renderHealthSummary(h) {
+  const score = fmtScore(h.score);
+  return score ? `Score ${score}. Health answers: can this torrent complete, and is it downloading well right now?` : "";
 }
 
 $$(".tab").forEach(btn => btn.addEventListener("click", () => {
@@ -203,7 +355,10 @@ async function loadFiles(hash) {
       tr.innerHTML = `<td>${escapeHtml(f.path)}</td><td>${fmtBytes(f.length)}</td><td>${fmtBytes(f.bytes_completed)}</td><td><select data-fi="${f.index}" class="prio"><option value="unwanted">Unwanted</option><option value="low">Low</option><option value="normal">Normal</option><option value="high">High</option></select></td><td><input type="checkbox" data-fi="${f.index}" class="want" ${f.wanted ? "checked" : ""}></td>`;
       tbody.appendChild(tr);
     });
-    $$("#files-table .prio").forEach(sel => sel.value = files.find(f => f.index == sel.dataset.fi).priority);
+    $$("#files-table .prio").forEach(sel => {
+      const file = files.find(f => f.index == sel.dataset.fi);
+      if (file && file.priority) sel.value = file.priority;
+    });
     $$("#files-table .prio").forEach(sel => sel.addEventListener("change", async () => {
       const fi = parseInt(sel.dataset.fi, 10);
       const priority = sel.value;
@@ -223,7 +378,7 @@ async function loadPeers(hash) {
     tbody.innerHTML = "";
     peers.forEach(p => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${escapeHtml(p.address)}</td><td>${escapeHtml(p.client || "")}</td><td>${(p.progress * 100).toFixed(0)}%</td><td>${fmtRate(p.rate_down)}</td><td>${fmtRate(p.rate_up)}</td>`;
+      tr.innerHTML = `<td>${escapeHtml(p.address)}</td><td>${escapeHtml(p.client)}</td><td>${fmtPercentFromFraction(p.progress, 0)}</td><td>${fmtRate(p.rate_down)}</td><td>${fmtRate(p.rate_up)}</td>`;
       tbody.appendChild(tr);
     });
   } catch (e) { log("peers error: " + e.message); }
@@ -236,7 +391,7 @@ async function loadTrackers(hash) {
     tbody.innerHTML = "";
     trackers.forEach(t => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${escapeHtml(t.url)}</td><td>${t.tier}</td><td>${t.status}</td><td>${t.seeders}</td><td>${t.leechers}</td>`;
+      tr.innerHTML = `<td>${escapeHtml(t.url)}</td><td>${fmtCount(t.tier)}</td><td>${escapeHtml(t.status)}</td><td>${fmtCount(t.seeders)}</td><td>${fmtCount(t.leechers)}</td>`;
       tbody.appendChild(tr);
     });
   } catch (e) { log("trackers error: " + e.message); }
@@ -258,18 +413,20 @@ $("#add-magnet-btn").addEventListener("click", async () => {
     const body = { magnet };
     if (dir) body.download_dir = dir;
     const h = await api("/torrents/magnet", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-    $("#add-magnet-result").textContent = "Added: " + h;
+    showToast("Torrent added", h, "success");
     $("#magnet-input").value = "";
-  } catch (e) { $("#add-magnet-result").textContent = "Error: " + e.message; }
+    refreshTorrents();
+  } catch (e) { showError("Add magnet failed", e); }
 });
 
 $("#add-file-btn").addEventListener("click", async () => {
   try {
     const file = $("#torrent-file").files[0];
-    if (!file) { $("#add-file-result").textContent = "Choose a file"; return; }
+    if (!file) { showToast("Choose a .torrent file", "", "warning"); return; }
     const h = await uploadTorrentFile(file);
-    $("#add-file-result").textContent = "Added: " + h;
-  } catch (e) { $("#add-file-result").textContent = "Error: " + e.message; }
+    showToast("Torrent added", h, "success");
+    refreshTorrents();
+  } catch (e) { showError("Upload failed", e); }
 });
 
 async function uploadTorrentFile(file) {
@@ -287,24 +444,23 @@ function torrentFilesFromTransfer(items) {
 
 async function uploadDroppedFiles(files) {
   const torrents = torrentFilesFromTransfer(files);
-  const status = $("#drop-status");
   if (torrents.length === 0) {
-    status.textContent = "No .torrent file found";
+    showToast("No .torrent file found", "", "warning");
     return;
   }
-  status.textContent = `Adding ${torrents.length} file${torrents.length === 1 ? "" : "s"}...`;
+  showToast(`Adding ${torrents.length} file${torrents.length === 1 ? "" : "s"}...`);
   let added = 0;
   for (const file of torrents) {
     try {
       await uploadTorrentFile(file);
       added++;
     } catch (e) {
-      status.textContent = `Error adding ${file.name}: ${e.message}`;
+      showToast(`Error adding ${file.name}`, e.message, "error");
       log(`drop upload error (${file.name}): ${e.message}`);
       return;
     }
   }
-  status.textContent = `Added ${added} file${added === 1 ? "" : "s"}`;
+  showToast(`Added ${added} file${added === 1 ? "" : "s"}`, "", "success");
   refreshTorrents();
 }
 
@@ -357,9 +513,10 @@ async function refreshNetwork() {
 async function refreshSettings() {
   try {
     const cfg = await api("/settings");
-    $("#bw-dl").value = cfg.bandwidth.global_download || 0;
-    $("#bw-ul").value = cfg.bandwidth.global_upload || 0;
+    $("#bw-dl").value = cfg.bandwidth.global_download ?? "";
+    $("#bw-ul").value = cfg.bandwidth.global_upload ?? "";
     $("#bw-alt").checked = !!cfg.bandwidth.alt_enabled;
+    $("#toast-seconds").value = String(Math.round(toastDisplayMs / 1000));
   } catch (e) { log("settings error: " + e.message); }
 }
 
@@ -370,19 +527,35 @@ $("#save-bw-btn").addEventListener("click", async () => {
     cfg.bandwidth.global_upload = parseInt($("#bw-ul").value, 10) || 0;
     cfg.bandwidth.alt_enabled = $("#bw-alt").checked;
     await api("/settings", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ bandwidth: cfg.bandwidth }) });
-    $("#save-bw-result").textContent = "Saved";
-  } catch (e) { $("#save-bw-result").textContent = "Error: " + e.message; }
+    showToast("Bandwidth settings saved", "", "success");
+  } catch (e) { showError("Save bandwidth failed", e); }
+});
+
+$("#save-toast-btn").addEventListener("click", () => {
+  const ms = setToastDisplaySeconds($("#toast-seconds").value);
+  $("#toast-seconds").value = String(Math.round(ms / 1000));
+  showToast("Notification settings saved", "", "success");
 });
 
 // --- Watch ---
 async function refreshWatch() {
   try {
     const hist = await api("/watch/history") || [];
-    $("#watch-history").innerHTML = hist.map(h => `<div>${escapeHtml(h.path)} - ${h.success ? "ok" : "fail"}</div>`).join("");
+    $("#watch-history").innerHTML = hist.map(h => `<div>${escapeHtml(h.path)} - ${escapeHtml(importStatus(h))}</div>`).join("");
   } catch (e) { log("watch error: " + e.message); }
 }
+function importStatus(item) {
+  if (item.success === true) return "ok";
+  if (item.error) return item.error;
+  if (item.success === false) return "fail";
+  return "";
+}
 $("#watch-scan-btn").addEventListener("click", async () => {
-  try { await api("/watch/scan", { method: "POST" }); refreshWatch(); } catch (e) { alert(e.message); }
+  try {
+    await api("/watch/scan", { method: "POST" });
+    showToast("Watch scan complete", "", "success");
+    refreshWatch();
+  } catch (e) { showError("Watch scan failed", e); }
 });
 
 // --- Logs ---
@@ -396,7 +569,10 @@ async function refreshLogs() {
 }
 
 function escapeHtml(s) {
-  return String(s || "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
+  return String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
+}
+function cssToken(s) {
+  return String(s ?? "").replace(/[^a-zA-Z0-9_-]/g, "");
 }
 function log(msg) {
   const el = $("#log-stream");

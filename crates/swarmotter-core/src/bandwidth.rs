@@ -31,7 +31,7 @@ pub struct BandwidthLimits {
     /// Max peers globally (0 = unlimited).
     #[serde(default)]
     pub max_peers: usize,
-    /// Max peers per torrent (0 = unlimited).
+    /// Max peers per torrent (0 = daemon default worker pool).
     #[serde(default)]
     pub max_peers_per_torrent: usize,
 }

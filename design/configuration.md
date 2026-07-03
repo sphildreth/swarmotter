@@ -41,8 +41,10 @@ SWARMOTTER_API__MAX_REQUEST_BODY_BYTES=16777216
 - **Storage** (`storage`): `download_dir`, `incomplete_dir`, `preallocate`,
   `sparse`. Incomplete data is written under `incomplete_dir` when configured
   and moved to `download_dir` after all pieces verify. When `preallocate` is
-  true, the engine sizes files before downloading; when false, it creates
-  directories and writes pieces as needed.
+  true, the engine sizes files before downloading. When `preallocate` is false
+  and `sparse` is true, it creates a visible active layout without pre-sizing
+  payload files and writes pieces as needed. When `sparse` is false, active
+  payload files are sized up front.
 - **Network containment** (`network`): see `vpn-network-containment.md`
   (`mode`, `required_interface`, `required_source_ipv4`,
   `required_source_ipv6`, `required_network_namespace`, `allow_ipv6`,
@@ -51,27 +53,35 @@ SWARMOTTER_API__MAX_REQUEST_BODY_BYTES=16777216
   on supported platforms, which is the DHCP/SLAAC-safe configuration. Source
   address fields are optional refinements for static-address deployments.
 - **Torrent** (`torrent`): `listen_port`, `allow_ipv6`, `utp_enabled`,
-  `utp_prefer_tcp`, `selfish`. When `utp_enabled` is true the engine attempts uTP
-  (BEP 29) peer connections through the contained UDP socket alongside TCP; uTP
-  traffic fail-closes with the rest of the data plane. `utp_prefer_tcp` selects
-  which transport is tried first (with the other as a fallback). When
-  `utp_enabled` is false, only TCP is used. `selfish` is an optional completion
-  policy: when `true`, SwarmOtter removes a torrent from the daemon immediately
-  after its download completes (all pieces verified), stops its engine and
-  seeder, and preserves the downloaded data on disk (no delete-data behavior);
-  SwarmOtter will not seed the torrent after completion. When `false` (the
-  default), normal completion and seeding behavior is unchanged.
+  `utp_prefer_tcp`, `selfish`. `allow_ipv6` filters IPv6 peer addresses when
+  false and must also be allowed by network containment. When `utp_enabled` is
+  true the engine attempts uTP (BEP 29) peer connections through the contained
+  UDP socket alongside TCP; uTP traffic fail-closes with the rest of the data
+  plane. `utp_prefer_tcp` selects which transport is tried first (with the
+  other as a fallback). When `utp_enabled` is false, only TCP is used.
+  `selfish` is an optional completion policy: when `true`, SwarmOtter removes
+  a torrent from the daemon immediately after its download completes (all
+  pieces verified), stops its engine and seeder, and preserves the downloaded
+  data on disk (no delete-data behavior); SwarmOtter will not seed the torrent
+  after completion. When `false` (the default), normal completion and seeding
+  behavior is unchanged.
 - **Bandwidth** (`bandwidth`): global/per-torrent download/upload limits,
   alternate speed mode, max peers. Global limits live in this section and are
   enforced as a shared aggregate across all active torrents; per-torrent limits
   (`download_limit`/`upload_limit`, 0 = unlimited) live on each torrent record
   and are set/changed live via `POST /api/v1/torrents/:hash/limits`. Both are
   enforced live by the engine/seeder rate shapers.
+  `max_peers` is a global peer worker cap divided across active downloads.
+  `max_peers_per_torrent` controls the engine's simultaneous download peer
+  worker cap; `0` uses the daemon default worker pool of 64.
 - **Queue** (`queue`): `max_active_downloads`, `max_active_seeds`,
-  `auto_start`.
+  `auto_start`. The daemon scheduler enforces active download slots, queue
+  ordering, start-now/resume bypass, and completed seeding slots.
 - **Seeding** (`seeding`): `global_ratio_limit`, `global_idle_limit`.
-- **DHT** (`dht`): `enabled`, `port`, `bootstrap_nodes`.
-- **PEX** (`pex`): `enabled`, `max_peers`.
+- **DHT** (`dht`): `enabled`, `port`, `bootstrap_nodes`. The shared DHT
+  runner binds the configured local UDP port.
+- **PEX** (`pex`): `enabled`, `max_peers`. The engine advertises/imports PEX
+  only when enabled and the torrent is non-private.
 - **Watch folders** (`watch`): array of `{ path, recursive, download_dir,
   label, start_behavior, archive_dir, failure_dir, delete_after_import }`.
 - **Logging** (`logging`): `level`, `json`, `file`, `file_path`. File logging

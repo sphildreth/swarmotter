@@ -32,6 +32,8 @@ pub struct DhtRunner {
     binder: Arc<dyn NetworkBinder>,
     table: Arc<Mutex<RoutingTable>>,
     bootstrap: Vec<SocketAddr>,
+    port: u16,
+    socket_lock: Mutex<()>,
 }
 
 impl DhtRunner {
@@ -39,12 +41,15 @@ impl DhtRunner {
         self_id: NodeId,
         binder: Arc<dyn NetworkBinder>,
         bootstrap: Vec<SocketAddr>,
+        port: u16,
     ) -> Self {
         Self {
             self_id,
             binder,
             table: Arc::new(Mutex::new(RoutingTable::new(16))),
             bootstrap,
+            port,
+            socket_lock: Mutex::new(()),
         }
     }
 
@@ -56,7 +61,7 @@ impl DhtRunner {
     /// Open the contained UDP socket. Returns an error in fail-closed mode.
     pub async fn socket(&self) -> Result<Box<dyn ContainedUdpSocket>> {
         self.binder
-            .udp_socket_for(self.bootstrap.first().copied())
+            .udp_socket_on(self.bootstrap.first().copied(), self.port)
             .await
     }
 
@@ -64,6 +69,7 @@ impl DhtRunner {
     /// and we learn its id, inserting it into the routing table.
     #[allow(dead_code)]
     pub async fn bootstrap(&self) -> Result<()> {
+        let _socket_guard = self.socket_lock.lock().await;
         let socket = self.socket().await?;
         for addr in &self.bootstrap {
             let txn = TransactionId::random();
@@ -93,6 +99,7 @@ impl DhtRunner {
     /// per-node timeouts so unreachable bootstrap nodes cannot stall the
     /// caller.
     pub async fn get_peers(&self, info_hash: InfoHash, max_rounds: usize) -> Result<Vec<PeerAddr>> {
+        let _socket_guard = self.socket_lock.lock().await;
         let socket = self.socket().await?;
         let mut discovered: Vec<PeerAddr> = Vec::new();
         let mut queried: Vec<SocketAddr> = Vec::new();
@@ -171,6 +178,7 @@ impl DhtRunner {
         port: u16,
         tokens: &[(SocketAddr, Vec<u8>)],
     ) -> Result<()> {
+        let _socket_guard = self.socket_lock.lock().await;
         let socket = self.socket().await?;
         for (addr, token) in tokens {
             let txn = TransactionId::random();
@@ -312,7 +320,7 @@ mod tests {
         });
 
         let binder = Arc::new(LoopbackBinder);
-        let runner = DhtRunner::new(NodeId::random(), binder, vec![node_addr]);
+        let runner = DhtRunner::new(NodeId::random(), binder, vec![node_addr], 0);
         let peers = runner.get_peers(info_hash, 2).await.unwrap();
         assert!(!peers.is_empty(), "should have discovered a peer");
         assert_eq!(peers[0].port, 6881);
@@ -323,11 +331,25 @@ mod tests {
     #[tokio::test]
     async fn dht_fail_closed_blocks_socket() {
         let binder = Arc::new(swarmotter_core::net::binder::BlockedBinder);
-        let runner = DhtRunner::new(NodeId::random(), binder, vec![]);
+        let runner = DhtRunner::new(NodeId::random(), binder, vec![], 0);
         match runner.socket().await {
             Ok(_) => panic!("expected fail-closed to block DHT socket"),
             Err(e) => assert!(e.is_network_blocked()),
         }
+    }
+
+    #[tokio::test]
+    async fn dht_socket_uses_configured_port() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let binder = Arc::new(LoopbackBinder);
+        let runner = DhtRunner::new(NodeId::random(), binder, vec![], port);
+        let socket = runner.socket().await.unwrap();
+
+        assert_eq!(socket.local_addr().unwrap().port(), port);
     }
 
     #[test]
@@ -347,7 +369,7 @@ mod tests {
     #[test]
     fn node_count_starts_empty() {
         let binder: Arc<dyn NetworkBinder> = Arc::new(LoopbackBinder);
-        let runner = DhtRunner::new(NodeId::random(), binder, vec![]);
+        let runner = DhtRunner::new(NodeId::random(), binder, vec![], 0);
         let _ = PeerAddr::from_socket_addr("127.0.0.1:1".parse().unwrap());
         // node_count is async; assert via a minimal runtime.
         let rt = tokio::runtime::Runtime::new().unwrap();

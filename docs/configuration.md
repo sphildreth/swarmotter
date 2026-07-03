@@ -150,14 +150,18 @@ unlimited or high is better for raw transfer throughput.
 | `download_dir` | unset | Final directory for verified completed downloads. |
 | `incomplete_dir` | unset | Active write directory for incomplete downloads. |
 | `preallocate` | `false` | Pre-size files before downloading. |
-| `sparse` | `true` | Use sparse files where supported. |
+| `sparse` | `true` | When `false`, active payload files are sized up front even if `preallocate = false`. |
 
 When `incomplete_dir` is set, SwarmOtter writes partial pieces and partial
 fast-resume metadata there while the torrent is downloading. After every piece
 is verified, the daemon moves the torrent data into `download_dir` and writes
 the completed fast-resume metadata next to the completed data. If
 `incomplete_dir` is unset, the active and final directory are both
-`download_dir`.
+`download_dir`. With `preallocate = false` and `sparse = true`, active
+single-file torrents still create a zero-length placeholder in
+`incomplete_dir` when the engine starts; the file is not sized to the full
+payload until data is written. With `sparse = false`, active payload files are
+sized up front.
 
 ### `[network]`
 
@@ -181,7 +185,7 @@ or network namespace.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `listen_port` | `51413` | Inbound peer TCP and DHT/uTP UDP port. |
-| `allow_ipv6` | `true` | Enables IPv6 peers when network containment also allows IPv6. |
+| `allow_ipv6` | `true` | Enables IPv6 peers when network containment also allows IPv6; when false, IPv6 peers are filtered before connecting. |
 | `utp_enabled` | `true` | Enables uTP peer transport through contained UDP sockets. |
 | `utp_prefer_tcp` | `true` | Tries TCP first, with uTP fallback. |
 | `selfish` | `false` | Removes a torrent after verified completion and does not seed it. |
@@ -195,8 +199,8 @@ or network namespace.
 | `alt_download` | `0` | Alternate download bytes/sec. |
 | `alt_upload` | `0` | Alternate upload bytes/sec. |
 | `alt_enabled` | `false` | Uses alternate limits when true. |
-| `max_peers` | `0` | Global peer cap, `0` means unlimited. |
-| `max_peers_per_torrent` | `0` | Per-torrent peer cap, `0` means unlimited. |
+| `max_peers` | `0` | Global peer worker cap divided across active downloads, `0` means no global cap. |
+| `max_peers_per_torrent` | `0` | Per-torrent peer worker cap. `0` uses the daemon default worker pool of 64. |
 
 ### `[queue]`
 
@@ -205,6 +209,11 @@ or network namespace.
 | `max_active_downloads` | `5` | Simultaneous active downloads, `0` means unlimited. |
 | `max_active_seeds` | `5` | Simultaneous active seeds, `0` means unlimited. |
 | `auto_start` | `true` | Starts newly added torrents automatically. |
+
+Queue limits are enforced by the daemon scheduler. `auto_start = false` leaves
+new torrents queued until resume/start-now is requested. Queue move operations
+change the real scheduling order, and `max_active_downloads` controls how many
+queued downloads may run at once.
 
 ### `[seeding]`
 
@@ -219,8 +228,8 @@ Omit a field to use its default.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `true` | Enables DHT. |
-| `port` | `51413` | DHT UDP port. |
+| `enabled` | `true` | Enables DHT for non-private torrents. |
+| `port` | `51413` | Local UDP port used by the shared DHT runner. |
 | `bootstrap_nodes` | built-in public bootstrap hostnames | DHT bootstrap nodes. |
 
 In strict mode, bootstrap hostnames are subject to DNS containment policy.
@@ -229,8 +238,8 @@ In strict mode, bootstrap hostnames are subject to DNS containment policy.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `enabled` | `true` | Enables peer exchange. |
-| `max_peers` | `0` | PEX peer cap, `0` means unlimited. |
+| `enabled` | `true` | Enables peer exchange for non-private torrents. |
+| `max_peers` | `0` | PEX peer addition cap, `0` means unlimited. |
 
 ### `[[watch]]`
 

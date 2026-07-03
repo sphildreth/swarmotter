@@ -342,6 +342,9 @@ impl Config {
                 "torrent.listen_port must be > 0".into(),
             ));
         }
+        if self.dht.port == 0 {
+            return Err(CoreError::InvalidConfig("dht.port must be > 0".into()));
+        }
         for w in &self.watch {
             if w.path.is_empty() {
                 return Err(CoreError::InvalidConfig(
@@ -548,6 +551,15 @@ auth_token = "secret"
         let toml = r#"
 [api]
 max_request_body_bytes = 0
+"#;
+        assert!(Config::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn dht_port_must_be_positive() {
+        let toml = r#"
+[dht]
+port = 0
 "#;
         assert!(Config::from_toml_str(toml).is_err());
     }
