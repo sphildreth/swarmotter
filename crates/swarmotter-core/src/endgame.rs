@@ -69,6 +69,21 @@ impl OutstandingRequests {
         self.counts.remove(&key);
     }
 
+    /// Release one peer's outstanding request for a block that was not
+    /// delivered. This prevents timed-out or malformed peer sessions from
+    /// permanently occupying duplicate request capacity.
+    pub fn cancel_request(&mut self, piece: u32, offset: u32) {
+        let key = (piece, offset);
+        let Some(count) = self.counts.get_mut(&key) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.counts.remove(&key);
+            self.pending.remove(&key);
+        }
+    }
+
     /// All still-outstanding blocks of a piece (for generating Cancel
     /// messages once the piece completes on any peer).
     pub fn outstanding_for_piece(&self, piece: u32) -> Vec<(u32, u32)> {
@@ -136,6 +151,19 @@ mod tests {
         assert!(!outstanding.contains(&(1, 0)));
         t.clear_piece(1);
         assert!(t.outstanding_for_piece(1).is_empty());
+    }
+
+    #[test]
+    fn cancel_request_releases_one_duplicate_slot() {
+        let mut t = OutstandingRequests::new(2);
+        assert!(t.request(1, 0));
+        assert!(t.request(1, 0));
+        assert!(!t.request(1, 0));
+
+        t.cancel_request(1, 0);
+
+        assert_eq!(t.duplicate_count(1, 0), 1);
+        assert!(t.request(1, 0));
     }
 
     #[test]

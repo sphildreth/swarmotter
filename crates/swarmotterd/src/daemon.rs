@@ -85,6 +85,10 @@ struct RateSample {
     /// health calculator as a normalization reference when no bandwidth cap
     /// is set.
     peak_rate_down: u64,
+    /// Highest smoothed upload rate observed for this torrent. This is
+    /// recorded for operational troubleshooting and structured performance
+    /// logs.
+    peak_rate_up: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -937,7 +941,24 @@ impl DaemonRuntime {
                         };
                         t.rate_down = smooth_rate(prev.rate_down, inst_down, last_download_at, now);
                         t.rate_up = smooth_rate(prev.rate_up, inst_up, last_upload_at, now);
-                        peak = peak.max(t.rate_down);
+                        let previous_peak_down = prev.peak_rate_down;
+                        let previous_peak_up = prev.peak_rate_up;
+                        peak = previous_peak_down.max(t.rate_down);
+                        let peak_rate_up = previous_peak_up.max(t.rate_up);
+                        if peak > previous_peak_down || peak_rate_up > previous_peak_up {
+                            log_torrent_throughput_peak(
+                                hash,
+                                t,
+                                &s,
+                                inst_down,
+                                inst_up,
+                                previous_peak_down,
+                                previous_peak_up,
+                                peak,
+                                peak_rate_up,
+                                now,
+                            );
+                        }
                         samples.insert(
                             *hash,
                             RateSample {
@@ -949,6 +970,7 @@ impl DaemonRuntime {
                                 last_upload_at,
                                 at: now,
                                 peak_rate_down: peak,
+                                peak_rate_up,
                             },
                         );
                     }
@@ -964,6 +986,7 @@ impl DaemonRuntime {
                             last_upload_at: None,
                             at: now,
                             peak_rate_down: 0,
+                            peak_rate_up: 0,
                         },
                     );
                 }
@@ -1176,7 +1199,17 @@ impl DaemonOps for DaemonRuntime {
         bytes: Vec<u8>,
         download_dir: Option<String>,
     ) -> Result<InfoHash> {
-        let parsed = meta::parse_torrent(&bytes)?;
+        let parsed = match meta::parse_torrent(&bytes) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    error_code = %e.code(),
+                    "torrent file add rejected"
+                );
+                return Err(e);
+            }
+        };
         let hash = parsed.info_hash;
         let mut t = Torrent::new(parsed, now());
         if let Some(d) = download_dir {
@@ -1186,13 +1219,24 @@ impl DaemonOps for DaemonRuntime {
         let blocked = t.state == TorrentState::NetworkBlocked;
         {
             let mut reg = self.registry.lock().await;
-            reg.add(t)
-                .map_err(|_| CoreError::DuplicateTorrent(hash.to_hex()))?;
+            if reg.add(t).is_err() {
+                tracing::warn!(
+                    info_hash = %hash,
+                    error_code = %CoreError::DuplicateTorrent(hash.to_hex()).code(),
+                    "torrent file add rejected: duplicate"
+                );
+                return Err(CoreError::DuplicateTorrent(hash.to_hex()));
+            }
         }
         self.queue.lock().await.add(hash);
         if !blocked {
             self.reconcile_queue().await;
         }
+        tracing::info!(
+            info_hash = %hash,
+            network_blocked = blocked,
+            "torrent file added"
+        );
         Ok(hash)
     }
 
@@ -1831,6 +1875,60 @@ async fn apply_network_state(t: &mut Torrent, health: &Arc<Mutex<NetworkHealth>>
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn log_torrent_throughput_peak(
+    hash: &InfoHash,
+    torrent: &Torrent,
+    state: &EngineState,
+    sample_rate_down: u64,
+    sample_rate_up: u64,
+    previous_peak_rate_down: u64,
+    previous_peak_rate_up: u64,
+    peak_rate_down: u64,
+    peak_rate_up: u64,
+    now: Instant,
+) {
+    tracing::info!(
+        info_hash = %hash,
+        name = %torrent.name(),
+        state = %torrent.state,
+        sample_rate_down_bps = sample_rate_down,
+        sample_rate_down_mib_s = rate_mib_per_second(sample_rate_down),
+        sample_rate_up_bps = sample_rate_up,
+        sample_rate_up_mib_s = rate_mib_per_second(sample_rate_up),
+        rate_down_bps = torrent.rate_down,
+        rate_down_mib_s = rate_mib_per_second(torrent.rate_down),
+        rate_up_bps = torrent.rate_up,
+        rate_up_mib_s = rate_mib_per_second(torrent.rate_up),
+        previous_peak_rate_down_bps = previous_peak_rate_down,
+        previous_peak_rate_down_mib_s = rate_mib_per_second(previous_peak_rate_down),
+        previous_peak_rate_up_bps = previous_peak_rate_up,
+        previous_peak_rate_up_mib_s = rate_mib_per_second(previous_peak_rate_up),
+        peak_rate_down_bps = peak_rate_down,
+        peak_rate_down_mib_s = rate_mib_per_second(peak_rate_down),
+        peak_rate_up_bps = peak_rate_up,
+        peak_rate_up_mib_s = rate_mib_per_second(peak_rate_up),
+        downloaded = state.downloaded,
+        uploaded = state.uploaded,
+        active_peer_workers = state.active_peers,
+        known_peers = state.peers.len(),
+        useful_peers = useful_peer_count(&state.peer_health, now),
+        tracker_ok = state.tracker_ok,
+        dht_discovery_ok = state.dht_discovery_ok,
+        pex_discovery_ok = state.pex_discovery_ok,
+        tracker_last_ok_seconds_ago = ?instant_age_seconds(now, state.tracker_last_ok),
+        dht_last_seen_seconds_ago = ?instant_age_seconds(now, state.dht_last_seen),
+        pex_last_seen_seconds_ago = ?instant_age_seconds(now, state.pex_last_seen),
+        webseed_last_seen_seconds_ago = ?instant_age_seconds(now, state.webseed_last_seen),
+        "torrent throughput peak increased"
+    );
+}
+
+fn rate_mib_per_second(bytes_per_second: u64) -> f64 {
+    let mib = bytes_per_second as f64 / 1_048_576.0;
+    (mib * 100.0).round() / 100.0
+}
+
 fn smooth_rate(
     previous_rate: u64,
     instantaneous_rate: u64,
@@ -2034,6 +2132,7 @@ mod tests {
                 last_upload_at: None,
                 at: Instant::now() - Duration::from_secs(2),
                 peak_rate_down: 0,
+                peak_rate_up: 0,
             },
         );
 
@@ -2042,6 +2141,15 @@ mod tests {
         assert!(summary.rate_up > 0);
         assert_eq!(summary.downloaded, 5_000);
         assert_eq!(summary.uploaded, 1_200);
+        let peak_sample = runtime
+            .rate_samples
+            .lock()
+            .await
+            .get(&hash)
+            .copied()
+            .unwrap();
+        assert_eq!(peak_sample.peak_rate_down, summary.rate_down);
+        assert_eq!(peak_sample.peak_rate_up, summary.rate_up);
 
         let stats = runtime.global_stats().await;
         assert_eq!(stats.download_rate, summary.rate_down);

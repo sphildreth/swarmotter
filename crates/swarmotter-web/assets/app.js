@@ -450,18 +450,31 @@ async function uploadDroppedFiles(files) {
   }
   showToast(`Adding ${torrents.length} file${torrents.length === 1 ? "" : "s"}...`);
   let added = 0;
+  let failed = 0;
   for (const file of torrents) {
     try {
       await uploadTorrentFile(file);
       added++;
     } catch (e) {
+      failed++;
       showToast(`Error adding ${file.name}`, e.message, "error");
       log(`drop upload error (${file.name}): ${e.message}`);
-      return;
     }
   }
-  showToast(`Added ${added} file${added === 1 ? "" : "s"}`, "", "success");
-  refreshTorrents();
+  if (added > 0) {
+    refreshTorrents();
+  }
+  if (failed > 0 && added > 0) {
+    showToast(
+      `Added ${added} file${added === 1 ? "" : "s"}`,
+      `${failed} failed`,
+      "warning",
+    );
+  } else if (failed > 0) {
+    showToast("No files added", `${failed} failed`, "error");
+  } else {
+    showToast(`Added ${added} file${added === 1 ? "" : "s"}`, "", "success");
+  }
 }
 
 let dragDepth = 0;

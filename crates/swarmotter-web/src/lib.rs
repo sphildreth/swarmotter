@@ -238,6 +238,8 @@ mod tests {
             "expectedRemovedTorrents",
             "showToast(\"Torrent removed\"",
             "showToast(`Added ${added} file",
+            "failed++",
+            "showToast(\"No files added\"",
             "id=\"toast-region\"",
             "id=\"toast-seconds\"",
             ".toast-region",

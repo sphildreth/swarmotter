@@ -60,6 +60,11 @@ status.
   `bandwidth.max_peers_per_torrent` instead of a fixed 16-worker limit. When
   unset (`0`), the daemon uses its default 64-worker pool so popular public
   torrents can use more discovered peers without extra configuration.
+- **Torrent throughput peak diagnostics:** the daemon now emits structured
+  log records whenever a torrent reaches a new smoothed download or upload
+  throughput peak, including sample rates, smoothed rates, previous peaks,
+  active/known/useful peer counts, byte counters, and tracker/DHT/PEX/webseed
+  discovery freshness for performance troubleshooting.
 - **Configuration enforcement pass:** previously modeled runtime settings are
   now wired into daemon behavior: `bandwidth.max_peers` participates in live
   peer worker caps, `queue.max_active_downloads`/`auto_start`/queue move
@@ -321,6 +326,15 @@ status.
   window of distinct pieces in flight per peer, bounded by the existing block
   request pipeline, so high-capacity peers do not stall behind a single
   256 KiB piece at a time.
+- Normal-mode peer sessions now advertise and parse BEP 10 `reqq`, then adapt
+  each peer's outstanding block request window from observed throughput while
+  respecting the remote and local caps. Piece reservation now tracks per-peer
+  availability, prefers rarer eligible pieces, and avoids idle backoff for
+  peers whose useful pieces are only temporarily reserved by other workers.
+- Normal-mode and endgame block accounting now accepts only requested offsets
+  with the expected block length, ignores duplicate/unsolicited/wrong-sized
+  blocks for request and rate accounting, and releases reserved piece/request
+  slots when a peer session errors or times out.
 - Completed verified pieces are now written through a full-piece storage path
   that validates piece bounds and preserves multi-file boundaries while
   reducing hot-path write overhead. Piece-slice writes are flushed before

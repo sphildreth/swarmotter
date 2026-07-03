@@ -259,8 +259,7 @@ async fn read_len_prefix<R: AsyncReadExt + Unpin>(rd: &mut R) -> std::io::Result
 
 /// A minimal in-process HTTP tracker that responds to announce with a compact
 /// peer list containing the seed peer.
-async fn run_tracker(addr: SocketAddr, seed: PeerAddr) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+async fn run_tracker(listener: tokio::net::TcpListener, seed: PeerAddr) -> std::io::Result<()> {
     loop {
         let (mut stream, _) = listener.accept().await?;
         tokio::spawn(async move {
@@ -497,8 +496,9 @@ async fn local_swarm_downloads_from_seed_via_tracker() {
     let piece_length: u64 = 16 * 1024;
 
     // 2. Build the .torrent metadata with an HTTP tracker placeholder.
-    let tracker_port = pick_port();
-    let tracker_url = format!("http://127.0.0.1:{tracker_port}/announce");
+    let tracker_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tracker_addr = tracker_listener.local_addr().unwrap();
+    let tracker_url = format!("http://{tracker_addr}/announce");
     let torrent_bytes = build_single_file_torrent(
         "payload.bin",
         &content,
@@ -512,10 +512,7 @@ async fn local_swarm_downloads_from_seed_via_tracker() {
     let dir = unique_dir("download");
     let download_dir = dir.clone();
 
-    // 4. Start the local HTTP tracker bound to a free port we reuse.
-    let tracker_addr: SocketAddr = format!("127.0.0.1:{tracker_port}").parse().unwrap();
-
-    // 5. Start the in-process seed peer (a listening TcpListener).
+    // 4. Start the in-process seed peer (a listening TcpListener).
     let seed_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let seed_addr = seed_listener.local_addr().unwrap();
     let seed_peer = PeerAddr::from_socket_addr(seed_addr);
@@ -523,10 +520,10 @@ async fn local_swarm_downloads_from_seed_via_tracker() {
     // Spawn the tracker with the seed peer address.
     let tracker_seed = seed_peer;
     tokio::spawn(async move {
-        let _ = run_tracker(tracker_addr, tracker_seed).await;
+        let _ = run_tracker(tracker_listener, tracker_seed).await;
     });
 
-    // Spawn the seed peer accept loop (serve a single leecher).
+    // 5. Spawn the seed peer accept loop (serve a single leecher).
     {
         let content_clone = content.clone();
         let meta_clone = meta.clone();
@@ -1338,11 +1335,11 @@ async fn local_swarm_magnet_fetches_metadata_then_downloads() {
     }
 
     // A local HTTP tracker announcing the seed peer.
-    let tracker_port = pick_port();
-    let tracker_url = format!("http://127.0.0.1:{tracker_port}/announce");
-    let tracker_addr: SocketAddr = format!("127.0.0.1:{tracker_port}").parse().unwrap();
+    let tracker_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tracker_addr = tracker_listener.local_addr().unwrap();
+    let tracker_url = format!("http://{tracker_addr}/announce");
     tokio::spawn(async move {
-        let _ = run_tracker(tracker_addr, seed_peer).await;
+        let _ = run_tracker(tracker_listener, seed_peer).await;
     });
 
     // Build the magnet link from the real info hash + tracker.

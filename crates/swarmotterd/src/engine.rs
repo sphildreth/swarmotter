@@ -684,7 +684,7 @@ impl TorrentEngine {
         if self.pex_enabled && !self.meta.is_private() {
             extensions.push((swarmotter_core::extensions::UT_PEX_NAME, local_pex_id));
         }
-        let ext_payload = swarmotter_core::extensions::encode_extension_handshake(
+        let ext_payload = swarmotter_core::extensions::encode_extension_handshake_with_reqq(
             &extensions,
             "SwarmOtter/0.1",
             None,
@@ -1037,7 +1037,10 @@ impl TorrentEngine {
         }
 
         const PEER_REFILL_INTERVAL: Duration = Duration::from_secs(5);
-        let shared = Arc::new(Mutex::new(ParallelPieceState::new(have.clone())));
+        let shared = Arc::new(Mutex::new(ParallelPieceState::new(
+            have.clone(),
+            self.meta.piece_count(),
+        )));
         let made_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pex_peers = Arc::new(Mutex::new(Vec::new()));
         let storage = Arc::new(storage.clone());
@@ -1094,12 +1097,15 @@ impl TorrentEngine {
             let wait_for = remaining.min(PEER_REFILL_INTERVAL);
             match timeout(wait_for, tasks.join_next()).await {
                 Ok(Some(joined)) => match joined {
-                    Ok((peer_addr, Ok(progressed))) => {
-                        if progressed {
-                            any_progress = true;
-                        } else {
-                            backoff_peer(peer_backoff, peer_addr.socket_addr());
-                        }
+                    Ok((_, Ok(PeerSessionOutcome::Progressed))) => {
+                        any_progress = true;
+                    }
+                    Ok((peer_addr, Ok(PeerSessionOutcome::NoProgress))) => {
+                        backoff_peer(peer_backoff, peer_addr.socket_addr());
+                    }
+                    Ok((_, Ok(PeerSessionOutcome::NoWorkAvailable))) => {
+                        // This peer had useful pieces, but all currently useful work
+                        // was already reserved by other workers. Do not penalize it.
                     }
                     Ok((peer_addr, Err(e))) => {
                         tracing::debug!(peer = %peer_addr.socket_addr(), error = %e, "parallel peer failed; suppressing");
@@ -1569,7 +1575,10 @@ enum CommandOutcome {
     Stop,
 }
 
-const NORMAL_REQUEST_PIPELINE: usize = 64;
+const NORMAL_REQUEST_FLOOR: usize = 32;
+const NORMAL_REQUEST_FALLBACK_CAP: usize = 500;
+const NORMAL_REQUEST_LOCAL_CAP: usize = 2_000;
+const NORMAL_REQUEST_TARGET_BUFFER_SECS: u64 = 10;
 const NORMAL_PEER_PIECE_WINDOW: usize = 4;
 const PEER_IDLE_BACKOFF: Duration = Duration::from_secs(20);
 const PEER_FAILURE_BACKOFF: Duration = Duration::from_secs(120);
@@ -2215,21 +2224,71 @@ async fn attempt_peer_wire_transport(
 struct ParallelPieceState {
     have: PieceBitfield,
     reserved: HashSet<usize>,
+    availability: Vec<u16>,
+    peer_pieces: HashMap<SocketAddr, Bitfield>,
 }
 
 impl ParallelPieceState {
-    fn new(have: PieceBitfield) -> Self {
+    fn new(have: PieceBitfield, piece_count: usize) -> Self {
         Self {
             have,
             reserved: HashSet::new(),
+            availability: vec![0; piece_count],
+            peer_pieces: HashMap::new(),
+        }
+    }
+
+    fn note_peer_bitfield(&mut self, peer: SocketAddr, bitfield: &Bitfield, piece_count: usize) {
+        if let Some(previous) = self.peer_pieces.insert(peer, bitfield.clone()) {
+            for i in 0..piece_count {
+                if previous.has(i) {
+                    self.availability[i] = self.availability[i].saturating_sub(1);
+                }
+            }
+        }
+        for i in 0..piece_count {
+            if bitfield.has(i) {
+                self.availability[i] = self.availability[i].saturating_add(1);
+            }
+        }
+    }
+
+    fn note_peer_have(&mut self, peer: SocketAddr, piece: u32, piece_count: usize) {
+        let piece = piece as usize;
+        if piece >= piece_count {
+            return;
+        }
+        let entry = self
+            .peer_pieces
+            .entry(peer)
+            .or_insert_with(|| Bitfield::new(piece_count));
+        if !entry.has(piece) {
+            entry.set(piece);
+            self.availability[piece] = self.availability[piece].saturating_add(1);
+        }
+    }
+
+    fn remove_peer(&mut self, peer: SocketAddr, piece_count: usize) {
+        let Some(previous) = self.peer_pieces.remove(&peer) else {
+            return;
+        };
+        for i in 0..piece_count {
+            if previous.has(i) {
+                self.availability[i] = self.availability[i].saturating_sub(1);
+            }
         }
     }
 
     fn reserve_piece(&mut self, peer_bf: &Bitfield, piece_count: usize) -> Option<usize> {
         let piece = (0..piece_count)
-            .find(|&i| peer_bf.has(i) && !self.have.has(i) && !self.reserved.contains(&i))?;
+            .filter(|&i| peer_bf.has(i) && !self.have.has(i) && !self.reserved.contains(&i))
+            .min_by_key(|&i| self.availability.get(i).copied().unwrap_or(0).max(1))?;
         self.reserved.insert(piece);
         Some(piece)
+    }
+
+    fn peer_has_missing_piece(&self, peer_bf: &Bitfield, piece_count: usize) -> bool {
+        (0..piece_count).any(|i| peer_bf.has(i) && !self.have.has(i))
     }
 
     fn release_piece(&mut self, piece: usize) {
@@ -2330,6 +2389,7 @@ async fn endgame_peer_session(
             let reqs = block_requests(piece_len);
             // Request blocks respecting the duplicate cap.
             let mut sent_any = false;
+            let mut session_outstanding = HashMap::new();
             for (off, len) in &reqs {
                 let allowed = outstanding.lock().await.request(piece_index as u32, *off);
                 if allowed {
@@ -2342,6 +2402,7 @@ async fn endgame_peer_session(
                         },
                     )
                     .await?;
+                    session_outstanding.insert(*off, *len);
                     sent_any = true;
                 }
             }
@@ -2371,12 +2432,20 @@ async fn endgame_peer_session(
                         offset,
                         block,
                     } => {
-                        if piece as usize == piece_index
-                            && assembler.add_block(offset, &block).is_ok()
-                        {
-                            received += 1;
-                            record_peer_block(&state, peer_addr, block.len() as u64).await;
-                            outstanding.lock().await.delivered(piece, offset);
+                        if piece as usize == piece_index {
+                            let Some(expected_len) = session_outstanding.get(&offset).copied()
+                            else {
+                                continue;
+                            };
+                            if block.len() != expected_len as usize {
+                                continue;
+                            }
+                            if assembler.add_block(offset, &block).is_ok() {
+                                session_outstanding.remove(&offset);
+                                received += 1;
+                                record_peer_block(&state, peer_addr, block.len() as u64).await;
+                                outstanding.lock().await.delivered(piece, offset);
+                            }
                         } else if piece as usize != piece_index {
                             // A block for a piece we no longer need (completed
                             // by another peer): cancel outstanding duplicates
@@ -2463,6 +2532,12 @@ async fn endgame_peer_session(
                     record_peer_hash_failure(&state, peer_addr).await;
                 }
             } else {
+                release_endgame_session_requests(
+                    &outstanding,
+                    piece_index as u32,
+                    &session_outstanding,
+                )
+                .await;
                 record_peer_timeout(&state, peer_addr).await;
             }
             continue;
@@ -2502,12 +2577,26 @@ async fn endgame_peer_session(
     Ok(progressed)
 }
 
+async fn release_endgame_session_requests(
+    outstanding: &Arc<Mutex<swarmotter_core::endgame::OutstandingRequests>>,
+    piece: u32,
+    session_outstanding: &HashMap<u32, u32>,
+) {
+    if session_outstanding.is_empty() {
+        return;
+    }
+    let mut outstanding = outstanding.lock().await;
+    for offset in session_outstanding.keys().copied() {
+        outstanding.cancel_request(piece, offset);
+    }
+}
+
 /// A normal-mode peer session used by the bounded parallel downloader. Each
 /// session reserves one missing piece at a time from shared state, so peers
 /// work on distinct pieces until endgame takes over.
 #[allow(clippy::too_many_arguments)]
 fn spawn_parallel_peer_task(
-    tasks: &mut tokio::task::JoinSet<(PeerAddr, Result<bool>)>,
+    tasks: &mut tokio::task::JoinSet<(PeerAddr, Result<PeerSessionOutcome>)>,
     peer_addr: PeerAddr,
     meta: TorrentMeta,
     binder: Arc<dyn NetworkBinder>,
@@ -2554,7 +2643,7 @@ struct ParallelPieceDownload {
     reqs: Vec<(u32, u32)>,
     next_req: usize,
     in_flight: usize,
-    received: usize,
+    outstanding_blocks: HashMap<u32, u32>,
     assembler: peer::PieceAssembler,
 }
 
@@ -2565,16 +2654,21 @@ impl ParallelPieceDownload {
             reqs: block_requests(piece_len),
             next_req: 0,
             in_flight: 0,
-            received: 0,
+            outstanding_blocks: HashMap::new(),
             assembler: peer::PieceAssembler::new(piece_index as u32, piece_len as usize),
         }
     }
 
-    async fn send_more<W>(&mut self, write_half: &mut W, global_in_flight: &mut usize) -> Result<()>
+    async fn send_more<W>(
+        &mut self,
+        write_half: &mut W,
+        global_in_flight: &mut usize,
+        request_budget: usize,
+    ) -> Result<()>
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
-        while self.next_req < self.reqs.len() && *global_in_flight < NORMAL_REQUEST_PIPELINE {
+        while self.next_req < self.reqs.len() && *global_in_flight < request_budget {
             let (offset, length) = self.reqs[self.next_req];
             peer::write_message(
                 write_half,
@@ -2587,19 +2681,93 @@ impl ParallelPieceDownload {
             .await?;
             self.next_req += 1;
             self.in_flight += 1;
+            self.outstanding_blocks.insert(offset, length);
             *global_in_flight += 1;
         }
         Ok(())
     }
 
-    fn record_block(&mut self, offset: u32, block: &[u8], global_in_flight: &mut usize) -> bool {
-        if self.assembler.add_block(offset, block).is_err() {
-            return false;
+    fn record_block(
+        &mut self,
+        offset: u32,
+        block: &[u8],
+        global_in_flight: &mut usize,
+    ) -> Result<Option<bool>> {
+        let Some(expected_len) = self.outstanding_blocks.get(&offset).copied() else {
+            return Ok(None);
+        };
+        if block.len() != expected_len as usize {
+            return Ok(None);
         }
-        self.received += 1;
+        let complete = self.assembler.add_block(offset, block)?;
+        self.outstanding_blocks.remove(&offset);
         self.in_flight = self.in_flight.saturating_sub(1);
         *global_in_flight = (*global_in_flight).saturating_sub(1);
-        self.received == self.reqs.len()
+        Ok(Some(complete))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerSessionOutcome {
+    Progressed,
+    NoProgress,
+    NoWorkAvailable,
+}
+
+#[derive(Debug, Clone)]
+struct PeerRequestWindow {
+    cap: usize,
+    smoothed_rate_bps: u64,
+    sample_bytes: u64,
+    sample_started_at: Instant,
+}
+
+impl PeerRequestWindow {
+    fn new(remote_reqq: Option<usize>, now: Instant) -> Self {
+        let cap = remote_reqq
+            .filter(|cap| *cap > 0)
+            .unwrap_or(NORMAL_REQUEST_FALLBACK_CAP)
+            .min(NORMAL_REQUEST_LOCAL_CAP)
+            .max(1);
+        Self {
+            cap,
+            smoothed_rate_bps: 0,
+            sample_bytes: 0,
+            sample_started_at: now,
+        }
+    }
+
+    fn set_remote_reqq(&mut self, remote_reqq: Option<usize>) {
+        let Some(remote_reqq) = remote_reqq.filter(|cap| *cap > 0) else {
+            return;
+        };
+        self.cap = remote_reqq.min(NORMAL_REQUEST_LOCAL_CAP).max(1);
+    }
+
+    fn record_block(&mut self, bytes: u64, now: Instant) {
+        self.sample_bytes = self.sample_bytes.saturating_add(bytes);
+        let elapsed = now.saturating_duration_since(self.sample_started_at);
+        if elapsed < Duration::from_millis(500) {
+            return;
+        }
+        let secs = elapsed.as_secs_f64();
+        let instantaneous = ((self.sample_bytes as f64) / secs) as u64;
+        self.smoothed_rate_bps = if self.smoothed_rate_bps == 0 {
+            instantaneous
+        } else {
+            ((self.smoothed_rate_bps as f64 * 0.65) + (instantaneous as f64 * 0.35)) as u64
+        };
+        self.sample_bytes = 0;
+        self.sample_started_at = now;
+    }
+
+    fn desired_in_flight(&self) -> usize {
+        let floor = NORMAL_REQUEST_FLOOR.min(self.cap);
+        let estimated = ((self
+            .smoothed_rate_bps
+            .saturating_mul(NORMAL_REQUEST_TARGET_BUFFER_SECS))
+            / peer::BLOCK_SIZE as u64) as usize;
+        estimated.max(floor).min(self.cap)
     }
 }
 
@@ -2612,13 +2780,13 @@ async fn fill_parallel_piece_window<W>(
     peer_bf: &Bitfield,
     meta: &TorrentMeta,
     piece_count: usize,
+    request_budget: usize,
 ) -> Result<bool>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut reserved_any = false;
-    while downloads.len() < NORMAL_PEER_PIECE_WINDOW && *global_in_flight < NORMAL_REQUEST_PIPELINE
-    {
+    while downloads.len() < NORMAL_PEER_PIECE_WINDOW && *global_in_flight < request_budget {
         let Some(piece_index) = ({
             let mut work = shared.lock().await;
             work.reserve_piece(peer_bf, piece_count)
@@ -2631,7 +2799,10 @@ where
             meta.piece_length
         } as u32;
         let mut download = ParallelPieceDownload::new(piece_index, piece_len);
-        if let Err(e) = download.send_more(write_half, global_in_flight).await {
+        if let Err(e) = download
+            .send_more(write_half, global_in_flight, request_budget)
+            .await
+        {
             shared.lock().await.release_piece(piece_index);
             return Err(e);
         }
@@ -2662,9 +2833,9 @@ async fn parallel_peer_session(
     pex_enabled: bool,
     allow_ipv6: bool,
     pex_max_peers: usize,
-) -> Result<bool> {
+) -> Result<PeerSessionOutcome> {
     if !binder.traffic_allowed() {
-        return Ok(false);
+        return Ok(PeerSessionOutcome::NoProgress);
     }
 
     let (mut reader, mut write_half, transport) = connect_peer_wire_with_transport(
@@ -2690,28 +2861,34 @@ async fn parallel_peer_session(
         }
     }
     peer::write_message(&mut write_half, &our_bf.encode_message()).await?;
-    if pex_enabled {
-        let ext_payload = swarmotter_core::extensions::encode_extension_handshake(
-            &[(swarmotter_core::extensions::UT_PEX_NAME, 1u8)],
-            "SwarmOtter/0.1",
-            None,
-        );
-        peer::write_message(
-            &mut write_half,
-            &Message::Extended {
-                id: swarmotter_core::extensions::EXTENSION_HANDSHAKE_ID,
-                payload: ext_payload,
-            },
-        )
-        .await?;
-    }
+    let extensions = if pex_enabled {
+        vec![(swarmotter_core::extensions::UT_PEX_NAME, 1u8)]
+    } else {
+        Vec::new()
+    };
+    let ext_payload = swarmotter_core::extensions::encode_extension_handshake_with_reqq(
+        &extensions,
+        "SwarmOtter/0.1",
+        None,
+    );
+    peer::write_message(
+        &mut write_half,
+        &Message::Extended {
+            id: swarmotter_core::extensions::EXTENSION_HANDSHAKE_ID,
+            payload: ext_payload,
+        },
+    )
+    .await?;
     peer::write_message(&mut write_half, &Message::Interested).await?;
     write_half.flush().await.ok();
 
     let mut peer_bf: Option<Bitfield> = None;
     let mut peer_choking = true;
     let mut progressed = false;
+    let mut no_work_available = false;
     let mut remote_pex_id: Option<u8> = None;
+    let mut request_window = PeerRequestWindow::new(None, Instant::now());
+    let peer_socket = peer_addr.socket_addr();
 
     loop {
         if Instant::now() > deadline {
@@ -2727,11 +2904,12 @@ async fn parallel_peer_session(
 
         if !peer_choking {
             let Some(peer_bf_snapshot) = peer_bf.clone() else {
-                return Ok(progressed);
+                break;
             };
             let mut downloads: HashMap<usize, ParallelPieceDownload> = HashMap::new();
             let mut global_in_flight = 0usize;
-            fill_parallel_piece_window(
+            let mut session_error = None;
+            if let Err(e) = fill_parallel_piece_window(
                 &mut write_half,
                 &mut downloads,
                 &mut global_in_flight,
@@ -2739,10 +2917,28 @@ async fn parallel_peer_session(
                 &peer_bf_snapshot,
                 &meta,
                 piece_count,
+                request_window.desired_in_flight(),
             )
-            .await?;
+            .await
+            {
+                session_error = Some(e);
+            }
             if downloads.is_empty() {
-                peer::write_message(&mut write_half, &Message::NotInterested).await?;
+                let has_missing = shared
+                    .lock()
+                    .await
+                    .peer_has_missing_piece(&peer_bf_snapshot, piece_count);
+                if has_missing {
+                    no_work_available = true;
+                } else if let Err(e) =
+                    peer::write_message(&mut write_half, &Message::NotInterested).await
+                {
+                    session_error = Some(e);
+                }
+                if let Some(e) = session_error {
+                    shared.lock().await.remove_peer(peer_socket, piece_count);
+                    return Err(e);
+                }
                 break;
             }
 
@@ -2767,18 +2963,34 @@ async fn parallel_peer_session(
                         let piece_index = piece as usize;
                         let mut complete_data = None;
                         if let Some(download) = downloads.get_mut(&piece_index) {
-                            let complete =
-                                download.record_block(offset, &block, &mut global_in_flight);
-                            record_peer_block(&state, peer_addr, block.len() as u64).await;
-                            last_block_at = Instant::now();
-                            received_any = true;
-                            if complete {
-                                complete_data = Some(download.assembler.data().to_vec());
-                            } else {
-                                download
-                                    .send_more(&mut write_half, &mut global_in_flight)
-                                    .await?;
-                                write_half.flush().await.ok();
+                            match download.record_block(offset, &block, &mut global_in_flight) {
+                                Ok(Some(complete)) => {
+                                    record_peer_block(&state, peer_addr, block.len() as u64).await;
+                                    let now = Instant::now();
+                                    request_window.record_block(block.len() as u64, now);
+                                    last_block_at = now;
+                                    received_any = true;
+                                    if complete {
+                                        complete_data = Some(download.assembler.data().to_vec());
+                                    } else if let Err(e) = download
+                                        .send_more(
+                                            &mut write_half,
+                                            &mut global_in_flight,
+                                            request_window.desired_in_flight(),
+                                        )
+                                        .await
+                                    {
+                                        session_error = Some(e);
+                                        break;
+                                    } else {
+                                        write_half.flush().await.ok();
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    session_error = Some(e);
+                                    break;
+                                }
                             }
                         }
                         if let Some(data) = complete_data {
@@ -2787,7 +2999,11 @@ async fn parallel_peer_session(
                                 limiter
                                     .acquire(RateDirection::Download, data.len() as u64)
                                     .await;
-                                storage.write_piece(piece_index, &data).await?;
+                                if let Err(e) = storage.write_piece(piece_index, &data).await {
+                                    shared.lock().await.release_piece(piece_index);
+                                    session_error = Some(e);
+                                    break;
+                                }
                                 let have_snapshot = {
                                     let mut work = shared.lock().await;
                                     if !work.have.has(piece_index) {
@@ -2800,14 +3016,18 @@ async fn parallel_peer_session(
                                     work.have.clone()
                                 };
                                 update_progress_state(&state, &meta, &have_snapshot).await;
-                                peer::write_message(
+                                if let Err(e) = peer::write_message(
                                     &mut write_half,
                                     &Message::Have {
                                         piece: piece_index as u32,
                                     },
                                 )
-                                .await?;
-                                fill_parallel_piece_window(
+                                .await
+                                {
+                                    session_error = Some(e);
+                                    break;
+                                }
+                                if let Err(e) = fill_parallel_piece_window(
                                     &mut write_half,
                                     &mut downloads,
                                     &mut global_in_flight,
@@ -2815,8 +3035,13 @@ async fn parallel_peer_session(
                                     peer_bf.as_ref().unwrap_or(&peer_bf_snapshot),
                                     &meta,
                                     piece_count,
+                                    request_window.desired_in_flight(),
                                 )
-                                .await?;
+                                .await
+                                {
+                                    session_error = Some(e);
+                                    break;
+                                }
                             } else {
                                 tracing::warn!(
                                     piece = piece_index,
@@ -2838,6 +3063,10 @@ async fn parallel_peer_session(
                     }
                     Message::Have { piece } => {
                         apply_peer_have(&mut peer_bf, piece_count, piece);
+                        shared
+                            .lock()
+                            .await
+                            .note_peer_have(peer_socket, piece, piece_count);
                         if let Some(bf) = &peer_bf {
                             let have = shared.lock().await.have.clone();
                             record_peer_availability(&state, peer_addr, bf, &have, piece_count)
@@ -2846,6 +3075,10 @@ async fn parallel_peer_session(
                     }
                     Message::Bitfield { bits } => {
                         let bf = Bitfield::from_bytes(bits, piece_count);
+                        shared
+                            .lock()
+                            .await
+                            .note_peer_bitfield(peer_socket, &bf, piece_count);
                         let have = shared.lock().await.have.clone();
                         record_peer_availability(&state, peer_addr, &bf, &have, piece_count).await;
                         peer_bf = Some(bf);
@@ -2860,6 +3093,7 @@ async fn parallel_peer_session(
                             pex_max_peers,
                             &pex_peers,
                             &state,
+                            &mut request_window,
                         )
                         .await;
                     }
@@ -2875,11 +3109,15 @@ async fn parallel_peer_session(
             for piece_index in downloads.keys().copied().collect::<Vec<_>>() {
                 shared.lock().await.release_piece(piece_index);
             }
+            if let Some(e) = session_error {
+                shared.lock().await.remove_peer(peer_socket, piece_count);
+                return Err(e);
+            }
             if !downloads.is_empty() {
                 record_peer_timeout(&state, peer_addr).await;
             }
             if !received_any {
-                return Ok(progressed);
+                break;
             }
             continue;
         }
@@ -2899,12 +3137,20 @@ async fn parallel_peer_session(
             }
             Message::Bitfield { bits } => {
                 let bf = Bitfield::from_bytes(bits, piece_count);
+                shared
+                    .lock()
+                    .await
+                    .note_peer_bitfield(peer_socket, &bf, piece_count);
                 let have = shared.lock().await.have.clone();
                 record_peer_availability(&state, peer_addr, &bf, &have, piece_count).await;
                 peer_bf = Some(bf);
             }
             Message::Have { piece } => {
                 apply_peer_have(&mut peer_bf, piece_count, piece);
+                shared
+                    .lock()
+                    .await
+                    .note_peer_have(peer_socket, piece, piece_count);
                 if let Some(bf) = &peer_bf {
                     let have = shared.lock().await.have.clone();
                     record_peer_availability(&state, peer_addr, bf, &have, piece_count).await;
@@ -2920,6 +3166,7 @@ async fn parallel_peer_session(
                     pex_max_peers,
                     &pex_peers,
                     &state,
+                    &mut request_window,
                 )
                 .await;
             }
@@ -2933,7 +3180,15 @@ async fn parallel_peer_session(
         }
     }
 
-    Ok(progressed)
+    shared.lock().await.remove_peer(peer_socket, piece_count);
+    let outcome = if progressed {
+        PeerSessionOutcome::Progressed
+    } else if no_work_available {
+        PeerSessionOutcome::NoWorkAvailable
+    } else {
+        PeerSessionOutcome::NoProgress
+    };
+    Ok(outcome)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2946,14 +3201,18 @@ async fn handle_parallel_pex_message(
     pex_max_peers: usize,
     pex_peers: &Arc<Mutex<Vec<PeerAddr>>>,
     state: &Arc<Mutex<EngineState>>,
+    request_window: &mut PeerRequestWindow,
 ) {
-    if !pex_enabled {
-        return;
-    }
     if id == swarmotter_core::extensions::EXTENSION_HANDSHAKE_ID {
         if let Ok(hs) = swarmotter_core::extensions::parse_extension_handshake(payload) {
-            *remote_pex_id = hs.id_for(swarmotter_core::extensions::UT_PEX_NAME);
+            if pex_enabled {
+                *remote_pex_id = hs.id_for(swarmotter_core::extensions::UT_PEX_NAME);
+            }
+            request_window.set_remote_reqq(hs.reqq.and_then(|reqq| usize::try_from(reqq).ok()));
         }
+        return;
+    }
+    if !pex_enabled {
         return;
     }
     if Some(id) != *remote_pex_id {
@@ -3116,6 +3375,90 @@ mod tests {
 
         assert_eq!(added, 1);
         assert_eq!(peers, vec![first, second]);
+    }
+
+    #[test]
+    fn parallel_piece_download_ignores_duplicate_or_unsolicited_blocks() {
+        let mut download = ParallelPieceDownload::new(0, peer::BLOCK_SIZE * 2);
+        download.outstanding_blocks.insert(0, peer::BLOCK_SIZE);
+        download.in_flight = 1;
+        let mut global_in_flight = 1usize;
+        let block = vec![0u8; peer::BLOCK_SIZE as usize];
+
+        assert_eq!(
+            download
+                .record_block(0, &block, &mut global_in_flight)
+                .unwrap(),
+            Some(false)
+        );
+        assert_eq!(download.in_flight, 0);
+        assert_eq!(global_in_flight, 0);
+
+        assert_eq!(
+            download
+                .record_block(0, &block, &mut global_in_flight)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            download
+                .record_block(peer::BLOCK_SIZE, &block, &mut global_in_flight)
+                .unwrap(),
+            None
+        );
+        assert_eq!(download.in_flight, 0);
+        assert_eq!(global_in_flight, 0);
+    }
+
+    #[test]
+    fn parallel_piece_download_rejects_wrong_sized_blocks_without_accounting() {
+        let mut download = ParallelPieceDownload::new(0, peer::BLOCK_SIZE);
+        download.outstanding_blocks.insert(0, peer::BLOCK_SIZE);
+        download.in_flight = 1;
+        let mut global_in_flight = 1usize;
+
+        assert_eq!(
+            download
+                .record_block(0, &[0u8; 1], &mut global_in_flight)
+                .unwrap(),
+            None
+        );
+        assert_eq!(download.in_flight, 1);
+        assert_eq!(global_in_flight, 1);
+        assert_eq!(download.outstanding_blocks.get(&0), Some(&peer::BLOCK_SIZE));
+    }
+
+    #[test]
+    fn peer_request_window_grows_with_observed_rate_and_respects_cap() {
+        let now = Instant::now();
+        let mut window = PeerRequestWindow::new(Some(128), now);
+        assert_eq!(window.desired_in_flight(), NORMAL_REQUEST_FLOOR);
+
+        window.sample_started_at = now - Duration::from_secs(1);
+        window.record_block(peer::BLOCK_SIZE as u64 * 128, now);
+
+        assert!(window.desired_in_flight() > NORMAL_REQUEST_FLOOR);
+        assert!(window.desired_in_flight() <= 128);
+    }
+
+    #[test]
+    fn parallel_piece_state_prefers_rarest_available_piece() {
+        let have = PieceBitfield::new(3);
+        let mut state = ParallelPieceState::new(have, 3);
+        let peer_a: SocketAddr = "127.0.0.1:6001".parse().unwrap();
+        let peer_b: SocketAddr = "127.0.0.2:6002".parse().unwrap();
+
+        let mut first = Bitfield::new(3);
+        first.set(0);
+        first.set(1);
+        state.note_peer_bitfield(peer_a, &first, 3);
+
+        let mut second = Bitfield::new(3);
+        second.set(0);
+        state.note_peer_bitfield(peer_b, &second, 3);
+
+        assert_eq!(state.reserve_piece(&first, 3), Some(1));
+        assert!(state.peer_has_missing_piece(&first, 3));
     }
 
     #[tokio::test]

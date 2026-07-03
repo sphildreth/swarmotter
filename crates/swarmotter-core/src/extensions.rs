@@ -37,13 +37,39 @@ pub const UT_PEX_NAME: &str = "ut_pex";
 /// The metadata extension name (BEP 9).
 pub const UT_METADATA_NAME: &str = "ut_metadata";
 
+/// Local BEP 10 `reqq` value: supported outstanding requests from a peer.
+pub const LOCAL_EXTENSION_REQQ: u64 = 250;
+
 /// Build the BEP 10 extension handshake payload advertising the supported
 /// extensions and their local message ids. The `m` dict maps names to ids.
-/// Also includes a `v` (client version) and `metadata_size` for BEP 9.
+/// Also includes a `v` (client version) and optional `metadata_size` for BEP 9.
 pub fn encode_extension_handshake(
     extensions: &[(&str, u8)],
     client_version: &str,
     metadata_size: Option<u64>,
+) -> Vec<u8> {
+    encode_extension_handshake_payload(extensions, client_version, metadata_size, None)
+}
+
+/// Build a BEP 10 extension handshake that also advertises the local `reqq`.
+pub fn encode_extension_handshake_with_reqq(
+    extensions: &[(&str, u8)],
+    client_version: &str,
+    metadata_size: Option<u64>,
+) -> Vec<u8> {
+    encode_extension_handshake_payload(
+        extensions,
+        client_version,
+        metadata_size,
+        Some(LOCAL_EXTENSION_REQQ),
+    )
+}
+
+fn encode_extension_handshake_payload(
+    extensions: &[(&str, u8)],
+    client_version: &str,
+    metadata_size: Option<u64>,
+    reqq: Option<u64>,
 ) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(b'd');
@@ -67,17 +93,25 @@ pub fn encode_extension_handshake(
         out.extend_from_slice(size.to_string().as_bytes());
         out.push(b'e');
     }
+    if let Some(reqq) = reqq.filter(|reqq| *reqq > 0) {
+        write_bytes(&mut out, b"reqq");
+        out.push(b'i');
+        out.extend_from_slice(reqq.to_string().as_bytes());
+        out.push(b'e');
+    }
     out.push(b'e');
     out
 }
 
-/// A parsed BEP 10 extension handshake: the `m` mapping and metadata size.
+/// A parsed BEP 10 extension handshake.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExtensionHandshake {
     /// Map of extension name -> remote message id.
     pub extensions: Vec<(String, u8)>,
     pub client_version: Option<String>,
     pub metadata_size: Option<u64>,
+    /// Remote-supported outstanding request count (`reqq`), when positive.
+    pub reqq: Option<u64>,
 }
 
 /// Parse a BEP 10 extension handshake payload.
@@ -106,10 +140,16 @@ pub fn parse_extension_handshake(payload: &[u8]) -> Result<ExtensionHandshake> {
         .find(|(k, _)| k == b"metadata_size")
         .and_then(|(_, v)| v.as_int())
         .map(|i| i as u64);
+    let reqq = dict
+        .iter()
+        .find(|(k, _)| k == b"reqq")
+        .and_then(|(_, v)| v.as_int())
+        .and_then(|i| (i > 0).then_some(i as u64));
     Ok(ExtensionHandshake {
         extensions,
         client_version,
         metadata_size,
+        reqq,
     })
 }
 
@@ -463,6 +503,15 @@ mod tests {
         assert_eq!(hs.id_for(UT_METADATA_NAME), Some(2));
         assert_eq!(hs.client_version.as_deref(), Some("SwarmOtter/0.1"));
         assert_eq!(hs.metadata_size, Some(4096));
+        assert_eq!(hs.reqq, None);
+    }
+
+    #[test]
+    fn extension_handshake_roundtrip_with_reqq() {
+        let payload = encode_extension_handshake_with_reqq(&[(UT_PEX_NAME, 1)], "v", None);
+        let hs = parse_extension_handshake(&payload).unwrap();
+        assert_eq!(hs.id_for(UT_PEX_NAME), Some(1));
+        assert_eq!(hs.reqq, Some(LOCAL_EXTENSION_REQQ));
     }
 
     #[test]
@@ -470,6 +519,21 @@ mod tests {
         let payload = encode_extension_handshake(&[(UT_PEX_NAME, 1)], "v", None);
         let hs = parse_extension_handshake(&payload).unwrap();
         assert!(hs.metadata_size.is_none());
+    }
+
+    #[test]
+    fn extension_handshake_parses_positive_reqq_only() {
+        let hs = parse_extension_handshake(b"d4:reqqi32ee").unwrap();
+        assert_eq!(hs.reqq, Some(32));
+
+        for payload in [
+            &b"d4:reqqi0ee"[..],
+            &b"d4:reqqi-1ee"[..],
+            &b"d4:reqq1:xe"[..],
+        ] {
+            let hs = parse_extension_handshake(payload).unwrap();
+            assert_eq!(hs.reqq, None);
+        }
     }
 
     #[test]
