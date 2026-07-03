@@ -61,11 +61,14 @@ status.
   `bandwidth.max_peers_per_torrent` instead of a fixed 16-worker limit. When
   unset (`0`), the daemon uses its default 64-worker pool so popular public
   torrents can use more discovered peers without extra configuration.
-- **Torrent throughput peak diagnostics:** the daemon now emits structured
-  log records whenever a torrent reaches a new smoothed download or upload
-  throughput peak, including sample rates, smoothed rates, previous peaks,
-  active/known/useful peer counts, byte counters, and tracker/DHT/PEX/webseed
-  discovery freshness for performance troubleshooting.
+- **Torrent throughput and scheduler diagnostics:** the daemon now emits
+  structured log records whenever a torrent reaches a new observed download or
+  upload throughput peak, including sample rates, smoothed rates, previous
+  peaks, active/known/useful peer counts, scheduler eligibility counts, byte
+  counters, and tracker/DHT/PEX/webseed discovery freshness for performance
+  troubleshooting. Per-torrent stats also expose live peer scheduler state so
+  high discovered-peer counts can be distinguished from filtered, failed,
+  backed-off, or serial-fallback peer pools.
 - **Runtime diagnostics and config replacement:** the API and Web UI now expose
   richer operational diagnostics for network containment, watch folders, recent
   logs, and a consolidated Doctor report that drives the header health badge.
@@ -272,6 +275,10 @@ status.
 
 ### Fixed
 
+- **Tracker announce diagnostics:** tracker API rows now use per-tracker
+  announce results instead of copying a torrent-level status message to every
+  tracker. Successful announces populate `last_message`, seeders, leechers, and
+  `last_announce`; `last_error` is only populated for failed announces.
 - **Delete-data storage cleanup:** removing a torrent with delete-data enabled
   now removes only the torrent payload and fast-resume metadata while preserving
   the configured `download_dir` and `incomplete_dir` root directories.

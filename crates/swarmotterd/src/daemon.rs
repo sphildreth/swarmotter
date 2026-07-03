@@ -28,7 +28,7 @@ use swarmotter_core::meta;
 use swarmotter_core::models::health::{HealthCalculator, HealthInput};
 use swarmotter_core::models::network::{NetworkContainmentMode, NetworkHealth};
 use swarmotter_core::models::peer::{EnginePeerHealth, Peer};
-use swarmotter_core::models::stats::{GlobalStats, TorrentDiagnostics};
+use swarmotter_core::models::stats::{GlobalStats, PeerSchedulerDiagnostics, TorrentDiagnostics};
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{TrackerId, TrackerInfo, TrackerKind, TrackerStatus};
 use swarmotter_core::models::{
@@ -91,12 +91,14 @@ struct RateSample {
     last_download_at: Option<Instant>,
     last_upload_at: Option<Instant>,
     at: Instant,
-    /// Highest smoothed download rate observed for this torrent; used by the
-    /// health calculator as a normalization reference when no bandwidth cap
-    /// is set.
+    /// Highest observed download rate for this torrent, considering both the
+    /// current smoothed rate and the instantaneous reconciliation sample. Used
+    /// by the health calculator as a normalization reference when no bandwidth
+    /// cap is set.
     peak_rate_down: u64,
-    /// Highest smoothed upload rate observed for this torrent. This is
-    /// recorded for operational troubleshooting and structured performance
+    /// Highest observed upload rate for this torrent, considering both the
+    /// current smoothed rate and the instantaneous reconciliation sample. This
+    /// is recorded for operational troubleshooting and structured performance
     /// logs.
     peak_rate_up: u64,
 }
@@ -105,6 +107,7 @@ struct RateSample {
 struct LiveTorrentDiagnostics {
     active_peer_workers: usize,
     known_peers: usize,
+    peer_scheduler: Option<PeerSchedulerDiagnostics>,
     useful_peers: Option<usize>,
     choked_peers: Option<usize>,
     unchoked_peers: Option<usize>,
@@ -135,6 +138,7 @@ impl LiveTorrentDiagnostics {
         Self {
             active_peer_workers: s.active_peers,
             known_peers: s.peers.len(),
+            peer_scheduler: Some(s.peer_scheduler.clone()),
             useful_peers: Some(useful_peer_count(&s.peer_health, now)),
             choked_peers: None,
             unchoked_peers: Some(unchoked_peers),
@@ -945,8 +949,10 @@ impl DaemonRuntime {
                         t.rate_up = smooth_rate(prev.rate_up, inst_up, last_upload_at, now);
                         let previous_peak_down = prev.peak_rate_down;
                         let previous_peak_up = prev.peak_rate_up;
-                        peak = previous_peak_down.max(t.rate_down);
-                        let peak_rate_up = previous_peak_up.max(t.rate_up);
+                        let observed_down = t.rate_down.max(inst_down);
+                        let observed_up = t.rate_up.max(inst_up);
+                        peak = previous_peak_down.max(observed_down);
+                        let peak_rate_up = previous_peak_up.max(observed_up);
                         if peak > previous_peak_down || peak_rate_up > previous_peak_up {
                             log_torrent_throughput_peak(
                                 hash,
@@ -1972,14 +1978,17 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn list_trackers(&self, hash: &InfoHash) -> Option<Vec<TrackerInfo>> {
-        // Reflect real tracker status from the live engine, if present.
-        let engine_tracker_ok = self
+        // Reflect real per-tracker announce results from the live engine, if
+        // present. Success text is kept separate from last_error so the UI and
+        // Transmission emulation do not report successful announces as errors.
+        let engine_trackers = self
             .engine_states
             .lock()
             .await
             .get(hash)
             .and_then(|s| s.try_lock().ok())
-            .map(|s| (s.tracker_ok, s.tracker_message.clone(), s.last_announce));
+            .map(|s| s.tracker_announces.clone())
+            .unwrap_or_default();
         self.registry.lock().await.get(hash).map(|t| {
             let mut out = Vec::new();
             let mut tier = 0usize;
@@ -1994,14 +2003,14 @@ impl DaemonOps for DaemonRuntime {
             }
             for url in &urls {
                 let mut info = make_tracker(url, tier);
-                if let Some((ok, msg, last)) = &engine_tracker_ok {
-                    info.status = if *ok {
-                        TrackerStatus::Ok
-                    } else {
-                        TrackerStatus::Error
-                    };
-                    info.last_error = msg.clone();
-                    info.last_announce = *last;
+                if let Some(snapshot) = engine_trackers.get(url) {
+                    info.status = snapshot.status;
+                    info.seeders = snapshot.seeders;
+                    info.leechers = snapshot.leechers;
+                    info.downloads = snapshot.downloads;
+                    info.last_error = snapshot.last_error.clone();
+                    info.last_message = snapshot.last_message.clone();
+                    info.last_announce = snapshot.last_announce;
                 }
                 out.push(info);
                 tier += 1;
@@ -2433,6 +2442,7 @@ impl DaemonOps for DaemonRuntime {
             upload_limit: t.upload_limit,
             active_peer_workers: live.active_peer_workers,
             known_peers: live.known_peers,
+            peer_scheduler: live.peer_scheduler,
             useful_peers: live.useful_peers,
             choked_peers: live.choked_peers,
             unchoked_peers: live.unchoked_peers,
@@ -2505,6 +2515,7 @@ fn make_tracker(url: &str, tier: usize) -> TrackerInfo {
         leechers: 0,
         downloads: 0,
         last_error: None,
+        last_message: None,
         next_announce: None,
         last_announce: None,
     }
@@ -2556,6 +2567,15 @@ fn log_torrent_throughput_peak(
         uploaded = state.uploaded,
         active_peer_workers = state.active_peers,
         known_peers = state.peers.len(),
+        peer_worker_limit = state.peer_scheduler.peer_worker_limit,
+        eligible_peers = state.peer_scheduler.eligible_peers,
+        filtered_peers = state.peer_scheduler.filtered_peers,
+        failed_peers = state.peer_scheduler.failed_peers,
+        backed_off_peers = state.peer_scheduler.backed_off_peers,
+        parallel_candidates = state.peer_scheduler.parallel_candidates,
+        parallel_workers_started = state.peer_scheduler.parallel_workers_started,
+        serial_peer_active = state.peer_scheduler.serial_peer_active,
+        scheduler_reason = ?state.peer_scheduler.last_reason,
         useful_peers = useful_peer_count(&state.peer_health, now),
         tracker_ok = state.tracker_ok,
         dht_discovery_ok = state.dht_discovery_ok,
@@ -2769,8 +2789,8 @@ mod tests {
             RateSample {
                 downloaded: 1_000,
                 uploaded: 200,
-                rate_down: 0,
-                rate_up: 0,
+                rate_down: 100,
+                rate_up: 100,
                 last_download_at: None,
                 last_upload_at: None,
                 at: Instant::now() - Duration::from_secs(2),
@@ -2791,8 +2811,12 @@ mod tests {
             .get(&hash)
             .copied()
             .unwrap();
-        assert_eq!(peak_sample.peak_rate_down, summary.rate_down);
-        assert_eq!(peak_sample.peak_rate_up, summary.rate_up);
+        assert!(peak_sample.peak_rate_down >= summary.rate_down);
+        assert!(peak_sample.peak_rate_up >= summary.rate_up);
+        assert!(
+            peak_sample.peak_rate_down > summary.rate_down,
+            "observed instantaneous peak should not be capped to the smoothed rate"
+        );
 
         let stats = runtime.global_stats().await;
         assert_eq!(stats.download_rate, summary.rate_down);
@@ -2981,6 +3005,17 @@ mod tests {
                 dht_last_seen: Some(now - Duration::from_secs(11)),
                 pex_last_seen: Some(now - Duration::from_secs(13)),
                 tracker_last_ok: Some(now - Duration::from_secs(7)),
+                peer_scheduler: PeerSchedulerDiagnostics {
+                    discovered_peers: 2,
+                    eligible_peers: 1,
+                    failed_peers: 1,
+                    peer_worker_limit: 8,
+                    parallel_candidates: 1,
+                    parallel_workers_started: 4,
+                    serial_peer_active: true,
+                    last_reason: Some("one eligible peer".into()),
+                    ..Default::default()
+                },
                 ..Default::default()
             })),
         );
@@ -2990,6 +3025,14 @@ mod tests {
         assert_eq!(stats.info_hash, hash);
         assert_eq!(stats.active_peer_workers, 4);
         assert_eq!(stats.known_peers, 2);
+        let scheduler = stats.peer_scheduler.as_ref().unwrap();
+        assert_eq!(scheduler.discovered_peers, 2);
+        assert_eq!(scheduler.eligible_peers, 1);
+        assert_eq!(scheduler.failed_peers, 1);
+        assert_eq!(scheduler.peer_worker_limit, 8);
+        assert_eq!(scheduler.parallel_candidates, 1);
+        assert_eq!(scheduler.parallel_workers_started, 4);
+        assert!(scheduler.serial_peer_active);
         assert_eq!(stats.useful_peers, Some(1));
         assert_eq!(stats.unchoked_peers, Some(1));
         assert_eq!(stats.choked_peers, None);
@@ -3007,6 +3050,86 @@ mod tests {
         let summary = runtime.get_torrent(&hash).await.unwrap();
         assert_eq!(summary.active_peer_workers, 4);
         assert_eq!(summary.known_peers, 2);
+    }
+
+    #[tokio::test]
+    async fn list_trackers_uses_per_tracker_live_announce_results() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let primary = "http://tracker.example/announce";
+        let secondary = "udp://tracker.example:6969/announce";
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "trackers.bin",
+            b"0123456789abcdef",
+            8,
+            Some(primary),
+            false,
+        );
+        let mut meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        meta.announce_list.push(vec![secondary.into()]);
+        let hash = meta.info_hash;
+        runtime
+            .registry
+            .lock()
+            .await
+            .add(Torrent::new(meta, 1))
+            .unwrap();
+
+        let mut state = EngineState::default();
+        state.tracker_announces.insert(
+            primary.into(),
+            crate::engine::TrackerAnnounceSnapshot {
+                status: TrackerStatus::Ok,
+                seeders: 256,
+                leechers: 12,
+                downloads: 0,
+                last_error: None,
+                last_message: Some("announce returned 64 peers".into()),
+                last_announce: Some(1234),
+            },
+        );
+        state.tracker_announces.insert(
+            secondary.into(),
+            crate::engine::TrackerAnnounceSnapshot {
+                status: TrackerStatus::Error,
+                seeders: 0,
+                leechers: 0,
+                downloads: 0,
+                last_error: Some("tracker announce timed out".into()),
+                last_message: None,
+                last_announce: Some(1235),
+            },
+        );
+        runtime
+            .engine_states
+            .lock()
+            .await
+            .insert(hash, Arc::new(Mutex::new(state)));
+
+        let trackers = runtime.list_trackers(&hash).await.unwrap();
+        let primary_row = trackers.iter().find(|t| t.url == primary).unwrap();
+        assert_eq!(primary_row.status, TrackerStatus::Ok);
+        assert_eq!(primary_row.seeders, 256);
+        assert_eq!(primary_row.leechers, 12);
+        assert_eq!(primary_row.last_error, None);
+        assert_eq!(
+            primary_row.last_message.as_deref(),
+            Some("announce returned 64 peers")
+        );
+        assert_eq!(primary_row.last_announce, Some(1234));
+
+        let secondary_row = trackers.iter().find(|t| t.url == secondary).unwrap();
+        assert_eq!(secondary_row.status, TrackerStatus::Error);
+        assert_eq!(
+            secondary_row.last_error.as_deref(),
+            Some("tracker announce timed out")
+        );
+        assert_eq!(secondary_row.last_message, None);
     }
 
     #[test]

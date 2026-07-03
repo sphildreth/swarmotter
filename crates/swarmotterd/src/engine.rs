@@ -33,6 +33,8 @@ use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
 use swarmotter_core::meta::TorrentMeta;
 use swarmotter_core::models::peer::EnginePeerHealth;
+use swarmotter_core::models::stats::PeerSchedulerDiagnostics;
+use swarmotter_core::models::tracker::TrackerStatus;
 use swarmotter_core::net::NetworkBinder;
 use swarmotter_core::peer::{
     self, block_requests, Bitfield, Handshake, Message, PeerAddr, PeerReader,
@@ -78,6 +80,18 @@ struct TrackerAnnounceOutcome {
     ok: bool,
     message: Option<String>,
     failures: u32,
+    tracker_results: HashMap<String, TrackerAnnounceSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackerAnnounceSnapshot {
+    pub status: TrackerStatus,
+    pub seeders: u64,
+    pub leechers: u64,
+    pub downloads: u64,
+    pub last_error: Option<String>,
+    pub last_message: Option<String>,
+    pub last_announce: Option<u64>,
 }
 
 /// Live engine state, shared between the engine task and the daemon so the
@@ -101,7 +115,9 @@ pub struct EngineState {
     pub peer_health: HashMap<std::net::SocketAddr, EnginePeerHealth>,
     pub tracker_ok: bool,
     pub tracker_message: Option<String>,
+    pub tracker_announces: HashMap<String, TrackerAnnounceSnapshot>,
     pub last_announce: Option<u64>,
+    pub peer_scheduler: PeerSchedulerDiagnostics,
     pub finished: bool,
     /// Recent tracker/announce failures counted across poll windows.
     pub tracker_failures_recent: u32,
@@ -393,10 +409,10 @@ impl TorrentEngine {
         }
 
         // Discover peers via tracker announce (HTTP/UDP) on each tier.
-        let mut discovered = self.filter_allowed_peers(self.announce(AnnounceEvent::Started).await);
+        let mut discovered = self.announce(AnnounceEvent::Started).await;
         // Merge any directly-supplied seed peers (local swarm / PEX / DHT).
         for p in &self.seed_peers {
-            if self.peer_allowed(p) && !discovered.contains(p) {
+            if !discovered.contains(p) {
                 discovered.push(*p);
             }
         }
@@ -459,14 +475,37 @@ impl TorrentEngine {
             let remaining = piece_count - have.count(piece_count);
             prune_peer_backoff(&mut bad_peers);
             prune_peer_backoff(&mut peer_backoff);
-            let mut eligible: Vec<PeerAddr> = discovered
-                .iter()
-                .filter(|p| self.peer_allowed(p))
-                .filter(|p| !peer_is_backed_off(&bad_peers, p.socket_addr()))
-                .filter(|p| !peer_is_backed_off(&peer_backoff, p.socket_addr()))
-                .copied()
-                .collect();
+            let (mut eligible, candidate_counts) =
+                classify_peer_candidates(&discovered, &bad_peers, &peer_backoff, self.allow_ipv6);
             balance_peer_families(&mut eligible);
+            let mut scheduler = PeerSchedulerDiagnostics {
+                discovered_peers: candidate_counts.discovered,
+                eligible_peers: candidate_counts.eligible,
+                filtered_peers: candidate_counts.filtered,
+                failed_peers: candidate_counts.failed,
+                backed_off_peers: candidate_counts.backed_off,
+                peer_worker_limit: max_concurrent,
+                parallel_candidates: eligible.len().min(max_concurrent),
+                last_reason: peer_scheduler_reason(&candidate_counts),
+                ..Default::default()
+            };
+            self.record_peer_scheduler(scheduler.clone()).await;
+            if !discovered.is_empty() && eligible.is_empty() {
+                tracing::debug!(
+                    info_hash = %self.meta.info_hash,
+                    discovered_peers = candidate_counts.discovered,
+                    filtered_peers = candidate_counts.filtered,
+                    failed_peers = candidate_counts.failed,
+                    backed_off_peers = candidate_counts.backed_off,
+                    "no eligible peer candidates after scheduler filtering"
+                );
+            } else if eligible.len() == 1 {
+                tracing::debug!(
+                    info_hash = %self.meta.info_hash,
+                    discovered_peers = discovered.len(),
+                    "single eligible peer candidate; serial fallback likely"
+                );
+            }
 
             // Endgame mode: when few pieces remain, request the remaining
             // blocks from multiple peers concurrently and cancel duplicates
@@ -487,6 +526,9 @@ impl TorrentEngine {
 
             let candidates =
                 rotated_peer_candidates(&eligible, &mut candidate_cursor, eligible.len());
+            scheduler.parallel_candidates = candidates.len();
+            scheduler.last_reason = peer_scheduler_reason(&candidate_counts);
+            self.record_peer_scheduler(scheduler).await;
 
             if candidates.len() > 1 {
                 let (progressed, pex_peers) = self
@@ -518,6 +560,9 @@ impl TorrentEngine {
                 candidates
             };
 
+            if !to_try.is_empty() {
+                self.set_peer_scheduler_serial_active(true).await;
+            }
             while let Some(peer_addr) = to_try.pop() {
                 if have.count(piece_count) == piece_count {
                     break;
@@ -539,30 +584,43 @@ impl TorrentEngine {
                     }
                 }
             }
+            self.set_peer_scheduler_serial_active(false).await;
 
             if !made_progress {
-                if discovered.is_empty() || bad_peers.len() >= discovered.len() {
+                let (_, latest_counts) = classify_peer_candidates(
+                    &discovered,
+                    &bad_peers,
+                    &peer_backoff,
+                    self.allow_ipv6,
+                );
+                if no_usable_peer_candidates(&latest_counts) {
                     // No usable peers; back off briefly and retry announce.
                     self.sleep_or_stop(Duration::from_secs(2)).await;
                     let refreshed = self.refresh_discovery_peers().await;
                     merge_unique_peers(&mut discovered, refreshed);
-                    if discovered.is_empty() {
+                    dedupe_peers(&mut discovered);
+                    self.state.lock().await.peers = discovered.clone();
+                    let (_, refreshed_counts) = classify_peer_candidates(
+                        &discovered,
+                        &bad_peers,
+                        &peer_backoff,
+                        self.allow_ipv6,
+                    );
+                    if no_usable_peer_candidates(&refreshed_counts) {
                         no_peer_rounds = no_peer_rounds.saturating_add(1);
                         let mut state = self.state.lock().await;
                         let existing = state.tracker_message.clone();
-                        if !existing
-                            .as_deref()
-                            .unwrap_or_default()
-                            .starts_with("no peers discovered")
-                        {
+                        let reason = peer_scheduler_reason(&refreshed_counts)
+                            .unwrap_or_else(|| "no usable peer candidates".into());
+                        if !existing.as_deref().unwrap_or_default().starts_with("no ") {
                             state.tracker_message = Some(match existing {
-                                Some(msg) => format!("no peers discovered; last announce: {msg}"),
-                                None => "no peers discovered".into(),
+                                Some(msg) => format!("{reason}; last announce: {msg}"),
+                                None => reason,
                             });
                         }
                         drop(state);
-                        // Bounded give-up: a torrent that never discovers peers
-                        // (no tracker, no seed peers, no DHT result) cannot
+                        // Bounded give-up: a torrent that never has usable peers
+                        // (no peers, or only peers filtered/failed out) cannot
                         // progress. Stop the engine so the daemon/test does not
                         // hang; the torrent remains incomplete and the user can
                         // add trackers or seed peers and re-start it.
@@ -571,7 +629,7 @@ impl TorrentEngine {
                             tracing::info!(
                                 info_hash = %self.meta.info_hash,
                                 tracker_message = ?tracker_message,
-                                "stopping engine: no peers discovered after bounded retries"
+                                "stopping engine: no usable peers after bounded retries"
                             );
                             break;
                         }
@@ -588,7 +646,7 @@ impl TorrentEngine {
     }
 
     fn peer_allowed(&self, peer: &PeerAddr) -> bool {
-        self.allow_ipv6 || !peer.ip.is_ipv6()
+        peer_allowed_by_config(peer, self.allow_ipv6)
     }
 
     fn filter_allowed_peers(&self, peers: Vec<PeerAddr>) -> Vec<PeerAddr> {
@@ -598,8 +656,22 @@ impl TorrentEngine {
             .collect()
     }
 
+    async fn record_peer_scheduler(&self, diagnostics: PeerSchedulerDiagnostics) {
+        self.state.lock().await.peer_scheduler = diagnostics;
+    }
+
+    async fn set_peer_scheduler_serial_active(&self, active: bool) {
+        self.state.lock().await.peer_scheduler.serial_peer_active = active;
+    }
+
+    async fn update_peer_scheduler_parallel_workers(&self, workers: usize) {
+        let mut state = self.state.lock().await;
+        state.peer_scheduler.parallel_workers_started = workers;
+        state.peer_scheduler.serial_peer_active = false;
+    }
+
     async fn refresh_discovery_peers(&self) -> Vec<PeerAddr> {
-        let mut refreshed = self.filter_allowed_peers(self.announce(AnnounceEvent::Empty).await);
+        let mut refreshed = self.announce(AnnounceEvent::Empty).await;
         let dht_peers = self.discover_dht_peers().await;
         merge_unique_peers(&mut refreshed, dht_peers);
         dedupe_peers(&mut refreshed);
@@ -620,7 +692,7 @@ impl TorrentEngine {
         .await;
         match result {
             Ok(Ok(lookup)) => {
-                let peers = self.filter_allowed_peers(lookup.peers);
+                let peers = lookup.peers;
                 if lookup.responding_nodes > 0 || !peers.is_empty() {
                     let mut s = self.state.lock().await;
                     s.dht_discovery_ok = !peers.is_empty();
@@ -1091,12 +1163,15 @@ impl TorrentEngine {
         }
 
         if tasks.is_empty() {
+            self.update_peer_scheduler_parallel_workers(0).await;
             return (false, Vec::new());
         }
 
         {
             let mut s = self.state.lock().await;
             s.active_peers = tasks.len();
+            s.peer_scheduler.parallel_workers_started = tasks.len();
+            s.peer_scheduler.serial_peer_active = false;
         }
 
         let mut any_progress = false;
@@ -1200,7 +1275,11 @@ impl TorrentEngine {
                 tracing::warn!(error = %e, "parallel resume persist failed");
             }
         }
-        self.state.lock().await.active_peers = 0;
+        {
+            let mut s = self.state.lock().await;
+            s.active_peers = 0;
+            s.peer_scheduler.serial_peer_active = false;
+        }
         merge_dynamic_parallel_candidates(
             &mut candidates,
             &mut seen_candidates,
@@ -1371,8 +1450,22 @@ impl TorrentEngine {
             };
         }
 
+        let announce_at = now_secs();
+        let mut outcome = TrackerAnnounceOutcome::default();
         let mut tasks = tokio::task::JoinSet::new();
         for url in trackers {
+            outcome.tracker_results.insert(
+                url.clone(),
+                TrackerAnnounceSnapshot {
+                    status: TrackerStatus::Updating,
+                    seeders: 0,
+                    leechers: 0,
+                    downloads: 0,
+                    last_error: None,
+                    last_message: Some("announce in progress".into()),
+                    last_announce: Some(announce_at),
+                },
+            );
             let binder = self.binder.clone();
             let req = AnnounceRequest {
                 tracker_url: url.clone(),
@@ -1401,12 +1494,15 @@ impl TorrentEngine {
             });
         }
 
-        let mut outcome = TrackerAnnounceOutcome::default();
+        let mut drain_late_results = false;
         loop {
             let joined = if return_after_first_peers && !outcome.peers.is_empty() {
                 match timeout(TRACKER_ANNOUNCE_EARLY_RETURN_GRACE, tasks.join_next()).await {
                     Ok(joined) => joined,
-                    Err(_) => break,
+                    Err(_) => {
+                        drain_late_results = true;
+                        break;
+                    }
                 }
             } else {
                 tasks.join_next().await
@@ -1414,49 +1510,42 @@ impl TorrentEngine {
             let Some(joined) = joined else {
                 break;
             };
-            match joined {
-                Ok((url, Ok(resp))) => {
-                    if let Some(fr) = resp.failure_reason {
-                        outcome.failures = outcome.failures.saturating_add(1);
-                        if !outcome.ok {
-                            outcome.message = Some(format!("{url}: {fr}"));
-                        }
-                        continue;
-                    }
-                    outcome.ok = true;
-                    let peer_count = resp.peers.len();
-                    if resp.peers.is_empty() {
-                        if outcome.message.is_none() {
-                            outcome.message = Some(format!(
-                                "{url}: announce returned 0 peers (seeders={}, leechers={})",
-                                resp.seeders, resp.leechers
-                            ));
-                        }
-                    } else {
-                        outcome.message = Some(format!(
-                            "{url}: announce returned {peer_count} peers (seeders={}, leechers={})",
-                            resp.seeders, resp.leechers
-                        ));
-                    }
-                    outcome.peers.extend(resp.peers);
-                }
-                Ok((url, Err(e))) => {
-                    outcome.failures = outcome.failures.saturating_add(1);
-                    if !outcome.ok {
-                        outcome.message = Some(format!("{url}: {e}"));
-                    }
-                    tracing::debug!(tracker = %url, error = %e, "tracker announce failed");
-                }
-                Err(e) => {
-                    outcome.failures = outcome.failures.saturating_add(1);
-                    if !outcome.ok {
-                        outcome.message = Some(format!("tracker announce task failed: {e}"));
-                    }
-                }
-            }
+            record_tracker_joined_result(&mut outcome, joined, announce_at);
+        }
+        if drain_late_results {
+            self.spawn_late_tracker_result_collector(tasks, announce_at);
         }
         dedupe_peers(&mut outcome.peers);
         outcome
+    }
+
+    fn spawn_late_tracker_result_collector(
+        &self,
+        mut tasks: tokio::task::JoinSet<(String, Result<tracker::AnnounceResponse>)>,
+        announce_at: u64,
+    ) {
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let mut outcome = TrackerAnnounceOutcome::default();
+            while let Some(joined) = tasks.join_next().await {
+                record_tracker_joined_result(&mut outcome, joined, announce_at);
+            }
+            if outcome.tracker_results.is_empty() && outcome.failures == 0 {
+                return;
+            }
+            let mut state = state.lock().await;
+            for (url, result) in &outcome.tracker_results {
+                state.tracker_announces.insert(url.clone(), result.clone());
+            }
+            if outcome.ok {
+                state.tracker_last_ok = Some(Instant::now());
+            }
+            if outcome.failures > 0 {
+                state.tracker_failures_recent = state
+                    .tracker_failures_recent
+                    .saturating_add(outcome.failures);
+            }
+        });
     }
 
     async fn record_tracker_announce_outcome(&self, outcome: &TrackerAnnounceOutcome) {
@@ -1464,6 +1553,9 @@ impl TorrentEngine {
         s.tracker_ok = outcome.ok;
         s.tracker_message = outcome.message.clone();
         s.last_announce = Some(now_secs());
+        for (url, result) in &outcome.tracker_results {
+            s.tracker_announces.insert(url.clone(), result.clone());
+        }
         if outcome.ok {
             s.tracker_last_ok = Some(Instant::now());
             if outcome.failures == 0 {
@@ -1742,6 +1834,152 @@ const NORMAL_PEER_PIECE_WINDOW: usize = 4;
 const PEER_IDLE_BACKOFF: Duration = Duration::from_secs(20);
 const PEER_FAILURE_BACKOFF: Duration = Duration::from_secs(120);
 
+fn record_tracker_joined_result(
+    outcome: &mut TrackerAnnounceOutcome,
+    joined: std::result::Result<
+        (String, Result<tracker::AnnounceResponse>),
+        tokio::task::JoinError,
+    >,
+    announce_at: u64,
+) {
+    match joined {
+        Ok((url, Ok(resp))) => {
+            if let Some(fr) = resp.failure_reason {
+                let aggregate = format!("{url}: {fr}");
+                outcome.failures = outcome.failures.saturating_add(1);
+                if !outcome.ok {
+                    outcome.message = Some(aggregate);
+                }
+                outcome.tracker_results.insert(
+                    url,
+                    TrackerAnnounceSnapshot {
+                        status: TrackerStatus::Error,
+                        seeders: resp.seeders,
+                        leechers: resp.leechers,
+                        downloads: 0,
+                        last_error: Some(fr),
+                        last_message: None,
+                        last_announce: Some(announce_at),
+                    },
+                );
+                return;
+            }
+            outcome.ok = true;
+            let peer_count = resp.peers.len();
+            let last_message = if resp.peers.is_empty() {
+                if outcome.message.is_none() {
+                    let message = format!(
+                        "{url}: announce returned 0 peers (seeders={}, leechers={})",
+                        resp.seeders, resp.leechers
+                    );
+                    outcome.message = Some(message.clone());
+                    message
+                } else {
+                    format!(
+                        "{url}: announce returned 0 peers (seeders={}, leechers={})",
+                        resp.seeders, resp.leechers
+                    )
+                }
+            } else {
+                let message = format!(
+                    "{url}: announce returned {peer_count} peers (seeders={}, leechers={})",
+                    resp.seeders, resp.leechers
+                );
+                outcome.message = Some(message.clone());
+                message
+            };
+            outcome.tracker_results.insert(
+                url,
+                TrackerAnnounceSnapshot {
+                    status: TrackerStatus::Ok,
+                    seeders: resp.seeders,
+                    leechers: resp.leechers,
+                    downloads: 0,
+                    last_error: None,
+                    last_message: Some(last_message),
+                    last_announce: Some(announce_at),
+                },
+            );
+            outcome.peers.extend(resp.peers);
+        }
+        Ok((url, Err(e))) => {
+            let error = e.to_string();
+            outcome.failures = outcome.failures.saturating_add(1);
+            if !outcome.ok {
+                outcome.message = Some(format!("{url}: {error}"));
+            }
+            tracing::debug!(tracker = %url, error = %error, "tracker announce failed");
+            outcome.tracker_results.insert(
+                url,
+                TrackerAnnounceSnapshot {
+                    status: TrackerStatus::Error,
+                    seeders: 0,
+                    leechers: 0,
+                    downloads: 0,
+                    last_error: Some(error),
+                    last_message: None,
+                    last_announce: Some(announce_at),
+                },
+            );
+        }
+        Err(e) => {
+            outcome.failures = outcome.failures.saturating_add(1);
+            if !outcome.ok {
+                outcome.message = Some(format!("tracker announce task failed: {e}"));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PeerCandidateCounts {
+    discovered: usize,
+    eligible: usize,
+    filtered: usize,
+    failed: usize,
+    backed_off: usize,
+}
+
+fn peer_allowed_by_config(peer: &PeerAddr, allow_ipv6: bool) -> bool {
+    allow_ipv6 || !peer.ip.is_ipv6()
+}
+
+fn classify_peer_candidates(
+    discovered: &[PeerAddr],
+    bad_peers: &HashMap<SocketAddr, Instant>,
+    peer_backoff: &HashMap<SocketAddr, Instant>,
+    allow_ipv6: bool,
+) -> (Vec<PeerAddr>, PeerCandidateCounts) {
+    let mut eligible = Vec::new();
+    let mut counts = PeerCandidateCounts {
+        discovered: discovered.len(),
+        ..Default::default()
+    };
+    for peer in discovered {
+        if !peer_allowed_by_config(peer, allow_ipv6) {
+            counts.filtered += 1;
+            continue;
+        }
+        if peer_is_backed_off(bad_peers, peer.socket_addr()) {
+            counts.failed += 1;
+            continue;
+        }
+        if peer_is_backed_off(peer_backoff, peer.socket_addr()) {
+            counts.backed_off += 1;
+            continue;
+        }
+        counts.eligible += 1;
+        eligible.push(*peer);
+    }
+    (eligible, counts)
+}
+
+fn no_usable_peer_candidates(counts: &PeerCandidateCounts) -> bool {
+    counts.discovered == 0
+        || (counts.eligible == 0
+            && counts.filtered.saturating_add(counts.failed) >= counts.discovered)
+}
+
 fn balance_peer_families(peers: &mut Vec<PeerAddr>) {
     if peers.len() < 2 {
         return;
@@ -1773,6 +2011,27 @@ fn balance_peer_families(peers: &mut Vec<PeerAddr>) {
         }
     }
     *peers = balanced;
+}
+
+fn peer_scheduler_reason(counts: &PeerCandidateCounts) -> Option<String> {
+    if counts.discovered == 0 {
+        return Some("no peers discovered".into());
+    }
+    if counts.eligible == 0 {
+        if counts.filtered > 0 && counts.failed == 0 && counts.backed_off == 0 {
+            return Some("all discovered peers filtered by configuration".into());
+        }
+        if counts.failed > 0 || counts.backed_off > 0 {
+            return Some(
+                "all discovered peers are cooling down after failures or no progress".into(),
+            );
+        }
+        return Some("no eligible peers after scheduler filtering".into());
+    }
+    if counts.eligible == 1 {
+        return Some("one eligible peer; using serial fallback when parallel round is idle".into());
+    }
+    None
 }
 
 fn dedupe_peers(peers: &mut Vec<PeerAddr>) {
@@ -3557,6 +3816,48 @@ mod tests {
         assert!(!peers[2].ip.is_ipv6());
         assert!(peers[3].ip.is_ipv6());
         assert!(peers[4].ip.is_ipv6());
+    }
+
+    #[test]
+    fn peer_candidate_classification_marks_all_filtered_as_unusable() {
+        let peers = vec![
+            PeerAddr::from_socket_addr("[2001:db8::1]:6001".parse().unwrap()),
+            PeerAddr::from_socket_addr("[2001:db8::2]:6002".parse().unwrap()),
+        ];
+
+        let (eligible, counts) =
+            classify_peer_candidates(&peers, &HashMap::new(), &HashMap::new(), false);
+
+        assert!(eligible.is_empty());
+        assert_eq!(counts.discovered, 2);
+        assert_eq!(counts.filtered, 2);
+        assert_eq!(counts.eligible, 0);
+        assert!(no_usable_peer_candidates(&counts));
+        assert_eq!(
+            peer_scheduler_reason(&counts).as_deref(),
+            Some("all discovered peers filtered by configuration")
+        );
+    }
+
+    #[test]
+    fn peer_candidate_classification_does_not_stop_for_idle_backoff_only() {
+        let peer = PeerAddr::from_socket_addr("127.0.0.1:6001".parse().unwrap());
+        let peers = vec![peer];
+        let mut peer_backoff = HashMap::new();
+        backoff_peer_for(
+            &mut peer_backoff,
+            peer.socket_addr(),
+            Duration::from_secs(60),
+        );
+
+        let (eligible, counts) =
+            classify_peer_candidates(&peers, &HashMap::new(), &peer_backoff, false);
+
+        assert!(eligible.is_empty());
+        assert_eq!(counts.discovered, 1);
+        assert_eq!(counts.backed_off, 1);
+        assert_eq!(counts.eligible, 0);
+        assert!(!no_usable_peer_candidates(&counts));
     }
 
     #[test]

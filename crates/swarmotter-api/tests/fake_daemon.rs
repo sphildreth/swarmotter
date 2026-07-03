@@ -275,6 +275,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
                     leechers: 0,
                     downloads: 0,
                     last_error: None,
+                    last_message: None,
                     next_announce: None,
                     last_announce: None,
                 });
@@ -292,6 +293,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
                         leechers: 0,
                         downloads: 0,
                         last_error: None,
+                        last_message: None,
                         next_announce: None,
                         last_announce: None,
                     });
@@ -484,6 +486,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             upload_limit: t.upload_limit,
             active_peer_workers: 0,
             known_peers: 0,
+            peer_scheduler: None,
             useful_peers: None,
             choked_peers: None,
             unchoked_peers: None,

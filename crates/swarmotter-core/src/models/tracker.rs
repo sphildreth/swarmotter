@@ -76,6 +76,7 @@ pub struct TrackerInfo {
     pub leechers: u64,
     pub downloads: u64,
     pub last_error: Option<String>,
+    pub last_message: Option<String>,
     pub next_announce: Option<u64>,
     pub last_announce: Option<u64>,
 }

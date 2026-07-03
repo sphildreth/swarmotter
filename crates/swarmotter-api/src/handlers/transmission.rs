@@ -1096,7 +1096,11 @@ fn torrent_tracker_stats(trackers: &[TrackerInfo]) -> Vec<Value> {
                     TrackerStatus::Working | TrackerStatus::Ok
                 ),
                 "last_announce_time": tracker.last_announce.unwrap_or(0),
-                "last_announce_result": tracker.last_error.clone().unwrap_or_default(),
+                "last_announce_result": tracker
+                    .last_error
+                    .clone()
+                    .or_else(|| tracker.last_message.clone())
+                    .unwrap_or_default(),
                 "next_announce_time": tracker.next_announce.unwrap_or(0),
             })
         })
@@ -1506,6 +1510,32 @@ mod tests {
         assert_eq!(
             decode_base64("aGVsbG8=").as_deref(),
             Some(b"hello".as_slice())
+        );
+    }
+
+    #[test]
+    fn tracker_stats_use_last_message_for_successful_announces() {
+        let rows = torrent_tracker_stats(&[TrackerInfo {
+            id: swarmotter_core::models::tracker::TrackerId("http://tracker.example".into()),
+            url: "http://tracker.example".into(),
+            kind: swarmotter_core::models::tracker::TrackerKind::Http,
+            tier: 0,
+            status: TrackerStatus::Ok,
+            seeders: 42,
+            leechers: 7,
+            downloads: 0,
+            last_error: None,
+            last_message: Some("announce returned 12 peers".into()),
+            next_announce: None,
+            last_announce: Some(1234),
+        }]);
+
+        assert_eq!(rows[0]["seeder_count"], json!(42));
+        assert_eq!(rows[0]["leecher_count"], json!(7));
+        assert_eq!(rows[0]["last_announce_succeeded"], json!(true));
+        assert_eq!(
+            rows[0]["last_announce_result"],
+            json!("announce returned 12 peers")
         );
     }
 }

@@ -191,6 +191,10 @@ Useful fields:
 - `active_peer_workers`: current bounded peer download workers.
 - `known_peers`: peers currently discovered by trackers, DHT, PEX, or direct
   input.
+- `peer_scheduler`: live scheduler counts showing discovered, eligible,
+  filtered, failed-backoff, no-progress-backoff, parallel candidate, worker
+  limit, and serial-fallback state. Use this when `known_peers` is high but
+  `active_peer_workers` is low or zero.
 - `useful_peers`: connected peers observed with pieces the torrent still needs
   and an unchoked or recently useful state.
 - `unchoked_peers`: connected peers the engine has observed as unchoked.
@@ -205,6 +209,11 @@ Useful fields:
   and PEX discovery signals when live engine data is available.
 - `dht_discovery_ok`, `pex_discovery_ok`: whether DHT or PEX discovery has
   succeeded recently in the live engine.
+
+Tracker rows from `/api/v1/torrents/<info_hash>/trackers` report per-tracker
+announce results. `seeders` and `leechers` come from the last announce response,
+`last_error` is set only for failed announces, and `last_message` carries the
+latest successful announce result.
 
 Common causes:
 

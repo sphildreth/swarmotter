@@ -219,6 +219,7 @@ async fn add_and_list_torrents() {
     let data = v["data"].as_object().unwrap();
     for field in [
         "useful_peers",
+        "peer_scheduler",
         "choked_peers",
         "unchoked_peers",
         "recent_peer_failures",

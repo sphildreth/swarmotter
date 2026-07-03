@@ -54,6 +54,22 @@ pub struct GlobalStats {
     pub uptime_seconds: u64,
 }
 
+/// Live peer scheduling diagnostics for understanding why discovered peers
+/// are or are not being used for download work.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PeerSchedulerDiagnostics {
+    pub discovered_peers: usize,
+    pub eligible_peers: usize,
+    pub filtered_peers: usize,
+    pub failed_peers: usize,
+    pub backed_off_peers: usize,
+    pub peer_worker_limit: usize,
+    pub parallel_candidates: usize,
+    pub parallel_workers_started: usize,
+    pub serial_peer_active: bool,
+    pub last_reason: Option<String>,
+}
+
 /// Per-torrent operational diagnostics for API/UI troubleshooting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentDiagnostics {
@@ -74,6 +90,7 @@ pub struct TorrentDiagnostics {
     pub upload_limit: u64,
     pub active_peer_workers: usize,
     pub known_peers: usize,
+    pub peer_scheduler: Option<PeerSchedulerDiagnostics>,
     pub useful_peers: Option<usize>,
     pub choked_peers: Option<usize>,
     pub unchoked_peers: Option<usize>,
