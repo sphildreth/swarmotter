@@ -134,12 +134,14 @@ mean the daemon has not published that live signal.
 | --- | --- | --- |
 | GET | `/settings` | Get configuration (API auth token redacted) |
 | PATCH | `/settings` | Update safe runtime settings (bandwidth/queue/seeding) |
+| PUT | `/settings` | Replace full configuration atomically after validation; reports restart-required fields |
 
 ### Network
 
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/network/health` | Network containment health |
+| GET | `/network/diagnostics` | Detailed network/path diagnostics for health troubleshooting |
 
 ### Watch folders
 
@@ -147,6 +149,14 @@ mean the daemon has not published that live signal.
 | --- | --- | --- |
 | POST | `/watch/scan` | Trigger a scan |
 | GET | `/watch/history` | Import history |
+| GET | `/watch/status` | Watch-folder status, folder readiness, and recent imports |
+
+### Logs and health checks
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/logs/recent` | Recent daemon logs (`lines=1..500`, default 100) |
+| GET | `/doctor` | Consolidated operational health report for diagnostics panels |
 
 ## Events (WebSocket/SSE)
 

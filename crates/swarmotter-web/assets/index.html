@@ -25,7 +25,7 @@
       <button data-view="watch" class="nav">Watch</button>
       <button data-view="logs" class="nav">Logs</button>
     </nav>
-    <div id="health-badge" class="badge"></div>
+    <button id="health-badge" class="badge nav" data-view="doctor" type="button">checking</button>
   </header>
 
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
@@ -94,37 +94,105 @@
     <!-- Network view -->
     <section id="view-network" class="view hidden">
       <h2>Network Containment</h2>
-      <div id="network-health" class="card"></div>
+      <div class="view-grid">
+        <div id="network-summary" class="card">
+          <h3>Network summary</h3>
+          <p class="muted">Container-bound state appears here.</p>
+        </div>
+        <div id="network-health" class="card">
+          <h3>Health payload</h3>
+          <pre class="health-payload">Waiting for data...</pre>
+        </div>
+        <div id="network-config" class="card">
+          <h3>Configuration</h3>
+          <p class="muted">Configured interface and bind targets populate here.</p>
+        </div>
+        <div id="network-interfaces" class="card">
+          <h3>Interfaces</h3>
+          <p class="muted">Observed routing interfaces populate here.</p>
+        </div>
+        <div id="network-originality" class="card">
+          <h3>Containment checks</h3>
+          <p class="muted">DNS and address checks populate here.</p>
+        </div>
+      </div>
     </section>
 
     <!-- Settings view -->
     <section id="view-settings" class="view hidden">
       <h2>Settings</h2>
-      <div class="card">
-        <h3>Bandwidth</h3>
-        <label>Global download limit (B/s, 0=unlimited) <input id="bw-dl" type="number"></label>
-        <label>Global upload limit (B/s, 0=unlimited) <input id="bw-ul" type="number"></label>
-        <label>Alternate speed mode <input id="bw-alt" type="checkbox"></label>
-        <button id="save-bw-btn">Save Bandwidth</button>
-      </div>
-      <div class="card">
-        <h3>Notifications</h3>
-        <label>Toast display time (seconds) <input id="toast-seconds" type="number" min="1" max="60" step="1"></label>
-        <button id="save-toast-btn">Save Notifications</button>
+      <div class="settings-layout">
+        <div id="settings-runtime-editor" class="card">
+          <h3>Runtime settings</h3>
+          <div class="card-subsection">
+            <h4>Bandwidth</h4>
+            <label>Global download limit (B/s, 0=unlimited) <input id="bw-dl" type="number"></label>
+            <label>Global upload limit (B/s, 0=unlimited) <input id="bw-ul" type="number"></label>
+            <label>Alternate speed mode <input id="bw-alt" type="checkbox"></label>
+            <button id="save-bw-btn">Save Bandwidth</button>
+          </div>
+          <div class="card-subsection">
+            <h4>Notifications</h4>
+            <label>Toast display time (seconds) <input id="toast-seconds" type="number" min="1" max="60" step="1"></label>
+            <button id="save-toast-btn">Save Notifications</button>
+          </div>
+        </div>
+        <div id="settings-full-config" class="card">
+          <h3>Full configuration</h3>
+          <textarea id="full-config-json" class="config-preview" rows="24" spellcheck="false">Awaiting configuration snapshot...</textarea>
+          <button id="save-config-btn">Save Full Configuration</button>
+        </div>
+        <div id="settings-save-status" class="card">
+          <h3>Save status</h3>
+          <p class="muted">No save operation yet.</p>
+        </div>
       </div>
     </section>
 
     <!-- Watch view -->
     <section id="view-watch" class="view hidden">
       <h2>Watch Folders</h2>
-      <button id="watch-scan-btn">Scan Now</button>
-      <div id="watch-history"></div>
+      <div class="watch-layout">
+        <div id="watch-config" class="card">
+          <h3>Watch config</h3>
+          <p class="muted">Watch folder configuration and defaults go here.</p>
+        </div>
+        <div id="watch-scan-result" class="card">
+          <h3>Scan result</h3>
+          <p class="muted">Run a scan to populate details.</p>
+        </div>
+        <div id="watch-history" class="card">
+          <h3>Scan history</h3>
+          <p class="muted">Recent paths and status stream here.</p>
+        </div>
+        <button id="watch-scan-btn">Scan Now</button>
+      </div>
     </section>
 
     <!-- Logs view -->
     <section id="view-logs" class="view hidden">
       <h2>Logs &amp; Errors</h2>
-      <pre id="log-stream"></pre>
+      <div id="log-controls" class="card">
+        <h3>Stream controls</h3>
+        <button id="refresh-logs-btn">Refresh Logs</button>
+        <span id="log-source" class="muted"></span>
+      </div>
+      <pre id="log-stream" aria-live="polite"></pre>
+    </section>
+
+    <!-- Doctor view -->
+    <section id="view-doctor" class="view hidden">
+      <h2>Doctor</h2>
+      <div class="view-grid">
+        <div id="doctor-summary" class="card">
+          <h3>Health summary</h3>
+          <p class="muted">System diagnostics summary appears here.</p>
+        </div>
+        <div id="doctor-checks" class="card">
+          <h3>Checks</h3>
+          <p class="muted">Configured health checks and results appear here.</p>
+        </div>
+      </div>
     </section>
   </main>
 

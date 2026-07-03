@@ -14,6 +14,7 @@
 //! (PEX/DHT are disabled for private torrents, not metadata exchange over an
 //! existing peer). See `design/requirements.md` and ADR-0013.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,9 +26,11 @@ use swarmotter_core::extensions::{self, MetadataMsgType};
 use swarmotter_core::hash::InfoHash;
 use swarmotter_core::meta::TorrentMeta;
 use swarmotter_core::net::NetworkBinder;
-use swarmotter_core::peer::{self, Bitfield, Handshake, Message, PeerAddr};
+use swarmotter_core::peer::{self, Handshake, Message, PeerAddr};
+use swarmotter_core::utp::{self, PeerDuplex, PeerTransport};
 
 const MAX_METADATA_SIZE: usize = 16 * 1024 * 1024;
+const METADATA_CANDIDATE_CONCURRENCY: usize = 32;
 
 /// Fetch the torrent metadata (`info` dict) from a peer via `ut_metadata`.
 /// Returns the assembled, info-hash-verified `info` bytes.
@@ -36,18 +39,58 @@ const MAX_METADATA_SIZE: usize = 16 * 1024 * 1024;
 /// tracker, PEX, or DHT). The connection goes through the binder. On success
 /// the raw `info` bytes can be turned into a `TorrentMeta` via
 /// [`build_meta_from_info`].
-pub async fn fetch_metadata(
-    binder: &dyn NetworkBinder,
+pub async fn fetch_metadata_with_transport(
+    binder: Arc<dyn NetworkBinder>,
     info_hash: InfoHash,
     peer_id: [u8; 20],
     peer: PeerAddr,
+    utp_enabled: bool,
+    utp_prefer_tcp: bool,
 ) -> Result<Vec<u8>> {
     if !binder.traffic_allowed() {
         return Err(CoreError::NetworkBlocked(
             "torrent data plane blocked; cannot fetch metadata".into(),
         ));
     }
-    let stream = binder.connect_peer(peer.socket_addr()).await?;
+    let transports = if utp_enabled {
+        if utp_prefer_tcp {
+            vec![PeerTransport::Tcp, PeerTransport::Utp]
+        } else {
+            vec![PeerTransport::Utp, PeerTransport::Tcp]
+        }
+    } else {
+        vec![PeerTransport::Tcp]
+    };
+
+    let mut last_error = None;
+    for transport in transports {
+        match fetch_metadata_via_transport(binder.clone(), transport, info_hash, peer_id, peer)
+            .await
+        {
+            Ok(info) => return Ok(info),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| CoreError::Internal("no metadata transport configured".into())))
+}
+
+async fn fetch_metadata_via_transport(
+    binder: Arc<dyn NetworkBinder>,
+    transport: PeerTransport,
+    info_hash: InfoHash,
+    peer_id: [u8; 20],
+    peer: PeerAddr,
+) -> Result<Vec<u8>> {
+    let (stream, _) = utp::connect_peer_stream(binder, transport, peer.socket_addr()).await?;
+    fetch_metadata_over_stream(stream, info_hash, peer_id).await
+}
+
+async fn fetch_metadata_over_stream(
+    stream: Box<dyn PeerDuplex>,
+    info_hash: InfoHash,
+    peer_id: [u8; 20],
+) -> Result<Vec<u8>> {
     let (read_half, mut write_half) = tokio::io::split(stream);
 
     // Handshake advertising extension support.
@@ -70,10 +113,9 @@ pub async fn fetch_metadata(
         ));
     }
 
-    // Send an empty bitfield and our extension handshake advertising
-    // ut_metadata.
-    let bf = Bitfield::new(0);
-    peer::write_message(&mut write_half, &bf.encode_message()).await?;
+    // Send our extension handshake advertising ut_metadata. Metadata-only
+    // magnet sessions do not know the torrent piece count yet, so sending a
+    // zero-length bitfield would be invalid for real multi-piece torrents.
     let local_metadata_id: u8 = 3u8;
     let ext_payload = extensions::encode_extension_handshake(
         &[(extensions::UT_METADATA_NAME, local_metadata_id)],
@@ -239,25 +281,96 @@ fn write_str(out: &mut Vec<u8>, s: &[u8]) {
 // Re-export Instant for module-local use without an extra import line at top.
 use std::time::Instant;
 
-/// Convenience: fetch metadata from the first peer that succeeds, trying a
-/// list of candidates in order.
-pub async fn fetch_metadata_from_candidates(
+/// Convenience: fetch metadata from the first peer that succeeds, racing a
+/// bounded set of candidates so one slow peer cannot block metadata discovery
+/// for an entire public swarm.
+pub async fn fetch_metadata_from_candidates_with_transport(
     binder: Arc<dyn NetworkBinder>,
     info_hash: InfoHash,
     peer_id: [u8; 20],
     candidates: &[PeerAddr],
+    utp_enabled: bool,
+    utp_prefer_tcp: bool,
 ) -> Result<Vec<u8>> {
+    let mut seen = HashSet::new();
+    let candidates: Vec<PeerAddr> = candidates
+        .iter()
+        .copied()
+        .filter(|peer| seen.insert(*peer))
+        .collect();
+    if candidates.is_empty() {
+        return Err(CoreError::Internal(
+            "metadata fetch failed from all candidates: no candidates".into(),
+        ));
+    }
+
+    let mut tasks = tokio::task::JoinSet::new();
     let mut last_err: Option<String> = None;
-    for peer in candidates {
-        match fetch_metadata(binder.as_ref(), info_hash, peer_id, *peer).await {
-            Ok(info) => return Ok(info),
-            Err(e) => last_err = Some(e.to_string()),
+    let mut next = 0usize;
+
+    while next < candidates.len() && tasks.len() < METADATA_CANDIDATE_CONCURRENCY {
+        spawn_metadata_fetch(
+            &mut tasks,
+            binder.clone(),
+            info_hash,
+            peer_id,
+            candidates[next],
+            utp_enabled,
+            utp_prefer_tcp,
+        );
+        next += 1;
+    }
+
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((_, Ok(info))) => return Ok(info),
+            Ok((peer, Err(e))) => {
+                last_err = Some(format!("{peer:?}: {e}"));
+            }
+            Err(e) => {
+                last_err = Some(format!("metadata candidate task failed: {e}"));
+            }
+        }
+        while next < candidates.len() && tasks.len() < METADATA_CANDIDATE_CONCURRENCY {
+            spawn_metadata_fetch(
+                &mut tasks,
+                binder.clone(),
+                info_hash,
+                peer_id,
+                candidates[next],
+                utp_enabled,
+                utp_prefer_tcp,
+            );
+            next += 1;
         }
     }
     Err(CoreError::Internal(format!(
         "metadata fetch failed from all candidates: {}",
-        last_err.unwrap_or_else(|| "no candidates".into())
+        last_err.unwrap_or_else(|| "all candidate tasks ended without result".into())
     )))
+}
+
+fn spawn_metadata_fetch(
+    tasks: &mut tokio::task::JoinSet<(PeerAddr, Result<Vec<u8>>)>,
+    binder: Arc<dyn NetworkBinder>,
+    info_hash: InfoHash,
+    peer_id: [u8; 20],
+    peer: PeerAddr,
+    utp_enabled: bool,
+    utp_prefer_tcp: bool,
+) {
+    tasks.spawn(async move {
+        let result = fetch_metadata_with_transport(
+            binder,
+            info_hash,
+            peer_id,
+            peer,
+            utp_enabled,
+            utp_prefer_tcp,
+        )
+        .await;
+        (peer, result)
+    });
 }
 
 #[cfg(test)]
@@ -312,9 +425,6 @@ mod tests {
         };
         wr.write_all(&our_hs.encode()).await?;
 
-        // Read the leecher's bitfield + extension handshake.
-        let _ = read_one_message(&mut rd).await; // bitfield
-                                                 // The leecher sends an Extended handshake (id 0).
         let local_metadata_id: u8 = 1u8;
         let ext_hs = extensions::encode_extension_handshake(
             &[(extensions::UT_METADATA_NAME, local_metadata_id)],
@@ -394,8 +504,6 @@ mod tests {
             reserved: extensions::EXTENSION_RESERVED,
         };
         wr.write_all(&our_hs.encode()).await?;
-        let _ = read_one_message(&mut rd).await; // bitfield
-        let _ = read_one_message(&mut rd).await; // extension handshake
         let local_metadata_id: u8 = 1u8;
         let ext_hs = extensions::encode_extension_handshake(
             &[(extensions::UT_METADATA_NAME, local_metadata_id)],
@@ -436,7 +544,6 @@ mod tests {
             reserved: extensions::EXTENSION_RESERVED,
         };
         wr.write_all(&our_hs.encode()).await?;
-        let _ = read_one_message(&mut rd).await; // bitfield
         let local_metadata_id: u8 = 1u8;
         let ext_hs = extensions::encode_extension_handshake(
             &[(extensions::UT_METADATA_NAME, local_metadata_id)],
@@ -547,11 +654,13 @@ mod tests {
         });
 
         let binder = Arc::new(LoopbackBinder);
-        let fetched = fetch_metadata(
-            binder.as_ref(),
+        let fetched = fetch_metadata_with_transport(
+            binder,
             info_hash,
             peer_id(b"-SW0090-"),
             PeerAddr::from_socket_addr(addr),
+            false,
+            true,
         )
         .await
         .expect("metadata fetch should succeed");
@@ -571,11 +680,13 @@ mod tests {
     #[tokio::test]
     async fn fetch_metadata_blocked_by_fail_closed_binder() {
         let binder = Arc::new(swarmotter_core::net::binder::BlockedBinder);
-        let err = fetch_metadata(
-            binder.as_ref(),
+        let err = fetch_metadata_with_transport(
+            binder,
             InfoHash::from_bytes([0u8; 20]),
             peer_id(b"-SW0091-"),
             PeerAddr::from_socket_addr("127.0.0.1:9".parse().unwrap()),
+            false,
+            true,
         )
         .await
         .unwrap_err();
@@ -602,11 +713,13 @@ mod tests {
         });
 
         let binder = Arc::new(LoopbackBinder);
-        let err = fetch_metadata(
-            binder.as_ref(),
+        let err = fetch_metadata_with_transport(
+            binder,
             info_hash,
             peer_id(b"-SW0092-"),
             PeerAddr::from_socket_addr(addr),
+            false,
+            true,
         )
         .await
         .unwrap_err();
@@ -628,11 +741,13 @@ mod tests {
         });
 
         let binder = Arc::new(LoopbackBinder);
-        let err = fetch_metadata(
-            binder.as_ref(),
+        let err = fetch_metadata_with_transport(
+            binder,
             info_hash,
             peer_id(b"-SW0093-"),
             PeerAddr::from_socket_addr(addr),
+            false,
+            true,
         )
         .await
         .unwrap_err();

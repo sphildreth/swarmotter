@@ -24,6 +24,15 @@ pub async fn update_settings(
     }
 }
 
-// Suppress unused import.
-#[allow(unused_imports)]
-use Config as _;
+pub async fn replace_settings(
+    State(state): State<SharedState>,
+    Json(mut config): Json<Config>,
+) -> Response {
+    if config.api.auth_token.is_none() {
+        config.api.auth_token = state.daemon.get_config().await.api.auth_token;
+    }
+    match state.daemon.replace_config(config).await {
+        Ok(result) => into_response(Ok(result)),
+        Err(e) => err_response(e),
+    }
+}

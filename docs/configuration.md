@@ -21,6 +21,17 @@ SWARMOTTER_NETWORK__REQUIRED_INTERFACE=br0
 SWARMOTTER_TORRENT__LISTEN_PORT=51413
 ```
 
+## Runtime configuration editing
+
+SwarmOtter exposes two update modes:
+
+- `PATCH /api/v1/settings` updates live-safe fields (bandwidth, queue, and seeding policy).
+- `PUT /api/v1/settings` replaces the full config after validation and persists it atomically.
+  The existing `api.auth_token` is preserved when omitted from the request body.
+
+The `PUT /api/v1/settings` response reports which fields were applied live, which
+fields require restart, and whether the write was persisted.
+
 ## Common configuration: bind torrents to `br0`
 
 Use this when the interface name is stable but addresses are assigned by DHCP,

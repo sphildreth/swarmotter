@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     let env_vars: Vec<(String, String)> = std::env::vars().collect();
     config = config.apply_env_overrides(&env_vars)?;
     let log_file = logging::init(&config.logging)?;
-    if let Some(path) = log_file {
+    if let Some(path) = &log_file {
         tracing::info!(path = %path.display(), "daemon file logging enabled");
     }
     if let Some(path) = &args.config {
@@ -75,7 +75,12 @@ async fn main() -> Result<()> {
     }
 
     let max_request_body_bytes = config.api.max_request_body_bytes;
-    let runtime = Arc::new(daemon::DaemonRuntime::new(config.clone(), health));
+    let runtime = Arc::new(daemon::DaemonRuntime::with_paths(
+        config.clone(),
+        health,
+        args.config.clone(),
+        log_file,
+    ));
     let broker = swarmotter_api::handlers::events::EventBroker::default();
 
     let state = Arc::new(AppState {
@@ -115,8 +120,9 @@ async fn main() -> Result<()> {
             .into_make_service(),
     );
 
-    // Spawn watch-folder scanner if configured.
-    if !state.config.lock().await.watch.is_empty() {
+    // Spawn watch-folder scanner. It reads the live daemon config each pass,
+    // so watch folders added through settings start working without restart.
+    {
         let rt = runtime.clone();
         tokio::spawn(async move {
             rt.watch_loop().await;

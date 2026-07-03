@@ -22,6 +22,7 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -263,32 +264,78 @@ async fn run_tracker(listener: tokio::net::TcpListener, seed: PeerAddr) -> std::
     loop {
         let (mut stream, _) = listener.accept().await?;
         tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
-            // Build a compact announce response with the single seed peer.
-            let mut peers = Vec::new();
-            if let std::net::IpAddr::V4(v4) = seed.ip {
-                peers.extend_from_slice(&v4.octets());
-                peers.extend_from_slice(&seed.port.to_be_bytes());
-            }
-            let mut body = Vec::new();
-            body.extend_from_slice(b"d");
-            body.extend_from_slice(b"8:intervali30e");
-            body.extend_from_slice(b"8:completei1e");
-            body.extend_from_slice(b"10:incompletei1e");
-            body.extend_from_slice(b"5:peers");
-            body.extend_from_slice(format!("{}:", peers.len()).as_bytes());
-            body.extend_from_slice(&peers);
-            body.extend_from_slice(b"e");
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-            let _ = stream.write_all(&body).await;
-            let _ = stream.flush().await;
+            let _ = write_tracker_peer_response(&mut stream, seed).await;
         });
     }
+}
+
+async fn run_flipping_tracker(
+    listener: tokio::net::TcpListener,
+    first: PeerAddr,
+    later: PeerAddr,
+) -> std::io::Result<()> {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    loop {
+        let (mut stream, _) = listener.accept().await?;
+        let request_count = request_count.clone();
+        tokio::spawn(async move {
+            let count = request_count.fetch_add(1, Ordering::Relaxed);
+            let peer = if count == 0 { first } else { later };
+            let _ = write_tracker_peer_response(&mut stream, peer).await;
+        });
+    }
+}
+
+async fn write_tracker_peer_response(
+    stream: &mut tokio::net::TcpStream,
+    seed: PeerAddr,
+) -> std::io::Result<()> {
+    let mut buf = vec![0u8; 4096];
+    let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+    // Build a compact announce response with the single seed peer.
+    let mut peers = Vec::new();
+    if let std::net::IpAddr::V4(v4) = seed.ip {
+        peers.extend_from_slice(&v4.octets());
+        peers.extend_from_slice(&seed.port.to_be_bytes());
+    }
+    let mut body = Vec::new();
+    body.extend_from_slice(b"d");
+    body.extend_from_slice(b"8:intervali30e");
+    body.extend_from_slice(b"8:completei1e");
+    body.extend_from_slice(b"10:incompletei1e");
+    body.extend_from_slice(b"5:peers");
+    body.extend_from_slice(format!("{}:", peers.len()).as_bytes());
+    body.extend_from_slice(&peers);
+    body.extend_from_slice(b"e");
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(resp.as_bytes()).await?;
+    stream.write_all(&body).await?;
+    stream.flush().await
+}
+
+async fn serve_no_extension_metadata_peer(
+    stream: tokio::net::TcpStream,
+    info_hash: swarmotter_core::hash::InfoHash,
+) -> swarmotter_core::Result<()> {
+    let (mut rd, mut wr) = tokio::io::split(stream);
+    let mut hs_buf = [0u8; 68];
+    rd.read_exact(&mut hs_buf).await?;
+    let their_hs = Handshake::decode(&hs_buf)
+        .map_err(|e| swarmotter_core::error::CoreError::Internal(e.to_string()))?;
+    if their_hs.info_hash != info_hash {
+        return Ok(());
+    }
+    let our_hs = Handshake {
+        info_hash,
+        peer_id: peer_id(b"-SD0094-"),
+        reserved: swarmotter_core::peer::RESERVED,
+    };
+    wr.write_all(&our_hs.encode()).await?;
+    wr.flush().await?;
+    Ok(())
 }
 
 /// A minimal in-process UDP tracker (BEP 15) that responds to a connect then
@@ -561,7 +608,7 @@ async fn local_swarm_downloads_from_seed_via_tracker() {
     );
 
     // Run with an overall timeout so a failure can't hang the test.
-    let final_state = tokio::time::timeout(Duration::from_secs(60), engine.run())
+    let final_state = tokio::time::timeout(Duration::from_secs(12), engine.run())
         .await
         .expect("engine did not finish in time")
         .expect("engine error");
@@ -1288,10 +1335,11 @@ fn pick_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-/// BEP 9 magnet end-to-end: a magnet link (info hash + tracker) is added to the
-/// engine with no real metadata. The engine announces to the tracker, discovers
-/// a seed peer, fetches the `info` dict via ut_metadata, verifies the info hash,
-/// then downloads the real content from the same seed.
+/// BEP 9 magnet end-to-end: a magnet link (info hash + trackers) is added to
+/// the engine with no real metadata. The engine announces to the trackers,
+/// retries after an incompatible metadata peer, discovers a seed peer from the
+/// next announce, fetches the `info` dict via ut_metadata, verifies the info
+/// hash, then downloads the real content from the same seed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_swarm_magnet_fetches_metadata_then_downloads() {
     use swarmotter_core::extensions;
@@ -1334,12 +1382,28 @@ async fn local_swarm_magnet_fetches_metadata_then_downloads() {
         });
     }
 
-    // A local HTTP tracker announcing the seed peer.
+    // A peer that handshakes but does not support BEP 10 metadata. The first
+    // tracker response advertises it so magnet fetch must retry discovery
+    // instead of treating one incompatible peer as terminal.
+    let bad_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let bad_peer = PeerAddr::from_socket_addr(bad_listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = bad_listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let _ = serve_no_extension_metadata_peer(stream, info_hash).await;
+            });
+        }
+    });
+
+    // A local HTTP tracker that first announces the bad peer, then the seed.
     let tracker_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tracker_addr = tracker_listener.local_addr().unwrap();
     let tracker_url = format!("http://{tracker_addr}/announce");
     tokio::spawn(async move {
-        let _ = run_tracker(tracker_listener, seed_peer).await;
+        let _ = run_flipping_tracker(tracker_listener, bad_peer, seed_peer).await;
     });
 
     // Build the magnet link from the real info hash + tracker.
@@ -1371,7 +1435,7 @@ async fn local_swarm_magnet_fetches_metadata_then_downloads() {
         Some(swarmotterd::engine::MagnetParams {
             info_hash,
             name: "magnet.bin".into(),
-            trackers: vec![magnet.trackers[0].clone()],
+            trackers: magnet.trackers.clone(),
         }),
     );
     let _ = magnet_uri;
@@ -1382,6 +1446,14 @@ async fn local_swarm_magnet_fetches_metadata_then_downloads() {
         .expect("magnet engine error");
 
     assert!(final_state.finished, "magnet download did not complete");
+    assert!(
+        final_state.tracker_ok,
+        "magnet tracker diagnostics not marked ok"
+    );
+    assert!(
+        final_state.last_announce.is_some(),
+        "magnet metadata fetch did not record a tracker announce"
+    );
     assert_eq!(
         final_state.pieces_have.count(meta.piece_count()),
         meta.piece_count(),

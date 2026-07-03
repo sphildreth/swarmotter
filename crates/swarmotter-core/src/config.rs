@@ -258,6 +258,13 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Serialize the effective configuration as TOML after validation.
+    pub fn to_toml_string(&self) -> Result<String> {
+        self.validate()?;
+        toml::to_string_pretty(self)
+            .map_err(|e| CoreError::InvalidConfig(format!("TOML serialize error: {e}")))
+    }
+
     /// Load from a TOML file path (sync; daemon reads before async runtime).
     pub fn from_file(path: &std::path::Path) -> Result<Self> {
         let s = std::fs::read_to_string(path).map_err(|e| {

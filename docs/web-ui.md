@@ -50,15 +50,29 @@ preference that can be changed in Settings > Notifications.
 
 ## Network health
 
-The header shows network containment health from:
+The UI shows network containment health from:
 
 ```text
 GET /api/v1/network/health
 ```
 
+Detailed network checks and path diagnostics use:
+
+```text
+GET /api/v1/network/diagnostics
+```
+
 If the UI shows `interface_missing`, the daemon cannot see the configured
 interface name in its current network namespace. See
 [Troubleshooting](troubleshooting.md).
+
+## Logs, Watch status, and doctor report
+
+Operational diagnostics in the UI come from:
+
+- `GET /api/v1/watch/status` for enabled folders and recent watch-folder activity.
+- `GET /api/v1/logs/recent` for live-tail style log snapshots.
+- `GET /api/v1/doctor` for a consolidated operational check summary.
 
 ## Browser assets
 

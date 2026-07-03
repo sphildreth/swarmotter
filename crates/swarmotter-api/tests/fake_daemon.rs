@@ -21,6 +21,11 @@ use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, 
 use swarmotter_core::models::tracker::{
     TrackerId, TrackerInfo, TrackerKind, TrackerStatus, TrackerTier,
 };
+use swarmotter_core::models::{
+    ConfigUpdateResult, DiagnosticLevel, DoctorCheck, DoctorReport, LogSnapshot,
+    NetworkDiagnostics, NetworkInterfaceDiagnostic, NetworkPathCheck, WatchFolderStatus,
+    WatchStatus,
+};
 use swarmotter_core::torrent::{Torrent, TorrentRegistry};
 use swarmotter_core::watch::ImportResult;
 use tokio::sync::Mutex;
@@ -341,8 +346,109 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         }
         Ok(())
     }
+    async fn replace_config(&self, config: Config) -> Result<ConfigUpdateResult> {
+        config.validate()?;
+        *self.config.lock().await = config.clone();
+        let mut redacted = config;
+        redacted.api.auth_token = None;
+        Ok(ConfigUpdateResult {
+            persisted: false,
+            config_path: None,
+            restart_required: false,
+            restart_required_fields: Vec::new(),
+            applied_runtime_fields: vec!["config".into()],
+            config: redacted,
+        })
+    }
     async fn network_health(&self) -> NetworkHealth {
         self.health.lock().await.clone()
+    }
+    async fn network_diagnostics(&self) -> NetworkDiagnostics {
+        let health = self.network_health().await;
+        let cfg = self.config.lock().await.clone();
+        NetworkDiagnostics {
+            listen_port: cfg.torrent.listen_port,
+            dht_port: cfg.dht.port,
+            torrent_allow_ipv6: cfg.torrent.allow_ipv6,
+            utp_enabled: cfg.torrent.utp_enabled,
+            utp_prefer_tcp: cfg.torrent.utp_prefer_tcp,
+            interfaces: vec![NetworkInterfaceDiagnostic {
+                name: "lo".into(),
+                status: "up".into(),
+                addresses: vec!["127.0.0.1".into(), "::1".into()],
+                selected: false,
+                has_ipv4: true,
+                has_ipv6: true,
+            }],
+            checks: vec![NetworkPathCheck {
+                id: "network_containment".into(),
+                label: "Network containment".into(),
+                level: if health.traffic_allowed {
+                    DiagnosticLevel::Ok
+                } else {
+                    DiagnosticLevel::Invalid
+                },
+                detail: health.detail.clone(),
+            }],
+            containment_matrix: Vec::new(),
+            health,
+        }
+    }
+    async fn doctor_report(&self) -> DoctorReport {
+        let network = self.network_health().await;
+        let mut level = if network.traffic_allowed {
+            DiagnosticLevel::Ok
+        } else {
+            DiagnosticLevel::Invalid
+        };
+        let watch = self.watch_status().await;
+        if watch.folders.is_empty() {
+            level = DiagnosticLevel::worst(level, DiagnosticLevel::Warning);
+        }
+        DoctorReport {
+            level,
+            summary: match level {
+                DiagnosticLevel::Ok => "all configured checks passed".into(),
+                DiagnosticLevel::Warning => "one or more checks need attention".into(),
+                DiagnosticLevel::Invalid => "one or more checks are invalid".into(),
+            },
+            checks: vec![
+                DoctorCheck {
+                    id: "network".into(),
+                    label: "Network containment".into(),
+                    level: if network.traffic_allowed {
+                        DiagnosticLevel::Ok
+                    } else {
+                        DiagnosticLevel::Invalid
+                    },
+                    detail: network.detail,
+                    remediation: None,
+                },
+                DoctorCheck {
+                    id: "watch".into(),
+                    label: "Watch folders".into(),
+                    level: if watch.folders.is_empty() {
+                        DiagnosticLevel::Warning
+                    } else {
+                        DiagnosticLevel::Ok
+                    },
+                    detail: if watch.folders.is_empty() {
+                        "no watch folders are configured".into()
+                    } else {
+                        "watch folders are configured".into()
+                    },
+                    remediation: None,
+                },
+            ],
+        }
+    }
+    async fn recent_logs(&self, _max_lines: usize) -> LogSnapshot {
+        LogSnapshot {
+            enabled: true,
+            path: None,
+            lines: vec!["fake daemon log line".into()],
+            truncated: false,
+        }
     }
     async fn global_stats(&self) -> GlobalStats {
         let reg = self.registry.lock().await;
@@ -396,6 +502,27 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
     }
     async fn watch_scan(&self) -> Result<()> {
         Ok(())
+    }
+    async fn watch_status(&self) -> WatchStatus {
+        let cfg = self.config.lock().await.clone();
+        let history = self.watch_imports.lock().await.clone();
+        WatchStatus {
+            enabled: !cfg.watch.is_empty(),
+            folders: cfg
+                .watch
+                .into_iter()
+                .map(|config| {
+                    let exists = std::path::Path::new(&config.path).is_dir();
+                    WatchFolderStatus {
+                        config,
+                        exists,
+                        pending_torrent_files: 0,
+                        last_result: history.last().cloned(),
+                    }
+                })
+                .collect(),
+            recent_imports: history,
+        }
     }
     async fn watch_history(&self) -> Vec<ImportResult> {
         self.watch_imports.lock().await.clone()

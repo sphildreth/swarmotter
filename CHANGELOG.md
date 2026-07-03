@@ -65,6 +65,13 @@ status.
   throughput peak, including sample rates, smoothed rates, previous peaks,
   active/known/useful peer counts, byte counters, and tracker/DHT/PEX/webseed
   discovery freshness for performance troubleshooting.
+- **Runtime diagnostics and config replacement:** the API and Web UI now expose
+  richer operational diagnostics for network containment, watch folders, recent
+  logs, and a consolidated Doctor report that drives the header health badge.
+  `PUT /api/v1/settings` validates and atomically replaces the full
+  configuration, preserves existing auth tokens when omitted, redacts auth
+  tokens in responses, applies live-safe fields immediately, and reports fields
+  that require restart. ADR-0025 records the decision.
 - **Configuration enforcement pass:** previously modeled runtime settings are
   now wired into daemon behavior: `bandwidth.max_peers` participates in live
   peer worker caps, `queue.max_active_downloads`/`auto_start`/queue move

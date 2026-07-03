@@ -2,6 +2,7 @@
 
 //! API request handlers.
 
+pub mod diagnostics;
 pub mod events;
 pub mod files;
 pub mod health;

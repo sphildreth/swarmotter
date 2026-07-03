@@ -9,6 +9,9 @@
 //! state. The control plane (API/Web UI) remains available independently.
 
 use std::collections::HashMap;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,7 +31,12 @@ use swarmotter_core::models::peer::{EnginePeerHealth, Peer};
 use swarmotter_core::models::stats::{GlobalStats, TorrentDiagnostics};
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{TrackerId, TrackerInfo, TrackerKind, TrackerStatus};
-use swarmotter_core::net::{self, OsInterfaceProbe};
+use swarmotter_core::models::{
+    ConfigUpdateResult, DiagnosticLevel, DoctorCheck, DoctorReport, LogSnapshot,
+    NetworkDiagnostics, NetworkInterfaceDiagnostic, NetworkPathCheck, WatchFolderStatus,
+    WatchStatus,
+};
+use swarmotter_core::net::{self, InterfaceProbe, OsInterfaceProbe};
 use swarmotter_core::queue::QueueState;
 use swarmotter_core::ratio::{self, SeedDecision, TorrentAccounting, TorrentSeeding};
 use swarmotter_core::torrent::{Torrent, TorrentRegistry};
@@ -45,6 +53,8 @@ pub struct DaemonRuntime {
     pub config: Arc<Mutex<Config>>,
     pub network_health: Arc<Mutex<NetworkHealth>>,
     pub watch_imports: Arc<Mutex<Vec<watch::ImportResult>>>,
+    config_path: Option<PathBuf>,
+    log_file_path: Option<PathBuf>,
     /// Live engine state per torrent, reconciled into summaries.
     engine_states: Arc<Mutex<HashMap<InfoHash, Arc<Mutex<EngineState>>>>>,
     /// Command channels to running engine tasks.
@@ -166,7 +176,17 @@ fn instant_age_seconds(now: Instant, seen: Option<Instant>) -> Option<u64> {
 }
 
 impl DaemonRuntime {
+    #[allow(dead_code)]
     pub fn new(config: Config, startup_health: NetworkHealth) -> Self {
+        Self::with_paths(config, startup_health, None, None)
+    }
+
+    pub fn with_paths(
+        config: Config,
+        startup_health: NetworkHealth,
+        config_path: Option<PathBuf>,
+        log_file_path: Option<PathBuf>,
+    ) -> Self {
         let global_limiter = swarmotter_core::bandwidth::RateLimiter::new(
             config.bandwidth.effective_download(),
             config.bandwidth.effective_upload(),
@@ -177,6 +197,8 @@ impl DaemonRuntime {
             config: Arc::new(Mutex::new(config)),
             network_health: Arc::new(Mutex::new(startup_health)),
             watch_imports: Arc::new(Mutex::new(Vec::new())),
+            config_path,
+            log_file_path,
             engine_states: Arc::new(Mutex::new(HashMap::new())),
             engine_cmds: Arc::new(Mutex::new(HashMap::new())),
             engine_handles: Arc::new(Mutex::new(HashMap::new())),
@@ -496,31 +518,8 @@ impl DaemonRuntime {
                             // If metadata was fetched via BEP 9, replace the
                             // placeholder meta with the real one and rebuild the
                             // file/piece bookkeeping.
-                            if let Some(real) = final_state.resolved_meta.clone() {
-                                t.meta = real.clone();
-                                t.needs_metadata = false;
-                                t.progress.have = (0..real.piece_count())
-                                    .map(|i| final_state.pieces_have.has(i))
-                                    .collect();
-                                t.files = real
-                                    .files
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, f)| swarmotter_core::models::torrent::TorrentFile {
-                                        index: i,
-                                        path: f.path.join("/"),
-                                        length: f.length,
-                                        bytes_completed: 0,
-                                        priority:
-                                            swarmotter_core::models::torrent::FilePriority::Normal,
-                                        wanted: true,
-                                    })
-                                    .collect();
-                                t.priorities = vec![
-                                    swarmotter_core::models::torrent::FilePriority::Normal;
-                                    real.files.len()
-                                ];
-                                t.wanted = vec![true; real.files.len()];
+                            if let Some(real) = final_state.resolved_meta.as_ref() {
+                                apply_resolved_metadata(t, real, &final_state);
                             }
                             t.downloaded = final_state.downloaded;
                             t.uploaded = final_state.uploaded;
@@ -920,6 +919,9 @@ impl DaemonRuntime {
         for (hash, state) in &states {
             let s = state.lock().await;
             if let Some(t) = reg.get_mut(hash) {
+                if let Some(real) = s.resolved_meta.as_ref() {
+                    apply_resolved_metadata(t, real, &s);
+                }
                 let mut peak = samples.get(hash).map(|p| p.peak_rate_down).unwrap_or(0);
                 if let Some(prev) = samples.get(hash).copied() {
                     let elapsed = now.duration_since(prev.at);
@@ -998,7 +1000,11 @@ impl DaemonRuntime {
                 if !t.state.is_error() && t.state != TorrentState::Paused {
                     if s.finished {
                         t.state = TorrentState::Completed;
+                    } else if t.needs_metadata {
+                        t.state = TorrentState::DownloadingMetadata;
                     } else if t.state == TorrentState::Queued {
+                        t.state = TorrentState::Downloading;
+                    } else if t.state == TorrentState::DownloadingMetadata {
                         t.state = TorrentState::Downloading;
                     }
                 }
@@ -1100,6 +1106,157 @@ impl DaemonRuntime {
         }
         Ok(hash)
     }
+
+    async fn apply_runtime_config_fields(&self) {
+        let cfg = self.config.lock().await.clone();
+        self.queue.lock().await.limits = cfg.queue.clone();
+        self.global_limiter
+            .set_capacity(
+                swarmotter_core::bandwidth::RateDirection::Download,
+                cfg.bandwidth.effective_download(),
+            )
+            .await;
+        self.global_limiter
+            .set_capacity(
+                swarmotter_core::bandwidth::RateDirection::Upload,
+                cfg.bandwidth.effective_upload(),
+            )
+            .await;
+        let probe = OsInterfaceProbe;
+        *self.network_health.lock().await = net::evaluate(&cfg.network, &probe);
+        self.reconcile_queue().await;
+        self.apply_peer_worker_limits().await;
+        self.reconcile_seeders().await;
+    }
+
+    async fn add_config_file_check(&self, checks: &mut Vec<DoctorCheck>) {
+        let Some(path) = &self.config_path else {
+            push_check(
+                checks,
+                "config_file",
+                "Config file",
+                DiagnosticLevel::Warning,
+                "daemon was started without a config file, so full settings cannot be persisted",
+                Some("start swarmotterd with --config to enable config.toml writes"),
+            );
+            return;
+        };
+        let level = if path.is_file() {
+            DiagnosticLevel::Ok
+        } else {
+            DiagnosticLevel::Warning
+        };
+        push_check(
+            checks,
+            "config_file",
+            "Config file",
+            level,
+            format!("configured path: {}", path.display()),
+            Some("create the config file or verify the daemon has write permissions"),
+        );
+    }
+
+    async fn add_log_file_check(&self, checks: &mut Vec<DoctorCheck>) {
+        let Some(path) = &self.log_file_path else {
+            push_check(
+                checks,
+                "log_file",
+                "Log file",
+                DiagnosticLevel::Warning,
+                "file logging is disabled; the Logs page can only show live events",
+                Some("enable logging.file or configure logging.file_path"),
+            );
+            return;
+        };
+        let level = if path.is_file() {
+            DiagnosticLevel::Ok
+        } else {
+            DiagnosticLevel::Warning
+        };
+        push_check(
+            checks,
+            "log_file",
+            "Log file",
+            level,
+            format!("log path: {}", path.display()),
+            Some("verify the daemon can create and read the log file"),
+        );
+    }
+
+    async fn add_storage_checks(&self, cfg: &Config, checks: &mut Vec<DoctorCheck>) {
+        add_storage_check(
+            checks,
+            "download_dir",
+            "Download directory",
+            cfg.storage.download_dir.as_deref(),
+        );
+        add_storage_check(
+            checks,
+            "incomplete_dir",
+            "Incomplete directory",
+            cfg.storage.incomplete_dir.as_deref(),
+        );
+    }
+
+    async fn add_watch_checks(&self, cfg: &Config, checks: &mut Vec<DoctorCheck>) {
+        if cfg.watch.is_empty() {
+            push_check(
+                checks,
+                "watch_folders",
+                "Watch folders",
+                DiagnosticLevel::Warning,
+                "no watch folders are configured",
+                Some("add [[watch]] entries if automatic .torrent import is desired"),
+            );
+            return;
+        }
+        let missing = cfg
+            .watch
+            .iter()
+            .filter(|folder| !Path::new(&folder.path).is_dir())
+            .count();
+        push_check(
+            checks,
+            "watch_folders",
+            "Watch folders",
+            if missing == 0 {
+                DiagnosticLevel::Ok
+            } else {
+                DiagnosticLevel::Warning
+            },
+            format!(
+                "{} configured, {} missing or unreadable",
+                cfg.watch.len(),
+                missing
+            ),
+            Some("verify watch folder paths and permissions"),
+        );
+    }
+
+    async fn add_torrent_runtime_check(&self, checks: &mut Vec<DoctorCheck>) {
+        let reg = self.registry.lock().await;
+        let errors = reg
+            .torrents
+            .values()
+            .filter(|torrent| torrent.error.is_some())
+            .count();
+        push_check(
+            checks,
+            "torrent_runtime",
+            "Torrent runtime",
+            if errors == 0 {
+                DiagnosticLevel::Ok
+            } else {
+                DiagnosticLevel::Warning
+            },
+            format!(
+                "{} torrents loaded, {} with errors",
+                reg.torrents.len(),
+                errors
+            ),
+            Some("open torrent details or logs for the affected torrents"),
+        );
+    }
 }
 
 fn move_failed_watch_file(
@@ -1120,6 +1277,215 @@ fn now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn redact_config(mut cfg: Config) -> Config {
+    cfg.api.auth_token = None;
+    cfg
+}
+
+fn write_config_atomically(path: &Path, config: &Config) -> Result<()> {
+    let toml = config.to_toml_string()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(CoreError::from)?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, toml).map_err(CoreError::from)?;
+    fs::rename(&tmp, path).map_err(CoreError::from)?;
+    Ok(())
+}
+
+fn restart_required_fields(previous: &Config, next: &Config) -> Vec<String> {
+    let mut fields = Vec::new();
+    if previous.api.bind_address != next.api.bind_address {
+        fields.push("api.bind_address".into());
+    }
+    if previous.api.max_request_body_bytes != next.api.max_request_body_bytes {
+        fields.push("api.max_request_body_bytes".into());
+    }
+    if previous.logging.level != next.logging.level {
+        fields.push("logging.level".into());
+    }
+    if previous.logging.json != next.logging.json {
+        fields.push("logging.json".into());
+    }
+    if previous.logging.file != next.logging.file {
+        fields.push("logging.file".into());
+    }
+    if previous.logging.file_path != next.logging.file_path {
+        fields.push("logging.file_path".into());
+    }
+    if previous.torrent.listen_port != next.torrent.listen_port {
+        fields.push("torrent.listen_port".into());
+    }
+    if previous.dht.port != next.dht.port {
+        fields.push("dht.port".into());
+    }
+    fields
+}
+
+fn push_check(
+    checks: &mut Vec<DoctorCheck>,
+    id: impl Into<String>,
+    label: impl Into<String>,
+    level: DiagnosticLevel,
+    detail: impl Into<String>,
+    remediation: Option<&str>,
+) {
+    checks.push(DoctorCheck {
+        id: id.into(),
+        label: label.into(),
+        level,
+        detail: detail.into(),
+        remediation: remediation.map(str::to_string),
+    });
+}
+
+fn containment_matrix(config: &Config, level: DiagnosticLevel) -> Vec<NetworkPathCheck> {
+    let mut rows = vec![
+        (
+            "peer_tcp",
+            "Peer TCP",
+            "outbound peer TCP uses the contained NetworkBinder",
+        ),
+        (
+            "peer_utp",
+            "Peer uTP",
+            "uTP uses contained UDP sockets with TCP fallback policy",
+        ),
+        (
+            "dht_udp",
+            "DHT UDP",
+            "DHT packets use the same contained UDP socket layer",
+        ),
+        (
+            "udp_tracker",
+            "UDP trackers",
+            "UDP tracker announces use contained UDP sockets",
+        ),
+        (
+            "http_tracker",
+            "HTTP(S) trackers",
+            "tracker HTTP/TLS is performed over contained sockets",
+        ),
+        (
+            "webseed",
+            "Web seeds",
+            "webseed range requests use contained HTTP/TLS sockets",
+        ),
+        (
+            "dns",
+            "DNS resolution",
+            "hostname resolution is validated or blocked by containment policy",
+        ),
+    ];
+    if !config.torrent.utp_enabled {
+        rows.retain(|(id, _, _)| *id != "peer_utp");
+    }
+    rows.into_iter()
+        .map(|(id, label, detail)| NetworkPathCheck {
+            id: id.into(),
+            label: label.into(),
+            level,
+            detail: detail.into(),
+        })
+        .collect()
+}
+
+fn add_storage_check(
+    checks: &mut Vec<DoctorCheck>,
+    id: &'static str,
+    label: &'static str,
+    path: Option<&str>,
+) {
+    let Some(path) = path else {
+        push_check(
+            checks,
+            id,
+            label,
+            DiagnosticLevel::Warning,
+            "not configured; daemon will use its default temporary directory behavior",
+            Some("set an explicit storage path for predictable operations"),
+        );
+        return;
+    };
+    let path = Path::new(path);
+    let existing = path.exists();
+    let disk = free_space_bytes(path).or_else(|| path.parent().and_then(free_space_bytes));
+    let level = match disk {
+        Some(bytes) if bytes < 1024 * 1024 * 1024 => DiagnosticLevel::Invalid,
+        Some(bytes) if bytes < 10 * 1024 * 1024 * 1024 => DiagnosticLevel::Warning,
+        Some(_) if existing || path.parent().map(Path::exists).unwrap_or(false) => {
+            DiagnosticLevel::Ok
+        }
+        Some(_) => DiagnosticLevel::Warning,
+        None => DiagnosticLevel::Warning,
+    };
+    let detail = match disk {
+        Some(bytes) => format!("{} available at {}", format_bytes(bytes), path.display()),
+        None => format!("unable to inspect free space at {}", path.display()),
+    };
+    push_check(
+        checks,
+        id,
+        label,
+        level,
+        detail,
+        Some("ensure the path exists, is writable, and has enough free space"),
+    );
+}
+
+#[cfg(unix)]
+fn free_space_bytes(path: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let stat = unsafe { stat.assume_init() };
+    Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+#[cfg(not(unix))]
+fn free_space_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+fn format_bytes(bytes: u64) -> String {
+    let mut value = bytes as f64;
+    let mut unit = "B";
+    for next in ["KB", "MB", "GB", "TB"] {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next;
+    }
+    if unit == "B" {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {unit}")
+    }
+}
+
+fn read_last_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>> {
+    if max_lines == 0 {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    for line in reader.lines() {
+        lines.push(line?);
+        if lines.len() > max_lines {
+            lines.remove(0);
+        }
+    }
+    Ok(lines)
 }
 
 fn effective_peer_worker_limit(
@@ -1156,6 +1522,34 @@ fn make_peer_id() -> [u8; 20] {
         *byte = (x & 0xff) as u8;
     }
     id
+}
+
+fn apply_resolved_metadata(
+    t: &mut Torrent,
+    real: &swarmotter_core::meta::TorrentMeta,
+    state: &EngineState,
+) {
+    t.meta = real.clone();
+    t.needs_metadata = false;
+    t.magnet_info_hash = None;
+    t.progress.have = (0..real.piece_count())
+        .map(|i| state.pieces_have.has(i))
+        .collect();
+    t.files = real
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| TorrentFile {
+            index: i,
+            path: f.path.join("/"),
+            length: f.length,
+            bytes_completed: 0,
+            priority: FilePriority::Normal,
+            wanted: true,
+        })
+        .collect();
+    t.priorities = vec![FilePriority::Normal; real.files.len()];
+    t.wanted = vec![true; real.files.len()];
 }
 
 #[async_trait]
@@ -1270,6 +1664,12 @@ impl DaemonOps for DaemonRuntime {
             reg.add(t)
                 .map_err(|_| CoreError::DuplicateTorrent(hash.to_hex()))?;
         }
+        tracing::info!(
+            info_hash = %hash,
+            network_blocked = blocked,
+            tracker_count = m.trackers.len(),
+            "magnet added"
+        );
         self.queue.lock().await.add(hash);
         if !blocked {
             self.reconcile_queue().await;
@@ -1713,9 +2113,6 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn update_settings(&self, patch: swarmotter_api::state::SettingsPatch) -> Result<()> {
-        let eff_dl;
-        let eff_ul;
-        let queue_limits;
         {
             let mut cfg = self.config.lock().await;
             if let Some(b) = patch.bandwidth {
@@ -1727,27 +2124,216 @@ impl DaemonOps for DaemonRuntime {
             if let Some(s) = patch.seeding {
                 cfg.seeding = s;
             }
-            eff_dl = cfg.bandwidth.effective_download();
-            eff_ul = cfg.bandwidth.effective_upload();
-            queue_limits = cfg.queue.clone();
         }
-        self.queue.lock().await.limits = queue_limits;
-        // Apply the new global limits live to the shared limiter (and therefore
-        // to all running engines/seeders, which share its buckets).
-        self.global_limiter
-            .set_capacity(swarmotter_core::bandwidth::RateDirection::Download, eff_dl)
-            .await;
-        self.global_limiter
-            .set_capacity(swarmotter_core::bandwidth::RateDirection::Upload, eff_ul)
-            .await;
-        self.reconcile_queue().await;
-        self.apply_peer_worker_limits().await;
-        self.reconcile_seeders().await;
+        self.apply_runtime_config_fields().await;
         Ok(())
+    }
+
+    async fn replace_config(&self, mut next: Config) -> Result<ConfigUpdateResult> {
+        let (previous, config_path) = {
+            let cfg = self.config.lock().await;
+            (cfg.clone(), self.config_path.clone())
+        };
+        if next.api.auth_token.is_none() {
+            next.api.auth_token = previous.api.auth_token.clone();
+        }
+        next.validate()?;
+
+        if let Some(path) = &config_path {
+            write_config_atomically(path, &next)?;
+        }
+
+        let restart_required_fields = restart_required_fields(&previous, &next);
+        {
+            let mut cfg = self.config.lock().await;
+            *cfg = next.clone();
+        }
+        self.apply_runtime_config_fields().await;
+
+        Ok(ConfigUpdateResult {
+            persisted: config_path.is_some(),
+            config_path: config_path.map(|p| p.display().to_string()),
+            restart_required: !restart_required_fields.is_empty(),
+            restart_required_fields,
+            applied_runtime_fields: vec![
+                "bandwidth".into(),
+                "queue".into(),
+                "seeding".into(),
+                "network".into(),
+                "torrent.allow_ipv6".into(),
+                "torrent.utp_enabled".into(),
+                "torrent.utp_prefer_tcp".into(),
+                "torrent.selfish".into(),
+                "storage".into(),
+                "watch".into(),
+            ],
+            config: redact_config(next),
+        })
     }
 
     async fn network_health(&self) -> NetworkHealth {
         self.network_health.lock().await.clone()
+    }
+
+    async fn network_diagnostics(&self) -> NetworkDiagnostics {
+        let cfg = self.config.lock().await.clone();
+        let health = self.network_health.lock().await.clone();
+        let probe = OsInterfaceProbe;
+        let interfaces = probe
+            .list()
+            .into_iter()
+            .map(|iface| {
+                let has_ipv4 = iface.addresses.iter().any(std::net::IpAddr::is_ipv4);
+                let has_ipv6 = iface.addresses.iter().any(std::net::IpAddr::is_ipv6);
+                NetworkInterfaceDiagnostic {
+                    selected: cfg.network.required_interface.as_deref()
+                        == Some(iface.name.as_str()),
+                    name: iface.name,
+                    status: format!("{:?}", iface.status).to_ascii_lowercase(),
+                    addresses: iface.addresses.iter().map(ToString::to_string).collect(),
+                    has_ipv4,
+                    has_ipv6,
+                }
+            })
+            .collect();
+        let traffic_level = if health.traffic_allowed {
+            DiagnosticLevel::Ok
+        } else {
+            DiagnosticLevel::Invalid
+        };
+        NetworkDiagnostics {
+            health: health.clone(),
+            listen_port: cfg.torrent.listen_port,
+            dht_port: cfg.dht.port,
+            torrent_allow_ipv6: cfg.torrent.allow_ipv6,
+            utp_enabled: cfg.torrent.utp_enabled,
+            utp_prefer_tcp: cfg.torrent.utp_prefer_tcp,
+            interfaces,
+            checks: vec![
+                NetworkPathCheck {
+                    id: "containment_status".into(),
+                    label: "Containment state".into(),
+                    level: traffic_level,
+                    detail: health.detail.clone(),
+                },
+                NetworkPathCheck {
+                    id: "ipv6_policy".into(),
+                    label: "IPv4/IPv6 policy".into(),
+                    level: if cfg.network.allow_ipv6 && cfg.torrent.allow_ipv6 {
+                        DiagnosticLevel::Ok
+                    } else {
+                        DiagnosticLevel::Warning
+                    },
+                    detail: format!(
+                        "network.allow_ipv6={}, torrent.allow_ipv6={}",
+                        cfg.network.allow_ipv6, cfg.torrent.allow_ipv6
+                    ),
+                },
+                NetworkPathCheck {
+                    id: "dns_validation".into(),
+                    label: "DNS containment validation".into(),
+                    level: if cfg.network.validate_dns {
+                        traffic_level
+                    } else {
+                        DiagnosticLevel::Warning
+                    },
+                    detail: if cfg.network.validate_dns {
+                        "DNS validation is enabled for the configured path".into()
+                    } else {
+                        "DNS validation is disabled; IP-literal peers and contained namespaces remain safest".into()
+                    },
+                },
+                NetworkPathCheck {
+                    id: "transport_selection".into(),
+                    label: "Peer transport selection".into(),
+                    level: DiagnosticLevel::Ok,
+                    detail: format!(
+                        "TCP is {}, uTP is {}, preference is {}",
+                        "enabled",
+                        if cfg.torrent.utp_enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        if cfg.torrent.utp_prefer_tcp {
+                            "tcp-first"
+                        } else {
+                            "utp-first"
+                        }
+                    ),
+                },
+            ],
+            containment_matrix: containment_matrix(&cfg, traffic_level),
+        }
+    }
+
+    async fn doctor_report(&self) -> DoctorReport {
+        let cfg = self.config.lock().await.clone();
+        let network = self.network_health.lock().await.clone();
+        let mut checks = Vec::new();
+        push_check(
+            &mut checks,
+            "config",
+            "Configuration validation",
+            if cfg.validate().is_ok() {
+                DiagnosticLevel::Ok
+            } else {
+                DiagnosticLevel::Invalid
+            },
+            "the active configuration parses and validates",
+            None,
+        );
+        push_check(
+            &mut checks,
+            "network",
+            "Network containment",
+            if network.traffic_allowed {
+                DiagnosticLevel::Ok
+            } else {
+                DiagnosticLevel::Invalid
+            },
+            network.detail,
+            Some(
+                "fix the configured interface/source/namespace before torrent traffic can continue",
+            ),
+        );
+        self.add_config_file_check(&mut checks).await;
+        self.add_log_file_check(&mut checks).await;
+        self.add_storage_checks(&cfg, &mut checks).await;
+        self.add_watch_checks(&cfg, &mut checks).await;
+        self.add_torrent_runtime_check(&mut checks).await;
+
+        let level = checks.iter().fold(DiagnosticLevel::Ok, |level, check| {
+            DiagnosticLevel::worst(level, check.level)
+        });
+        let summary = match level {
+            DiagnosticLevel::Ok => "all doctor checks passed".into(),
+            DiagnosticLevel::Warning => "one or more doctor checks need attention".into(),
+            DiagnosticLevel::Invalid => "one or more doctor checks are invalid".into(),
+        };
+        DoctorReport {
+            level,
+            summary,
+            checks,
+        }
+    }
+
+    async fn recent_logs(&self, max_lines: usize) -> LogSnapshot {
+        let Some(path) = self.log_file_path.clone() else {
+            return LogSnapshot {
+                enabled: false,
+                path: None,
+                lines: Vec::new(),
+                truncated: false,
+            };
+        };
+        let lines = read_last_lines(&path, max_lines).unwrap_or_default();
+        LogSnapshot {
+            enabled: true,
+            path: Some(path.display().to_string()),
+            truncated: lines.len() >= max_lines,
+            lines,
+        }
     }
 
     async fn global_stats(&self) -> GlobalStats {
@@ -1843,6 +2429,41 @@ impl DaemonOps for DaemonRuntime {
 
     async fn watch_scan(&self) -> Result<()> {
         self.scan_watch_folders().await
+    }
+
+    async fn watch_status(&self) -> WatchStatus {
+        let cfg = self.config.lock().await.clone();
+        let history = self.watch_imports.lock().await.clone();
+        let enabled = !cfg.watch.is_empty();
+        let folders = cfg
+            .watch
+            .into_iter()
+            .map(|folder| {
+                let path = Path::new(&folder.path);
+                let exists = path.is_dir();
+                let pending_torrent_files = if exists {
+                    watch::scan_torrent_files(path, folder.recursive).len()
+                } else {
+                    0
+                };
+                let last_result = history
+                    .iter()
+                    .rev()
+                    .find(|result| result.path.starts_with(&folder.path))
+                    .cloned();
+                WatchFolderStatus {
+                    config: folder,
+                    exists,
+                    pending_torrent_files,
+                    last_result,
+                }
+            })
+            .collect();
+        WatchStatus {
+            enabled,
+            folders,
+            recent_imports: history,
+        }
     }
 
     async fn watch_history(&self) -> Vec<watch::ImportResult> {
@@ -2159,6 +2780,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_applies_resolved_magnet_metadata_while_engine_runs() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let real_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "resolved-magnet.bin",
+            b"resolved magnet payload",
+            8,
+            None,
+            false,
+        );
+        let real_meta = swarmotter_core::meta::parse_torrent(&real_bytes).unwrap();
+        let hash = real_meta.info_hash;
+        let placeholder_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "magnet placeholder",
+            b"placeholder",
+            8,
+            None,
+            false,
+        );
+        let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
+        let mut torrent = Torrent::new(placeholder_meta, 1);
+        torrent.state = TorrentState::DownloadingMetadata;
+        torrent.needs_metadata = true;
+        torrent.magnet_info_hash = Some(hash);
+        runtime.registry.lock().await.add(torrent).unwrap();
+
+        let mut pieces_have =
+            swarmotter_core::storage::resume::PieceBitfield::new(real_meta.piece_count());
+        pieces_have.set(0);
+        runtime.engine_states.lock().await.insert(
+            hash,
+            Arc::new(Mutex::new(EngineState {
+                pieces_have,
+                piece_count: real_meta.piece_count(),
+                total_length: real_meta.total_length,
+                resolved_meta: Some(real_meta.clone()),
+                ..Default::default()
+            })),
+        );
+
+        let summary = runtime.get_torrent(&hash).await.unwrap();
+        assert_eq!(summary.state, TorrentState::Downloading);
+        assert_eq!(summary.name, "resolved-magnet.bin");
+        assert_eq!(summary.total_length, real_meta.total_length);
+        assert_eq!(summary.piece_count, real_meta.piece_count());
+        assert_eq!(summary.pieces_have, 1);
+
+        let reg = runtime.registry.lock().await;
+        let torrent = reg.get(&hash).unwrap();
+        assert!(!torrent.needs_metadata);
+        assert_eq!(torrent.files[0].path, "resolved-magnet.bin");
+    }
+
+    #[tokio::test]
+    async fn reconcile_keeps_unresolved_magnet_in_metadata_state() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let placeholder_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "magnet placeholder",
+            b"placeholder",
+            8,
+            None,
+            false,
+        );
+        let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
+        let hash =
+            swarmotter_core::hash::InfoHash::from_hex("95c6c298c84fee2eee10c044d673537da158f0f8")
+                .unwrap();
+        let mut torrent = Torrent::new(placeholder_meta, 1);
+        torrent.state = TorrentState::Queued;
+        torrent.needs_metadata = true;
+        torrent.magnet_info_hash = Some(hash);
+        runtime.registry.lock().await.add(torrent).unwrap();
+        runtime.engine_states.lock().await.insert(
+            hash,
+            Arc::new(Mutex::new(EngineState {
+                tracker_message: Some("fetching metadata via BEP 9".into()),
+                ..Default::default()
+            })),
+        );
+
+        let summary = runtime.get_torrent(&hash).await.unwrap();
+        assert_eq!(summary.state, TorrentState::DownloadingMetadata);
+        assert_eq!(summary.total_length, "placeholder".len() as u64);
+    }
+
+    #[tokio::test]
     async fn torrent_stats_includes_live_engine_diagnostics() {
         let cfg = Config::default();
         let health = NetworkHealth::blocked(
@@ -2275,6 +2993,30 @@ mod tests {
         assert_eq!(effective_peer_worker_limit(120, 0, 3), 40);
         assert_eq!(effective_peer_worker_limit(120, 24, 3), 24);
         assert_eq!(effective_peer_worker_limit(2, 64, 5), 1);
+    }
+
+    #[tokio::test]
+    async fn replace_config_preserves_and_redacts_auth_token() {
+        let mut cfg = Config::default();
+        cfg.api.auth_token = Some("existing-token".into());
+        cfg.api.require_auth = true;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+
+        let mut next = runtime.get_config().await;
+        next.api.auth_token = None;
+        next.api.require_auth = true;
+        let result = runtime.replace_config(next).await.unwrap();
+
+        assert_eq!(
+            runtime.get_config().await.api.auth_token.as_deref(),
+            Some("existing-token")
+        );
+        assert_eq!(result.config.api.auth_token, None);
     }
 
     #[tokio::test]

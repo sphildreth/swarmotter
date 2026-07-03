@@ -139,18 +139,6 @@ impl DhtRunner {
         Ok(())
     }
 
-    /// Iterative `get_peers` for an info hash. Returns discovered peers and
-    /// populates the routing table with nodes that responded. Performs a
-    /// bounded number of rounds against the closest known nodes, with short
-    /// per-node timeouts so unreachable bootstrap nodes cannot stall the
-    /// caller.
-    pub async fn get_peers(&self, info_hash: InfoHash, max_rounds: usize) -> Result<Vec<PeerAddr>> {
-        Ok(self
-            .get_peers_with_stats(info_hash, max_rounds)
-            .await?
-            .peers)
-    }
-
     /// Iterative `get_peers` with basic reachability counters for diagnostics.
     pub async fn get_peers_with_stats(
         &self,
@@ -582,7 +570,11 @@ mod tests {
 
         let binder = Arc::new(LoopbackBinder);
         let runner = DhtRunner::new(NodeId::random(), binder, vec![node_addr], 0);
-        let peers = runner.get_peers(info_hash, 2).await.unwrap();
+        let peers = runner
+            .get_peers_with_stats(info_hash, 2)
+            .await
+            .unwrap()
+            .peers;
         assert!(!peers.is_empty(), "should have discovered a peer");
         assert_eq!(peers[0].port, 6881);
         assert_eq!(peers[0].ip.to_string(), "1.2.3.4");
@@ -634,7 +626,11 @@ mod tests {
 
         let binder = Arc::new(LoopbackBinder);
         let runner = DhtRunner::new(NodeId::random(), binder, vec![v4_addr], 0);
-        let peers = runner.get_peers(info_hash, 4).await.unwrap();
+        let peers = runner
+            .get_peers_with_stats(info_hash, 4)
+            .await
+            .unwrap()
+            .peers;
 
         assert!(peers
             .iter()

@@ -52,6 +52,10 @@ const PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const NORMAL_PEER_SESSION_DEADLINE: Duration = Duration::from_secs(180);
 const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DHT_DISCOVERY_ROUNDS: usize = 6;
+const TRACKER_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(8);
+const TRACKER_ANNOUNCE_EARLY_RETURN_GRACE: Duration = Duration::from_millis(250);
+const MAGNET_METADATA_RETRY_PAUSE: Duration = Duration::from_secs(2);
+const MAGNET_METADATA_MAX_ROUNDS: u32 = 8;
 const WEBSEED_BATCH_PIECES: usize = 128;
 const WEBSEED_MAX_CONCURRENT_REQUESTS: usize = 32;
 const WEBSEED_MAX_MIRROR_ATTEMPTS: usize = 4;
@@ -66,6 +70,14 @@ pub struct MagnetParams {
     pub info_hash: swarmotter_core::hash::InfoHash,
     pub name: String,
     pub trackers: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct TrackerAnnounceOutcome {
+    peers: Vec<PeerAddr>,
+    ok: bool,
+    message: Option<String>,
+    failures: u32,
 }
 
 /// Live engine state, shared between the engine task and the daemon so the
@@ -420,6 +432,7 @@ impl TorrentEngine {
                 CommandOutcome::Continue | CommandOutcome::Pause => {}
             }
             let max_concurrent = self.current_peer_worker_limit();
+            self.sync_have_from_state(&mut have, piece_count).await;
 
             if have.count(piece_count) == piece_count {
                 let storage = self.complete_storage(&storage).await?;
@@ -1310,11 +1323,13 @@ impl TorrentEngine {
         }
     }
 
-    /// Announce to all HTTP trackers in tier order; return discovered peers.
+    /// Announce to all HTTP/UDP trackers and return discovered peers.
     async fn announce(&self, event: AnnounceEvent) -> Vec<PeerAddr> {
-        let mut all = Vec::new();
-        let mut ok = false;
-        let mut msg: Option<String> = None;
+        let trackers: Vec<String> =
+            tracker::announce_tiers(self.meta.announce.as_deref(), &self.meta.announce_list)
+                .into_iter()
+                .flatten()
+                .collect();
         let (uploaded, downloaded, left) = {
             let s = self.state.lock().await;
             (
@@ -1323,53 +1338,196 @@ impl TorrentEngine {
                 s.total_length.saturating_sub(s.bytes_completed),
             )
         };
-        for tier in tracker::announce_tiers(self.meta.announce.as_deref(), &self.meta.announce_list)
-        {
-            for url in tier {
-                let req = AnnounceRequest {
-                    tracker_url: url.clone(),
-                    info_hash: self.meta.info_hash,
-                    peer_id: self.peer_id,
-                    port: self.listen_port,
-                    uploaded,
-                    downloaded,
-                    left,
-                    event,
-                    numwant: Some(200),
-                    compact: true,
-                };
-                let result = if url.starts_with("udp://") {
-                    udp_tracker::udp_announce(self.binder.as_ref(), &req).await
-                } else {
-                    tracker::http_announce(self.binder.as_ref(), &req).await
-                };
-                match result {
-                    Ok(resp) => {
-                        if let Some(fr) = resp.failure_reason {
-                            msg = Some(format!("{url}: {fr}"));
-                            continue;
+        let outcome = self
+            .announce_trackers(
+                self.meta.info_hash,
+                trackers,
+                uploaded,
+                downloaded,
+                left,
+                event,
+                true,
+            )
+            .await;
+        self.record_tracker_announce_outcome(&outcome).await;
+        outcome.peers
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn announce_trackers(
+        &self,
+        info_hash: InfoHash,
+        trackers: Vec<String>,
+        uploaded: u64,
+        downloaded: u64,
+        left: u64,
+        event: AnnounceEvent,
+        return_after_first_peers: bool,
+    ) -> TrackerAnnounceOutcome {
+        if trackers.is_empty() {
+            return TrackerAnnounceOutcome {
+                message: Some("no trackers configured".into()),
+                ..Default::default()
+            };
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for url in trackers {
+            let binder = self.binder.clone();
+            let req = AnnounceRequest {
+                tracker_url: url.clone(),
+                info_hash,
+                peer_id: self.peer_id,
+                port: self.listen_port,
+                uploaded,
+                downloaded,
+                left,
+                event,
+                numwant: Some(200),
+                compact: true,
+            };
+            tasks.spawn(async move {
+                let result = timeout(TRACKER_ANNOUNCE_TIMEOUT, async {
+                    if url.starts_with("udp://") {
+                        udp_tracker::udp_announce(binder.as_ref(), &req).await
+                    } else {
+                        tracker::http_announce(binder.as_ref(), &req).await
+                    }
+                })
+                .await
+                .map_err(|_| CoreError::Internal("tracker announce timed out".into()))
+                .and_then(|r| r);
+                (url, result)
+            });
+        }
+
+        let mut outcome = TrackerAnnounceOutcome::default();
+        loop {
+            let joined = if return_after_first_peers && !outcome.peers.is_empty() {
+                match timeout(TRACKER_ANNOUNCE_EARLY_RETURN_GRACE, tasks.join_next()).await {
+                    Ok(joined) => joined,
+                    Err(_) => break,
+                }
+            } else {
+                tasks.join_next().await
+            };
+            let Some(joined) = joined else {
+                break;
+            };
+            match joined {
+                Ok((url, Ok(resp))) => {
+                    if let Some(fr) = resp.failure_reason {
+                        outcome.failures = outcome.failures.saturating_add(1);
+                        if !outcome.ok {
+                            outcome.message = Some(format!("{url}: {fr}"));
                         }
-                        ok = true;
-                        if resp.peers.is_empty() {
-                            msg = Some(format!(
+                        continue;
+                    }
+                    outcome.ok = true;
+                    let peer_count = resp.peers.len();
+                    if resp.peers.is_empty() {
+                        if outcome.message.is_none() {
+                            outcome.message = Some(format!(
                                 "{url}: announce returned 0 peers (seeders={}, leechers={})",
                                 resp.seeders, resp.leechers
                             ));
                         }
-                        all.extend(resp.peers);
+                    } else {
+                        outcome.message = Some(format!(
+                            "{url}: announce returned {peer_count} peers (seeders={}, leechers={})",
+                            resp.seeders, resp.leechers
+                        ));
                     }
-                    Err(e) => {
-                        msg = Some(format!("{url}: {e}"));
-                        tracing::debug!(tracker = %url, error = %e, "tracker announce failed");
+                    outcome.peers.extend(resp.peers);
+                }
+                Ok((url, Err(e))) => {
+                    outcome.failures = outcome.failures.saturating_add(1);
+                    if !outcome.ok {
+                        outcome.message = Some(format!("{url}: {e}"));
+                    }
+                    tracing::debug!(tracker = %url, error = %e, "tracker announce failed");
+                }
+                Err(e) => {
+                    outcome.failures = outcome.failures.saturating_add(1);
+                    if !outcome.ok {
+                        outcome.message = Some(format!("tracker announce task failed: {e}"));
                     }
                 }
             }
         }
+        dedupe_peers(&mut outcome.peers);
+        outcome
+    }
+
+    async fn record_tracker_announce_outcome(&self, outcome: &TrackerAnnounceOutcome) {
         let mut s = self.state.lock().await;
-        s.tracker_ok = ok;
-        s.tracker_message = msg;
+        s.tracker_ok = outcome.ok;
+        s.tracker_message = outcome.message.clone();
         s.last_announce = Some(now_secs());
-        all
+        if outcome.ok {
+            s.tracker_last_ok = Some(Instant::now());
+            if outcome.failures == 0 {
+                s.tracker_failures_recent = 0;
+            }
+        }
+        if outcome.failures > 0 {
+            s.tracker_failures_recent = s.tracker_failures_recent.saturating_add(outcome.failures);
+        }
+    }
+
+    async fn discover_magnet_dht_peers(&self, info_hash: InfoHash) -> Vec<PeerAddr> {
+        let Some(dht) = &self.dht else {
+            return Vec::new();
+        };
+        let dht_result = tokio::time::timeout(
+            DHT_DISCOVERY_TIMEOUT,
+            dht.get_peers_with_stats(info_hash, DHT_DISCOVERY_ROUNDS),
+        )
+        .await;
+        match dht_result {
+            Ok(Ok(lookup)) => {
+                let peers = self.filter_allowed_peers(lookup.peers);
+                if lookup.responding_nodes > 0 || !peers.is_empty() {
+                    let mut s = self.state.lock().await;
+                    s.dht_discovery_ok = !peers.is_empty();
+                    s.dht_last_seen = Some(Instant::now());
+                }
+                tracing::debug!(
+                    queried = lookup.queried_nodes,
+                    responding = lookup.responding_nodes,
+                    peers = peers.len(),
+                    "DHT magnet metadata peer discovery completed"
+                );
+                peers
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "DHT magnet metadata peer discovery failed");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::debug!("DHT magnet metadata peer discovery timed out");
+                Vec::new()
+            }
+        }
+    }
+
+    async fn sync_have_from_state(&self, have: &mut PieceBitfield, piece_count: usize) {
+        let state_have = {
+            let s = self.state.lock().await;
+            if s.pieces_have.count(piece_count) <= have.count(piece_count) {
+                None
+            } else {
+                Some(s.pieces_have.clone())
+            }
+        };
+        let Some(state_have) = state_have else {
+            return;
+        };
+        for piece in 0..piece_count {
+            if state_have.has(piece) {
+                have.set(piece);
+            }
+        }
     }
 
     /// Fetch magnet metadata via BEP 9. Announces to the magnet's trackers
@@ -1377,98 +1535,99 @@ impl TorrentEngine {
     /// seed peers, then fetches the `info` dict from the candidates. All peer
     /// connections go through the binder.
     async fn fetch_magnet_metadata(&self, magnet: &MagnetParams) -> Result<Vec<u8>> {
-        // Build a temporary announce request set against the real info hash
-        // using the magnet's trackers. We reuse the engine's announce helper
-        // shape but with the magnet info hash by temporarily swapping it in:
-        // simpler to announce directly here.
-        let mut candidates: Vec<PeerAddr> = Vec::new();
-        for tier in tracker::announce_tiers(magnet.trackers.first().map(|s| s.as_str()), &[]) {
-            for url in tier {
-                let req = AnnounceRequest {
-                    tracker_url: url.clone(),
-                    info_hash: magnet.info_hash,
-                    peer_id: self.peer_id,
-                    port: self.listen_port,
-                    uploaded: 0,
-                    downloaded: 0,
-                    left: 0,
-                    event: AnnounceEvent::Started,
-                    numwant: Some(200),
-                    compact: true,
-                };
-                let result = if url.starts_with("udp://") {
-                    udp_tracker::udp_announce(self.binder.as_ref(), &req).await
-                } else {
-                    tracker::http_announce(self.binder.as_ref(), &req).await
-                };
-                if let Ok(resp) = result {
-                    if resp.failure_reason.is_none() {
-                        candidates.extend(resp.peers);
-                    }
+        let mut candidates = Vec::new();
+        let mut last_error: Option<CoreError> = None;
+
+        for round in 1..=MAGNET_METADATA_MAX_ROUNDS {
+            match self.poll_commands().await {
+                CommandOutcome::Stop => {
+                    return Err(CoreError::Internal("magnet metadata fetch stopped".into()));
                 }
+                CommandOutcome::Reannounce | CommandOutcome::Continue | CommandOutcome::Pause => {}
             }
-        }
-        // Merge announce-list tiers too.
-        if magnet.trackers.len() > 1 {
-            let extra = tracker::announce_tiers(None, &[magnet.trackers[1..].to_vec()]);
-            for tier in extra {
-                for url in tier {
-                    let req = AnnounceRequest {
-                        tracker_url: url.clone(),
-                        info_hash: magnet.info_hash,
-                        peer_id: self.peer_id,
-                        port: self.listen_port,
-                        uploaded: 0,
-                        downloaded: 0,
-                        left: 0,
-                        event: AnnounceEvent::Started,
-                        numwant: Some(200),
-                        compact: true,
-                    };
-                    let result = if url.starts_with("udp://") {
-                        udp_tracker::udp_announce(self.binder.as_ref(), &req).await
+
+            let outcome = self
+                .announce_trackers(
+                    magnet.info_hash,
+                    magnet.trackers.clone(),
+                    0,
+                    0,
+                    1,
+                    if round == 1 {
+                        AnnounceEvent::Started
                     } else {
-                        tracker::http_announce(self.binder.as_ref(), &req).await
-                    };
-                    if let Ok(resp) = result {
-                        if resp.failure_reason.is_none() {
-                            candidates.extend(resp.peers);
-                        }
-                    }
-                }
-            }
-        }
-        for p in &self.seed_peers {
-            if !candidates.contains(p) {
-                candidates.push(*p);
-            }
-        }
-        // Trackerless magnet fallback: if no trackers/peers, discover via DHT.
-        if candidates.is_empty() {
-            if let Some(dht) = &self.dht {
-                let dht_result = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    dht.get_peers(magnet.info_hash, 3),
+                        AnnounceEvent::Empty
+                    },
+                    false,
                 )
                 .await;
-                if let Ok(Ok(peers)) = dht_result {
-                    candidates.extend(peers);
+            self.record_tracker_announce_outcome(&outcome).await;
+            merge_unique_peers(&mut candidates, self.filter_allowed_peers(outcome.peers));
+
+            for p in &self.seed_peers {
+                if self.peer_allowed(p) && !candidates.contains(p) {
+                    candidates.push(*p);
                 }
             }
+
+            let dht_peers = self.discover_magnet_dht_peers(magnet.info_hash).await;
+            merge_unique_peers(&mut candidates, dht_peers);
+            dedupe_peers(&mut candidates);
+            self.state.lock().await.peers = candidates.clone();
+
+            if candidates.is_empty() {
+                last_error = Some(CoreError::Internal(
+                    "magnet metadata fetch: no peers discovered".into(),
+                ));
+                tracing::debug!(round, "magnet metadata discovery found no peers");
+            } else {
+                tracing::debug!(
+                    round,
+                    candidates = candidates.len(),
+                    "attempting magnet metadata fetch from discovered peers"
+                );
+                match crate::metadata::fetch_metadata_from_candidates_with_transport(
+                    self.binder.clone(),
+                    magnet.info_hash,
+                    self.peer_id,
+                    &candidates,
+                    self.utp_enabled,
+                    self.utp_prefer_tcp,
+                )
+                .await
+                {
+                    Ok(info) => {
+                        tracing::info!(
+                            info_hash = %magnet.info_hash,
+                            round,
+                            candidates = candidates.len(),
+                            "magnet metadata fetched"
+                        );
+                        return Ok(info);
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            round,
+                            candidates = candidates.len(),
+                            "magnet metadata fetch round failed; will retry discovery"
+                        );
+                        last_error = Some(e);
+                    }
+                }
+            }
+
+            if round < MAGNET_METADATA_MAX_ROUNDS {
+                self.sleep_or_stop(MAGNET_METADATA_RETRY_PAUSE).await;
+            }
         }
-        self.state.lock().await.peers = candidates.clone();
-        if candidates.is_empty() {
-            return Err(CoreError::Internal(
-                "magnet metadata fetch: no peers discovered".into(),
-            ));
-        }
-        crate::metadata::fetch_metadata_from_candidates(
-            self.binder.clone(),
-            magnet.info_hash,
-            self.peer_id,
-            &candidates,
-        )
-        .await
+
+        Err(CoreError::Internal(format!(
+            "magnet metadata fetch failed after discovery retries: {}",
+            last_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "no metadata candidates".into())
+        )))
     }
 
     async fn update_progress(&self, have: &PieceBitfield) {
@@ -3324,6 +3483,42 @@ mod tests {
         have.set(1);
         let pick = engine.pick_piece(Some(&peer_bf), &have);
         assert_eq!(pick, Some(2));
+    }
+
+    #[tokio::test]
+    async fn sync_have_from_state_merges_more_complete_live_state() {
+        let bytes =
+            build_single_file_torrent("f", b"0123456789abcdef0123456789abcdef", 8, None, false);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let piece_count = meta.piece_count();
+        let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        {
+            let mut live = state.lock().await;
+            live.piece_count = piece_count;
+            live.pieces_have = PieceBitfield::new(piece_count);
+            live.pieces_have.set(0);
+            live.pieces_have.set(2);
+        }
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let engine = TorrentEngine::new(
+            meta,
+            PathBuf::from("/tmp"),
+            [0u8; 20],
+            binder,
+            state,
+            rx,
+            vec![],
+            6881,
+        );
+        let mut have = PieceBitfield::new(piece_count);
+        have.set(0);
+
+        engine.sync_have_from_state(&mut have, piece_count).await;
+
+        assert!(have.has(0));
+        assert!(have.has(2));
+        assert_eq!(have.count(piece_count), 2);
     }
 
     #[test]

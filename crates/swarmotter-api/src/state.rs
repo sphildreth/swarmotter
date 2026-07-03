@@ -11,6 +11,9 @@ use std::sync::Arc;
 use swarmotter_core::config::Config;
 use swarmotter_core::error::Result;
 use swarmotter_core::hash::InfoHash;
+use swarmotter_core::models::diagnostics::{
+    ConfigUpdateResult, DoctorReport, LogSnapshot, NetworkDiagnostics, WatchStatus,
+};
 use swarmotter_core::models::network::NetworkHealth;
 use swarmotter_core::models::peer::Peer;
 use swarmotter_core::models::stats::{GlobalStats, TorrentDiagnostics};
@@ -108,9 +111,17 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn get_config(&self) -> Config;
     /// Update safe runtime settings (bandwidth/queue/seeding limits).
     async fn update_settings(&self, patch: SettingsPatch) -> Result<()>;
+    /// Replace the full validated configuration.
+    async fn replace_config(&self, config: Config) -> Result<ConfigUpdateResult>;
 
     /// Network containment health.
     async fn network_health(&self) -> NetworkHealth;
+    /// Rich network diagnostics for API dashboards.
+    async fn network_diagnostics(&self) -> NetworkDiagnostics;
+    /// Doctor/system health checks.
+    async fn doctor_report(&self) -> DoctorReport;
+    /// Recent daemon log lines.
+    async fn recent_logs(&self, max_lines: usize) -> LogSnapshot;
     /// Global stats.
     async fn global_stats(&self) -> GlobalStats;
     /// Per-torrent diagnostics and stats.
@@ -118,6 +129,8 @@ pub trait DaemonOps: Send + Sync + 'static {
 
     /// Trigger a watch-folder scan.
     async fn watch_scan(&self) -> Result<()>;
+    /// Watch-folder configured status.
+    async fn watch_status(&self) -> WatchStatus;
     /// Watch-folder import history.
     async fn watch_history(&self) -> Vec<swarmotter_core::watch::ImportResult>;
 }

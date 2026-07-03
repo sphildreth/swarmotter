@@ -2,12 +2,37 @@
 // SwarmOtter Web UI controller. Consumes the same REST API as external tools.
 const API = "/api/v1";
 const DEFAULT_TOAST_DISPLAY_MS = 5000;
+const MAX_TOAST_DISPLAY_MS = 60000;
+const MAX_VISIBLE_TOASTS = 3;
+const MAX_LOG_LINES = 500;
 const TOAST_DISPLAY_STORAGE_KEY = "swarmotter.toastDisplayMs";
 let currentHash = null;
 let toastDisplayMs = loadToastDisplayMs();
 let torrentsLoaded = false;
 let knownTorrents = new Map();
 let expectedRemovedTorrents = new Map();
+let magnetAddInFlight = false;
+let logEventSource = null;
+let lastEventStreamErrorAt = 0;
+let fullConfigSnapshot = null;
+
+const EVENT_KINDS = [
+  "torrent_added",
+  "torrent_changed",
+  "torrent_removed",
+  "torrent_error",
+  "torrent_metadata_received",
+  "torrent_completed",
+  "torrent_files_changed",
+  "torrent_trackers_changed",
+  "torrent_peers_changed",
+  "stats_updated",
+  "network_status_changed",
+  "watch_folder_imported",
+  "watch_folder_failed",
+  "settings_changed",
+  "daemon_health_changed",
+];
 
 const TORRENT_ACTIONS = [
   {
@@ -39,17 +64,23 @@ const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 function loadToastDisplayMs() {
   try {
     const raw = window.localStorage.getItem(TOAST_DISPLAY_STORAGE_KEY);
-    const ms = Number(raw);
-    return Number.isFinite(ms) && ms >= 1000 ? ms : DEFAULT_TOAST_DISPLAY_MS;
+    return normalizeToastDurationMs(raw);
   } catch {
     return DEFAULT_TOAST_DISPLAY_MS;
   }
 }
 
+function normalizeToastDurationMs(value) {
+  const ms = Number(value);
+  return Number.isFinite(ms)
+    ? Math.max(1000, Math.min(MAX_TOAST_DISPLAY_MS, Math.round(ms)))
+    : DEFAULT_TOAST_DISPLAY_MS;
+}
+
 function setToastDisplaySeconds(seconds) {
   const n = Number(seconds);
   const ms = Number.isFinite(n)
-    ? Math.max(1000, Math.min(60000, Math.round(n * 1000)))
+    ? normalizeToastDurationMs(n * 1000)
     : DEFAULT_TOAST_DISPLAY_MS;
   toastDisplayMs = ms;
   try { window.localStorage.setItem(TOAST_DISPLAY_STORAGE_KEY, String(ms)); } catch {}
@@ -59,14 +90,27 @@ function setToastDisplaySeconds(seconds) {
 function showToast(title, message = "", type = "info", durationMs = toastDisplayMs) {
   const region = $("#toast-region");
   if (!region) return;
+  const safeDurationMs = normalizeToastDurationMs(durationMs);
+  while (region.children.length >= MAX_VISIBLE_TOASTS) {
+    region.firstElementChild.remove();
+  }
   const toast = document.createElement("div");
   toast.className = "toast " + cssToken(type || "info");
   toast.setAttribute("role", type === "error" ? "alert" : "status");
+  toast.tabIndex = 0;
   toast.innerHTML = `
     <div class="toast-title">${escapeHtml(title)}</div>
     ${message ? `<div class="toast-message">${escapeHtml(message)}</div>` : ""}`;
   region.appendChild(toast);
-  window.setTimeout(() => toast.remove(), durationMs);
+  const remove = () => {
+    window.clearTimeout(timer);
+    toast.remove();
+  };
+  const timer = window.setTimeout(remove, safeDurationMs);
+  toast.addEventListener("click", remove);
+  toast.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") remove();
+  });
 }
 
 function showError(title, error) {
@@ -133,10 +177,9 @@ async function api(path, opts = {}) {
 }
 
 // --- Navigation ---
-$$(".nav").forEach(btn => btn.addEventListener("click", () => {
+function openView(view, activeButton = null) {
   $$(".nav").forEach(b => b.classList.remove("active"));
-  btn.classList.add("active");
-  const view = btn.dataset.view;
+  if (activeButton && activeButton.classList.contains("nav")) activeButton.classList.add("active");
   $$(".view").forEach(v => v.classList.add("hidden"));
   $("#view-" + view).classList.remove("hidden");
   if (view === "torrents") refreshTorrents();
@@ -144,6 +187,11 @@ $$(".nav").forEach(btn => btn.addEventListener("click", () => {
   if (view === "settings") refreshSettings();
   if (view === "watch") refreshWatch();
   if (view === "logs") refreshLogs();
+  if (view === "doctor") refreshDoctor();
+}
+
+$$(".nav").forEach(btn => btn.addEventListener("click", () => {
+  openView(btn.dataset.view, btn);
 }));
 
 // --- Torrents ---
@@ -338,6 +386,42 @@ function renderHealthSummary(h) {
   return score ? `Score ${score}. Health answers: can this torrent complete, and is it downloading well right now?` : "";
 }
 
+function levelLabel(level) {
+  switch (level) {
+    case "ok": return "OK";
+    case "warning": return "Warning";
+    case "invalid": return "Invalid";
+    default: return healthLabelName(level);
+  }
+}
+
+function levelClass(level) {
+  if (level === "ok") return "status-ok";
+  if (level === "warning") return "status-warning";
+  if (level === "invalid") return "status-invalid";
+  return "";
+}
+
+function renderStatus(level) {
+  return `<span class="status-pill ${levelClass(level)}">${escapeHtml(levelLabel(level))}</span>`;
+}
+
+function renderKv(rows) {
+  return `<dl class="kv">${rows.map(([key, value]) => (
+    `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(value ?? "")}</dd>`
+  )).join("")}</dl>`;
+}
+
+function renderCheckList(checks) {
+  if (!checks || checks.length === 0) return `<p class="muted">No checks reported.</p>`;
+  return `<ul class="compact-list">${checks.map(c => `
+    <li>
+      <div>${renderStatus(c.level)} <strong>${escapeHtml(c.label || c.id)}</strong></div>
+      <div class="muted">${escapeHtml(c.detail || "")}</div>
+      ${c.remediation ? `<div>${escapeHtml(c.remediation)}</div>` : ""}
+    </li>`).join("")}</ul>`;
+}
+
 $$(".tab").forEach(btn => btn.addEventListener("click", () => {
   $$(".tab").forEach(b => b.classList.remove("active"));
   btn.classList.add("active");
@@ -407,16 +491,39 @@ $("#back-btn").addEventListener("click", () => {
 
 // --- Add ---
 $("#add-magnet-btn").addEventListener("click", async () => {
+  if (magnetAddInFlight) return;
+  const button = $("#add-magnet-btn");
+  const input = $("#magnet-input");
   try {
-    const magnet = $("#magnet-input").value.trim();
+    const magnet = input.value.trim();
+    if (!magnet) {
+      showToast("Enter a magnet link", "", "warning");
+      return;
+    }
+    magnetAddInFlight = true;
+    button.disabled = true;
+    button.setAttribute("aria-busy", "true");
+    showToast("Adding magnet", "", "info");
     const dir = $("#magnet-dir").value.trim();
     const body = { magnet };
     if (dir) body.download_dir = dir;
     const h = await api("/torrents/magnet", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     showToast("Torrent added", h, "success");
-    $("#magnet-input").value = "";
+    input.value = "";
     refreshTorrents();
-  } catch (e) { showError("Add magnet failed", e); }
+  } catch (e) {
+    if (e && e.code === "duplicate_torrent") {
+      showToast("Torrent already added", "", "warning");
+      input.value = "";
+      refreshTorrents();
+    } else {
+      showError("Add magnet failed", e);
+    }
+  } finally {
+    magnetAddInFlight = false;
+    button.disabled = false;
+    button.removeAttribute("aria-busy");
+  }
 });
 
 $("#add-file-btn").addEventListener("click", async () => {
@@ -513,12 +620,45 @@ document.addEventListener("drop", (e) => {
 // --- Network ---
 async function refreshNetwork() {
   try {
-    const h = await api("/network/health");
-    const el = $("#network-health");
-    const badge = $("#health-badge");
-    el.innerHTML = `<pre>${escapeHtml(JSON.stringify(h, null, 2))}</pre>`;
-    badge.textContent = h.status;
-    badge.className = "badge " + (h.traffic_allowed ? "ok" : "bad");
+    const d = await api("/network/diagnostics");
+    const h = d.health || {};
+    $("#network-summary").innerHTML = `
+      <h3>Network summary</h3>
+      ${renderKv([
+        ["Mode", h.mode],
+        ["Status", h.status],
+        ["Traffic allowed", String(!!h.traffic_allowed)],
+        ["Listen port", d.listen_port],
+        ["DHT port", d.dht_port],
+        ["Peer transports", `${d.utp_enabled ? "TCP + uTP" : "TCP only"} (${d.utp_prefer_tcp ? "TCP first" : "uTP first"})`],
+      ])}
+      <p class="muted">${escapeHtml(h.detail || "")}</p>`;
+    $("#network-health").innerHTML = `<h3>Health payload</h3><pre class="health-payload">${escapeHtml(JSON.stringify(h, null, 2))}</pre>`;
+    $("#network-config").innerHTML = `
+      <h3>Configuration</h3>
+      ${renderKv([
+        ["Required interface", h.required_interface || "not set"],
+        ["Required IPv4", h.required_source_ipv4 || "not set"],
+        ["Required IPv6", h.required_source_ipv6 || "not set"],
+        ["Network IPv6", String(!!h.allow_ipv6)],
+        ["Torrent IPv6", String(!!d.torrent_allow_ipv6)],
+        ["Fail closed", String(!!h.fail_closed)],
+      ])}`;
+    $("#network-interfaces").innerHTML = `
+      <h3>Interfaces</h3>
+      <table><thead><tr><th>Name</th><th>Status</th><th>Families</th><th>Addresses</th></tr></thead>
+      <tbody>${(d.interfaces || []).map(iface => `
+        <tr>
+          <td>${iface.selected ? "<strong>" : ""}${escapeHtml(iface.name)}${iface.selected ? "</strong>" : ""}</td>
+          <td>${escapeHtml(iface.status)}</td>
+          <td>${iface.has_ipv4 ? "IPv4" : ""}${iface.has_ipv4 && iface.has_ipv6 ? " + " : ""}${iface.has_ipv6 ? "IPv6" : ""}</td>
+          <td>${escapeHtml((iface.addresses || []).join(", "))}</td>
+        </tr>`).join("")}</tbody></table>`;
+    $("#network-originality").innerHTML = `
+      <h3>Containment matrix</h3>
+      ${renderCheckList(d.containment_matrix || [])}
+      <h3>Checks</h3>
+      ${renderCheckList(d.checks || [])}`;
   } catch (e) { log("network error: " + e.message); }
 }
 
@@ -530,6 +670,8 @@ async function refreshSettings() {
     $("#bw-ul").value = cfg.bandwidth.global_upload ?? "";
     $("#bw-alt").checked = !!cfg.bandwidth.alt_enabled;
     $("#toast-seconds").value = String(Math.round(toastDisplayMs / 1000));
+    fullConfigSnapshot = cfg;
+    $("#full-config-json").value = JSON.stringify(cfg, null, 2);
   } catch (e) { log("settings error: " + e.message); }
 }
 
@@ -541,6 +683,8 @@ $("#save-bw-btn").addEventListener("click", async () => {
     cfg.bandwidth.alt_enabled = $("#bw-alt").checked;
     await api("/settings", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ bandwidth: cfg.bandwidth }) });
     showToast("Bandwidth settings saved", "", "success");
+    await refreshSettings();
+    await refreshDoctorBadge();
   } catch (e) { showError("Save bandwidth failed", e); }
 });
 
@@ -550,13 +694,114 @@ $("#save-toast-btn").addEventListener("click", () => {
   showToast("Notification settings saved", "", "success");
 });
 
+$("#save-config-btn").addEventListener("click", async () => {
+  const status = $("#settings-save-status");
+  try {
+    const raw = $("#full-config-json").value.trim();
+    if (!raw) {
+      showToast("Configuration is empty", "", "warning");
+      return;
+    }
+    const nextConfig = JSON.parse(raw);
+    const result = await api("/settings", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(nextConfig),
+    });
+    fullConfigSnapshot = result.config;
+    $("#full-config-json").value = JSON.stringify(result.config, null, 2);
+    renderConfigSaveStatus(result);
+    showToast("Configuration saved", result.restart_required ? "Restart required for some fields" : "", "success");
+    await refreshDoctorBadge();
+  } catch (e) {
+    if (status) {
+      status.innerHTML = `<h3>Save status</h3>${renderCheckList([{
+        id: "config_save",
+        label: "Configuration save",
+        level: "invalid",
+        detail: e.message || String(e),
+      }])}`;
+    }
+    showError("Save configuration failed", e);
+  }
+});
+
+function renderConfigSaveStatus(result) {
+  $("#settings-save-status").innerHTML = `
+    <h3>Save status</h3>
+    ${renderKv([
+      ["Persisted to config.toml", String(!!result.persisted)],
+      ["Config path", result.config_path || ""],
+      ["Restart required", String(!!result.restart_required)],
+      ["Restart fields", (result.restart_required_fields || []).join(", ")],
+      ["Runtime fields applied", (result.applied_runtime_fields || []).join(", ")],
+    ])}`;
+}
+
 // --- Watch ---
 async function refreshWatch() {
   try {
-    const hist = await api("/watch/history") || [];
-    $("#watch-history").innerHTML = hist.map(h => `<div>${escapeHtml(h.path)} - ${escapeHtml(importStatus(h))}</div>`).join("");
+    const status = await api("/watch/status");
+    renderWatch(status);
+    return status;
   } catch (e) { log("watch error: " + e.message); }
 }
+
+function renderWatch(status, scanDetail = "") {
+  const folders = status?.folders || [];
+  const imports = status?.recent_imports || [];
+  const pending = folders.reduce((sum, folder) => sum + (finiteNumber(folder.pending_torrent_files) || 0), 0);
+  $("#watch-config").innerHTML = `
+    <h3>Watch config</h3>
+    ${folders.length === 0 ? `<p class="muted">No watch folders configured.</p>` : `
+      <table>
+        <thead><tr><th>Path</th><th>Status</th><th>Pending</th><th>Defaults</th></tr></thead>
+        <tbody>${folders.map(folder => renderWatchFolderRow(folder)).join("")}</tbody>
+      </table>`}`;
+  $("#watch-scan-result").innerHTML = `
+    <h3>Scan result</h3>
+    ${renderKv([
+      ["Automatic watch", status?.enabled ? "enabled" : "not configured"],
+      ["Configured folders", String(folders.length)],
+      ["Pending .torrent files", String(pending)],
+      ["Scan Now action", "scan configured watch folders, import .torrent files, then apply delete/archive/failure handling"],
+      ["Last manual scan", scanDetail],
+    ])}`;
+  $("#watch-history").innerHTML = `
+    <h3>Scan history</h3>
+    ${imports.length === 0 ? `<p class="muted">No imports recorded.</p>` : `
+      <table>
+        <thead><tr><th>Path</th><th>Status</th><th>Info hash</th><th>Detail</th></tr></thead>
+        <tbody>${imports.slice().reverse().slice(0, 40).map(item => `
+          <tr>
+            <td>${escapeHtml(item.path)}</td>
+            <td>${renderStatus(item.success ? "ok" : "invalid")}</td>
+            <td>${escapeHtml(item.info_hash_hex || "")}</td>
+            <td>${escapeHtml(importStatus(item))}</td>
+          </tr>`).join("")}</tbody>
+      </table>`}`;
+}
+
+function renderWatchFolderRow(folder) {
+  const cfg = folder.config || {};
+  const defaults = [
+    cfg.download_dir ? `dir ${cfg.download_dir}` : "",
+    cfg.label ? `label ${cfg.label}` : "",
+    cfg.start_behavior ? `start ${cfg.start_behavior}` : "",
+    cfg.recursive ? "recursive" : "",
+    cfg.delete_after_import ? "delete after import" : "leave source",
+    cfg.archive_dir ? `archive ${cfg.archive_dir}` : "",
+    cfg.failure_dir ? `failures ${cfg.failure_dir}` : "",
+  ].filter(Boolean).join(", ");
+  return `
+    <tr>
+      <td>${escapeHtml(cfg.path || "")}</td>
+      <td>${renderStatus(folder.exists ? "ok" : "warning")}</td>
+      <td>${fmtCount(folder.pending_torrent_files)}</td>
+      <td>${escapeHtml(defaults)}</td>
+    </tr>`;
+}
+
 function importStatus(item) {
   if (item.success === true) return "ok";
   if (item.error) return item.error;
@@ -565,20 +810,129 @@ function importStatus(item) {
 }
 $("#watch-scan-btn").addEventListener("click", async () => {
   try {
+    const before = await api("/watch/status");
+    const beforeCount = (before.recent_imports || []).length;
     await api("/watch/scan", { method: "POST" });
-    showToast("Watch scan complete", "", "success");
-    refreshWatch();
+    const after = await api("/watch/status");
+    const imported = Math.max(0, (after.recent_imports || []).length - beforeCount);
+    const detail = `${imported} import result${imported === 1 ? "" : "s"} recorded`;
+    renderWatch(after, detail);
+    showToast("Watch scan complete", detail, "success");
   } catch (e) { showError("Watch scan failed", e); }
 });
 
 // --- Logs ---
 async function refreshLogs() {
-  $("#log-stream").textContent = "Live event stream connecting...";
   try {
-    const es = new EventSource(API + "/events");
-    es.onmessage = (e) => { $("#log-stream").textContent += "\n" + e.data; };
-    es.onerror = () => { $("#log-stream").textContent += "\n[event stream closed]"; };
+    const snapshot = await api("/logs/recent?lines=200");
+    renderLogSnapshot(snapshot);
+    connectEventStream();
   } catch (e) { log("events error: " + e.message); }
+}
+
+$("#refresh-logs-btn").addEventListener("click", refreshLogs);
+
+function renderLogSnapshot(snapshot) {
+  const lines = snapshot?.lines || [];
+  const source = snapshot?.path
+    ? `${snapshot.path}${snapshot.truncated ? " (tail)" : ""}`
+    : "live event stream";
+  $("#log-source").textContent = snapshot?.enabled ? source : `${source} unavailable`;
+  $("#log-stream").textContent = lines.length ? lines.join("\n") : "[no recent log lines]";
+}
+
+function connectEventStream() {
+  if (logEventSource) return;
+  try {
+    logEventSource = new EventSource(API + "/events");
+    logEventSource.onopen = () => appendLogLine("[event stream connected]");
+    EVENT_KINDS.forEach(kind => {
+      logEventSource.addEventListener(kind, (event) => {
+        appendEventLine(kind, event.data);
+      });
+    });
+    logEventSource.onerror = () => {
+      const nowMs = Date.now();
+      if (nowMs - lastEventStreamErrorAt > 10000) {
+        appendLogLine("[event stream disconnected; browser will retry]");
+        lastEventStreamErrorAt = nowMs;
+      }
+    };
+  } catch (e) {
+    appendLogLine("[event stream unavailable] " + e.message);
+  }
+}
+
+function appendEventLine(kind, raw) {
+  let event = null;
+  try { event = JSON.parse(raw); } catch {}
+  const hash = event?.info_hash ? ` ${event.info_hash}` : "";
+  const payload = event?.payload && Object.keys(event.payload).length
+    ? " " + JSON.stringify(event.payload)
+    : "";
+  appendLogLine(`[event] ${kind}${hash}${payload}`);
+  if (kind === "daemon_health_changed") refreshDoctorBadge();
+  if (kind === "network_status_changed" && !$("#view-network").classList.contains("hidden")) refreshNetwork();
+  if ((kind === "watch_folder_imported" || kind === "watch_folder_failed") && !$("#view-watch").classList.contains("hidden")) refreshWatch();
+  if (kind === "settings_changed" && !$("#view-settings").classList.contains("hidden")) refreshSettings();
+}
+
+function appendLogLine(line) {
+  const el = $("#log-stream");
+  if (!el) return;
+  const current = el.textContent && !el.textContent.startsWith("[no recent")
+    ? el.textContent.split("\n")
+    : [];
+  current.push(line);
+  while (current.length > MAX_LOG_LINES) current.shift();
+  el.textContent = current.join("\n");
+  el.scrollTop = el.scrollHeight;
+}
+
+// --- Doctor ---
+async function refreshDoctor() {
+  try {
+    const report = await api("/doctor");
+    renderDoctor(report);
+    updateHealthBadge(report);
+    return report;
+  } catch (e) {
+    updateHealthBadge({ level: "invalid", summary: e.message || String(e), checks: [] });
+    log("doctor error: " + e.message);
+  }
+}
+
+async function refreshDoctorBadge() {
+  try {
+    updateHealthBadge(await api("/doctor"));
+  } catch (e) {
+    updateHealthBadge({ level: "invalid", summary: e.message || String(e), checks: [] });
+  }
+}
+
+function renderDoctor(report) {
+  $("#doctor-summary").innerHTML = `
+    <h3>Health summary</h3>
+    ${renderKv([
+      ["Overall", levelLabel(report.level)],
+      ["Summary", report.summary || ""],
+      ["Checks", String((report.checks || []).length)],
+    ])}`;
+  $("#doctor-checks").innerHTML = `
+    <h3>Checks</h3>
+    ${renderCheckList(report.checks || [])}`;
+}
+
+function updateHealthBadge(report) {
+  const badge = $("#health-badge");
+  if (!badge) return;
+  const level = report?.level || "warning";
+  badge.classList.remove("ok", "warn", "bad");
+  if (level === "ok") badge.classList.add("ok");
+  else if (level === "warning") badge.classList.add("warn");
+  else badge.classList.add("bad");
+  badge.textContent = levelLabel(level);
+  badge.title = report?.summary || "";
 }
 
 function escapeHtml(s) {
@@ -588,8 +942,7 @@ function cssToken(s) {
   return String(s ?? "").replace(/[^a-zA-Z0-9_-]/g, "");
 }
 function log(msg) {
-  const el = $("#log-stream");
-  if (el) el.textContent += "\n" + msg;
+  if ($("#log-stream")) appendLogLine(msg);
   else console.log(msg);
 }
 
@@ -598,7 +951,7 @@ $("#search").addEventListener("input", refreshTorrents);
 // --- Init ---
 (async function init() {
   await refreshTorrents();
-  await refreshNetwork();
+  await refreshDoctorBadge();
   setInterval(refreshTorrents, 5000);
-  setInterval(refreshNetwork, 10000);
+  setInterval(refreshDoctorBadge, 10000);
 })();

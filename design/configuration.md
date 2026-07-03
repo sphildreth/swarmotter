@@ -10,9 +10,12 @@ For operator-facing examples and option reference, see
 
 SwarmOtter is configured through a TOML configuration file plus environment
 variable overrides. Invalid required configuration produces clear startup
-errors. Safe defaults are provided where possible. Runtime settings updates are
-supported for bandwidth, queue, and seeding limits; settings requiring restart
-must be changed in the config file.
+errors. Safe defaults are provided where possible. Runtime updates use two modes:
+
+- **Runtime-safe settings patch (`PATCH /api/v1/settings`)**: updates live bandwidth,
+  queue, and seeding fields without restarting.
+- **Full config replacement (`PUT /api/v1/settings`)**: validates the full config
+  before persistence, persists atomically, and reports fields that require restart.
 
 ## Environment variable overrides
 
@@ -37,7 +40,9 @@ SWARMOTTER_API__MAX_REQUEST_BODY_BYTES=16777216
   required and all `/api/v1` routes require either
   `Authorization: Bearer <token>` or `X-SwarmOtter-Auth: <token>`.
   `GET /api/v1/settings` redacts the token. `max_request_body_bytes` bounds API
-  request bodies, including torrent file uploads.
+  request bodies, including torrent file uploads. Full config updates through
+  `PUT /api/v1/settings` preserve an existing `api.auth_token` if omitted in
+  the request body.
 - **Storage** (`storage`): `download_dir`, `incomplete_dir`, `preallocate`,
   `sparse`. Incomplete data is written under `incomplete_dir` when configured
   and moved to `download_dir` after all pieces verify. When `preallocate` is

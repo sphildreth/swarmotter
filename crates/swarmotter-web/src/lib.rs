@@ -232,11 +232,16 @@ mod tests {
     fn web_ui_uses_toast_notifications() {
         for needle in [
             "const DEFAULT_TOAST_DISPLAY_MS = 5000",
+            "const MAX_VISIBLE_TOASTS = 3",
             "function showToast(",
+            "function normalizeToastDurationMs(",
             "function setToastDisplaySeconds(",
             "swarmotter.toastDisplayMs",
             "expectedRemovedTorrents",
+            "magnetAddInFlight",
+            "duplicate_torrent",
             "showToast(\"Torrent removed\"",
+            "showToast(\"Adding magnet\"",
             "showToast(`Added ${added} file",
             "failed++",
             "showToast(\"No files added\"",
@@ -263,6 +268,63 @@ mod tests {
             assert!(
                 !APP_JS.contains(old_message_surface) && !INDEX_HTML.contains(old_message_surface),
                 "Web UI still contains old message surface {old_message_surface}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_includes_extended_view_markup() {
+        for id in [
+            "network-summary",
+            "network-config",
+            "network-interfaces",
+            "network-originality",
+            "settings-runtime-editor",
+            "settings-full-config",
+            "settings-save-status",
+            "watch-config",
+            "watch-history",
+            "watch-scan-result",
+            "log-controls",
+            "log-stream",
+            "doctor-summary",
+            "doctor-checks",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{}\"", id)),
+                "Web UI is missing placeholder id {id}"
+            );
+        }
+
+        for needle in [
+            "id=\"health-badge\"",
+            "data-view=\"doctor\"",
+            "id=\"view-doctor\"",
+            "class=\"view-grid\"",
+            "class=\"settings-layout\"",
+            "class=\"watch-layout\"",
+        ] {
+            assert!(
+                INDEX_HTML.contains(needle),
+                "Web UI is missing markup marker {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_has_new_layout_classes() {
+        for needle in [
+            ".view-grid",
+            ".settings-layout",
+            ".watch-layout",
+            ".card-subsection",
+            ".config-preview",
+            ".health-payload",
+            "#health-badge",
+        ] {
+            assert!(
+                STYLE_CSS.contains(needle),
+                "style.css is missing class {needle}"
             );
         }
     }

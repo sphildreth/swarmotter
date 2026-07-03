@@ -119,13 +119,23 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
         // Settings
         .route(
             "/settings",
-            get(handlers::settings::get_settings).patch(handlers::settings::update_settings),
+            get(handlers::settings::get_settings)
+                .patch(handlers::settings::update_settings)
+                .put(handlers::settings::replace_settings),
         )
         // Network
         .route("/network/health", get(handlers::network::network_health))
+        .route(
+            "/network/diagnostics",
+            get(handlers::diagnostics::network_diagnostics),
+        )
         // Watch folders
         .route("/watch/scan", post(handlers::watch::watch_scan))
         .route("/watch/history", get(handlers::watch::watch_history))
+        .route("/watch/status", get(handlers::diagnostics::watch_status))
+        // Logs and health checks.
+        .route("/logs/recent", get(handlers::diagnostics::recent_logs))
+        .route("/doctor", get(handlers::diagnostics::doctor_report))
         // Events (SSE)
         .route("/events", get(handlers::events::sse_events))
         // WebSocket

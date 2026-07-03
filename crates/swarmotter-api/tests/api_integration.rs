@@ -6,12 +6,22 @@ mod fake_daemon;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use swarmotter_core::config::Config;
+use serde::de::DeserializeOwned;
+use swarmotter_core::config::{Config, StartBehavior, WatchFolderConfig};
 use swarmotter_core::meta::build_single_file_torrent;
+use swarmotter_core::models::network::NetworkContainmentStatus;
+use swarmotter_core::models::{
+    ConfigUpdateResult, DiagnosticLevel, DoctorReport, LogSnapshot, NetworkDiagnostics, WatchStatus,
+};
 use tower::ServiceExt;
 
 fn known_magnet() -> String {
     "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062ba1f7a4e&dn=test".to_string()
+}
+
+fn parse_api_data<T: DeserializeOwned>(body: &[u8]) -> T {
+    let v: serde_json::Value = serde_json::from_slice(body).unwrap();
+    serde_json::from_value(v["data"].clone()).unwrap()
 }
 
 #[tokio::test]
@@ -324,6 +334,107 @@ async fn settings_get_and_update() {
 }
 
 #[tokio::test]
+async fn settings_put_replaces_and_preserves_auth_token() {
+    let mut cfg = Config::default();
+    cfg.api.auth_token = Some("existing-token".into());
+
+    let state = fake_daemon::fake_state_with_config(cfg.clone());
+    let app = swarmotter_api::app_router(state);
+
+    let mut payload = serde_json::to_value(cfg).unwrap();
+    payload["api"]["auth_token"] = serde_json::Value::Null;
+    payload["api"]["require_auth"] = serde_json::Value::Bool(true);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let result: ConfigUpdateResult = parse_api_data(&body);
+    assert_eq!(result.persisted, false);
+    assert_eq!(result.config_path, None);
+    assert_eq!(result.restart_required, false);
+    assert!(result.restart_required_fields.is_empty());
+    assert_eq!(result.config.api.auth_token, None);
+    assert_eq!(result.config.api.require_auth, true);
+    assert_eq!(result.applied_runtime_fields, vec!["config"]);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/settings")
+                .header("authorization", "Bearer existing-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut rotated = payload;
+    rotated["api"]["auth_token"] = serde_json::json!("rotated-token");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer existing-token")
+                .body(Body::from(rotated.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let result: ConfigUpdateResult = parse_api_data(&body);
+    assert_eq!(result.config.api.auth_token, None);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/settings")
+                .header("authorization", "Bearer existing-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/settings")
+                .header("authorization", "Bearer rotated-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn network_health_endpoint() {
     let state = fake_daemon::fake_state();
     let app = swarmotter_api::app_router(state);
@@ -480,6 +591,125 @@ async fn api_body_limit_rejects_oversized_upload() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn network_diagnostics_endpoint() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/network/diagnostics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: NetworkDiagnostics = parse_api_data(&body);
+    assert_eq!(v.health.status, NetworkContainmentStatus::Disabled);
+    let checks = v.checks;
+    assert!(!checks.is_empty());
+    assert!(v.interfaces.len() >= 1);
+}
+
+#[tokio::test]
+async fn watch_status_endpoint_reflects_config() {
+    let mut cfg = Config::default();
+    cfg.watch.push(WatchFolderConfig {
+        path: "/tmp/swarmotter-nonexistent-watch".into(),
+        recursive: true,
+        download_dir: Some("/tmp/downloads".into()),
+        label: Some("linux".into()),
+        start_behavior: StartBehavior::Paused,
+        archive_dir: None,
+        failure_dir: None,
+        delete_after_import: true,
+    });
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/watch/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: WatchStatus = parse_api_data(&body);
+    let folders = v.folders;
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0].config.path, "/tmp/swarmotter-nonexistent-watch");
+    assert!(v.enabled);
+}
+
+#[tokio::test]
+async fn recent_logs_endpoint_supports_limit() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/logs/recent?lines=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: LogSnapshot = parse_api_data(&body);
+    assert!(!v.lines.is_empty());
+    assert!(v.lines.len() <= 1);
+    assert!(v.enabled);
+    assert_eq!(v.truncated, false);
+}
+
+#[tokio::test]
+async fn doctor_checks_endpoint_contains_status() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/doctor")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: DoctorReport = parse_api_data(&body);
+    assert!(!v.checks.is_empty());
+    assert!(matches!(
+        v.level,
+        DiagnosticLevel::Ok | DiagnosticLevel::Warning | DiagnosticLevel::Invalid
+    ));
 }
 
 #[tokio::test]

@@ -2,6 +2,7 @@
 
 //! Public domain models used across the daemon and API.
 
+pub mod diagnostics;
 pub mod health;
 pub mod network;
 pub mod peer;
@@ -9,6 +10,11 @@ pub mod stats;
 pub mod torrent;
 pub mod tracker;
 
+pub use diagnostics::{
+    ConfigUpdateResult, DiagnosticLevel, DoctorCheck, DoctorReport, LogSnapshot,
+    NetworkDiagnostics, NetworkInterfaceDiagnostic, NetworkPathCheck, WatchFolderStatus,
+    WatchStatus,
+};
 pub use health::{HealthCalculator, HealthInput};
 pub use network::{NetworkContainmentMode, NetworkContainmentStatus, NetworkHealth};
 pub use peer::{EnginePeerHealth, Peer, PeerDirection, PeerFlags};
