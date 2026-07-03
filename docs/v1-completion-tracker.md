@@ -28,12 +28,14 @@ ACK, the full SYN/STATE/DATA/FIN/RESET connection lifecycle, timestamp echo and
 one-way delay measurement, retransmission, idle timeout, graceful close, and
 TCP/uTP transport selection in the engine. The network binder supports
 contained UDP sockets, inbound TCP listeners, outbound TCP, tracker HTTP,
-tracker HTTPS (TLS over contained socket), and UDP trackers — all fail-closed.
-Real TCP and uTP peer protocol, HTTP/HTTPS/UDP tracker announce, PEX (BEP 10/11),
-BEP 9 magnet metadata fetch, DHT (BEP 5), inbound seeding/upload, endgame mode,
-live bandwidth shaping, real disk I/O with fast-resume, and a local-swarm
-download harness (HTTP + UDP trackers + direct peer + seeding + endgame +
-bandwidth + PEX + magnet + uTP) are implemented and tested. Platform-specific
+tracker HTTPS (TLS over contained socket), HTTP/HTTPS webseed range requests,
+and UDP trackers — all fail-closed.
+Real TCP and uTP peer protocol, HTTP/HTTPS/UDP tracker announce, HTTP/HTTPS
+webseed range downloads, PEX (BEP 10/11), BEP 9 magnet metadata fetch, DHT
+(BEP 5), inbound seeding/upload, endgame mode, live bandwidth shaping, real
+disk I/O with fast-resume, and a local-swarm download harness (HTTP + UDP
+trackers + direct peer + webseed + seeding + endgame + bandwidth + PEX +
+magnet + uTP) are implemented and tested. Platform-specific
 interface/source binding is abstracted behind `InterfaceProbe`; the OS probe
 surfaces `interface_missing` in strict mode by default, which is correct
 fail-closed behavior. Live sockets are centralized behind the `NetworkBinder`
@@ -112,6 +114,11 @@ UDP socket (see ADR-0020).
 - [x] Tracker tiers and manual tracker lists
 - [x] Tracker edit/add/remove via API
 - [x] Tracker status surfaced through API/UI from live engine state
+- [x] HTTP/HTTPS webseeds — BEP 19 `url-list` metadata parsing plus contained
+      HTTP byte-range downloads through `NetworkBinder`; pieces are SHA-1
+      verified before storage writes, webseed bytes count toward live download
+      accounting and rate limits, and a loopback range-server local swarm test
+      proves completion without trackers or peers
 
 ### Peer Protocol
 
@@ -286,11 +293,13 @@ UDP socket (see ADR-0020).
       /resume roundtrip/recheck covered
 - [x] Local swarm tests — real download completion from a generated payload
       through a local HTTP tracker, a local UDP tracker (BEP 15), and a direct
-      seed peer is covered (HTTP + UDP tracker + direct peer paths); real
-      seeding/upload via the inbound `Seeder` listener is covered; PEX, magnet
-      metadata fetch, DHT, endgame, bandwidth, and a full uTP download over the
-      contained UDP path are covered by local fixtures; a uTP fail-closed test
-      proves the `BlockedBinder` blocks uTP swarm downloads; an
+      seed peer is covered (HTTP + UDP tracker + direct peer paths); webseed
+      download completion from a generated payload is covered through a
+      loopback HTTP range server; real seeding/upload via the inbound `Seeder`
+      listener is covered; PEX, magnet metadata fetch, DHT, endgame,
+      bandwidth, and a full uTP download over the contained UDP path are
+      covered by local fixtures; a uTP fail-closed test proves the
+      `BlockedBinder` blocks uTP swarm downloads; an
       active-download health test samples the live engine state during a
       generated lawful local download and asserts the per-torrent health
       reports a non-zero score with at least one bar.
@@ -309,11 +318,12 @@ UDP socket (see ADR-0020).
 ## Blockers
 
 None currently. The live TCP and uTP peer protocol, HTTP/HTTPS/UDP tracker
-announce, PEX (BEP 10/11), BEP 9 magnet metadata fetch, DHT (BEP 5), inbound
-peer listening/seeding upload, endgame mode, live bandwidth shaping, full
-production uTP (LEDBAT, SACK, full connection lifecycle, transport selection),
-real disk I/O with fast-resume, and a local-swarm download harness are
-implemented and tested. All v1.0.0 data-plane capabilities are implemented.
+announce, HTTP/HTTPS webseed downloads, PEX (BEP 10/11), BEP 9 magnet
+metadata fetch, DHT (BEP 5), inbound peer listening/seeding upload, endgame
+mode, live bandwidth shaping, full production uTP (LEDBAT, SACK, full
+connection lifecycle, transport selection), real disk I/O with fast-resume,
+and a local-swarm download harness are implemented and tested. All v1.0.0
+data-plane capabilities are implemented.
 Platform-specific `InterfaceProbe` OS-level enumeration (getifaddrs) and DNS
 enforcement are abstracted; the abstraction enforces fail-closed correctly by
 surfacing `interface_missing`/`dns_not_constrained` in strict mode when the
@@ -327,7 +337,7 @@ honest platform-coverage limitation, not a missing capability.
 | `cargo fmt --all -- --check` | pass |
 | `cargo check --workspace --all-targets --all-features` | pass |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass (no warnings) |
-| `cargo test --all --all-features` | pass (core 201 unit including 10 per-torrent health + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 12 local swarm including active-download health + 1 daemon download) |
+| `cargo test --all --all-features` | pass (core 216 unit including webseed metadata/range/health tests + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 14 local swarm including webseed and active-download health + 4 daemon download) |
 | local swarm download (HTTP tracker + direct peer) | pass |
 | local swarm download (UDP tracker, BEP 15) | pass |
 | local swarm seeding (inbound Seeder serves completed download) | pass |
@@ -336,6 +346,7 @@ honest platform-coverage limitation, not a missing capability.
 | local swarm per-torrent bandwidth (download throttled by per-torrent limit with unlimited global) | pass |
 | local swarm PEX (peer discovered via BEP 10/11) | pass |
 | local swarm magnet (BEP 9 metadata fetch then download) | pass |
+| local swarm webseed (BEP 19 `url-list` + HTTP range download) | pass |
 | local swarm uTP download (contained uTP seed + engine over uTP) | pass |
 | local swarm uTP fail-closed (BlockedBinder blocks uTP download) | pass |
 | local swarm active-download health (live engine reports non-zero health) | pass |

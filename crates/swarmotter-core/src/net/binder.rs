@@ -88,6 +88,17 @@ pub trait NetworkBinder: Send + Sync {
     /// `vpn-network-containment.md`).
     async fn http_get(&self, url: &str) -> Result<HttpResponse>;
 
+    /// Issue an HTTP/1.1 byte-range GET through the contained path. `start`
+    /// is inclusive and `end_exclusive` is exclusive, matching torrent piece
+    /// byte ranges; implementations convert this to an HTTP `Range:
+    /// bytes=start-(end_exclusive - 1)` header.
+    async fn http_get_range(
+        &self,
+        url: &str,
+        start: u64,
+        end_exclusive: u64,
+    ) -> Result<HttpResponse>;
+
     /// Resolve a torrent data-plane hostname through the contained path's DNS
     /// policy. IP literals return directly; hostnames must not be resolved
     /// before this binder has enforced containment.
@@ -147,34 +158,17 @@ impl NetworkBinder for LoopbackBinder {
     }
 
     async fn http_get(&self, url: &str) -> Result<HttpResponse> {
-        let parsed = url::Url::parse(url)
-            .map_err(|e| CoreError::Internal(format!("bad tracker url: {e}")))?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| CoreError::Internal(format!("tracker url missing host: {url}")))?;
-        let port = parsed.port_or_known_default().unwrap_or(80);
-        let addr: SocketAddr = format!("{}:{}", host, port)
-            .parse()
-            .map_err(|e| CoreError::Internal(format!("bad tracker addr: {e}")))?;
-        let mut stream = tokio::net::TcpStream::connect(addr)
-            .await
-            .map_err(CoreError::from)?;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let path = parsed.path();
-        let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
-        let req = format!(
-            "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: SwarmOtter/1.0\r\n\r\n"
-        );
-        stream
-            .write_all(req.as_bytes())
-            .await
-            .map_err(CoreError::from)?;
-        let mut buf = Vec::new();
-        stream
-            .read_to_end(&mut buf)
-            .await
-            .map_err(CoreError::from)?;
-        parse_http_response(&buf)
+        loopback_http_get(url, None).await
+    }
+
+    async fn http_get_range(
+        &self,
+        url: &str,
+        start: u64,
+        end_exclusive: u64,
+    ) -> Result<HttpResponse> {
+        validate_http_range(start, end_exclusive)?;
+        loopback_http_get(url, Some((start, end_exclusive))).await
     }
 
     async fn resolve_host(&self, host: &str, port: u16) -> Result<SocketAddr> {
@@ -224,6 +218,58 @@ impl NetworkBinder for LoopbackBinder {
     fn traffic_allowed(&self) -> bool {
         true
     }
+}
+
+#[cfg(any(test, feature = "test-binder"))]
+async fn loopback_http_get(url: &str, range: Option<(u64, u64)>) -> Result<HttpResponse> {
+    let parsed =
+        url::Url::parse(url).map_err(|e| CoreError::Internal(format!("bad tracker url: {e}")))?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| CoreError::Internal(format!("tracker url missing host: {url}")))?;
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .map_err(|e| CoreError::Internal(format!("bad tracker addr: {e}")))?;
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .map_err(CoreError::from)?;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let path = parsed.path();
+    let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
+    let mut req = format!(
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: SwarmOtter/1.0\r\n"
+    );
+    if let Some((start, end_exclusive)) = range {
+        req.push_str(&http_range_header(start, end_exclusive)?);
+    }
+    req.push_str("\r\n");
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(CoreError::from)?;
+    let mut buf = Vec::new();
+    stream
+        .read_to_end(&mut buf)
+        .await
+        .map_err(CoreError::from)?;
+    parse_http_response(&buf)
+}
+
+#[cfg(any(test, feature = "test-binder"))]
+fn validate_http_range(start: u64, end_exclusive: u64) -> Result<()> {
+    if end_exclusive <= start {
+        return Err(CoreError::InvalidArgument(
+            "HTTP byte range end must be greater than start".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-binder"))]
+fn http_range_header(start: u64, end_exclusive: u64) -> Result<String> {
+    validate_http_range(start, end_exclusive)?;
+    Ok(format!("Range: bytes={}-{}\r\n", start, end_exclusive - 1))
 }
 
 #[cfg(any(test, feature = "test-binder"))]
@@ -288,6 +334,17 @@ impl NetworkBinder for BlockedBinder {
     }
 
     async fn http_get(&self, _url: &str) -> Result<HttpResponse> {
+        Err(CoreError::NetworkBlocked(
+            "torrent data plane blocked".into(),
+        ))
+    }
+
+    async fn http_get_range(
+        &self,
+        _url: &str,
+        _start: u64,
+        _end_exclusive: u64,
+    ) -> Result<HttpResponse> {
         Err(CoreError::NetworkBlocked(
             "torrent data plane blocked".into(),
         ))
@@ -413,7 +470,42 @@ mod tests {
             .http_get("http://127.0.0.1:9/announce")
             .await
             .is_err());
+        assert!(binder
+            .http_get_range("http://127.0.0.1:9/file", 0, 4)
+            .await
+            .is_err());
         assert!(binder.udp_socket().await.is_err());
         assert!(binder.bind_peer_listener(0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn loopback_http_get_range_sends_range_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let n = stream.read(&mut req).await.unwrap();
+            let req = std::str::from_utf8(&req[..n]).unwrap();
+            assert!(req.starts_with("GET /file.bin?token=local HTTP/1.1\r\n"));
+            assert!(req.contains("\r\nRange: bytes=5-10\r\n"));
+
+            stream
+                .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 6\r\n\r\nabcdef")
+                .await
+                .unwrap();
+        });
+
+        let binder = LoopbackBinder;
+        let resp = binder
+            .http_get_range(&format!("http://{addr}/file.bin?token=local"), 5, 11)
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status, 206);
+        assert_eq!(resp.body, b"abcdef");
+        server.await.unwrap();
     }
 }

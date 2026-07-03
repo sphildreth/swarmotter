@@ -28,7 +28,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use swarmotter_core::meta::{build_single_file_torrent, parse_torrent};
+use swarmotter_core::meta::{
+    build_single_file_torrent, build_single_file_torrent_with_webseeds, parse_torrent,
+};
 use swarmotter_core::net::binder::LoopbackBinder;
 use swarmotter_core::peer::{self, Bitfield, Handshake, Message, PeerAddr};
 use swarmotter_core::storage::StorageIo;
@@ -353,6 +355,133 @@ fn unique_dir(label: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&p).unwrap();
     p
+}
+
+async fn run_webseed_server(
+    listener: tokio::net::TcpListener,
+    content: Arc<Vec<u8>>,
+) -> swarmotter_core::Result<()> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let content = content.clone();
+        tokio::spawn(async move {
+            let _ = serve_webseed_range(stream, content).await;
+        });
+    }
+}
+
+async fn serve_webseed_range(
+    mut stream: tokio::net::TcpStream,
+    content: Arc<Vec<u8>>,
+) -> swarmotter_core::Result<()> {
+    let mut req = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        req.extend_from_slice(&buf[..n]);
+        if req.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let req = String::from_utf8_lossy(&req);
+    let Some((start, end)) = parse_range_header(&req) else {
+        stream
+            .write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\n\r\n")
+            .await?;
+        return Ok(());
+    };
+    if start > end || end >= content.len() {
+        stream
+            .write_all(b"HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\n\r\n")
+            .await?;
+        return Ok(());
+    }
+    let body = &content[start..=end];
+    let head = format!(
+        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {}-{}/{}\r\nConnection: close\r\n\r\n",
+        body.len(),
+        start,
+        end,
+        content.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    Ok(())
+}
+
+fn parse_range_header(req: &str) -> Option<(usize, usize)> {
+    let line = req
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("range: bytes="))?;
+    let range = line.split_once("bytes=")?.1.trim();
+    let (start, end) = range.split_once('-')?;
+    Some((start.parse().ok()?, end.parse().ok()?))
+}
+
+/// Webseed download: a legal generated payload is served by a local HTTP range
+/// server advertised through BEP 19 `url-list`. No tracker or peer is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_swarm_downloads_from_webseed_url_list() {
+    let mut content = Vec::with_capacity(96 * 1024 + 17);
+    for i in 0..96 * 1024 + 17 {
+        content.push(((i * 17) % 251) as u8);
+    }
+    let piece_length: u64 = 16 * 1024;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let webseed_url = format!("http://{addr}/payload.bin");
+    let server = tokio::spawn(run_webseed_server(listener, Arc::new(content.clone())));
+
+    let torrent_bytes = build_single_file_torrent_with_webseeds(
+        "payload.bin",
+        &content,
+        piece_length,
+        None,
+        false,
+        &[&webseed_url],
+    );
+    let meta = parse_torrent(&torrent_bytes).unwrap();
+    assert_eq!(meta.webseeds, vec![webseed_url]);
+
+    let dir = unique_dir("webseed-download");
+    let binder = Arc::new(LoopbackBinder);
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
+    let engine = TorrentEngine::new(
+        meta.clone(),
+        dir.clone(),
+        peer_id(b"-SWWS000"),
+        binder,
+        state,
+        cmd_rx,
+        vec![],
+        6881,
+    );
+
+    let final_state = tokio::time::timeout(Duration::from_secs(30), engine.run())
+        .await
+        .expect("engine did not finish")
+        .expect("engine error");
+
+    assert!(final_state.finished, "webseed download did not complete");
+    assert_eq!(
+        final_state.pieces_have.count(meta.piece_count()),
+        meta.piece_count(),
+        "not all webseed pieces verified"
+    );
+    assert_eq!(final_state.downloaded, meta.total_length);
+
+    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
+    assert_eq!(written, content);
+    assert!(!storage.resume_path().exists());
+
+    server.abort();
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Full end-to-end: a legal generated payload is torrented, a local seed peer

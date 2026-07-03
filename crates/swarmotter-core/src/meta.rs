@@ -32,6 +32,9 @@ pub struct TorrentMeta {
     pub announce: Option<String>,
     /// Tracker tiers (announce-list), in order.
     pub announce_list: Vec<Vec<String>>,
+    /// BEP 19 HTTP/FTP webseed URLs (`url-list`), preserving torrent order.
+    #[serde(default)]
+    pub webseeds: Vec<String>,
     pub comment: Option<String>,
     pub created_by: Option<String>,
     pub creation_date: Option<u64>,
@@ -251,6 +254,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let webseeds = parse_url_list(root);
     let comment = get_str(root, b"comment").map(|s| s.to_string());
     let created_by = get_str(root, b"created by").map(|s| s.to_string());
     let creation_date = get_int(root, b"creation date").map(|i| i as u64);
@@ -265,6 +269,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta> {
         private,
         announce,
         announce_list,
+        webseeds,
         comment,
         created_by,
         creation_date,
@@ -282,6 +287,22 @@ fn get_int(dict: &[(Vec<u8>, Value)], key: &[u8]) -> Option<i64> {
     dict.iter()
         .find(|(k, _)| k == key)
         .and_then(|(_, v)| v.as_int())
+}
+
+fn parse_url_list(dict: &[(Vec<u8>, Value)]) -> Vec<String> {
+    let mut out = match dict.iter().find(|(k, _)| k == b"url-list").map(|(_, v)| v) {
+        Some(Value::Str(_)) => get_str(dict, b"url-list")
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default(),
+        Some(Value::List(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str_utf8().map(|s| s.to_string()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|url| !url.is_empty() && seen.insert(url.clone()));
+    out
 }
 
 fn validate_path_component(value: &str, kind: &str) -> Result<()> {
@@ -344,6 +365,18 @@ pub fn build_single_file_torrent(
     announce: Option<&str>,
     private: bool,
 ) -> Vec<u8> {
+    build_single_file_torrent_with_webseeds(name, content, piece_length, announce, private, &[])
+}
+
+/// Build a minimal valid single-file `.torrent` body with BEP 19 webseeds.
+pub fn build_single_file_torrent_with_webseeds(
+    name: &str,
+    content: &[u8],
+    piece_length: u64,
+    announce: Option<&str>,
+    private: bool,
+    webseeds: &[&str],
+) -> Vec<u8> {
     use sha1::{Digest, Sha1};
     let mut pieces = Vec::new();
     let mut offset = 0usize;
@@ -383,6 +416,7 @@ pub fn build_single_file_torrent(
     }
     info.push(b'e');
     out.extend_from_slice(&info);
+    write_webseeds(&mut out, webseeds);
     out.push(b'e');
     out
 }
@@ -394,6 +428,18 @@ pub fn build_multi_file_torrent(
     contents: &[&[u8]],
     piece_length: u64,
     announce: Option<&str>,
+) -> Vec<u8> {
+    build_multi_file_torrent_with_webseeds(name, files, contents, piece_length, announce, &[])
+}
+
+/// Build a multi-file `.torrent` body with BEP 19 webseeds.
+pub fn build_multi_file_torrent_with_webseeds(
+    name: &str,
+    files: &[(Vec<String>, u64)],
+    contents: &[&[u8]],
+    piece_length: u64,
+    announce: Option<&str>,
+    webseeds: &[&str],
 ) -> Vec<u8> {
     use sha1::{Digest, Sha1};
     assert_eq!(files.len(), contents.len());
@@ -444,8 +490,25 @@ pub fn build_multi_file_torrent(
     info.push(b'e');
     info.push(b'e');
     out.extend_from_slice(&info);
+    write_webseeds(&mut out, webseeds);
     out.push(b'e');
     out
+}
+
+fn write_webseeds(out: &mut Vec<u8>, webseeds: &[&str]) {
+    if webseeds.is_empty() {
+        return;
+    }
+    write_str(out, b"url-list");
+    if webseeds.len() == 1 {
+        write_str(out, webseeds[0].as_bytes());
+        return;
+    }
+    out.push(b'l');
+    for webseed in webseeds {
+        write_str(out, webseed.as_bytes());
+    }
+    out.push(b'e');
 }
 
 fn write_str(out: &mut Vec<u8>, s: &[u8]) {
@@ -484,6 +547,7 @@ mod tests {
             meta.announce.as_deref(),
             Some("http://tracker.example/announce")
         );
+        assert!(meta.webseeds.is_empty());
         let expected_pieces = (content.len() as u64).div_ceil(16);
         assert_eq!(meta.piece_count() as u64, expected_pieces);
         let last_len = meta.last_piece_length();
@@ -602,5 +666,51 @@ mod tests {
         let contents: Vec<&[u8]> = vec![b"one", b"two", b"three"];
         let bytes = build_multi_file_torrent("safe", &files, &contents, 8, None);
         assert!(parse_torrent(&bytes).is_err());
+    }
+
+    #[test]
+    fn parses_single_webseed_url_list() {
+        let bytes = with_url_list(
+            build_single_file_torrent("f", b"webseed data", 8, None, false),
+            string_value(b"http://127.0.0.1/files/f"),
+        );
+
+        let meta = parse_torrent(&bytes).unwrap();
+
+        assert_eq!(meta.webseeds, vec!["http://127.0.0.1/files/f"]);
+    }
+
+    #[test]
+    fn parses_list_webseed_url_list() {
+        let mut url_list = Vec::new();
+        url_list.push(b'l');
+        write_str(&mut url_list, b"http://127.0.0.1/files/f");
+        write_str(&mut url_list, b"https://webseed.example/data/f");
+        url_list.push(b'e');
+        let bytes = with_url_list(
+            build_single_file_torrent("f", b"webseed data", 8, None, false),
+            url_list,
+        );
+
+        let meta = parse_torrent(&bytes).unwrap();
+
+        assert_eq!(
+            meta.webseeds,
+            vec!["http://127.0.0.1/files/f", "https://webseed.example/data/f"]
+        );
+    }
+
+    fn string_value(value: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_str(&mut out, value);
+        out
+    }
+
+    fn with_url_list(mut torrent: Vec<u8>, value: Vec<u8>) -> Vec<u8> {
+        assert_eq!(torrent.pop(), Some(b'e'));
+        write_str(&mut torrent, b"url-list");
+        torrent.extend_from_slice(&value);
+        torrent.push(b'e');
+        torrent
     }
 }

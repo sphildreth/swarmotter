@@ -21,8 +21,9 @@ time or duration estimates.
 
 - **Torrent input:** magnet links, `.torrent` files, browser-friendly magnet
   submission, watch-folder import.
-- **Peer discovery:** HTTP trackers, HTTPS trackers, UDP trackers, DHT, PEX,
-  tracker tiers, manual tracker lists.
+- **Peer discovery and alternate data sources:** HTTP trackers, HTTPS
+  trackers, UDP trackers, HTTP/HTTPS webseeds (`url-list`), DHT, PEX, tracker
+  tiers, manual tracker lists.
 - **Peer protocol:** TCP peers, uTP/UDP peers where practical, handshake,
   metadata exchange, piece availability, piece scheduling, choking, endgame,
   bad-peer handling, IPv4/IPv6 controls.
@@ -66,8 +67,8 @@ for `v1.0.0` only when every item in the `v1.0.0` completion checklist (see
 `design/PRD.md`) is complete and:
 
 - All required torrent input methods work.
-- Magnet metadata fetch, DHT, PEX, HTTP/HTTPS/UDP trackers, and peer protocol
-  download/upload work.
+- Magnet metadata fetch, DHT, PEX, HTTP/HTTPS/UDP trackers, HTTP/HTTPS
+  webseeds, and peer protocol download/upload work.
 - Fast resume, forced recheck, watch folders, browser magnet submission, file
   selection/priorities, queueing, ratio/seeding limits, and bandwidth limits
   work.

@@ -98,6 +98,7 @@ Required v1.0.0 capabilities include:
 - HTTP trackers.
 - HTTPS trackers.
 - UDP trackers.
+- HTTP/HTTPS webseeds.
 - DHT.
 - PEX.
 - TCP peer connections.
@@ -276,6 +277,7 @@ SwarmOtter is not ready for `v1.0.0` until all of the following are complete:
 - PEX support.
 - UDP tracker support.
 - HTTP/HTTPS tracker support.
+- HTTP/HTTPS webseed support.
 - Browser-friendly magnet submission.
 - Watch-folder import.
 - Fast resume.
@@ -311,6 +313,7 @@ The core engine handles:
 - Info hash handling.
 - Peer discovery.
 - Tracker communication.
+- Webseed downloads.
 - DHT.
 - PEX.
 - Peer wire protocol.
@@ -574,15 +577,17 @@ Required behavior:
 - Expose watch-folder status through the API and Web UI.
 - Log import success and failure details.
 
-## Peer Discovery Requirements
+## Peer Discovery and Alternate Data Source Requirements
 
-SwarmOtter must support all major peer discovery mechanisms required for a complete v1.0.0 release.
+SwarmOtter must support all major peer discovery mechanisms and webseed data
+sources required for a complete v1.0.0 release.
 
 Required mechanisms:
 
 - HTTP trackers.
 - HTTPS trackers.
 - UDP trackers.
+- HTTP/HTTPS webseeds.
 - DHT.
 - PEX.
 - Tracker-provided peers.
@@ -630,6 +635,18 @@ Required behavior:
 - Tracker edit/add/remove through API/UI.
 - Respect announce intervals.
 - Include all tracker traffic in VPN/NIC containment.
+
+### Webseeds
+
+HTTP/HTTPS webseed support is required for v1.0.0.
+
+Required behavior:
+
+- Parse BEP 19 `url-list` webseed metadata.
+- Download payload bytes with HTTP byte-range requests.
+- Verify pieces before writing them to storage.
+- Include all webseed traffic and DNS resolution in VPN/NIC containment.
+- Account webseed bytes in download statistics and bandwidth controls.
 
 ## Peer Protocol Requirements
 
@@ -1446,4 +1463,3 @@ The project is ready for `v1.0.0` only when every item below is complete:
 - Dependency license review is complete.
 - No unauthorized copyrighted sample content, magnets, torrent files, screenshots, or default pirate indexers are included.
 - VPN/NIC documentation is framed around routing control, privacy-preserving network design, network containment, and fail-closed safety.
-

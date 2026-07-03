@@ -25,6 +25,9 @@ connections:
   address/interface.
 - `http_get(url)` issues tracker (and webseed/metadata) HTTP GETs through the
   same contained path.
+- `http_get_range(url, start, end_exclusive)` issues webseed HTTP byte-range
+  GETs through the same contained path, using end-exclusive torrent byte-range
+  semantics at the trait boundary and an HTTP `Range` header on the wire.
 - `udp_socket()` returns a contained, source-bound UDP datagram socket
   (`ContainedUdpSocket` trait) for UDP trackers, DHT, and uTP.
 - `bind_peer_listener(port)` returns a contained, source-bound inbound TCP
@@ -54,6 +57,8 @@ directly.
 
 - Torrent traffic cannot silently use the default route; every socket is gated
   and can be bound to the configured source address or interface.
+- Webseed downloads use contained HTTP byte-range requests and cannot bypass
+  the binder or silently fall back to the default route.
 - Adding a new data-plane transport (uTP, DHT UDP) means extending the binder,
   not bypassing it.
 - DNS resolution for tracker, UDP tracker, and DHT bootstrap hostnames is

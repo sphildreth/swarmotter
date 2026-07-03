@@ -62,6 +62,8 @@ pub struct HealthInput {
     pub timeout_failures: u32,
     /// Whether a valid block has been received in the recent past.
     pub received_block_recently: bool,
+    /// Whether an HTTP/HTTPS webseed supplied payload bytes recently.
+    pub webseed_recent_ok: bool,
     /// How long ago a valid block was last seen. `None` means never.
     pub time_since_last_block: Option<Duration>,
     /// Number of known peer candidates (connected + candidate pool).
@@ -94,6 +96,7 @@ impl Default for HealthInput {
             hash_failures: 0,
             timeout_failures: 0,
             received_block_recently: false,
+            webseed_recent_ok: false,
             time_since_last_block: None,
             known_peers: 0,
             no_peers_discovered: false,
@@ -260,7 +263,7 @@ impl HealthCalculator {
                 missing_with_zero_sources
             ));
         }
-        if missing_piece_count > 0 && useful_peers == 0 {
+        if missing_piece_count > 0 && useful_peers == 0 && !input.webseed_recent_ok {
             score = score.min(30);
             if !reasons.iter().any(|r| r.contains("no useful peer")) {
                 reasons.push("no useful peer is currently sending data".to_string());
@@ -272,7 +275,7 @@ impl HealthCalculator {
         }
         let discovery_dark =
             !input.tracker_recent_ok && !input.dht_recent_ok && !input.pex_recent_ok;
-        if discovery_dark && peer_summaries.is_empty() {
+        if discovery_dark && peer_summaries.is_empty() && !input.webseed_recent_ok {
             score = score.min(20);
             reasons.push("no discovery and no connected peers".to_string());
         }
@@ -317,6 +320,9 @@ fn count_missing_with_zero_sources(input: &HealthInput, peer_summaries: &[PeerSu
     // `has_missing_pieces` flag and the configured heuristic: if no peer has
     // any missing piece, every missing piece has zero sources.
     let any_peer_has_missing = peer_summaries.iter().any(|p| p.has_missing);
+    if input.webseed_recent_ok {
+        return 0;
+    }
     if !any_peer_has_missing {
         return input.piece_count.saturating_sub(
             (0..input.piece_count)
@@ -342,6 +348,10 @@ fn availability_score(
     if missing_piece_count == 0 {
         reasons.push("all missing pieces are available".to_string());
         return 100;
+    }
+    if input.webseed_recent_ok {
+        reasons.push("webseed is providing missing pieces".to_string());
+        return 70;
     }
     let zero_source = count_missing_with_zero_sources(input, peer_summaries);
     if zero_source > 0 {
@@ -451,6 +461,10 @@ fn peer_score(
     reasons: &mut Vec<String>,
 ) -> u8 {
     if useful == 0 {
+        if _input.webseed_recent_ok {
+            reasons.push("webseed is sending data".to_string());
+            return 70;
+        }
         if peers_with_needed_pieces == 0 {
             reasons.push("no connected peer has the pieces we need".to_string());
         } else {
@@ -528,10 +542,15 @@ fn discovery_score(
     let dht_active = !input.private && input.dht_recent_ok;
     let pex_active = !input.private && input.pex_recent_ok;
     let tracker_active = input.tracker_recent_ok;
+    let webseed_active = input.webseed_recent_ok;
 
     if tracker_active && (dht_active || pex_active) {
         reasons.push("tracker and DHT/PEX are healthy".to_string());
         return 100;
+    }
+    if webseed_active {
+        reasons.push("webseed source is healthy".to_string());
+        return 75;
     }
     if tracker_active || dht_active || pex_active {
         if dht_active {
@@ -641,6 +660,30 @@ mod tests {
             .reasons
             .iter()
             .any(|r| r.contains("no source") || r.contains("no useful peer")));
+    }
+
+    #[test]
+    fn active_webseed_without_peers_is_a_valid_source() {
+        let pieces = vec![true, false, false, false];
+        let mut input = input_with_missing_pieces(&pieces);
+        input.webseed_recent_ok = true;
+        input.received_block_recently = true;
+        input.rate_down = 2 * 1024 * 1024;
+
+        let h = HealthCalculator::new().compute(&input);
+
+        assert!(
+            h.score >= 55,
+            "active webseed should not be capped as a no-source torrent, got {}",
+            h.score
+        );
+        assert!(matches!(
+            h.label,
+            HealthLabel::Fair | HealthLabel::Good | HealthLabel::Excellent
+        ));
+        assert!(h.reasons.iter().any(|r| r.contains("webseed")));
+        assert!(!h.reasons.iter().any(|r| r.contains("no source")));
+        assert!(!h.reasons.iter().any(|r| r.contains("no useful peer")));
     }
 
     #[test]

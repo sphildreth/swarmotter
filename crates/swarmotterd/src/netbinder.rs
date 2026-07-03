@@ -29,6 +29,7 @@ use swarmotter_core::net::{
 };
 
 const MAX_TRACKER_HTTP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const HTTP_TRACKER_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -56,14 +57,27 @@ async fn tls_connect(
 }
 
 /// Send an HTTP/1.1 GET request over any async read/write stream and parse
-/// the response. Used for both plaintext (TCP) and TLS tracker connections.
-async fn http_over_stream<S>(mut stream: S, req: &[u8]) -> Result<HttpResponse>
+/// the response. Used by tests for both plaintext and TLS connections.
+#[cfg(test)]
+async fn http_over_stream<S>(stream: S, req: &[u8]) -> Result<HttpResponse>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    http_over_stream_limited(stream, req, MAX_TRACKER_HTTP_RESPONSE_BYTES, "tracker").await
+}
+
+async fn http_over_stream_limited<S>(
+    mut stream: S,
+    req: &[u8],
+    max_response_bytes: usize,
+    response_kind: &str,
+) -> Result<HttpResponse>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     timeout(HTTP_TRACKER_IO_TIMEOUT, stream.write_all(req))
         .await
-        .map_err(|_| CoreError::Internal("tracker request write timed out".into()))?
+        .map_err(|_| CoreError::Internal(format!("{response_kind} request write timed out")))?
         .map_err(CoreError::from)?;
 
     let mut buf = Vec::with_capacity(8192);
@@ -71,15 +85,14 @@ where
     loop {
         let n = timeout(HTTP_TRACKER_IO_TIMEOUT, stream.read(&mut chunk))
             .await
-            .map_err(|_| CoreError::Internal("tracker response read timed out".into()))?
+            .map_err(|_| CoreError::Internal(format!("{response_kind} response read timed out")))?
             .map_err(CoreError::from)?;
         if n == 0 {
             break;
         }
-        if buf.len().saturating_add(n) > MAX_TRACKER_HTTP_RESPONSE_BYTES {
+        if buf.len().saturating_add(n) > max_response_bytes {
             return Err(CoreError::Internal(format!(
-                "tracker response exceeded {} bytes",
-                MAX_TRACKER_HTTP_RESPONSE_BYTES
+                "{response_kind} response exceeded {max_response_bytes} bytes"
             )));
         }
         buf.extend_from_slice(&chunk[..n]);
@@ -128,6 +141,49 @@ impl ContainedBinder {
         Ok(())
     }
 
+    async fn contained_http_get(
+        &self,
+        url: &str,
+        range: Option<(u64, u64)>,
+        response_kind: &str,
+    ) -> Result<HttpResponse> {
+        self.guard().await?;
+        let max_response_bytes = match range {
+            Some((start, end_exclusive)) => http_range_response_limit(start, end_exclusive)?,
+            None => MAX_TRACKER_HTTP_RESPONSE_BYTES,
+        };
+        let parsed = url::Url::parse(url)
+            .map_err(|e| CoreError::Internal(format!("bad tracker url: {e}")))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| CoreError::Internal(format!("tracker url missing host: {url}")))?;
+        let is_https = parsed.scheme() == "https";
+        let port = parsed
+            .port_or_known_default()
+            .unwrap_or(if is_https { 443 } else { 80 });
+        // Resolve through the binder so hostname lookup is gated by the same
+        // containment and DNS policy as socket creation.
+        let addr: SocketAddr = self.resolve_host(host, port).await?;
+        let stream = self.connect_peer(addr).await?;
+        let req = build_http_get_request(&parsed, host, range)?;
+        if is_https {
+            // TLS over the contained TCP connection. Certificate validation
+            // uses the platform root trust store (webpki-roots); it stays
+            // enabled unless a documented test-only path overrides it.
+            let tls_stream = tls_connect(stream, host).await?;
+            http_over_stream_limited(
+                tls_stream,
+                req.as_bytes(),
+                max_response_bytes,
+                response_kind,
+            )
+            .await
+        } else {
+            http_over_stream_limited(stream, req.as_bytes(), max_response_bytes, response_kind)
+                .await
+        }
+    }
+
     /// Update the network configuration at runtime (e.g. when the daemon
     /// reconfigures containment). Existing in-flight connections are not
     /// affected; new connections honor the updated config.
@@ -164,34 +220,17 @@ impl NetworkBinder for ContainedBinder {
     }
 
     async fn http_get(&self, url: &str) -> Result<HttpResponse> {
-        self.guard().await?;
-        let parsed = url::Url::parse(url)
-            .map_err(|e| CoreError::Internal(format!("bad tracker url: {e}")))?;
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| CoreError::Internal(format!("tracker url missing host: {url}")))?;
-        let is_https = parsed.scheme() == "https";
-        let port = parsed
-            .port_or_known_default()
-            .unwrap_or(if is_https { 443 } else { 80 });
-        // Resolve through the binder so hostname lookup is gated by the same
-        // containment and DNS policy as socket creation.
-        let addr: SocketAddr = self.resolve_host(host, port).await?;
-        let stream = self.connect_peer(addr).await?;
-        let path = parsed.path();
-        let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
-        let req = format!(
-            "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: SwarmOtter/1.0\r\n\r\n"
-        );
-        if is_https {
-            // TLS over the contained TCP connection. Certificate validation
-            // uses the platform root trust store (webpki-roots); it stays
-            // enabled unless a documented test-only path overrides it.
-            let tls_stream = tls_connect(stream, host).await?;
-            http_over_stream(tls_stream, req.as_bytes()).await
-        } else {
-            http_over_stream(stream, req.as_bytes()).await
-        }
+        self.contained_http_get(url, None, "tracker").await
+    }
+
+    async fn http_get_range(
+        &self,
+        url: &str,
+        start: u64,
+        end_exclusive: u64,
+    ) -> Result<HttpResponse> {
+        self.contained_http_get(url, Some((start, end_exclusive)), "webseed")
+            .await
     }
 
     async fn resolve_host(&self, host: &str, port: u16) -> Result<SocketAddr> {
@@ -454,6 +493,47 @@ fn hostname_prefers_ipv6(host: &str) -> bool {
         .is_some_and(|label| label.eq_ignore_ascii_case("ipv6"))
 }
 
+fn build_http_get_request(
+    parsed: &url::Url,
+    host: &str,
+    range: Option<(u64, u64)>,
+) -> Result<String> {
+    let path = parsed.path();
+    let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
+    let mut req = format!(
+        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: SwarmOtter/1.0\r\n"
+    );
+    if let Some((start, end_exclusive)) = range {
+        req.push_str(&http_range_header(start, end_exclusive)?);
+    }
+    req.push_str("\r\n");
+    Ok(req)
+}
+
+fn http_range_header(start: u64, end_exclusive: u64) -> Result<String> {
+    if end_exclusive <= start {
+        return Err(CoreError::InvalidArgument(
+            "HTTP byte range end must be greater than start".into(),
+        ));
+    }
+    Ok(format!("Range: bytes={}-{}\r\n", start, end_exclusive - 1))
+}
+
+fn http_range_response_limit(start: u64, end_exclusive: u64) -> Result<usize> {
+    if end_exclusive <= start {
+        return Err(CoreError::InvalidArgument(
+            "HTTP byte range end must be greater than start".into(),
+        ));
+    }
+    let len = end_exclusive - start;
+    let len = usize::try_from(len).map_err(|_| {
+        CoreError::InvalidArgument("HTTP byte range is too large for this platform".into())
+    })?;
+    len.checked_add(MAX_HTTP_HEADER_BYTES).ok_or_else(|| {
+        CoreError::InvalidArgument("HTTP byte range response limit overflowed".into())
+    })
+}
+
 fn udp_bind_addr(cfg: &NetworkConfig, remote: Option<SocketAddr>) -> SocketAddr {
     let use_ipv6 = remote.map(|addr| addr.is_ipv6()).unwrap_or_else(|| {
         cfg.required_source_ipv6.is_some() && cfg.required_source_ipv4.is_none()
@@ -612,6 +692,29 @@ mod tests {
             Ok(_) => panic!("strict binder unexpectedly created a UDP socket"),
             Err(err) => err,
         };
+        assert!(err.is_network_blocked());
+    }
+
+    #[tokio::test]
+    async fn strict_binder_blocks_webseed_range_without_socket_path() {
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            fail_closed: true,
+            ..Default::default()
+        };
+        let binder = ContainedBinder::new(
+            cfg,
+            Arc::new(FakeProbe {
+                dns_ok: false,
+                source_ok: false,
+                namespace_ok: false,
+            }),
+        );
+
+        let err = binder
+            .http_get_range("http://127.0.0.1:9/file.bin", 0, 16)
+            .await
+            .unwrap_err();
         assert!(err.is_network_blocked());
     }
 

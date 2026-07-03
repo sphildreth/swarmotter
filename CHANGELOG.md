@@ -23,6 +23,13 @@ status.
 
 ### Added
 
+- **Contained webseed downloads:** torrent metadata now preserves BEP 19
+  `url-list` webseeds, and the engine can fetch missing pieces from HTTP/HTTPS
+  webseeds using contained byte-range GETs through `NetworkBinder`. Webseed
+  payloads are SHA-1 verified before disk writes, count toward live download
+  throughput, respect configured download rate limits, are recognized by
+  per-torrent health as a valid active source, and are covered by a loopback
+  range-server integration test.
 - **Per-torrent health calculation and display**: every torrent summary and
   detail response now includes a `health` object with a 0..100 score, a
   0..5 signal-bar mapping, a human-readable label

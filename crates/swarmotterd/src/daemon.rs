@@ -997,6 +997,7 @@ impl DaemonRuntime {
                     s.timeout_failures,
                     s.last_valid_block,
                     s.block_last_seen,
+                    s.webseed_last_seen,
                     s.dht_last_seen,
                     s.pex_last_seen,
                     s.tracker_last_ok,
@@ -1872,6 +1873,7 @@ fn build_health_input(
     timeout_failures: u32,
     last_valid_block: Option<std::time::Instant>,
     block_last_seen: Option<std::time::Instant>,
+    webseed_last_seen: Option<std::time::Instant>,
     dht_last_seen: Option<std::time::Instant>,
     pex_last_seen: Option<std::time::Instant>,
     tracker_last_ok: Option<std::time::Instant>,
@@ -1896,10 +1898,17 @@ fn build_health_input(
         || block_last_seen
             .map(|t| now.duration_since(t) < recent_window)
             .unwrap_or(false)
+        || webseed_last_seen
+            .map(|t| now.duration_since(t) < recent_window)
+            .unwrap_or(false)
         || peer_block_recent
         || t.rate_down > 0;
+    let webseed_recent_ok = webseed_last_seen
+        .map(|t| now.duration_since(t) < recent_window)
+        .unwrap_or(false);
     let time_since_last_block = last_valid_block
         .or(block_last_seen)
+        .or(webseed_last_seen)
         .map(|t| now.duration_since(t));
     let tracker_recent_ok = *tracker_ok
         || tracker_last_ok
@@ -1965,6 +1974,7 @@ fn build_health_input(
         hash_failures,
         timeout_failures,
         received_block_recently,
+        webseed_recent_ok,
         time_since_last_block,
         known_peers,
         no_peers_discovered,
@@ -2252,6 +2262,7 @@ mod tests {
             0,
             0,
             0,
+            None,
             None,
             None,
             None,
