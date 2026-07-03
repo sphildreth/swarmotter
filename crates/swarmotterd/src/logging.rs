@@ -85,12 +85,14 @@ pub fn init(config: &LoggingConfig) -> Result<Option<PathBuf>> {
     if config.json {
         tracing_subscriber::fmt()
             .json()
+            .with_ansi(false)
             .with_env_filter(filter)
             .with_writer(writer)
             .try_init()
             .map_err(|e| CoreError::Internal(format!("failed to initialize logging: {e}")))?;
     } else {
         tracing_subscriber::fmt()
+            .with_ansi(false)
             .with_env_filter(filter)
             .with_writer(writer)
             .try_init()

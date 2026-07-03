@@ -153,13 +153,14 @@ function fmtProgress(bytesCompleted, totalLength) {
   const completed = finiteNumber(bytesCompleted);
   const total = finiteNumber(totalLength);
   if (completed === null || total === null || total <= 0) return "";
-  return (completed / total * 100).toFixed(1) + "%";
+  return (Math.min(completed, total) / total * 100).toFixed(1) + "%";
 }
 function renderProgressCell(bytesCompleted, totalLength) {
   const completed = finiteNumber(bytesCompleted);
   const total = finiteNumber(totalLength);
   if (completed === null || total === null || total <= 0) return "";
-  return `<progress value="${completed}" max="${total}"></progress> ${fmtProgress(completed, total)}`;
+  const safeCompleted = Math.min(completed, total);
+  return `<progress value="${safeCompleted}" max="${total}"></progress> ${fmtProgress(safeCompleted, total)}`;
 }
 
 async function api(path, opts = {}) {

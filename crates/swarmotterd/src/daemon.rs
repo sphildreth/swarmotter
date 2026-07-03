@@ -993,6 +993,7 @@ impl DaemonRuntime {
                     );
                 }
                 t.progress.have = (0..s.piece_count).map(|i| s.pieces_have.has(i)).collect();
+                t.progress.total = s.piece_count;
                 t.downloaded = s.downloaded;
                 t.uploaded = s.uploaded;
                 t.active_peer_workers = s.active_peers;
@@ -1480,12 +1481,33 @@ fn read_last_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>
     let reader = BufReader::new(file);
     let mut lines = Vec::new();
     for line in reader.lines() {
-        lines.push(line?);
+        lines.push(strip_ansi_controls(&line?));
         if lines.len() > max_lines {
             lines.remove(0);
         }
     }
     Ok(lines)
+}
+
+fn strip_ansi_controls(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn effective_peer_worker_limit(
@@ -1535,6 +1557,7 @@ fn apply_resolved_metadata(
     t.progress.have = (0..real.piece_count())
         .map(|i| state.pieces_have.has(i))
         .collect();
+    t.progress.total = real.piece_count();
     t.files = real
         .files
         .iter()
@@ -2831,10 +2854,13 @@ mod tests {
         assert_eq!(summary.total_length, real_meta.total_length);
         assert_eq!(summary.piece_count, real_meta.piece_count());
         assert_eq!(summary.pieces_have, 1);
+        assert!(summary.bytes_completed <= summary.total_length);
+        assert!(summary.progress() <= 1.0);
 
         let reg = runtime.registry.lock().await;
         let torrent = reg.get(&hash).unwrap();
         assert!(!torrent.needs_metadata);
+        assert_eq!(torrent.progress.total, real_meta.piece_count());
         assert_eq!(torrent.files[0].path, "resolved-magnet.bin");
     }
 
@@ -2993,6 +3019,15 @@ mod tests {
         assert_eq!(effective_peer_worker_limit(120, 0, 3), 40);
         assert_eq!(effective_peer_worker_limit(120, 24, 3), 24);
         assert_eq!(effective_peer_worker_limit(2, 64, 5), 1);
+    }
+
+    #[test]
+    fn strip_ansi_controls_removes_terminal_sequences_from_logs() {
+        let raw = "\u{1b}[2m2026-07-03T19:43:03Z\u{1b}[0m \u{1b}[32mINFO\u{1b}[0m message";
+        assert_eq!(
+            strip_ansi_controls(raw),
+            "2026-07-03T19:43:03Z INFO message"
+        );
     }
 
     #[tokio::test]
