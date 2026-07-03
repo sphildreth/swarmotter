@@ -438,12 +438,12 @@ async fn settings_put_replaces_and_preserves_auth_token() {
         .await
         .unwrap();
     let result: ConfigUpdateResult = parse_api_data(&body);
-    assert_eq!(result.persisted, false);
+    assert!(!result.persisted);
     assert_eq!(result.config_path, None);
-    assert_eq!(result.restart_required, false);
+    assert!(!result.restart_required);
     assert!(result.restart_required_fields.is_empty());
     assert_eq!(result.config.api.auth_token, None);
-    assert_eq!(result.config.api.require_auth, true);
+    assert!(result.config.api.require_auth);
     assert_eq!(result.applied_runtime_fields, vec!["config"]);
 
     let resp = app
@@ -956,7 +956,7 @@ async fn network_diagnostics_endpoint() {
     assert_eq!(v.health.status, NetworkContainmentStatus::Disabled);
     let checks = v.checks;
     assert!(!checks.is_empty());
-    assert!(v.interfaces.len() >= 1);
+    assert!(!v.interfaces.is_empty());
 }
 
 #[tokio::test]
@@ -1020,7 +1020,7 @@ async fn recent_logs_endpoint_supports_limit() {
     assert!(!v.lines.is_empty());
     assert!(v.lines.len() <= 1);
     assert!(v.enabled);
-    assert_eq!(v.truncated, false);
+    assert!(!v.truncated);
 }
 
 #[tokio::test]

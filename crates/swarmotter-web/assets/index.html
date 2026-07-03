@@ -94,7 +94,7 @@
     <!-- Network view -->
     <section id="view-network" class="view hidden">
       <h2>Network Containment</h2>
-      <div class="view-grid">
+      <div class="view-grid network-layout">
         <div id="network-summary" class="card">
           <h3>Network summary</h3>
           <p class="muted">Container-bound state appears here.</p>
@@ -121,32 +121,155 @@
     <!-- Settings view -->
     <section id="view-settings" class="view hidden">
       <h2>Settings</h2>
-      <div class="settings-layout">
-        <div id="settings-runtime-editor" class="card">
-          <h3>Runtime settings</h3>
-          <div class="card-subsection">
-            <h4>Bandwidth</h4>
-            <label>Global download limit (B/s, 0=unlimited) <input id="bw-dl" type="number"></label>
-            <label>Global upload limit (B/s, 0=unlimited) <input id="bw-ul" type="number"></label>
-            <label>Alternate speed mode <input id="bw-alt" type="checkbox"></label>
-            <button id="save-bw-btn">Save Bandwidth</button>
-          </div>
-          <div class="card-subsection">
-            <h4>Notifications</h4>
-            <label>Toast display time (seconds) <input id="toast-seconds" type="number" min="1" max="60" step="1"></label>
-            <button id="save-toast-btn">Save Notifications</button>
+      <form id="settings-editor" class="settings-layout">
+        <div id="settings-api" class="card">
+          <h3>API</h3>
+          <div class="settings-form-grid">
+            <label class="settings-field"><span>Bind address</span><input id="cfg-api-bind-address" type="text" required></label>
+            <label class="settings-field"><span>New auth token</span><input id="cfg-api-auth-token" type="password" autocomplete="new-password"></label>
+            <label class="settings-field"><span>Max request body bytes</span><input id="cfg-api-max-request-body-bytes" type="number" min="1" step="1" required></label>
+            <label class="settings-check"><input id="cfg-api-require-auth" type="checkbox"><span>Require auth</span></label>
           </div>
         </div>
-        <div id="settings-full-config" class="card">
-          <h3>Full configuration</h3>
-          <textarea id="full-config-json" class="config-preview" rows="24" spellcheck="false">Awaiting configuration snapshot...</textarea>
-          <button id="save-config-btn">Save Full Configuration</button>
+
+        <div id="settings-compatibility" class="card">
+          <h3>Compatibility</h3>
+          <label class="settings-check"><input id="cfg-compat-transmission-enabled" type="checkbox"><span>Transmission RPC API</span></label>
         </div>
-        <div id="settings-save-status" class="card">
+
+        <div id="settings-storage" class="card">
+          <h3>Storage</h3>
+          <div class="settings-form-grid">
+            <label class="settings-field"><span>Download directory</span><input id="cfg-storage-download-dir" type="text"></label>
+            <label class="settings-field"><span>Incomplete directory</span><input id="cfg-storage-incomplete-dir" type="text"></label>
+            <label class="settings-check"><input id="cfg-storage-preallocate" type="checkbox"><span>Preallocate files</span></label>
+            <label class="settings-check"><input id="cfg-storage-sparse" type="checkbox"><span>Sparse files</span></label>
+          </div>
+        </div>
+
+        <div id="settings-network" class="card settings-wide">
+          <h3>Network containment</h3>
+          <div class="settings-form-grid">
+            <label class="settings-field">
+              <span>Mode</span>
+              <select id="cfg-network-mode">
+                <option value="disabled">Disabled</option>
+                <option value="preferred">Preferred</option>
+                <option value="strict">Strict</option>
+              </select>
+            </label>
+            <label class="settings-field"><span>Required interface</span><input id="cfg-network-required-interface" type="text"></label>
+            <label class="settings-field"><span>Required IPv4 source</span><input id="cfg-network-required-source-ipv4" type="text"></label>
+            <label class="settings-field"><span>Required IPv6 source</span><input id="cfg-network-required-source-ipv6" type="text"></label>
+            <label class="settings-field"><span>Required network namespace</span><input id="cfg-network-required-network-namespace" type="text"></label>
+            <label class="settings-check"><input id="cfg-network-allow-ipv6" type="checkbox"><span>Allow IPv6</span></label>
+            <label class="settings-check"><input id="cfg-network-fail-closed" type="checkbox"><span>Fail closed</span></label>
+            <label class="settings-check"><input id="cfg-network-validate-route" type="checkbox"><span>Validate route</span></label>
+            <label class="settings-check"><input id="cfg-network-validate-dns" type="checkbox"><span>Validate DNS</span></label>
+          </div>
+        </div>
+
+        <div id="settings-torrent" class="card">
+          <h3>Torrent</h3>
+          <div class="settings-form-grid">
+            <label class="settings-field"><span>Listen port</span><input id="cfg-torrent-listen-port" type="number" min="1" max="65535" step="1" required></label>
+            <label class="settings-check"><input id="cfg-torrent-allow-ipv6" type="checkbox"><span>Allow IPv6 peers</span></label>
+            <label class="settings-check"><input id="cfg-torrent-utp-enabled" type="checkbox"><span>Enable uTP</span></label>
+            <label class="settings-check"><input id="cfg-torrent-utp-prefer-tcp" type="checkbox"><span>Prefer TCP before uTP</span></label>
+            <label class="settings-check"><input id="cfg-torrent-selfish" type="checkbox"><span>Selfish completion</span></label>
+          </div>
+        </div>
+
+        <div id="settings-bandwidth" class="card">
+          <h3>Bandwidth</h3>
+          <div class="settings-form-grid">
+            <label class="settings-field"><span>Global download B/s</span><input id="cfg-bandwidth-global-download" type="number" min="0" step="1" required></label>
+            <label class="settings-field"><span>Global upload B/s</span><input id="cfg-bandwidth-global-upload" type="number" min="0" step="1" required></label>
+            <label class="settings-field"><span>Alt download B/s</span><input id="cfg-bandwidth-alt-download" type="number" min="0" step="1" required></label>
+            <label class="settings-field"><span>Alt upload B/s</span><input id="cfg-bandwidth-alt-upload" type="number" min="0" step="1" required></label>
+            <label class="settings-field"><span>Max peers</span><input id="cfg-bandwidth-max-peers" type="number" min="0" step="1" required></label>
+            <label class="settings-field"><span>Max peers per torrent</span><input id="cfg-bandwidth-max-peers-per-torrent" type="number" min="0" step="1" required></label>
+            <label class="settings-check"><input id="cfg-bandwidth-alt-enabled" type="checkbox"><span>Alternate speed mode</span></label>
+          </div>
+        </div>
+
+        <div id="settings-queue" class="card">
+          <h3>Queue</h3>
+          <div class="settings-form-grid">
+            <label class="settings-field"><span>Max active downloads</span><input id="cfg-queue-max-active-downloads" type="number" min="0" step="1" required></label>
+            <label class="settings-field"><span>Max active seeds</span><input id="cfg-queue-max-active-seeds" type="number" min="0" step="1" required></label>
+            <label class="settings-check"><input id="cfg-queue-auto-start" type="checkbox"><span>Auto-start new torrents</span></label>
+          </div>
+        </div>
+
+        <div id="settings-seeding" class="card">
+          <h3>Seeding</h3>
+          <div class="settings-form-grid">
+            <label class="settings-field"><span>Global ratio limit</span><input id="cfg-seeding-global-ratio-limit" type="number" min="0" step="0.01"></label>
+            <label class="settings-field"><span>Global idle limit seconds</span><input id="cfg-seeding-global-idle-limit" type="number" min="0" step="1"></label>
+          </div>
+        </div>
+
+        <div id="settings-dht" class="card">
+          <h3>DHT</h3>
+          <div class="settings-form-grid">
+            <label class="settings-field"><span>Port</span><input id="cfg-dht-port" type="number" min="1" max="65535" step="1" required></label>
+            <label class="settings-check"><input id="cfg-dht-enabled" type="checkbox"><span>Enable DHT</span></label>
+          </div>
+          <label class="settings-field"><span>Bootstrap nodes</span><textarea id="cfg-dht-bootstrap-nodes" class="settings-list" rows="5" spellcheck="false"></textarea></label>
+        </div>
+
+        <div id="settings-pex" class="card">
+          <h3>PEX</h3>
+          <div class="settings-form-grid">
+            <label class="settings-field"><span>Max peers</span><input id="cfg-pex-max-peers" type="number" min="0" step="1" required></label>
+            <label class="settings-check"><input id="cfg-pex-enabled" type="checkbox"><span>Enable PEX</span></label>
+          </div>
+        </div>
+
+        <div id="settings-watch" class="card settings-wide">
+          <div class="settings-card-heading">
+            <h3>Watch folders</h3>
+            <button id="add-watch-folder-btn" type="button">Add Folder</button>
+          </div>
+          <div id="settings-watch-list" class="settings-watch-list"></div>
+        </div>
+
+        <div id="settings-logging" class="card">
+          <h3>Logging</h3>
+          <div class="settings-form-grid">
+            <label class="settings-field"><span>Level</span><input id="cfg-logging-level" type="text" list="logging-level-options" required></label>
+            <datalist id="logging-level-options">
+              <option value="trace"></option>
+              <option value="debug"></option>
+              <option value="info"></option>
+              <option value="warn"></option>
+              <option value="error"></option>
+            </datalist>
+            <label class="settings-field"><span>File path</span><input id="cfg-logging-file-path" type="text"></label>
+            <label class="settings-check"><input id="cfg-logging-json" type="checkbox"><span>JSON logs</span></label>
+            <label class="settings-check"><input id="cfg-logging-file" type="checkbox"><span>File logging</span></label>
+          </div>
+        </div>
+
+        <div id="settings-interface" class="card">
+          <h3>Interface</h3>
+          <div class="settings-form-grid">
+            <label class="settings-field"><span>Toast display seconds</span><input id="toast-seconds" type="number" min="1" max="60" step="1"></label>
+            <button id="save-toast-btn" type="button">Save Notifications</button>
+          </div>
+        </div>
+
+        <div class="settings-actions settings-wide">
+          <button id="save-settings-btn" type="submit">Save Settings</button>
+          <button id="reload-settings-btn" type="button" class="secondary">Reload</button>
+        </div>
+
+        <div id="settings-save-status" class="card settings-wide">
           <h3>Save status</h3>
           <p class="muted">No save operation yet.</p>
         </div>
-      </div>
+      </form>
     </section>
 
     <!-- Watch view -->
@@ -165,7 +288,7 @@
           <h3>Scan history</h3>
           <p class="muted">Recent paths and status stream here.</p>
         </div>
-        <button id="watch-scan-btn">Scan Now</button>
+        <button id="watch-scan-btn" disabled>Scan Now</button>
       </div>
     </section>
 

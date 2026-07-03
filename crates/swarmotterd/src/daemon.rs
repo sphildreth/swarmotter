@@ -1003,9 +1003,9 @@ impl DaemonRuntime {
                         t.state = TorrentState::Completed;
                     } else if t.needs_metadata {
                         t.state = TorrentState::DownloadingMetadata;
-                    } else if t.state == TorrentState::Queued {
-                        t.state = TorrentState::Downloading;
-                    } else if t.state == TorrentState::DownloadingMetadata {
+                    } else if t.state == TorrentState::Queued
+                        || t.state == TorrentState::DownloadingMetadata
+                    {
                         t.state = TorrentState::Downloading;
                     }
                 }
@@ -2681,8 +2681,7 @@ fn build_health_input(
                 .map(|t| now.duration_since(t) < recent_window)
                 .unwrap_or(false);
         let unchoked = (p.unchoked && last_seen_recent) || useful_recently;
-        let has_missing =
-            (p.has_missing_pieces && last_seen_recent) || (useful_recently && last_seen_recent);
+        let has_missing = (useful_recently || p.has_missing_pieces) && last_seen_recent;
         peers.push(EnginePeerHealth {
             piece_bitfield: p.piece_bitfield.clone(),
             has_missing_pieces: has_missing,

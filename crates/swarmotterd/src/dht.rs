@@ -320,6 +320,7 @@ impl DhtRunner {
         hints
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_response(
         &self,
         from: SocketAddr,

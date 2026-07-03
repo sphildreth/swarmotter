@@ -667,50 +667,284 @@ async function refreshNetwork() {
 async function refreshSettings() {
   try {
     const cfg = await api("/settings");
-    $("#bw-dl").value = cfg.bandwidth.global_download ?? "";
-    $("#bw-ul").value = cfg.bandwidth.global_upload ?? "";
-    $("#bw-alt").checked = !!cfg.bandwidth.alt_enabled;
-    $("#toast-seconds").value = String(Math.round(toastDisplayMs / 1000));
     fullConfigSnapshot = cfg;
-    $("#full-config-json").value = JSON.stringify(cfg, null, 2);
+    renderSettingsEditor(cfg);
   } catch (e) { log("settings error: " + e.message); }
 }
 
-$("#save-bw-btn").addEventListener("click", async () => {
-  try {
-    const cfg = await api("/settings");
-    cfg.bandwidth.global_download = parseInt($("#bw-dl").value, 10) || 0;
-    cfg.bandwidth.global_upload = parseInt($("#bw-ul").value, 10) || 0;
-    cfg.bandwidth.alt_enabled = $("#bw-alt").checked;
-    await api("/settings", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ bandwidth: cfg.bandwidth }) });
-    showToast("Bandwidth settings saved", "", "success");
-    await refreshSettings();
-    await refreshDoctorBadge();
-  } catch (e) { showError("Save bandwidth failed", e); }
-});
+function settingsField(id) {
+  return $("#" + id);
+}
 
-$("#save-toast-btn").addEventListener("click", () => {
-  const ms = setToastDisplaySeconds($("#toast-seconds").value);
-  $("#toast-seconds").value = String(Math.round(ms / 1000));
-  showToast("Notification settings saved", "", "success");
-});
+function setSettingsValue(id, value) {
+  const el = settingsField(id);
+  if (el) el.value = value ?? "";
+}
 
-$("#save-config-btn").addEventListener("click", async () => {
+function setSettingsChecked(id, value) {
+  const el = settingsField(id);
+  if (el) el.checked = !!value;
+}
+
+function settingsString(id) {
+  return settingsField(id).value.trim();
+}
+
+function settingsOptionalString(id) {
+  const value = settingsString(id);
+  return value ? value : null;
+}
+
+function settingsInteger(id, fallback = 0) {
+  const value = settingsField(id).value;
+  if (value === "") return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.trunc(n) : fallback;
+}
+
+function settingsFloatOrNull(id) {
+  const value = settingsField(id).value;
+  if (value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function settingsIntegerOrNull(id) {
+  const value = settingsField(id).value;
+  if (value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.trunc(n) : null;
+}
+
+function settingsLineList(id) {
+  return settingsField(id).value
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(Boolean);
+}
+
+function renderSettingsEditor(cfg) {
+  const apiCfg = cfg.api || {};
+  const compatibility = cfg.compatibility || {};
+  const transmission = compatibility.transmission || {};
+  const storage = cfg.storage || {};
+  const network = cfg.network || {};
+  const torrent = cfg.torrent || {};
+  const bandwidth = cfg.bandwidth || {};
+  const queue = cfg.queue || {};
+  const seeding = cfg.seeding || {};
+  const dht = cfg.dht || {};
+  const pex = cfg.pex || {};
+  const logging = cfg.logging || {};
+
+  setSettingsValue("cfg-api-bind-address", apiCfg.bind_address);
+  setSettingsValue("cfg-api-auth-token", "");
+  setSettingsValue("cfg-api-max-request-body-bytes", apiCfg.max_request_body_bytes);
+  setSettingsChecked("cfg-api-require-auth", apiCfg.require_auth);
+
+  setSettingsChecked("cfg-compat-transmission-enabled", transmission.enabled);
+
+  setSettingsValue("cfg-storage-download-dir", storage.download_dir);
+  setSettingsValue("cfg-storage-incomplete-dir", storage.incomplete_dir);
+  setSettingsChecked("cfg-storage-preallocate", storage.preallocate);
+  setSettingsChecked("cfg-storage-sparse", storage.sparse);
+
+  setSettingsValue("cfg-network-mode", network.mode || "disabled");
+  setSettingsValue("cfg-network-required-interface", network.required_interface);
+  setSettingsValue("cfg-network-required-source-ipv4", network.required_source_ipv4);
+  setSettingsValue("cfg-network-required-source-ipv6", network.required_source_ipv6);
+  setSettingsValue("cfg-network-required-network-namespace", network.required_network_namespace);
+  setSettingsChecked("cfg-network-allow-ipv6", network.allow_ipv6);
+  setSettingsChecked("cfg-network-fail-closed", network.fail_closed);
+  setSettingsChecked("cfg-network-validate-route", network.validate_route);
+  setSettingsChecked("cfg-network-validate-dns", network.validate_dns);
+
+  setSettingsValue("cfg-torrent-listen-port", torrent.listen_port);
+  setSettingsChecked("cfg-torrent-allow-ipv6", torrent.allow_ipv6);
+  setSettingsChecked("cfg-torrent-utp-enabled", torrent.utp_enabled);
+  setSettingsChecked("cfg-torrent-utp-prefer-tcp", torrent.utp_prefer_tcp);
+  setSettingsChecked("cfg-torrent-selfish", torrent.selfish);
+
+  setSettingsValue("cfg-bandwidth-global-download", bandwidth.global_download);
+  setSettingsValue("cfg-bandwidth-global-upload", bandwidth.global_upload);
+  setSettingsValue("cfg-bandwidth-alt-download", bandwidth.alt_download);
+  setSettingsValue("cfg-bandwidth-alt-upload", bandwidth.alt_upload);
+  setSettingsValue("cfg-bandwidth-max-peers", bandwidth.max_peers);
+  setSettingsValue("cfg-bandwidth-max-peers-per-torrent", bandwidth.max_peers_per_torrent);
+  setSettingsChecked("cfg-bandwidth-alt-enabled", bandwidth.alt_enabled);
+
+  setSettingsValue("cfg-queue-max-active-downloads", queue.max_active_downloads);
+  setSettingsValue("cfg-queue-max-active-seeds", queue.max_active_seeds);
+  setSettingsChecked("cfg-queue-auto-start", queue.auto_start);
+
+  setSettingsValue("cfg-seeding-global-ratio-limit", seeding.global_ratio_limit);
+  setSettingsValue("cfg-seeding-global-idle-limit", seeding.global_idle_limit);
+
+  setSettingsValue("cfg-dht-port", dht.port);
+  setSettingsChecked("cfg-dht-enabled", dht.enabled);
+  setSettingsValue("cfg-dht-bootstrap-nodes", (dht.bootstrap_nodes || []).join("\n"));
+
+  setSettingsValue("cfg-pex-max-peers", pex.max_peers);
+  setSettingsChecked("cfg-pex-enabled", pex.enabled);
+
+  setSettingsValue("cfg-logging-level", logging.level || "info");
+  setSettingsValue("cfg-logging-file-path", logging.file_path);
+  setSettingsChecked("cfg-logging-json", logging.json);
+  setSettingsChecked("cfg-logging-file", logging.file);
+
+  renderWatchFolderEditors(cfg.watch || []);
+  setSettingsValue("toast-seconds", String(Math.round(toastDisplayMs / 1000)));
+}
+
+function collectSettingsConfig() {
+  const authToken = settingsOptionalString("cfg-api-auth-token");
+  return {
+    api: {
+      bind_address: settingsString("cfg-api-bind-address"),
+      auth_token: authToken,
+      require_auth: settingsField("cfg-api-require-auth").checked,
+      max_request_body_bytes: settingsInteger("cfg-api-max-request-body-bytes", 1),
+    },
+    compatibility: {
+      transmission: {
+        enabled: settingsField("cfg-compat-transmission-enabled").checked,
+      },
+    },
+    storage: {
+      download_dir: settingsOptionalString("cfg-storage-download-dir"),
+      incomplete_dir: settingsOptionalString("cfg-storage-incomplete-dir"),
+      preallocate: settingsField("cfg-storage-preallocate").checked,
+      sparse: settingsField("cfg-storage-sparse").checked,
+    },
+    network: {
+      mode: settingsString("cfg-network-mode"),
+      required_interface: settingsOptionalString("cfg-network-required-interface"),
+      required_source_ipv4: settingsOptionalString("cfg-network-required-source-ipv4"),
+      required_source_ipv6: settingsOptionalString("cfg-network-required-source-ipv6"),
+      required_network_namespace: settingsOptionalString("cfg-network-required-network-namespace"),
+      allow_ipv6: settingsField("cfg-network-allow-ipv6").checked,
+      fail_closed: settingsField("cfg-network-fail-closed").checked,
+      validate_route: settingsField("cfg-network-validate-route").checked,
+      validate_dns: settingsField("cfg-network-validate-dns").checked,
+    },
+    torrent: {
+      listen_port: settingsInteger("cfg-torrent-listen-port", 51413),
+      allow_ipv6: settingsField("cfg-torrent-allow-ipv6").checked,
+      utp_enabled: settingsField("cfg-torrent-utp-enabled").checked,
+      utp_prefer_tcp: settingsField("cfg-torrent-utp-prefer-tcp").checked,
+      selfish: settingsField("cfg-torrent-selfish").checked,
+    },
+    bandwidth: {
+      global_download: settingsInteger("cfg-bandwidth-global-download"),
+      global_upload: settingsInteger("cfg-bandwidth-global-upload"),
+      alt_download: settingsInteger("cfg-bandwidth-alt-download"),
+      alt_upload: settingsInteger("cfg-bandwidth-alt-upload"),
+      alt_enabled: settingsField("cfg-bandwidth-alt-enabled").checked,
+      max_peers: settingsInteger("cfg-bandwidth-max-peers"),
+      max_peers_per_torrent: settingsInteger("cfg-bandwidth-max-peers-per-torrent"),
+    },
+    queue: {
+      max_active_downloads: settingsInteger("cfg-queue-max-active-downloads"),
+      max_active_seeds: settingsInteger("cfg-queue-max-active-seeds"),
+      auto_start: settingsField("cfg-queue-auto-start").checked,
+    },
+    seeding: {
+      global_ratio_limit: settingsFloatOrNull("cfg-seeding-global-ratio-limit"),
+      global_idle_limit: settingsIntegerOrNull("cfg-seeding-global-idle-limit"),
+    },
+    dht: {
+      enabled: settingsField("cfg-dht-enabled").checked,
+      bootstrap_nodes: settingsLineList("cfg-dht-bootstrap-nodes"),
+      port: settingsInteger("cfg-dht-port", 51413),
+    },
+    pex: {
+      enabled: settingsField("cfg-pex-enabled").checked,
+      max_peers: settingsInteger("cfg-pex-max-peers"),
+    },
+    watch: collectWatchFolderEditors(),
+    logging: {
+      level: settingsString("cfg-logging-level"),
+      json: settingsField("cfg-logging-json").checked,
+      file: settingsField("cfg-logging-file").checked,
+      file_path: settingsOptionalString("cfg-logging-file-path"),
+    },
+  };
+}
+
+function renderWatchFolderEditors(folders) {
+  const list = $("#settings-watch-list");
+  if (!list) return;
+  if (!folders || folders.length === 0) {
+    list.innerHTML = `<p class="muted">No watch folders configured.</p>`;
+    return;
+  }
+  list.innerHTML = folders.map((folder, index) => renderWatchFolderEditor(folder, index)).join("");
+}
+
+function renderWatchFolderEditor(folder, index) {
+  const cfg = folder || {};
+  return `
+    <div class="watch-folder-editor">
+      <div class="watch-folder-header">
+        <strong>Folder ${index + 1}</strong>
+        <button type="button" class="icon-button danger" data-settings-action="remove-watch-folder" aria-label="Remove watch folder" title="Remove watch folder">
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M6 6l1 15h10l1-15"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+        </button>
+      </div>
+      <div class="settings-form-grid">
+        <label class="settings-field"><span>Path</span><input data-watch-field="path" type="text" required value="${escapeHtml(cfg.path || "")}"></label>
+        <label class="settings-field"><span>Download directory</span><input data-watch-field="download_dir" type="text" value="${escapeHtml(cfg.download_dir || "")}"></label>
+        <label class="settings-field"><span>Label</span><input data-watch-field="label" type="text" value="${escapeHtml(cfg.label || "")}"></label>
+        <label class="settings-field">
+          <span>Start behavior</span>
+          <select data-watch-field="start_behavior">
+            <option value="start"${(cfg.start_behavior || "start") === "start" ? " selected" : ""}>Start</option>
+            <option value="paused"${cfg.start_behavior === "paused" ? " selected" : ""}>Paused</option>
+          </select>
+        </label>
+        <label class="settings-field"><span>Archive directory</span><input data-watch-field="archive_dir" type="text" value="${escapeHtml(cfg.archive_dir || "")}"></label>
+        <label class="settings-field"><span>Failure directory</span><input data-watch-field="failure_dir" type="text" value="${escapeHtml(cfg.failure_dir || "")}"></label>
+        <label class="settings-check"><input data-watch-field="recursive" type="checkbox"${cfg.recursive ? " checked" : ""}><span>Recursive</span></label>
+        <label class="settings-check"><input data-watch-field="delete_after_import" type="checkbox"${cfg.delete_after_import !== false ? " checked" : ""}><span>Delete after import</span></label>
+      </div>
+    </div>`;
+}
+
+function collectWatchFolderEditors() {
+  return $$("#settings-watch-list .watch-folder-editor").map(row => ({
+    path: watchInput(row, "path").value.trim(),
+    recursive: watchInput(row, "recursive").checked,
+    download_dir: watchOptionalString(row, "download_dir"),
+    label: watchOptionalString(row, "label"),
+    start_behavior: watchInput(row, "start_behavior").value,
+    archive_dir: watchOptionalString(row, "archive_dir"),
+    failure_dir: watchOptionalString(row, "failure_dir"),
+    delete_after_import: watchInput(row, "delete_after_import").checked,
+  }));
+}
+
+function watchInput(row, field) {
+  return row.querySelector(`[data-watch-field="${field}"]`);
+}
+
+function watchOptionalString(row, field) {
+  const value = watchInput(row, field).value.trim();
+  return value ? value : null;
+}
+
+$("#settings-editor").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.reportValidity()) return;
   const status = $("#settings-save-status");
   try {
-    const raw = $("#full-config-json").value.trim();
-    if (!raw) {
-      showToast("Configuration is empty", "", "warning");
-      return;
-    }
-    const nextConfig = JSON.parse(raw);
     const result = await api("/settings", {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(nextConfig),
+      body: JSON.stringify(collectSettingsConfig()),
     });
     fullConfigSnapshot = result.config;
-    $("#full-config-json").value = JSON.stringify(result.config, null, 2);
+    renderSettingsEditor(result.config);
     renderConfigSaveStatus(result);
     showToast("Configuration saved", result.restart_required ? "Restart required for some fields" : "", "success");
     await refreshDoctorBadge();
@@ -725,6 +959,44 @@ $("#save-config-btn").addEventListener("click", async () => {
     }
     showError("Save configuration failed", e);
   }
+});
+
+$("#reload-settings-btn").addEventListener("click", async () => {
+  await refreshSettings();
+  showToast("Settings reloaded", "", "info");
+});
+
+$("#add-watch-folder-btn").addEventListener("click", () => {
+  const folders = collectWatchFolderEditors();
+  folders.push({
+    path: "",
+    recursive: false,
+    download_dir: null,
+    label: null,
+    start_behavior: "start",
+    archive_dir: null,
+    failure_dir: null,
+    delete_after_import: true,
+  });
+  renderWatchFolderEditors(folders);
+  const rows = $$("#settings-watch-list .watch-folder-editor");
+  const last = rows[rows.length - 1];
+  if (last) watchInput(last, "path").focus();
+});
+
+$("#settings-watch-list").addEventListener("click", (event) => {
+  const remove = event.target.closest('[data-settings-action="remove-watch-folder"]');
+  if (!remove) return;
+  remove.closest(".watch-folder-editor")?.remove();
+  if ($$("#settings-watch-list .watch-folder-editor").length === 0) {
+    renderWatchFolderEditors([]);
+  }
+});
+
+$("#save-toast-btn").addEventListener("click", () => {
+  const ms = setToastDisplaySeconds($("#toast-seconds").value);
+  $("#toast-seconds").value = String(Math.round(ms / 1000));
+  showToast("Notification settings saved", "", "success");
 });
 
 function renderConfigSaveStatus(result) {
@@ -752,6 +1024,11 @@ function renderWatch(status, scanDetail = "") {
   const folders = status?.folders || [];
   const imports = status?.recent_imports || [];
   const pending = folders.reduce((sum, folder) => sum + (finiteNumber(folder.pending_torrent_files) || 0), 0);
+  const scanButton = $("#watch-scan-btn");
+  if (scanButton) {
+    scanButton.disabled = folders.length === 0;
+    scanButton.title = folders.length === 0 ? "No watch folders configured" : "";
+  }
   $("#watch-config").innerHTML = `
     <h3>Watch config</h3>
     ${folders.length === 0 ? `<p class="muted">No watch folders configured.</p>` : `

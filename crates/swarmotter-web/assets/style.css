@@ -64,16 +64,149 @@ nav { display: flex; gap: 0.3rem; }
   gap: 1rem;
   margin-top: 0.75rem;
 }
+.network-layout {
+  grid-template-columns: repeat(3, minmax(20rem, 1fr));
+  align-items: start;
+}
+.network-layout .card {
+  min-width: 0;
+  overflow: hidden;
+}
+#network-interfaces {
+  grid-column: span 2;
+  overflow-x: auto;
+}
+#network-originality {
+  grid-column: span 1;
+}
+#network-interfaces table {
+  min-width: 58rem;
+}
+#network-interfaces th,
+#network-interfaces td {
+  vertical-align: top;
+}
+#network-interfaces td:last-child {
+  white-space: nowrap;
+}
+#network-health pre {
+  max-height: 38rem;
+  overflow: auto;
+  white-space: pre;
+}
+#view-network .kv {
+  grid-template-columns: minmax(7.5rem, 11rem) minmax(0, 1fr);
+}
+#view-network .kv dd {
+  overflow-wrap: break-word;
+  word-break: normal;
+  min-width: 0;
+}
+@media (max-width: 1200px) {
+  .network-layout {
+    grid-template-columns: repeat(2, minmax(20rem, 1fr));
+  }
+  #network-interfaces,
+  #network-originality {
+    grid-column: 1 / -1;
+  }
+}
+@media (max-width: 720px) {
+  .network-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  #view-network .kv {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  #view-network .kv dt {
+    margin-top: 0.35rem;
+  }
+}
 .settings-layout,
 .watch-layout {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
   gap: 1rem;
   margin-top: 0.75rem;
+  align-items: start;
 }
 .settings-layout .card,
 .watch-layout .card {
   margin-bottom: 0;
+}
+.settings-layout .settings-wide {
+  grid-column: 1 / -1;
+}
+.settings-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.65rem 0.9rem;
+  align-items: end;
+}
+.settings-field {
+  display: grid;
+  gap: 0.25rem;
+  margin: 0;
+  min-width: 0;
+}
+.settings-field span,
+.settings-check span {
+  color: var(--muted);
+  font-size: 0.88rem;
+  line-height: 1.25;
+}
+.settings-field input,
+.settings-field select,
+.settings-field textarea {
+  width: 100%;
+  min-width: 0;
+}
+.settings-check {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  min-height: 2.15rem;
+  margin: 0;
+}
+.settings-check input[type="checkbox"] {
+  flex: 0 0 auto;
+}
+.settings-card-heading,
+.watch-folder-header,
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.settings-card-heading,
+.watch-folder-header {
+  justify-content: space-between;
+  margin-bottom: 0.7rem;
+}
+.settings-actions {
+  flex-wrap: wrap;
+}
+.settings-watch-list {
+  display: grid;
+  gap: 0.75rem;
+}
+.watch-folder-editor {
+  min-width: 0;
+  padding: 0.8rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #202020;
+}
+.settings-list {
+  min-height: 8rem;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  line-height: 1.35;
+}
+button.secondary {
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid var(--border);
 }
 .card-subsection {
   margin-bottom: 1rem;
@@ -81,19 +214,9 @@ nav { display: flex; gap: 0.3rem; }
 .card-subsection h4 {
   margin: 0 0 0.45rem;
 }
-.config-preview,
 .health-payload {
   margin: 0;
   white-space: pre-wrap;
-}
-textarea.config-preview {
-  display: block;
-  width: 100%;
-  min-height: 24rem;
-  margin-bottom: 0.7rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.82rem;
-  line-height: 1.35;
 }
 #watch-scan-btn {
   margin-top: 0;
@@ -195,6 +318,11 @@ button {
   cursor: pointer;
 }
 button:hover { opacity: 0.9; }
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+button:disabled:hover { opacity: 0.45; }
 button.danger { background: var(--danger); color: #fff; }
 .torrent-actions {
   display: inline-flex;
@@ -307,6 +435,7 @@ h4 {
 }
 label { display: block; margin: 0.4rem 0; }
 input[type="number"] { width: 12rem; }
+.settings-field input[type="number"] { width: 100%; }
 
 /* --- Health indicator --- */
 /* Signal-bars style health display. Rendered as five CSS bars that scale

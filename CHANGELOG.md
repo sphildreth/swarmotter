@@ -278,6 +278,10 @@ status.
 
 ### Changed
 
+- The Web UI Settings tab now uses a structured full-configuration editor for
+  API, compatibility, storage, network containment, torrent, bandwidth, queue,
+  seeding, DHT, PEX, watch folder, and logging settings instead of mixing a
+  partial form with a raw JSON editor.
 - Active downloads now write partial data and partial fast-resume metadata
   under `[storage].incomplete_dir` when configured. After all pieces verify,
   the engine moves completed data to `[storage].download_dir` and removes

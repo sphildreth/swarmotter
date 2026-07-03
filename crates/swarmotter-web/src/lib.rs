@@ -279,8 +279,21 @@ mod tests {
             "network-config",
             "network-interfaces",
             "network-originality",
-            "settings-runtime-editor",
-            "settings-full-config",
+            "settings-editor",
+            "settings-api",
+            "settings-compatibility",
+            "settings-storage",
+            "settings-network",
+            "settings-torrent",
+            "settings-bandwidth",
+            "settings-queue",
+            "settings-seeding",
+            "settings-dht",
+            "settings-pex",
+            "settings-watch",
+            "settings-watch-list",
+            "settings-logging",
+            "settings-interface",
             "settings-save-status",
             "watch-config",
             "watch-history",
@@ -316,15 +329,131 @@ mod tests {
         for needle in [
             ".view-grid",
             ".settings-layout",
+            ".settings-wide",
+            ".settings-form-grid",
+            ".settings-field",
+            ".settings-check",
+            ".settings-watch-list",
+            ".watch-folder-editor",
+            ".settings-actions",
             ".watch-layout",
+            ".network-layout",
             ".card-subsection",
-            ".config-preview",
             ".health-payload",
             "#health-badge",
         ] {
             assert!(
                 STYLE_CSS.contains(needle),
                 "style.css is missing class {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_settings_uses_structured_full_editor() {
+        for id in [
+            "cfg-api-bind-address",
+            "cfg-api-auth-token",
+            "cfg-api-require-auth",
+            "cfg-api-max-request-body-bytes",
+            "cfg-compat-transmission-enabled",
+            "cfg-storage-download-dir",
+            "cfg-storage-incomplete-dir",
+            "cfg-storage-preallocate",
+            "cfg-storage-sparse",
+            "cfg-network-mode",
+            "cfg-network-required-interface",
+            "cfg-network-required-source-ipv4",
+            "cfg-network-required-source-ipv6",
+            "cfg-network-required-network-namespace",
+            "cfg-network-allow-ipv6",
+            "cfg-network-fail-closed",
+            "cfg-network-validate-route",
+            "cfg-network-validate-dns",
+            "cfg-torrent-listen-port",
+            "cfg-torrent-allow-ipv6",
+            "cfg-torrent-utp-enabled",
+            "cfg-torrent-utp-prefer-tcp",
+            "cfg-torrent-selfish",
+            "cfg-bandwidth-global-download",
+            "cfg-bandwidth-global-upload",
+            "cfg-bandwidth-alt-download",
+            "cfg-bandwidth-alt-upload",
+            "cfg-bandwidth-max-peers",
+            "cfg-bandwidth-max-peers-per-torrent",
+            "cfg-bandwidth-alt-enabled",
+            "cfg-queue-max-active-downloads",
+            "cfg-queue-max-active-seeds",
+            "cfg-queue-auto-start",
+            "cfg-seeding-global-ratio-limit",
+            "cfg-seeding-global-idle-limit",
+            "cfg-dht-enabled",
+            "cfg-dht-port",
+            "cfg-dht-bootstrap-nodes",
+            "cfg-pex-enabled",
+            "cfg-pex-max-peers",
+            "cfg-logging-level",
+            "cfg-logging-json",
+            "cfg-logging-file",
+            "cfg-logging-file-path",
+            "logging-level-options",
+            "save-settings-btn",
+            "reload-settings-btn",
+            "add-watch-folder-btn",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{}\"", id)),
+                "Settings editor is missing field id {id}"
+            );
+        }
+
+        for needle in [
+            "function renderSettingsEditor(",
+            "function collectSettingsConfig(",
+            "function renderWatchFolderEditors(",
+            "function collectWatchFolderEditors(",
+            "method: \"PUT\"",
+            "Configuration saved",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "Settings editor is missing JS support {needle}"
+            );
+        }
+
+        for old_surface in [
+            "settings-runtime-editor",
+            "settings-full-config",
+            "full-config-json",
+            "save-config-btn",
+            "save-bw-btn",
+            "bw-dl",
+            "bw-ul",
+            "bw-alt",
+            "config-preview",
+        ] {
+            assert!(
+                !INDEX_HTML.contains(old_surface)
+                    && !APP_JS.contains(old_surface)
+                    && !STYLE_CSS.contains(old_surface),
+                "Settings editor still contains old raw/partial config surface {old_surface}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_disables_watch_scan_without_configured_folders() {
+        assert!(
+            INDEX_HTML.contains("id=\"watch-scan-btn\" disabled"),
+            "Watch scan button should start disabled until watch status is loaded"
+        );
+        for needle in [
+            "scanButton.disabled = folders.length === 0",
+            "No watch folders configured",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "Watch view is missing disabled scan button support {needle}"
             );
         }
     }

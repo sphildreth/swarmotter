@@ -913,7 +913,7 @@ impl TorrentEngine {
                             let before = discovered.len();
                             add_pex_peers(
                                 discovered,
-                                pex.added.into_iter().chain(pex.added6.into_iter()),
+                                pex.added.into_iter().chain(pex.added6),
                                 self.allow_ipv6,
                                 max_peers,
                             );
@@ -2886,8 +2886,7 @@ impl PeerRequestWindow {
         let cap = remote_reqq
             .filter(|cap| *cap > 0)
             .unwrap_or(NORMAL_REQUEST_FALLBACK_CAP)
-            .min(NORMAL_REQUEST_LOCAL_CAP)
-            .max(1);
+            .clamp(1, NORMAL_REQUEST_LOCAL_CAP);
         Self {
             cap,
             smoothed_rate_bps: 0,
@@ -2900,7 +2899,7 @@ impl PeerRequestWindow {
         let Some(remote_reqq) = remote_reqq.filter(|cap| *cap > 0) else {
             return;
         };
-        self.cap = remote_reqq.min(NORMAL_REQUEST_LOCAL_CAP).max(1);
+        self.cap = remote_reqq.clamp(1, NORMAL_REQUEST_LOCAL_CAP);
     }
 
     fn record_block(&mut self, bytes: u64, now: Instant) {
@@ -3384,7 +3383,7 @@ async fn handle_parallel_pex_message(
     let before = peers.len();
     add_pex_peers(
         &mut peers,
-        pex.added.into_iter().chain(pex.added6.into_iter()),
+        pex.added.into_iter().chain(pex.added6),
         allow_ipv6,
         pex_max_peers,
     );
