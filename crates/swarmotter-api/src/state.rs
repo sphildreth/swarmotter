@@ -15,7 +15,7 @@ use swarmotter_core::config::Config;
 use swarmotter_core::error::Result;
 use swarmotter_core::hash::InfoHash;
 use swarmotter_core::models::diagnostics::{
-    ConfigUpdateResult, DoctorReport, LogSnapshot, NetworkDiagnostics, WatchStatus,
+    ConfigUpdateResult, DoctorReport, LogSnapshot, NetworkDiagnostics, ResetResult, WatchStatus,
 };
 use swarmotter_core::models::network::NetworkHealth;
 use swarmotter_core::models::peer::Peer;
@@ -116,6 +116,8 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn update_settings(&self, patch: SettingsPatch) -> Result<()>;
     /// Replace the full validated configuration.
     async fn replace_config(&self, config: Config) -> Result<ConfigUpdateResult>;
+    /// Reset all download state, configured storage contents, and daemon logs.
+    async fn reset_downloads(&self) -> Result<ResetResult>;
 
     /// Network containment health.
     async fn network_health(&self) -> NetworkHealth;

@@ -23,8 +23,8 @@ use swarmotter_core::models::tracker::{
 };
 use swarmotter_core::models::{
     ConfigUpdateResult, DiagnosticLevel, DoctorCheck, DoctorReport, LogSnapshot,
-    NetworkDiagnostics, NetworkInterfaceDiagnostic, NetworkPathCheck, WatchFolderStatus,
-    WatchStatus,
+    NetworkDiagnostics, NetworkInterfaceDiagnostic, NetworkPathCheck, ResetResult,
+    WatchFolderStatus, WatchStatus,
 };
 use swarmotter_core::torrent::{Torrent, TorrentRegistry};
 use swarmotter_core::watch::ImportResult;
@@ -360,6 +360,17 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             restart_required_fields: Vec::new(),
             applied_runtime_fields: vec!["config".into()],
             config: redacted,
+        })
+    }
+    async fn reset_downloads(&self) -> Result<ResetResult> {
+        let removed = self.registry.lock().await.torrents.len();
+        self.registry.lock().await.torrents.clear();
+        Ok(ResetResult {
+            torrents_removed: removed,
+            storage_paths: Vec::new(),
+            storage_entries_removed: 0,
+            log_paths: Vec::new(),
+            log_files_cleared: 0,
         })
     }
     async fn network_health(&self) -> NetworkHealth {

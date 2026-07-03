@@ -35,3 +35,7 @@ pub async fn recent_logs(
 pub async fn doctor_report(State(state): State<SharedState>) -> Response {
     into_response(Ok(state.daemon.doctor_report().await))
 }
+
+pub async fn reset_downloads(State(state): State<SharedState>) -> Response {
+    into_response(state.daemon.reset_downloads().await)
+}

@@ -76,6 +76,11 @@ status.
   configuration, preserves existing auth tokens when omitted, redacts auth
   tokens in responses, applies live-safe fields immediately, and reports fields
   that require restart. ADR-0025 records the decision.
+- **Confirmed download reset:** the API now exposes `POST /api/v1/reset` and
+  the Web UI Settings view provides a confirmed Reset action that stops all
+  torrent activity, removes torrent records, empties configured download and
+  incomplete directory contents while preserving the roots, and clears daemon
+  logs. ADR-0027 records the destructive reset workflow.
 - **Configuration enforcement pass:** previously modeled runtime settings are
   now wired into daemon behavior: `bandwidth.max_peers` participates in live
   peer worker caps, `queue.max_active_downloads`/`auto_start`/queue move

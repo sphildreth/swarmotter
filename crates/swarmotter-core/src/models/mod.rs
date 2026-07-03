@@ -12,8 +12,8 @@ pub mod tracker;
 
 pub use diagnostics::{
     ConfigUpdateResult, DiagnosticLevel, DoctorCheck, DoctorReport, LogSnapshot,
-    NetworkDiagnostics, NetworkInterfaceDiagnostic, NetworkPathCheck, WatchFolderStatus,
-    WatchStatus,
+    NetworkDiagnostics, NetworkInterfaceDiagnostic, NetworkPathCheck, ResetResult,
+    WatchFolderStatus, WatchStatus,
 };
 pub use health::{HealthCalculator, HealthInput};
 pub use network::{NetworkContainmentMode, NetworkContainmentStatus, NetworkHealth};

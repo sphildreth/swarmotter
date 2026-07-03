@@ -138,6 +138,7 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
         // Logs and health checks.
         .route("/logs/recent", get(handlers::diagnostics::recent_logs))
         .route("/doctor", get(handlers::diagnostics::doctor_report))
+        .route("/reset", post(handlers::diagnostics::reset_downloads))
         // Events (SSE)
         .route("/events", get(handlers::events::sse_events))
         // WebSocket

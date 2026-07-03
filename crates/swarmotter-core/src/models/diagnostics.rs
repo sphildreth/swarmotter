@@ -100,6 +100,15 @@ pub struct LogSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResetResult {
+    pub torrents_removed: usize,
+    pub storage_paths: Vec<String>,
+    pub storage_entries_removed: usize,
+    pub log_paths: Vec<String>,
+    pub log_files_cleared: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigUpdateResult {
     pub persisted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

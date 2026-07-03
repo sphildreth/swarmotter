@@ -74,6 +74,11 @@ Operational diagnostics in the UI come from:
 - `GET /api/v1/logs/recent` for live-tail style log snapshots.
 - `GET /api/v1/doctor` for a consolidated operational check summary.
 
+The Settings view also exposes a destructive Reset action. After confirmation,
+it calls `POST /api/v1/reset` to stop torrent activity, remove torrent records,
+empty the configured download and incomplete directories while preserving those
+root directories, and clear daemon log files.
+
 ## Browser assets
 
 The daemon serves the Web UI favicon set and app manifest from the embedded

@@ -399,6 +399,7 @@ mod tests {
             "logging-level-options",
             "save-settings-btn",
             "reload-settings-btn",
+            "reset-downloads-btn",
             "add-watch-folder-btn",
         ] {
             assert!(
@@ -413,6 +414,8 @@ mod tests {
             "function renderWatchFolderEditors(",
             "function collectWatchFolderEditors(",
             "method: \"PUT\"",
+            "api(\"/reset\"",
+            "Reset all downloads?",
             "Configuration saved",
         ] {
             assert!(

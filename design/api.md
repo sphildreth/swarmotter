@@ -210,6 +210,14 @@ reported one.
 | --- | --- | --- |
 | GET | `/logs/recent` | Recent daemon logs (`lines=1..500`, default 100) |
 | GET | `/doctor` | Consolidated operational health report for diagnostics panels |
+| POST | `/reset` | Stop all torrent work, remove torrent records, delete contents of configured download/incomplete directories, and clear daemon log files |
+
+`POST /reset` is destructive and must be presented by clients with an explicit
+confirmation step. The daemon preserves the configured `download_dir` and
+`incomplete_dir` root directories themselves, removes registered torrent
+payloads from per-torrent override locations, clears in-memory torrent/queue
+state, and truncates the active daemon log file so the running logger can
+continue writing to the same path.
 
 ## Events (WebSocket/SSE)
 

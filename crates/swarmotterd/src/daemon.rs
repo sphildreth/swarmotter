@@ -33,8 +33,8 @@ use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, 
 use swarmotter_core::models::tracker::{TrackerId, TrackerInfo, TrackerKind, TrackerStatus};
 use swarmotter_core::models::{
     ConfigUpdateResult, DiagnosticLevel, DoctorCheck, DoctorReport, LogSnapshot,
-    NetworkDiagnostics, NetworkInterfaceDiagnostic, NetworkPathCheck, WatchFolderStatus,
-    WatchStatus,
+    NetworkDiagnostics, NetworkInterfaceDiagnostic, NetworkPathCheck, ResetResult,
+    WatchFolderStatus, WatchStatus,
 };
 use swarmotter_core::net::{self, InterfaceProbe, OsInterfaceProbe};
 use swarmotter_core::queue::QueueState;
@@ -179,6 +179,13 @@ fn instant_age_seconds(now: Instant, seen: Option<Instant>) -> Option<u64> {
     seen.map(|instant| now.saturating_duration_since(instant).as_secs())
 }
 
+fn default_download_dir_string() -> String {
+    std::env::temp_dir()
+        .join("swarmotter-downloads")
+        .display()
+        .to_string()
+}
+
 impl DaemonRuntime {
     #[allow(dead_code)]
     pub fn new(config: Config, startup_health: NetworkHealth) -> Self {
@@ -222,12 +229,10 @@ impl DaemonRuntime {
             return d.clone();
         }
         let cfg = self.config.lock().await;
-        cfg.storage.download_dir.clone().unwrap_or_else(|| {
-            std::env::temp_dir()
-                .join("swarmotter-downloads")
-                .display()
-                .to_string()
-        })
+        cfg.storage
+            .download_dir
+            .clone()
+            .unwrap_or_else(default_download_dir_string)
     }
 
     /// Resolve the active write directory for a torrent. Incomplete downloads
@@ -628,6 +633,36 @@ impl DaemonRuntime {
         self.engine_states.lock().await.remove(hash);
         self.engine_limiters.lock().await.remove(hash);
         self.rate_samples.lock().await.remove(hash);
+    }
+
+    async fn stop_all_torrent_tasks(&self, registry_hashes: &[InfoHash]) {
+        let mut hashes = registry_hashes.to_vec();
+        hashes.extend(self.engine_handles.lock().await.keys().copied());
+        hashes.extend(self.seeder_handles.lock().await.keys().copied());
+        hashes.sort();
+        hashes.dedup();
+        for hash in hashes {
+            self.force_stop_engine(&hash).await;
+        }
+    }
+
+    async fn clear_download_runtime_state(&self) {
+        {
+            let mut reg = self.registry.lock().await;
+            reg.torrents.clear();
+        }
+        {
+            let mut queue = self.queue.lock().await;
+            queue.order.clear();
+            queue.bypass.clear();
+        }
+        self.engine_states.lock().await.clear();
+        self.engine_cmds.lock().await.clear();
+        self.engine_handles.lock().await.clear();
+        self.engine_limiters.lock().await.clear();
+        self.seeder_shutdowns.lock().await.clear();
+        self.seeder_handles.lock().await.clear();
+        self.rate_samples.lock().await.clear();
     }
 
     /// Spawn the inbound peer listener / seeder for a torrent. It shares the
@@ -2203,6 +2238,77 @@ impl DaemonOps for DaemonRuntime {
         })
     }
 
+    async fn reset_downloads(&self) -> Result<ResetResult> {
+        let torrents: Vec<Torrent> = self
+            .registry
+            .lock()
+            .await
+            .torrents
+            .values()
+            .cloned()
+            .collect();
+        let registry_hashes: Vec<InfoHash> = torrents.iter().map(Torrent::info_hash).collect();
+        self.stop_all_torrent_tasks(&registry_hashes).await;
+        self.clear_download_runtime_state().await;
+
+        let mut storage_paths = Vec::new();
+        for torrent in &torrents {
+            let complete_dir = self.resolve_download_dir(torrent).await;
+            let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
+            for dir in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
+                let storage =
+                    swarmotter_core::storage::StorageIo::new(torrent.meta.clone(), dir.clone());
+                storage.remove_all().await?;
+                push_display_path(&mut storage_paths, &dir);
+            }
+        }
+
+        let cfg = self.config.lock().await.clone();
+        let download_dir = cfg
+            .storage
+            .download_dir
+            .clone()
+            .unwrap_or_else(default_download_dir_string);
+        let incomplete_dir = cfg
+            .storage
+            .incomplete_dir
+            .clone()
+            .unwrap_or_else(|| download_dir.clone());
+        let mut storage_entries_removed = 0usize;
+        for dir in unique_pathbufs([PathBuf::from(incomplete_dir), PathBuf::from(download_dir)]) {
+            storage_entries_removed =
+                storage_entries_removed.saturating_add(remove_directory_contents(&dir).await?);
+            push_display_path(&mut storage_paths, &dir);
+        }
+
+        let mut log_paths = Vec::new();
+        let mut log_files_cleared = 0usize;
+        if let Some(path) = &self.log_file_path {
+            truncate_log_file(path).await?;
+            log_files_cleared = 1;
+            push_display_path(&mut log_paths, path);
+        }
+
+        self.clear_download_runtime_state().await;
+
+        tracing::warn!(
+            torrents_removed = torrents.len(),
+            storage_entries_removed,
+            log_files_cleared,
+            storage_paths = ?storage_paths,
+            log_paths = ?log_paths,
+            "download state reset by API request"
+        );
+
+        Ok(ResetResult {
+            torrents_removed: torrents.len(),
+            storage_paths,
+            storage_entries_removed,
+            log_paths,
+            log_files_cleared,
+        })
+    }
+
     async fn network_health(&self) -> NetworkHealth {
         self.network_health.lock().await.clone()
     }
@@ -2521,6 +2627,81 @@ fn make_tracker(url: &str, tier: usize) -> TrackerInfo {
     }
 }
 
+fn unique_pathbufs<I>(paths: I) -> Vec<PathBuf>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    let mut out = Vec::new();
+    for path in paths {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn push_display_path(paths: &mut Vec<String>, path: &Path) {
+    let value = path.display().to_string();
+    if !paths.contains(&value) {
+        paths.push(value);
+    }
+}
+
+async fn remove_directory_contents(path: &Path) -> Result<usize> {
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(CoreError::Storage(format!(
+                "reset path is not a directory: {}",
+                path.display()
+            )));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir_all(path)
+                .await
+                .map_err(CoreError::from)?;
+            return Ok(0);
+        }
+        Err(e) => return Err(CoreError::from(e)),
+    }
+
+    let mut entries = tokio::fs::read_dir(path).await.map_err(CoreError::from)?;
+    let mut removed = 0usize;
+    while let Some(entry) = entries.next_entry().await.map_err(CoreError::from)? {
+        let entry_path = entry.path();
+        let meta = tokio::fs::symlink_metadata(&entry_path)
+            .await
+            .map_err(CoreError::from)?;
+        if meta.is_dir() && !meta.file_type().is_symlink() {
+            tokio::fs::remove_dir_all(&entry_path)
+                .await
+                .map_err(CoreError::from)?;
+        } else {
+            tokio::fs::remove_file(&entry_path)
+                .await
+                .map_err(CoreError::from)?;
+        }
+        removed = removed.saturating_add(1);
+    }
+    Ok(removed)
+}
+
+async fn truncate_log_file(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(CoreError::from)?;
+    }
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await
+        .map_err(CoreError::from)?;
+    Ok(())
+}
+
 /// Apply current network containment state to a torrent's lifecycle state.
 async fn apply_network_state(t: &mut Torrent, health: &Arc<Mutex<NetworkHealth>>) {
     let h = health.lock().await;
@@ -2746,6 +2927,19 @@ fn build_health_input(
 mod tests {
     use super::*;
     use swarmotter_api::state::DaemonOps;
+
+    fn unique_dir(label: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "swarmotter-daemon-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
 
     #[tokio::test]
     async fn reconcile_updates_transfer_rates_and_global_stats() {
@@ -3130,6 +3324,83 @@ mod tests {
             Some("tracker announce timed out")
         );
         assert_eq!(secondary_row.last_message, None);
+    }
+
+    #[tokio::test]
+    async fn reset_downloads_clears_storage_roots_registry_and_logs() {
+        let root = unique_dir("reset");
+        let download_dir = root.join("downloads");
+        let incomplete_dir = root.join("incomplete");
+        let log_file = root.join("swarmotterd.log");
+        tokio::fs::create_dir_all(download_dir.join("nested"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&incomplete_dir).await.unwrap();
+        tokio::fs::write(download_dir.join("nested").join("old.bin"), b"old")
+            .await
+            .unwrap();
+        tokio::fs::write(incomplete_dir.join("partial.bin"), b"partial")
+            .await
+            .unwrap();
+        tokio::fs::write(&log_file, b"old log line\n")
+            .await
+            .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(download_dir.display().to_string());
+        cfg.storage.incomplete_dir = Some(incomplete_dir.display().to_string());
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::with_paths(cfg, health, None, Some(log_file.clone()));
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "reset.bin",
+            b"0123456789abcdef",
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = meta.info_hash;
+        runtime
+            .registry
+            .lock()
+            .await
+            .add(Torrent::new(meta, 1))
+            .unwrap();
+        runtime.queue.lock().await.add(hash);
+
+        let result = runtime.reset_downloads().await.unwrap();
+
+        assert_eq!(result.torrents_removed, 1);
+        assert_eq!(result.log_files_cleared, 1);
+        assert!(result
+            .storage_paths
+            .contains(&download_dir.display().to_string()));
+        assert!(result
+            .storage_paths
+            .contains(&incomplete_dir.display().to_string()));
+        assert!(runtime.registry.lock().await.torrents.is_empty());
+        assert!(runtime.queue.lock().await.order.is_empty());
+        assert!(download_dir.is_dir());
+        assert!(incomplete_dir.is_dir());
+        assert!(tokio::fs::read_dir(&download_dir)
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .is_none());
+        assert!(tokio::fs::read_dir(&incomplete_dir)
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(tokio::fs::metadata(&log_file).await.unwrap().len(), 0);
     }
 
     #[test]

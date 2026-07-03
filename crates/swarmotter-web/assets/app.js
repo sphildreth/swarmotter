@@ -966,6 +966,35 @@ $("#reload-settings-btn").addEventListener("click", async () => {
   showToast("Settings reloaded", "", "info");
 });
 
+$("#reset-downloads-btn").addEventListener("click", async () => {
+  const confirmed = window.confirm(
+    "Reset all downloads? This stops all torrents, removes torrent records, deletes all files inside the configured download and incomplete directories, and clears daemon logs."
+  );
+  if (!confirmed) return;
+  const button = $("#reset-downloads-btn");
+  button.disabled = true;
+  try {
+    const result = await api("/reset", { method: "POST" });
+    currentHash = null;
+    knownTorrents.clear();
+    expectedRemovedTorrents.clear();
+    torrentsLoaded = false;
+    await refreshTorrents();
+    if (!$("#view-logs").classList.contains("hidden")) await refreshLogs();
+    await refreshDoctorBadge();
+    const detail = [
+      `${fmtCount(result.torrents_removed)} torrents`,
+      `${fmtCount(result.storage_entries_removed)} storage entries`,
+      `${fmtCount(result.log_files_cleared)} log files`,
+    ].join(" cleared; ");
+    showToast("Reset complete", detail, "success");
+  } catch (e) {
+    showError("Reset failed", e);
+  } finally {
+    button.disabled = false;
+  }
+});
+
 $("#add-watch-folder-btn").addEventListener("click", () => {
   const folders = collectWatchFolderEditors();
   folders.push({
