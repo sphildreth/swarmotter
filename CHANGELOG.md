@@ -282,6 +282,9 @@ status.
 - Tracker diagnostics now preserve the concrete last announce error when a
   torrent stops after no peer discovery, instead of replacing it with only a
   generic no-peer message.
+- Torrent removal now force-stops active data-plane tasks before deleting
+  files, so `delete_data = true` returns promptly and removes active incomplete
+  payloads even when a peer session is stalled.
 - Linux interface-bound containment can now validate DNS for hostname trackers
   and DHT bootstrap nodes when DNS is tied to the required interface, including
   systemd-resolved link DNS such as `resolvectl dns br0`.

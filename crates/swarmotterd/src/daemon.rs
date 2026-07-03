@@ -533,6 +533,20 @@ impl DaemonRuntime {
         self.rate_samples.lock().await.remove(hash);
     }
 
+    async fn force_stop_engine(&self, hash: &InfoHash) {
+        if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
+            let _ = tx.try_send(EngineCommand::Stop);
+        }
+        if let Some(handle) = self.engine_handles.lock().await.remove(hash) {
+            handle.abort();
+            let _ = handle.await;
+        }
+        self.force_stop_seeder(hash).await;
+        self.engine_states.lock().await.remove(hash);
+        self.engine_limiters.lock().await.remove(hash);
+        self.rate_samples.lock().await.remove(hash);
+    }
+
     /// Spawn the inbound peer listener / seeder for a torrent. It shares the
     /// live engine state and serves verified pieces through the contained
     /// listener. No-op if already running or if the torrent is private and
@@ -605,6 +619,16 @@ impl DaemonRuntime {
             let _ = tx.send(true);
         }
         if let Some(handle) = self.seeder_handles.lock().await.remove(hash) {
+            let _ = handle.await;
+        }
+    }
+
+    async fn force_stop_seeder(&self, hash: &InfoHash) {
+        if let Some(tx) = self.seeder_shutdowns.lock().await.remove(hash) {
+            let _ = tx.send(true);
+        }
+        if let Some(handle) = self.seeder_handles.lock().await.remove(hash) {
+            handle.abort();
             let _ = handle.await;
         }
     }
@@ -1122,13 +1146,16 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn remove_torrent(&self, hash: &InfoHash, delete_data: bool) -> Result<()> {
-        // Stop the live engine and clean up its resources.
-        self.stop_engine(hash).await;
         let removed = {
             let mut reg = self.registry.lock().await;
             reg.remove(hash)
                 .ok_or_else(|| CoreError::NotFound("torrent".into()))?
         };
+        self.queue.lock().await.remove(hash);
+        self.rate_samples.lock().await.remove(hash);
+        // Removal must not wait for an active peer session to reach its next
+        // command poll. Abort the live data-plane task before deleting files.
+        self.force_stop_engine(hash).await;
         if delete_data {
             let complete_dir = self.resolve_download_dir(&removed).await;
             let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
@@ -1142,8 +1169,6 @@ impl DaemonOps for DaemonRuntime {
                 let _ = storage.remove_all().await;
             }
         }
-        self.queue.lock().await.remove(hash);
-        self.rate_samples.lock().await.remove(hash);
         self.reconcile_queue().await;
         Ok(())
     }

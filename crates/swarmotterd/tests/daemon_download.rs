@@ -68,6 +68,24 @@ async fn spawn_seed(content: Vec<u8>, meta: swarmotter_core::meta::TorrentMeta) 
     PeerAddr::from_socket_addr(addr)
 }
 
+async fn spawn_stalling_seed(
+    meta: swarmotter_core::meta::TorrentMeta,
+) -> (PeerAddr, tokio::sync::oneshot::Receiver<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let info_hash = meta.info_hash;
+    let peer_id = peer_id(b"-SDSTAL-");
+    let piece_count = meta.piece_count();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let _ = serve_stalling_seed(stream, info_hash, peer_id, piece_count, ready_tx).await;
+    });
+    (PeerAddr::from_socket_addr(addr), ready_rx)
+}
+
 fn peer_id(prefix: &[u8; 8]) -> [u8; 20] {
     let mut id = [0u8; 20];
     id[..8].copy_from_slice(prefix);
@@ -150,6 +168,56 @@ async fn serve_seed(
     }
 }
 
+async fn serve_stalling_seed(
+    stream: tokio::net::TcpStream,
+    info_hash: swarmotter_core::hash::InfoHash,
+    peer_id: [u8; 20],
+    piece_count: usize,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut rd, mut wr) = tokio::io::split(stream);
+    let mut hs = [0u8; 68];
+    rd.read_exact(&mut hs).await?;
+    let their_hs = Handshake::decode(&hs).map_err(|e| e.to_string())?;
+    if their_hs.info_hash != info_hash {
+        return Err("info hash mismatch".into());
+    }
+    let our_hs = Handshake {
+        info_hash,
+        peer_id,
+        reserved: swarmotter_core::peer::RESERVED,
+    };
+    wr.write_all(&our_hs.encode()).await?;
+    let mut bf = Bitfield::new(piece_count);
+    for i in 0..piece_count {
+        bf.set(i);
+    }
+    peer::write_message(&mut wr, &bf.encode_message()).await?;
+    wr.flush().await?;
+
+    let mut ready = Some(ready);
+    loop {
+        let mut len = [0u8; 4];
+        rd.read_exact(&mut len).await?;
+        let n = u32::from_be_bytes(len) as usize;
+        if n == 0 {
+            continue;
+        }
+        let mut body = vec![0u8; n];
+        rd.read_exact(&mut body).await?;
+        let id = body[0];
+        if Some(peer::MessageId::Interested) == peer::MessageId::from_u8(id) {
+            peer::write_message(&mut wr, &Message::Unchoke).await?;
+            wr.flush().await?;
+            if let Some(tx) = ready.take() {
+                let _ = tx.send(());
+            }
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            return Ok(());
+        }
+    }
+}
+
 async fn spawn_tracker(addr: SocketAddr, seed: PeerAddr) {
     tokio::spawn(async move {
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
@@ -181,6 +249,67 @@ async fn spawn_tracker(addr: SocketAddr, seed: PeerAddr) {
             });
         }
     });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_remove_active_torrent_delete_data_returns_promptly() {
+    let content = vec![7u8; 128 * 1024];
+    let piece_length: u64 = 16 * 1024;
+    let tracker_port = pick_port();
+    let tracker_url = format!("http://127.0.0.1:{tracker_port}/announce");
+    let torrent_bytes = build_single_file_torrent(
+        "remove_active_payload.bin",
+        &content,
+        piece_length,
+        Some(&tracker_url),
+        false,
+    );
+    let meta = parse_torrent(&torrent_bytes).unwrap();
+
+    let (seed, peer_active) = spawn_stalling_seed(meta.clone()).await;
+    let tracker_addr: SocketAddr = format!("127.0.0.1:{tracker_port}").parse().unwrap();
+    spawn_tracker(tracker_addr, seed).await;
+
+    let mut cfg = Config::default();
+    cfg.network.mode = swarmotter_core::models::network::NetworkContainmentMode::Disabled;
+    cfg.dht.enabled = false;
+    cfg.bandwidth.max_peers_per_torrent = 1;
+    let healthy = swarmotter_core::models::network::NetworkHealth::blocked(
+        swarmotter_core::models::network::NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let download_dir = unique_dir("daemon-remove-active");
+    cfg.storage.download_dir = Some(download_dir.display().to_string());
+    let runtime = std::sync::Arc::new(DaemonRuntime::new(cfg, healthy));
+
+    let hash = runtime
+        .add_torrent_file(torrent_bytes, Some(download_dir.display().to_string()))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), peer_active)
+        .await
+        .expect("engine should connect to the stalling peer")
+        .expect("stalling peer should signal active session");
+
+    let storage = swarmotter_core::storage::StorageIo::new(meta.clone(), download_dir.clone());
+    assert!(
+        storage.file_path(0).unwrap().exists(),
+        "active torrent should create the visible incomplete payload path"
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), runtime.remove_torrent(&hash, true))
+        .await
+        .expect("active torrent removal must not wait on the stalled peer")
+        .expect("active torrent removal should succeed");
+    assert!(runtime.get_torrent(&hash).await.is_none());
+    assert!(
+        !storage.file_path(0).unwrap().exists(),
+        "delete_data = true must remove active payload data"
+    );
+
+    std::fs::remove_dir_all(&download_dir).ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

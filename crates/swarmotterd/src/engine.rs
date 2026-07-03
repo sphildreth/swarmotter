@@ -918,7 +918,7 @@ impl TorrentEngine {
         let download_dir = self.download_dir.clone();
 
         let peers: Vec<PeerAddr> = candidates.iter().take(ENDGAME_MAX_PEERS).copied().collect();
-        let mut handles = Vec::new();
+        let mut handles = AbortOnDropHandles::new();
         let deadline = Instant::now() + ENDGAME_STEP_DEADLINE;
         for peer_addr in peers {
             let meta = self.meta.clone();
@@ -954,7 +954,11 @@ impl TorrentEngine {
 
         // Wait for all endgame peer sessions; record bad peers on failure.
         let mut any_progress = false;
-        for (peer_addr, h) in candidates.iter().take(ENDGAME_MAX_PEERS).zip(handles) {
+        for (peer_addr, h) in candidates
+            .iter()
+            .take(ENDGAME_MAX_PEERS)
+            .zip(handles.drain())
+        {
             match h.await {
                 Ok(Ok(progressed)) => {
                     if progressed {
@@ -1005,7 +1009,7 @@ impl TorrentEngine {
         let made_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let storage = Arc::new(storage.clone());
         let deadline = Instant::now() + PARALLEL_STEP_DEADLINE;
-        let mut handles = Vec::with_capacity(candidates.len());
+        let mut handles = AbortOnDropHandles::with_capacity(candidates.len());
 
         {
             let mut s = self.state.lock().await;
@@ -1046,7 +1050,7 @@ impl TorrentEngine {
         }
 
         let mut any_progress = false;
-        for (peer_addr, handle) in candidates.iter().zip(handles) {
+        for (peer_addr, handle) in candidates.iter().zip(handles.drain()) {
             match handle.await {
                 Ok(Ok(progressed)) => {
                     if progressed {
@@ -1334,6 +1338,54 @@ enum CommandOutcome {
     Continue,
     Pause,
     Stop,
+}
+
+struct AbortOnDropHandles<T> {
+    handles: Vec<AbortOnDropHandle<T>>,
+}
+
+impl<T> AbortOnDropHandles<T> {
+    fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+        }
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            handles: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, handle: tokio::task::JoinHandle<T>) {
+        self.handles.push(AbortOnDropHandle { handle });
+    }
+
+    fn drain(&mut self) -> std::vec::Drain<'_, AbortOnDropHandle<T>> {
+        self.handles.drain(..)
+    }
+}
+
+struct AbortOnDropHandle<T> {
+    handle: tokio::task::JoinHandle<T>,
+}
+
+impl<T> std::future::Future for AbortOnDropHandle<T> {
+    type Output = std::result::Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        std::pin::Pin::new(&mut this.handle).poll(cx)
+    }
+}
+
+impl<T> Drop for AbortOnDropHandle<T> {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 fn add_pex_peers<I>(discovered: &mut Vec<PeerAddr>, peers: I, allow_ipv6: bool, max_peers: usize)
