@@ -213,6 +213,7 @@ impl StorageIo {
                 .map_err(CoreError::from)?;
             let chunk = &data[data_off..data_off + slice.length as usize];
             file.write_all(chunk).await.map_err(CoreError::from)?;
+            file.flush().await.map_err(CoreError::from)?;
             data_off += slice.length as usize;
         }
         Ok(())
@@ -347,7 +348,7 @@ impl StorageIo {
         Ok(bf)
     }
 
-    /// Persist fast-resume metadata next to the torrent data.
+    /// Persist fast-resume metadata next to active torrent data.
     pub async fn save_resume(&self, resume: &FastResume) -> Result<PathBuf> {
         let path = self.resume_path();
         if let Some(parent) = path.parent() {
@@ -396,6 +397,12 @@ impl StorageIo {
             .join(format!("{}.swarmotter.resume", self.meta.name))
     }
 
+    /// Remove fast-resume metadata for this torrent, if present.
+    pub async fn remove_resume(&self) -> Result<()> {
+        let _ = fs::remove_file(self.resume_path()).await;
+        Ok(())
+    }
+
     /// Move verified torrent data from this storage root to another root,
     /// preserving torrent-relative paths. The destination must not already
     /// contain the torrent's files; refusing to overwrite avoids clobbering
@@ -434,7 +441,7 @@ impl StorageIo {
             }
         }
 
-        let _ = fs::remove_file(self.resume_path()).await;
+        self.remove_resume().await?;
         Ok(destination)
     }
 
@@ -445,7 +452,7 @@ impl StorageIo {
             let _ = fs::remove_file(&p).await;
             cleanup_empty_parents(p.parent(), &self.download_dir).await;
         }
-        let _ = fs::remove_file(self.resume_path()).await;
+        self.remove_resume().await?;
         // For multi-file, remove the now-empty top-level directory.
         if self.meta.is_multi_file {
             let _ = fs::remove_dir(&self.download_dir).await;
@@ -907,7 +914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn move_to_moves_data_and_resume_to_destination_root() {
+    async fn move_to_moves_data_and_removes_active_resume() {
         let content = b"0123456789abcdef";
         let bytes = build_single_file_torrent("move.bin", content, 8, None, false);
         let meta = parse_torrent(&bytes).unwrap();
@@ -941,6 +948,7 @@ mod tests {
             std::fs::read(complete_store.file_path(0).unwrap()).unwrap(),
             content
         );
+        assert!(!complete_store.resume_path().exists());
         std::fs::remove_dir_all(&active).ok();
         std::fs::remove_dir_all(&complete).ok();
     }

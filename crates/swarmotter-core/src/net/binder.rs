@@ -197,10 +197,15 @@ impl NetworkBinder for LoopbackBinder {
 
     async fn udp_socket_on(
         &self,
-        _remote: Option<SocketAddr>,
+        remote: Option<SocketAddr>,
         local_port: u16,
     ) -> Result<Box<dyn ContainedUdpSocket>> {
-        let socket = tokio::net::UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], local_port)))
+        let bind = if remote.is_some_and(|addr| addr.is_ipv6()) {
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], local_port))
+        } else {
+            SocketAddr::from(([127, 0, 0, 1], local_port))
+        };
+        let socket = tokio::net::UdpSocket::bind(bind)
             .await
             .map_err(CoreError::from)?;
         Ok(Box::new(LoopbackUdpSocket { socket }))

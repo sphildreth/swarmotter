@@ -10,7 +10,7 @@
 //! - the engine connects to the peer through the contained network layer,
 //! - the BitTorrent handshake and message exchange complete,
 //! - all pieces are requested, received, verified by SHA-1, and written to disk,
-//! - fast-resume state is persisted,
+//! - completion removes transient fast-resume metadata,
 //! - the engine reports a finished download.
 //!
 //! All traffic stays on loopback via `LoopbackBinder` (the contained network
@@ -453,14 +453,9 @@ async fn local_swarm_downloads_from_seed_via_tracker() {
     let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
     assert_eq!(written, content, "downloaded content mismatches original");
 
-    // 8. Fast-resume metadata should exist and reflect completion.
-    let resume = storage
-        .load_resume(&meta.info_hash)
-        .await
-        .unwrap()
-        .expect("resume should exist");
-    assert_eq!(resume.piece_count, meta.piece_count());
-    assert!(resume.piece_bitfield.count(meta.piece_count()) == meta.piece_count());
+    // 8. Completed downloads should not leave SwarmOtter metadata next to
+    // user payload files.
+    assert!(!storage.resume_path().exists());
 
     // 9. Stop command should be honored.
     let _ = cmd_tx;

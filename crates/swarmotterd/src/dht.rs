@@ -46,6 +46,29 @@ struct DhtCandidate {
     addr: SocketAddr,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DhtAddressFamily {
+    V4,
+    V6,
+}
+
+impl DhtAddressFamily {
+    fn for_addr(addr: SocketAddr) -> Self {
+        if addr.is_ipv6() {
+            Self::V6
+        } else {
+            Self::V4
+        }
+    }
+
+    fn matches(self, addr: SocketAddr) -> bool {
+        matches!(
+            (self, addr),
+            (Self::V4, SocketAddr::V4(_)) | (Self::V6, SocketAddr::V6(_))
+        )
+    }
+}
+
 /// A live DHT runner bound to a contained UDP socket.
 pub struct DhtRunner {
     self_id: NodeId,
@@ -79,10 +102,13 @@ impl DhtRunner {
     }
 
     /// Open the contained UDP socket. Returns an error in fail-closed mode.
+    #[allow(dead_code)]
     pub async fn socket(&self) -> Result<Box<dyn ContainedUdpSocket>> {
-        self.binder
-            .udp_socket_on(self.bootstrap.first().copied(), self.port)
-            .await
+        self.socket_for(self.bootstrap.first().copied()).await
+    }
+
+    async fn socket_for(&self, remote: Option<SocketAddr>) -> Result<Box<dyn ContainedUdpSocket>> {
+        self.binder.udp_socket_on(remote, self.port).await
     }
 
     /// Bootstrap: ping each configured bootstrap node so it learns about us
@@ -90,8 +116,8 @@ impl DhtRunner {
     #[allow(dead_code)]
     pub async fn bootstrap(&self) -> Result<()> {
         let _socket_guard = self.socket_lock.lock().await;
-        let socket = self.socket().await?;
         for addr in &self.bootstrap {
+            let socket = self.socket_for(Some(*addr)).await?;
             let txn = TransactionId::random();
             let q = build_ping(txn, self.self_id);
             let _ = socket.send_to(*addr, &q).await;
@@ -132,23 +158,92 @@ impl DhtRunner {
         max_rounds: usize,
     ) -> Result<DhtLookupResult> {
         let _socket_guard = self.socket_lock.lock().await;
-        let socket: Arc<dyn ContainedUdpSocket> = self.socket().await?.into();
+        let target = NodeId::from_bytes(*info_hash.as_bytes());
+        let mut hints = self.lookup_family_hints(target).await;
         let mut result = DhtLookupResult::default();
+        let mut seen_peers: HashSet<PeerAddr> = HashSet::new();
+        let mut attempted_families: HashSet<DhtAddressFamily> = HashSet::new();
+        let mut opened_socket = false;
+        let mut first_error = None;
+        let mut index = 0usize;
+
+        while index < hints.len() {
+            let hint = hints[index];
+            index += 1;
+            let family = DhtAddressFamily::for_addr(hint);
+            if !attempted_families.insert(family) {
+                continue;
+            }
+
+            let socket: Arc<dyn ContainedUdpSocket> = match self.socket_for(Some(hint)).await {
+                Ok(socket) => {
+                    opened_socket = true;
+                    socket.into()
+                }
+                Err(e) => {
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                    continue;
+                }
+            };
+
+            let (partial, deferred_hints) = self
+                .get_peers_with_socket(info_hash, max_rounds, socket, family, hint)
+                .await;
+            result.queried_nodes += partial.queried_nodes;
+            result.responding_nodes += partial.responding_nodes;
+            for peer in partial.peers {
+                if seen_peers.insert(peer) {
+                    result.peers.push(peer);
+                }
+            }
+            for hint in deferred_hints {
+                add_family_hint(&mut hints, hint);
+            }
+        }
+
+        if !opened_socket {
+            if let Some(e) = first_error {
+                return Err(e);
+            }
+        }
+
+        Ok(result)
+    }
+
+    async fn get_peers_with_socket(
+        &self,
+        info_hash: InfoHash,
+        max_rounds: usize,
+        socket: Arc<dyn ContainedUdpSocket>,
+        family: DhtAddressFamily,
+        seed_hint: SocketAddr,
+    ) -> (DhtLookupResult, Vec<SocketAddr>) {
+        let mut result = DhtLookupResult::default();
+        let mut deferred_hints = Vec::new();
         let mut queried: HashSet<SocketAddr> = HashSet::new();
         let mut queued: HashSet<SocketAddr> = HashSet::new();
         let mut pending: Vec<DhtCandidate> = self
             .bootstrap
             .iter()
             .copied()
+            .filter(|addr| family.matches(*addr))
             .map(|addr| DhtCandidate { id: None, addr })
             .collect();
-        queued.extend(self.bootstrap.iter().copied());
         let target = NodeId::from_bytes(*info_hash.as_bytes());
+        queued.extend(pending.iter().map(|candidate| candidate.addr));
+        if family.matches(seed_hint) && queued.insert(seed_hint) {
+            pending.push(DhtCandidate {
+                id: None,
+                addr: seed_hint,
+            });
+        }
         // Seed with any known routing-table nodes.
         {
             let table = self.table.lock().await;
             for n in table.closest(&target, 32) {
-                if queued.insert(n.addr) {
+                if family.matches(n.addr) && queued.insert(n.addr) {
                     pending.push(DhtCandidate {
                         id: Some(n.id),
                         addr: n.addr,
@@ -176,7 +271,7 @@ impl DhtRunner {
                 if !queried.insert(addr) {
                     continue;
                 }
-                let txn = TransactionId::random();
+                let txn = unique_transaction_id(&transactions);
                 let q = build_get_peers(txn, self.self_id, info_hash);
                 if socket.send_to(addr, &q).await.is_err() {
                     continue;
@@ -206,15 +301,35 @@ impl DhtRunner {
                 }
                 transactions.remove(&resp.txn);
                 result.responding_nodes += 1;
-                self.handle_response(from, &resp, &mut result.peers, &mut pending, &mut queued)
-                    .await;
+                self.handle_response(
+                    from,
+                    &resp,
+                    &mut result.peers,
+                    &mut pending,
+                    &mut queued,
+                    &mut deferred_hints,
+                    family,
+                )
+                .await;
                 if result.peers.len() >= DHT_MAX_PEERS {
                     result.peers.truncate(DHT_MAX_PEERS);
                     break;
                 }
             }
         }
-        Ok(result)
+        (result, deferred_hints)
+    }
+
+    async fn lookup_family_hints(&self, target: NodeId) -> Vec<SocketAddr> {
+        let mut hints = Vec::new();
+        for addr in &self.bootstrap {
+            add_family_hint(&mut hints, *addr);
+        }
+        let table = self.table.lock().await;
+        for n in table.closest(&target, 64) {
+            add_family_hint(&mut hints, n.addr);
+        }
+        hints
     }
 
     async fn handle_response(
@@ -224,6 +339,8 @@ impl DhtRunner {
         discovered: &mut Vec<PeerAddr>,
         pending: &mut Vec<DhtCandidate>,
         queued: &mut HashSet<SocketAddr>,
+        deferred_hints: &mut Vec<SocketAddr>,
+        family: DhtAddressFamily,
     ) {
         if let Some(id) = resp.sender_id {
             self.table
@@ -237,7 +354,9 @@ impl DhtRunner {
             }
         }
         for n in &resp.nodes {
-            if queued.insert(n.addr) {
+            if !family.matches(n.addr) {
+                add_family_hint(deferred_hints, n.addr);
+            } else if queued.insert(n.addr) {
                 pending.push(DhtCandidate {
                     id: Some(n.id),
                     addr: n.addr,
@@ -256,8 +375,8 @@ impl DhtRunner {
         tokens: &[(SocketAddr, Vec<u8>)],
     ) -> Result<()> {
         let _socket_guard = self.socket_lock.lock().await;
-        let socket = self.socket().await?;
         for (addr, token) in tokens {
+            let socket = self.socket_for(Some(*addr)).await?;
             let txn = TransactionId::random();
             let q = dht::build_announce_peer(txn, self.self_id, info_hash, port, token.clone());
             let _ = socket.send_to(*addr, &q).await;
@@ -329,6 +448,25 @@ fn sort_candidates_by_distance(candidates: &mut [DhtCandidate], target: NodeId) 
     });
 }
 
+fn add_family_hint(hints: &mut Vec<SocketAddr>, addr: SocketAddr) {
+    let family = DhtAddressFamily::for_addr(addr);
+    if !hints
+        .iter()
+        .any(|existing| DhtAddressFamily::for_addr(*existing) == family)
+    {
+        hints.push(addr);
+    }
+}
+
+fn unique_transaction_id(transactions: &HashMap<TransactionId, SocketAddr>) -> TransactionId {
+    loop {
+        let txn = TransactionId::random();
+        if !transactions.contains_key(&txn) {
+            return txn;
+        }
+    }
+}
+
 #[cfg(test)]
 mod utp_transport_tests {
     use super::*;
@@ -353,6 +491,43 @@ mod tests {
     use super::*;
     use swarmotter_core::net::binder::LoopbackBinder;
     use swarmotter_core::peer::PeerAddr;
+
+    fn write_bstr(out: &mut Vec<u8>, bytes: &[u8]) {
+        out.extend_from_slice(bytes.len().to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(bytes);
+    }
+
+    fn txn_from_query(buf: &[u8]) -> Vec<u8> {
+        swarmotter_core::bencode::decode(buf)
+            .ok()
+            .and_then(|root| {
+                root.as_dict()
+                    .and_then(|d| d.iter().find(|(k, _)| k == b"t"))
+                    .and_then(|(_, v)| v.as_str())
+                    .map(Vec::from)
+            })
+            .unwrap_or_else(|| vec![0, 0])
+    }
+
+    fn response_start(responder_id: [u8; 20]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(b'd');
+        write_bstr(&mut out, b"r");
+        out.push(b'd');
+        write_bstr(&mut out, b"id");
+        write_bstr(&mut out, &responder_id);
+        out
+    }
+
+    fn response_finish(out: &mut Vec<u8>, txn: &[u8]) {
+        out.push(b'e');
+        write_bstr(out, b"t");
+        write_bstr(out, txn);
+        write_bstr(out, b"y");
+        write_bstr(out, b"r");
+        out.push(b'e');
+    }
 
     /// A minimal local DHT node that responds to get_peers with a peer and a
     /// node, exercising the contained UDP path over loopback.
@@ -412,6 +587,60 @@ mod tests {
         assert_eq!(peers[0].port, 6881);
         assert_eq!(peers[0].ip.to_string(), "1.2.3.4");
         task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dht_get_peers_follows_nodes6_from_ipv4_response() {
+        let v4_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let v4_addr = v4_sock.local_addr().unwrap();
+        let Ok(v6_sock) = tokio::net::UdpSocket::bind("[::1]:0").await else {
+            return;
+        };
+        let v6_addr = v6_sock.local_addr().unwrap();
+        let info_hash = InfoHash::from_bytes([0xcd; 20]);
+
+        let v4_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, peer) = v4_sock.recv_from(&mut buf).await.unwrap();
+            let txn = txn_from_query(&buf[..n]);
+            let mut out = response_start([9u8; 20]);
+            write_bstr(&mut out, b"nodes6");
+            let mut node = Vec::new();
+            node.extend_from_slice(&[8u8; 20]);
+            if let SocketAddr::V6(addr) = v6_addr {
+                node.extend_from_slice(&addr.ip().octets());
+                node.extend_from_slice(&addr.port().to_be_bytes());
+            }
+            write_bstr(&mut out, &node);
+            response_finish(&mut out, &txn);
+            v4_sock.send_to(&out, peer).await.unwrap();
+        });
+
+        let v6_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            let (n, peer) = v6_sock.recv_from(&mut buf).await.unwrap();
+            let txn = txn_from_query(&buf[..n]);
+            let mut out = response_start([8u8; 20]);
+            write_bstr(&mut out, b"values");
+            out.push(b'l');
+            let mut compact_peer = Vec::new();
+            compact_peer.extend_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+            compact_peer.extend_from_slice(&6881u16.to_be_bytes());
+            write_bstr(&mut out, &compact_peer);
+            out.push(b'e');
+            response_finish(&mut out, &txn);
+            v6_sock.send_to(&out, peer).await.unwrap();
+        });
+
+        let binder = Arc::new(LoopbackBinder);
+        let runner = DhtRunner::new(NodeId::random(), binder, vec![v4_addr], 0);
+        let peers = runner.get_peers(info_hash, 4).await.unwrap();
+
+        assert!(peers
+            .iter()
+            .any(|peer| peer.ip.is_ipv6() && peer.port == 6881));
+        v4_task.await.unwrap();
+        v6_task.await.unwrap();
     }
 
     #[tokio::test]

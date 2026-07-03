@@ -154,10 +154,10 @@ unlimited or high is better for raw transfer throughput.
 
 When `incomplete_dir` is set, SwarmOtter writes partial pieces and partial
 fast-resume metadata there while the torrent is downloading. After every piece
-is verified, the daemon moves the torrent data into `download_dir` and writes
-the completed fast-resume metadata next to the completed data. If
-`incomplete_dir` is unset, the active and final directory are both
-`download_dir`. With `preallocate = false` and `sparse = true`, active
+is verified, the daemon moves the torrent data into `download_dir` and removes
+SwarmOtter fast-resume metadata so the completed directory contains only user
+payload files. If `incomplete_dir` is unset, the active and final directory are
+both `download_dir`. With `preallocate = false` and `sparse = true`, active
 single-file torrents still create a zero-length placeholder in
 `incomplete_dir` when the engine starts; the file is not sized to the full
 payload until data is written. With `sparse = false`, active payload files are

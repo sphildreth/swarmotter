@@ -17,6 +17,7 @@
 //! torrents disable DHT. See `design/requirements.md` and ADR-0019.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::bencode;
 use crate::error::{CoreError, Result};
@@ -154,12 +155,9 @@ impl TransactionId {
     }
 
     pub fn random() -> Self {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0xdead);
-        let b = [(nanos & 0xff) as u8, ((nanos >> 8) & 0xff) as u8];
-        Self(b)
+        static NEXT_TRANSACTION_ID: AtomicU16 = AtomicU16::new(1);
+        let value = NEXT_TRANSACTION_ID.fetch_add(1, Ordering::Relaxed);
+        Self(value.to_be_bytes())
     }
 
     pub fn as_bytes(&self) -> &[u8; 2] {
@@ -201,15 +199,14 @@ impl KrpcMethod {
 pub fn encode_query(txn: TransactionId, method: KrpcMethod, args: &KrpcArgs) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(b'd');
+    write_str(&mut out, b"a");
+    encode_args(&mut out, method, args);
+    write_str(&mut out, b"q");
+    write_str(&mut out, method.name().as_bytes());
     write_str(&mut out, b"t");
     write_str(&mut out, txn.as_bytes());
     write_str(&mut out, b"y");
     write_str(&mut out, b"q");
-    write_str(&mut out, b"q");
-    write_str(&mut out, method.name().as_bytes());
-    // 'a' arguments
-    write_str(&mut out, b"a");
-    encode_args(&mut out, method, args);
     out.push(b'e');
     out
 }
@@ -572,6 +569,37 @@ mod tests {
         // parse_response expects a response; queries aren't responses, so we
         // just assert the encoded form is well-formed bencode.
         assert!(bencode::decode(&q).is_ok());
+    }
+
+    #[test]
+    fn query_outer_keys_are_canonical() {
+        fn offset(haystack: &[u8], needle: &[u8]) -> usize {
+            haystack
+                .windows(needle.len())
+                .position(|w| w == needle)
+                .unwrap()
+        }
+
+        let id = NodeId::from_bytes([7; 20]);
+        let info_hash = InfoHash::from_bytes([8; 20]);
+        let q = build_get_peers(TransactionId::new([1, 2]), id, info_hash);
+
+        assert!(q.starts_with(b"d1:a"));
+        let a = offset(&q, b"1:a");
+        let query = offset(&q, b"1:q9:get_peers");
+        let txn = offset(&q, b"1:t2:");
+        let y = offset(&q, b"1:y1:q");
+        assert!(a < query);
+        assert!(query < txn);
+        assert!(txn < y);
+    }
+
+    #[test]
+    fn random_transaction_ids_advance() {
+        let first = TransactionId::random();
+        let second = TransactionId::random();
+
+        assert_ne!(first, second);
     }
 
     #[test]

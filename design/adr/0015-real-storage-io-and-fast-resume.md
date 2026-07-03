@@ -28,7 +28,10 @@ Implement real async storage I/O in `swarmotter-core::storage::io`:
   pieces.
 - `save_resume`/`load_resume` persist and reload the JSON fast-resume file
   (`<name>.swarmotter.resume`), validating info hash and piece count; a
-  mismatch is reported as a storage error.
+  mismatch is reported as a storage error. Fast-resume metadata is retained
+  only for active or incomplete downloads; after all pieces verify, completion
+  removes the metadata so final download directories contain only payload
+  files.
 - `remove_all`/remove paths delete data files and resume metadata safely.
 - `build_resume` constructs a `FastResume` from live state with accurate
   `bytes_completed` computed from verified piece lengths.

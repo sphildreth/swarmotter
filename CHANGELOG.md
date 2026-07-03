@@ -231,9 +231,10 @@ status.
 - **TCP/uTP transport selection in the engine:** the engine opens peer streams
   through `swarmotter_core::utp::connect_peer_stream`, selecting TCP and/or uTP
   per config (`torrent.utp_enabled`, `torrent.utp_prefer_tcp`). The preferred
-  transport is tried first with the other as a fallback; TCP remains available;
-  private-torrent, rate-limit, endgame, and fail-closed containment behavior
-  apply unchanged to the uTP path.
+  transport is tried first with the other as a fallback, and fallback now
+  covers peer-wire handshake failures as well as raw connection failures; TCP
+  remains available; private-torrent, rate-limit, endgame, and fail-closed
+  containment behavior apply unchanged to the uTP path.
 - The engine now terminates gracefully after a bounded number of consecutive
   no-peer announce rounds when a torrent has no trackers, no seed peers, and no
   DHT result, instead of looping forever.
@@ -253,9 +254,10 @@ status.
 
 - Active downloads now write partial data and partial fast-resume metadata
   under `[storage].incomplete_dir` when configured. After all pieces verify,
-  the engine moves completed data to `[storage].download_dir` and writes the
-  completed fast-resume metadata there. If `incomplete_dir` is unset, the
-  active and completed roots remain the same.
+  the engine moves completed data to `[storage].download_dir` and removes
+  SwarmOtter fast-resume metadata so completed download directories contain
+  only user payload files. If `incomplete_dir` is unset, the active and
+  completed roots remain the same.
 - API/UI transfer rates are now calculated from live engine byte-counter
   deltas instead of remaining at zero while progress changes. Downloaded byte
   counters now track received network bytes, completed byte counters continue
@@ -264,7 +266,8 @@ status.
   recheck progress update verified completion without being counted as newly
   downloaded network bytes, so resumed torrents do not produce false download
   speed spikes. When a non-preallocated payload file is visibly ahead of its
-  fast-resume metadata, the engine now rechecks storage instead of trusting a
+  fast-resume metadata, or when fast-resume claims verified data that is no
+  longer present on disk, the engine now rechecks storage instead of trusting a
   stale resume bitfield, so progress reflects verified on-disk pieces rather
   than stale resume state.
 - Added `GET /api/v1/torrents/:hash/stats` for per-torrent troubleshooting and
@@ -292,9 +295,34 @@ status.
   quickly. The live engine now honors manual reannounce commands by
   immediately refreshing tracker peers, and periodic refreshes also retry DHT
   peer discovery instead of relying on a single startup lookup.
+- Normal-mode peer scheduling now refills failed/stalled worker slots from the
+  full eligible peer candidate pool while useful sessions are still running,
+  instead of waiting for an entire fixed batch to finish. Peer failure
+  diagnostics now count failed parallel peer attempts so the stats endpoint can
+  distinguish a large discovered pool from a small set of productive sockets.
+  Normal peer rounds now return on the discovery refresh cadence so PEX,
+  tracker, and DHT peers are merged into the candidate pool regularly instead
+  of being held behind long-lived peer sessions.
+- Normal peer sessions now stay open across multiple discovery refresh windows
+  instead of being torn down every refresh cadence, reducing reconnect churn
+  against large public swarms. Live peer diagnostics now require recent peer
+  activity before counting peers as useful or unchoked, so the UI distinguishes
+  a large discovered peer pool from currently productive sockets.
+- Long-lived normal peer rounds now wake periodically to import PEX and
+  refreshed discovery candidates, then backfill open worker slots without
+  waiting for the entire round to end. Parallel peer sessions now keep a small
+  window of distinct pieces in flight per peer, bounded by the existing block
+  request pipeline, so high-capacity peers do not stall behind a single
+  256 KiB piece at a time.
 - Completed verified pieces are now written through a full-piece storage path
   that validates piece bounds and preserves multi-file boundaries while
-  reducing hot-path write overhead.
+  reducing hot-path write overhead. Piece-slice writes are flushed before
+  verification or immediate reads so sparse, non-preallocated files cannot
+  expose stale lengths during fast local checks.
+- DHT KRPC query encoding now uses canonical outer dictionary ordering, batched
+  lookups use unique transaction IDs, and DHT lookups follow IPv6 `nodes6`
+  results through IPv6-contained UDP sockets instead of trying to use the first
+  bootstrap node's address family for every follow-up query.
 - `GET /api/v1/torrents/:hash/stats` now includes additional live performance
   diagnostics for useful/choked/unchoked peers, recent peer/tracker failures,
   and tracker/DHT/PEX discovery freshness.

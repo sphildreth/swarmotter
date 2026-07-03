@@ -30,6 +30,7 @@ use tokio::time::timeout;
 
 use swarmotter_core::bandwidth::{RateDirection, RateLimiter, ShapedLimiter};
 use swarmotter_core::error::{CoreError, Result};
+use swarmotter_core::hash::InfoHash;
 use swarmotter_core::meta::TorrentMeta;
 use swarmotter_core::models::peer::EnginePeerHealth;
 use swarmotter_core::net::NetworkBinder;
@@ -48,6 +49,7 @@ use swarmotter_core::utp::{self, PeerTransport};
 /// keep several useful peers busy without requiring operator tuning.
 pub const DEFAULT_PEER_WORKER_LIMIT: usize = 64;
 const PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const NORMAL_PEER_SESSION_DEADLINE: Duration = Duration::from_secs(180);
 const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DHT_DISCOVERY_ROUNDS: usize = 6;
 
@@ -350,9 +352,7 @@ impl TorrentEngine {
             let complete_have = self.load_or_recheck(&complete_storage).await?;
             if complete_have.count(piece_count) == piece_count {
                 self.update_progress(&complete_have).await;
-                self.mark_finished().await;
-                self.persist_resume(&complete_storage, &complete_have)
-                    .await?;
+                self.finish_without_resume(&complete_storage).await?;
                 return Ok(self.state.lock().await.clone());
             }
         }
@@ -370,8 +370,7 @@ impl TorrentEngine {
 
         if have.count(piece_count) == piece_count {
             let storage = self.complete_storage(&storage).await?;
-            self.mark_finished().await;
-            self.persist_resume(&storage, &have).await?;
+            self.finish_without_resume(&storage).await?;
             return Ok(self.state.lock().await.clone());
         }
 
@@ -418,8 +417,7 @@ impl TorrentEngine {
 
             if have.count(piece_count) == piece_count {
                 let storage = self.complete_storage(&storage).await?;
-                self.mark_finished().await;
-                self.persist_resume(&storage, &have).await?;
+                self.finish_without_resume(&storage).await?;
                 // Announce completion to trackers.
                 self.announce(AnnounceEvent::Completed).await;
                 break;
@@ -463,17 +461,15 @@ impl TorrentEngine {
                 }
             }
 
-            let candidates = rotated_peer_candidates(
-                &eligible,
-                &mut candidate_cursor,
-                max_concurrent.saturating_mul(2),
-            );
+            let candidates =
+                rotated_peer_candidates(&eligible, &mut candidate_cursor, eligible.len());
             let mut made_progress = false;
 
             if candidates.len() > 1 {
                 let (progressed, pex_peers) = self
                     .run_parallel_peer_round(
-                        &candidates[..candidates.len().min(max_concurrent)],
+                        &candidates,
+                        max_concurrent,
                         &storage,
                         &mut have,
                         &mut bad_peers,
@@ -504,13 +500,7 @@ impl TorrentEngine {
                     break;
                 }
                 match self
-                    .download_from_peer(
-                        &peer_addr,
-                        &storage,
-                        &mut have,
-                        &mut bad_peers,
-                        &mut discovered,
-                    )
+                    .download_from_peer(&peer_addr, &storage, &mut have, &mut discovered)
                     .await
                 {
                     Ok(progressed) => {
@@ -632,24 +622,6 @@ impl TorrentEngine {
         }
     }
 
-    /// Open a peer byte stream with transport selection. Tries the preferred
-    /// transport first, then falls back to the other if it is available and
-    /// the preferred fails. Returns the connected duplex stream and the
-    /// transport that succeeded. All connections go through the binder; in
-    /// strict fail-closed mode both return `NetworkBlocked`.
-    async fn connect_peer(
-        &self,
-        peer_addr: &PeerAddr,
-    ) -> Result<(Box<dyn utp::PeerDuplex>, PeerTransport)> {
-        connect_peer_stream_with_transport(
-            self.binder.clone(),
-            *peer_addr,
-            self.utp_enabled,
-            self.utp_prefer_tcp,
-        )
-        .await
-    }
-
     /// Attempt to download missing pieces from a single peer. Returns true if
     /// at least one new piece was verified and written.
     async fn download_from_peer(
@@ -657,7 +629,6 @@ impl TorrentEngine {
         peer_addr: &PeerAddr,
         storage: &StorageIo,
         have: &mut PieceBitfield,
-        bad_peers: &mut HashMap<SocketAddr, Instant>,
         discovered: &mut Vec<PeerAddr>,
     ) -> Result<bool> {
         if !self.binder.traffic_allowed() {
@@ -666,25 +637,16 @@ impl TorrentEngine {
         if !self.peer_allowed(peer_addr) {
             return Ok(false);
         }
-        let (stream, transport) = self.connect_peer(peer_addr).await?;
+        let (mut reader, mut write_half, transport) = connect_peer_wire_with_transport(
+            self.binder.clone(),
+            *peer_addr,
+            self.meta.info_hash,
+            self.peer_id,
+            self.utp_enabled,
+            self.utp_prefer_tcp,
+        )
+        .await?;
         tracing::debug!(peer = %peer_addr.socket_addr(), transport = transport.as_str(), "peer connected");
-        let (read_half, mut write_half) = tokio::io::split(stream);
-
-        // Handshake. Advertise BEP 10 extension support for PEX/metadata.
-        let hs = Handshake {
-            info_hash: self.meta.info_hash,
-            peer_id: self.peer_id,
-            reserved: swarmotter_core::extensions::EXTENSION_RESERVED,
-        };
-        peer::write_handshake(&mut write_half, &hs).await?;
-        let mut reader = PeerReader::new(read_half);
-        let their_hs = timeout(Duration::from_secs(10), reader.read_handshake()).await??;
-        if their_hs.info_hash != self.meta.info_hash {
-            backoff_failed_peer(bad_peers, peer_addr.socket_addr());
-            return Err(CoreError::Internal(
-                "peer handshake info hash mismatch".into(),
-            ));
-        }
 
         // Exchange bitfields.
         let mut our_bf = Bitfield::new(self.meta.piece_count());
@@ -1054,6 +1016,7 @@ impl TorrentEngine {
     async fn run_parallel_peer_round(
         &self,
         candidates: &[PeerAddr],
+        max_active: usize,
         storage: &StorageIo,
         have: &mut PieceBitfield,
         bad_peers: &mut HashMap<SocketAddr, Instant>,
@@ -1063,76 +1026,140 @@ impl TorrentEngine {
             return (false, Vec::new());
         }
 
-        const PARALLEL_STEP_DEADLINE: Duration = Duration::from_secs(180);
+        const PEER_REFILL_INTERVAL: Duration = Duration::from_secs(5);
         let shared = Arc::new(Mutex::new(ParallelPieceState::new(have.clone())));
         let made_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pex_peers = Arc::new(Mutex::new(Vec::new()));
         let storage = Arc::new(storage.clone());
-        let deadline = Instant::now() + PARALLEL_STEP_DEADLINE;
-        let mut handles = AbortOnDropHandles::with_capacity(candidates.len());
+        let deadline = Instant::now() + NORMAL_PEER_SESSION_DEADLINE;
+        let max_active = max_active.max(1);
+        let mut candidates = candidates.to_vec();
+        let mut seen_candidates: HashSet<SocketAddr> =
+            candidates.iter().map(|p| p.socket_addr()).collect();
+        let mut discovered_pex = Vec::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut next_candidate = 0usize;
+        let mut next_discovery_refresh = Instant::now() + PEER_REFRESH_INTERVAL;
+
+        while next_candidate < candidates.len() && tasks.len() < max_active {
+            spawn_parallel_peer_task(
+                &mut tasks,
+                candidates[next_candidate],
+                self.meta.clone(),
+                self.binder.clone(),
+                self.peer_id,
+                shared.clone(),
+                storage.clone(),
+                self.state.clone(),
+                deadline,
+                made_progress.clone(),
+                pex_peers.clone(),
+                self.limiter.clone(),
+                self.utp_enabled,
+                self.utp_prefer_tcp,
+                self.pex_enabled && !self.meta.is_private(),
+                self.allow_ipv6,
+                self.pex_max_peers,
+            );
+            next_candidate += 1;
+        }
+
+        if tasks.is_empty() {
+            return (false, Vec::new());
+        }
 
         {
             let mut s = self.state.lock().await;
-            s.active_peers = candidates.len();
-        }
-
-        for peer_addr in candidates {
-            let peer_addr = *peer_addr;
-            let meta = self.meta.clone();
-            let binder = self.binder.clone();
-            let peer_id = self.peer_id;
-            let shared = shared.clone();
-            let storage = storage.clone();
-            let state = self.state.clone();
-            let made_progress = made_progress.clone();
-            let pex_peers = pex_peers.clone();
-            let limiter = self.limiter.clone();
-            let utp_enabled = self.utp_enabled;
-            let utp_prefer_tcp = self.utp_prefer_tcp;
-            let pex_enabled = self.pex_enabled && !self.meta.is_private();
-            let allow_ipv6 = self.allow_ipv6;
-            let pex_max_peers = self.pex_max_peers;
-            handles.push(tokio::spawn(async move {
-                parallel_peer_session(
-                    binder,
-                    peer_addr,
-                    meta,
-                    peer_id,
-                    shared,
-                    storage,
-                    state,
-                    deadline,
-                    made_progress,
-                    pex_peers,
-                    limiter,
-                    utp_enabled,
-                    utp_prefer_tcp,
-                    pex_enabled,
-                    allow_ipv6,
-                    pex_max_peers,
-                )
-                .await
-            }));
+            s.active_peers = tasks.len();
         }
 
         let mut any_progress = false;
-        for (peer_addr, handle) in candidates.iter().zip(handles.drain()) {
-            match handle.await {
-                Ok(Ok(progressed)) => {
-                    if progressed {
-                        any_progress = true;
-                    } else {
-                        backoff_peer(peer_backoff, peer_addr.socket_addr());
-                    }
-                }
-                Ok(Err(e)) => {
-                    tracing::debug!(peer = %peer_addr.socket_addr(), error = %e, "parallel peer failed; suppressing");
-                    backoff_failed_peer(bad_peers, peer_addr.socket_addr());
-                }
-                Err(_) => {
-                    backoff_failed_peer(bad_peers, peer_addr.socket_addr());
-                }
+        while !tasks.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                tasks.abort_all();
+                break;
             }
+
+            let wait_for = remaining.min(PEER_REFILL_INTERVAL);
+            match timeout(wait_for, tasks.join_next()).await {
+                Ok(Some(joined)) => match joined {
+                    Ok((peer_addr, Ok(progressed))) => {
+                        if progressed {
+                            any_progress = true;
+                        } else {
+                            backoff_peer(peer_backoff, peer_addr.socket_addr());
+                        }
+                    }
+                    Ok((peer_addr, Err(e))) => {
+                        tracing::debug!(peer = %peer_addr.socket_addr(), error = %e, "parallel peer failed; suppressing");
+                        record_peer_disconnect(&self.state).await;
+                        backoff_failed_peer(bad_peers, peer_addr.socket_addr());
+                    }
+                    Err(_) => {
+                        record_peer_disconnect(&self.state).await;
+                    }
+                },
+                Ok(None) => break,
+                Err(_) => {}
+            }
+
+            let complete = {
+                let work = shared.lock().await;
+                work.have.count(self.meta.piece_count()) == self.meta.piece_count()
+            };
+            if complete {
+                tasks.abort_all();
+                break;
+            }
+
+            merge_dynamic_parallel_candidates(
+                &mut candidates,
+                &mut seen_candidates,
+                &mut discovered_pex,
+                &pex_peers,
+                bad_peers,
+                peer_backoff,
+                self.allow_ipv6,
+            )
+            .await;
+            if Instant::now() >= next_discovery_refresh {
+                let refreshed = self.refresh_discovery_peers().await;
+                merge_parallel_candidate_iter(
+                    &mut candidates,
+                    &mut seen_candidates,
+                    refreshed,
+                    bad_peers,
+                    peer_backoff,
+                    self.allow_ipv6,
+                );
+                next_discovery_refresh = Instant::now() + PEER_REFRESH_INTERVAL;
+            }
+
+            while !complete && next_candidate < candidates.len() && tasks.len() < max_active {
+                spawn_parallel_peer_task(
+                    &mut tasks,
+                    candidates[next_candidate],
+                    self.meta.clone(),
+                    self.binder.clone(),
+                    self.peer_id,
+                    shared.clone(),
+                    storage.clone(),
+                    self.state.clone(),
+                    deadline,
+                    made_progress.clone(),
+                    pex_peers.clone(),
+                    self.limiter.clone(),
+                    self.utp_enabled,
+                    self.utp_prefer_tcp,
+                    self.pex_enabled && !self.meta.is_private(),
+                    self.allow_ipv6,
+                    self.pex_max_peers,
+                );
+                next_candidate += 1;
+            }
+
+            self.state.lock().await.active_peers = tasks.len();
         }
 
         let merged = shared.lock().await.have.clone();
@@ -1145,8 +1172,17 @@ impl TorrentEngine {
             }
         }
         self.state.lock().await.active_peers = 0;
-        let pex_peers = pex_peers.lock().await.clone();
-        (progressed, pex_peers)
+        merge_dynamic_parallel_candidates(
+            &mut candidates,
+            &mut seen_candidates,
+            &mut discovered_pex,
+            &pex_peers,
+            bad_peers,
+            peer_backoff,
+            self.allow_ipv6,
+        )
+        .await;
+        (progressed, discovered_pex)
     }
 
     /// Pick a piece we don't have that the peer has.
@@ -1335,12 +1371,12 @@ impl TorrentEngine {
     async fn load_or_recheck(&self, storage: &StorageIo) -> Result<PieceBitfield> {
         if let Some(resume) = storage.load_resume(&self.meta.info_hash).await? {
             let payload_bytes = storage.payload_bytes_on_disk().await?;
-            if self.sparse && !self.preallocate && payload_bytes > resume.bytes_completed {
+            if self.sparse && !self.preallocate && payload_bytes != resume.bytes_completed {
                 tracing::info!(
                     info_hash = %self.meta.info_hash,
                     payload_bytes,
                     resume_bytes_completed = resume.bytes_completed,
-                    "fast resume is behind on-disk payload; rechecking storage"
+                    "fast resume byte count differs from on-disk payload; rechecking storage"
                 );
                 storage.recheck().await
             } else {
@@ -1362,6 +1398,16 @@ impl TorrentEngine {
             "moving completed torrent data to download directory"
         );
         storage.move_to(self.complete_dir.clone()).await
+    }
+
+    async fn finish_without_resume(&self, storage: &StorageIo) -> Result<()> {
+        self.mark_finished().await;
+        storage.remove_resume().await?;
+        if self.download_dir != self.complete_dir {
+            let active_storage = StorageIo::new(self.meta.clone(), self.download_dir.clone());
+            active_storage.remove_resume().await?;
+        }
+        Ok(())
     }
 
     async fn persist_resume(&self, storage: &StorageIo, have: &PieceBitfield) -> Result<()> {
@@ -1418,6 +1464,7 @@ enum CommandOutcome {
 }
 
 const NORMAL_REQUEST_PIPELINE: usize = 64;
+const NORMAL_PEER_PIECE_WINDOW: usize = 4;
 const PEER_IDLE_BACKOFF: Duration = Duration::from_secs(20);
 const PEER_FAILURE_BACKOFF: Duration = Duration::from_secs(120);
 
@@ -1558,6 +1605,11 @@ async fn record_peer_hash_failure(state: &Arc<Mutex<EngineState>>, peer_addr: Pe
     entry.last_seen = Some(Instant::now());
 }
 
+async fn record_peer_disconnect(state: &Arc<Mutex<EngineState>>) {
+    let mut st = state.lock().await;
+    st.peer_disconnects_recent = st.peer_disconnects_recent.saturating_add(1);
+}
+
 fn prune_peer_backoff(backoff: &mut HashMap<SocketAddr, Instant>) {
     let now = Instant::now();
     backoff.retain(|_, until| *until > now);
@@ -1603,34 +1655,6 @@ fn rotated_peer_candidates(
     out
 }
 
-async fn send_more_piece_requests<W>(
-    write_half: &mut W,
-    piece: u32,
-    reqs: &[(u32, u32)],
-    next_req: &mut usize,
-    in_flight: &mut usize,
-) -> Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    while *next_req < reqs.len() && *in_flight < NORMAL_REQUEST_PIPELINE {
-        let (offset, length) = reqs[*next_req];
-        peer::write_message(
-            write_half,
-            &Message::Request {
-                piece,
-                offset,
-                length,
-            },
-        )
-        .await?;
-        *next_req += 1;
-        *in_flight += 1;
-    }
-    write_half.flush().await.ok();
-    Ok(())
-}
-
 struct AbortOnDropHandles<T> {
     handles: Vec<AbortOnDropHandle<T>>,
 }
@@ -1639,12 +1663,6 @@ impl<T> AbortOnDropHandles<T> {
     fn new() -> Self {
         Self {
             handles: Vec::new(),
-        }
-    }
-
-    fn with_capacity(capacity: usize) -> Self {
-        Self {
-            handles: Vec::with_capacity(capacity),
         }
     }
 
@@ -1696,28 +1714,133 @@ where
     }
 }
 
-async fn connect_peer_stream_with_transport(
+async fn merge_dynamic_parallel_candidates(
+    candidates: &mut Vec<PeerAddr>,
+    seen: &mut HashSet<SocketAddr>,
+    discovered_pex: &mut Vec<PeerAddr>,
+    pex_peers: &Arc<Mutex<Vec<PeerAddr>>>,
+    bad_peers: &HashMap<SocketAddr, Instant>,
+    peer_backoff: &HashMap<SocketAddr, Instant>,
+    allow_ipv6: bool,
+) {
+    let peers = {
+        let mut peers = pex_peers.lock().await;
+        std::mem::take(&mut *peers)
+    };
+    for peer in peers {
+        if push_parallel_candidate(candidates, seen, peer, bad_peers, peer_backoff, allow_ipv6) {
+            discovered_pex.push(peer);
+        }
+    }
+}
+
+fn merge_parallel_candidate_iter<I>(
+    candidates: &mut Vec<PeerAddr>,
+    seen: &mut HashSet<SocketAddr>,
+    peers: I,
+    bad_peers: &HashMap<SocketAddr, Instant>,
+    peer_backoff: &HashMap<SocketAddr, Instant>,
+    allow_ipv6: bool,
+) where
+    I: IntoIterator<Item = PeerAddr>,
+{
+    for peer in peers {
+        push_parallel_candidate(candidates, seen, peer, bad_peers, peer_backoff, allow_ipv6);
+    }
+}
+
+fn push_parallel_candidate(
+    candidates: &mut Vec<PeerAddr>,
+    seen: &mut HashSet<SocketAddr>,
+    peer: PeerAddr,
+    bad_peers: &HashMap<SocketAddr, Instant>,
+    peer_backoff: &HashMap<SocketAddr, Instant>,
+    allow_ipv6: bool,
+) -> bool {
+    if !allow_ipv6 && peer.ip.is_ipv6() {
+        return false;
+    }
+    let addr = peer.socket_addr();
+    if peer_is_backed_off(bad_peers, addr) || peer_is_backed_off(peer_backoff, addr) {
+        return false;
+    }
+    if !seen.insert(addr) {
+        return false;
+    }
+    candidates.push(peer);
+    true
+}
+
+type PeerReadHalf = tokio::io::ReadHalf<Box<dyn utp::PeerDuplex>>;
+type PeerWriteHalf = tokio::io::WriteHalf<Box<dyn utp::PeerDuplex>>;
+
+async fn connect_peer_wire_with_transport(
     binder: Arc<dyn NetworkBinder>,
     peer_addr: PeerAddr,
+    info_hash: InfoHash,
+    peer_id: [u8; 20],
     utp_enabled: bool,
     utp_prefer_tcp: bool,
-) -> Result<(Box<dyn utp::PeerDuplex>, PeerTransport)> {
-    let addr = peer_addr.socket_addr();
-    if utp_enabled {
-        let (first, second) = if utp_prefer_tcp {
-            (PeerTransport::Tcp, PeerTransport::Utp)
+) -> Result<(PeerReader<PeerReadHalf>, PeerWriteHalf, PeerTransport)> {
+    let transports = if utp_enabled {
+        if utp_prefer_tcp {
+            vec![PeerTransport::Tcp, PeerTransport::Utp]
         } else {
-            (PeerTransport::Utp, PeerTransport::Tcp)
-        };
-        match utp::connect_peer_stream(binder.clone(), first, addr).await {
-            Ok(s) => return Ok(s),
+            vec![PeerTransport::Utp, PeerTransport::Tcp]
+        }
+    } else {
+        vec![PeerTransport::Tcp]
+    };
+
+    let mut last_error = None;
+    for (idx, transport) in transports.iter().copied().enumerate() {
+        match attempt_peer_wire_transport(binder.clone(), transport, peer_addr, info_hash, peer_id)
+            .await
+        {
+            Ok(session) => return Ok(session),
             Err(e) => {
-                tracing::debug!(peer = %addr, transport = first.as_str(), error = %e, "preferred transport failed; trying fallback")
+                if idx + 1 < transports.len() {
+                    tracing::debug!(
+                        peer = %peer_addr.socket_addr(),
+                        transport = transport.as_str(),
+                        error = %e,
+                        "peer transport failed before usable handshake; trying fallback"
+                    );
+                }
+                last_error = Some(e);
             }
         }
-        return utp::connect_peer_stream(binder, second, addr).await;
     }
-    utp::connect_peer_stream(binder, PeerTransport::Tcp, addr).await
+
+    Err(last_error.unwrap_or_else(|| CoreError::Internal("no peer transport configured".into())))
+}
+
+async fn attempt_peer_wire_transport(
+    binder: Arc<dyn NetworkBinder>,
+    transport: PeerTransport,
+    peer_addr: PeerAddr,
+    info_hash: InfoHash,
+    peer_id: [u8; 20],
+) -> Result<(PeerReader<PeerReadHalf>, PeerWriteHalf, PeerTransport)> {
+    let (stream, selected) =
+        utp::connect_peer_stream(binder, transport, peer_addr.socket_addr()).await?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let hs = Handshake {
+        info_hash,
+        peer_id,
+        reserved: swarmotter_core::extensions::EXTENSION_RESERVED,
+    };
+    peer::write_handshake(&mut write_half, &hs).await?;
+    write_half.flush().await?;
+    let mut reader = PeerReader::new(read_half);
+    let their_hs = timeout(Duration::from_secs(10), reader.read_handshake()).await??;
+    if their_hs.info_hash != info_hash {
+        return Err(CoreError::Internal(
+            "peer handshake info hash mismatch".into(),
+        ));
+    }
+
+    Ok((reader, write_half, selected))
 }
 
 #[derive(Debug, Clone)]
@@ -1767,48 +1890,21 @@ async fn endgame_peer_session(
     utp_enabled: bool,
     utp_prefer_tcp: bool,
 ) -> Result<bool> {
-    use swarmotter_core::peer::{block_requests, Bitfield, Handshake, Message, PeerReader};
     if !binder.traffic_allowed() {
         return Ok(false);
     }
     let storage = StorageIo::new(meta.clone(), download_dir);
-    let addr = peer_addr.socket_addr();
-    let stream = if utp_enabled {
-        let (first, second) = if utp_prefer_tcp {
-            (PeerTransport::Tcp, PeerTransport::Utp)
-        } else {
-            (PeerTransport::Utp, PeerTransport::Tcp)
-        };
-        match utp::connect_peer_stream(binder.clone(), first, addr).await {
-            Ok((s, _t)) => s,
-            Err(_) => {
-                utp::connect_peer_stream(binder.clone(), second, addr)
-                    .await?
-                    .0
-            }
-        }
-    } else {
-        utp::connect_peer_stream(binder.clone(), PeerTransport::Tcp, addr)
-            .await?
-            .0
-    };
-    let (read_half, mut write_half) = tokio::io::split(stream);
-    record_peer_connected(&state, peer_addr).await;
-
-    // Handshake.
-    let hs = Handshake {
-        info_hash: meta.info_hash,
+    let (mut reader, mut write_half, transport) = connect_peer_wire_with_transport(
+        binder.clone(),
+        peer_addr,
+        meta.info_hash,
         peer_id,
-        reserved: swarmotter_core::extensions::EXTENSION_RESERVED,
-    };
-    peer::write_handshake(&mut write_half, &hs).await?;
-    let mut reader = PeerReader::new(read_half);
-    let their_hs = timeout(Duration::from_secs(10), reader.read_handshake()).await??;
-    if their_hs.info_hash != meta.info_hash {
-        return Err(CoreError::Internal(
-            "peer handshake info hash mismatch".into(),
-        ));
-    }
+        utp_enabled,
+        utp_prefer_tcp,
+    )
+    .await?;
+    tracing::debug!(peer = %peer_addr.socket_addr(), transport = transport.as_str(), "endgame peer connected");
+    record_peer_connected(&state, peer_addr).await;
 
     // Send our bitfield and express interest.
     let mut our_bf = Bitfield::new(meta.piece_count());
@@ -2042,6 +2138,145 @@ async fn endgame_peer_session(
 /// session reserves one missing piece at a time from shared state, so peers
 /// work on distinct pieces until endgame takes over.
 #[allow(clippy::too_many_arguments)]
+fn spawn_parallel_peer_task(
+    tasks: &mut tokio::task::JoinSet<(PeerAddr, Result<bool>)>,
+    peer_addr: PeerAddr,
+    meta: TorrentMeta,
+    binder: Arc<dyn NetworkBinder>,
+    peer_id: [u8; 20],
+    shared: Arc<Mutex<ParallelPieceState>>,
+    storage: Arc<StorageIo>,
+    state: Arc<Mutex<EngineState>>,
+    deadline: Instant,
+    made_progress: Arc<std::sync::atomic::AtomicBool>,
+    pex_peers: Arc<Mutex<Vec<PeerAddr>>>,
+    limiter: ShapedLimiter,
+    utp_enabled: bool,
+    utp_prefer_tcp: bool,
+    pex_enabled: bool,
+    allow_ipv6: bool,
+    pex_max_peers: usize,
+) {
+    tasks.spawn(async move {
+        let result = parallel_peer_session(
+            binder,
+            peer_addr,
+            meta,
+            peer_id,
+            shared,
+            storage,
+            state,
+            deadline,
+            made_progress,
+            pex_peers,
+            limiter,
+            utp_enabled,
+            utp_prefer_tcp,
+            pex_enabled,
+            allow_ipv6,
+            pex_max_peers,
+        )
+        .await;
+        (peer_addr, result)
+    });
+}
+
+struct ParallelPieceDownload {
+    piece_index: usize,
+    reqs: Vec<(u32, u32)>,
+    next_req: usize,
+    in_flight: usize,
+    received: usize,
+    assembler: peer::PieceAssembler,
+}
+
+impl ParallelPieceDownload {
+    fn new(piece_index: usize, piece_len: u32) -> Self {
+        Self {
+            piece_index,
+            reqs: block_requests(piece_len),
+            next_req: 0,
+            in_flight: 0,
+            received: 0,
+            assembler: peer::PieceAssembler::new(piece_index as u32, piece_len as usize),
+        }
+    }
+
+    async fn send_more<W>(&mut self, write_half: &mut W, global_in_flight: &mut usize) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        while self.next_req < self.reqs.len() && *global_in_flight < NORMAL_REQUEST_PIPELINE {
+            let (offset, length) = self.reqs[self.next_req];
+            peer::write_message(
+                write_half,
+                &Message::Request {
+                    piece: self.piece_index as u32,
+                    offset,
+                    length,
+                },
+            )
+            .await?;
+            self.next_req += 1;
+            self.in_flight += 1;
+            *global_in_flight += 1;
+        }
+        Ok(())
+    }
+
+    fn record_block(&mut self, offset: u32, block: &[u8], global_in_flight: &mut usize) -> bool {
+        if self.assembler.add_block(offset, block).is_err() {
+            return false;
+        }
+        self.received += 1;
+        self.in_flight = self.in_flight.saturating_sub(1);
+        *global_in_flight = (*global_in_flight).saturating_sub(1);
+        self.received == self.reqs.len()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fill_parallel_piece_window<W>(
+    write_half: &mut W,
+    downloads: &mut HashMap<usize, ParallelPieceDownload>,
+    global_in_flight: &mut usize,
+    shared: &Arc<Mutex<ParallelPieceState>>,
+    peer_bf: &Bitfield,
+    meta: &TorrentMeta,
+    piece_count: usize,
+) -> Result<bool>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut reserved_any = false;
+    while downloads.len() < NORMAL_PEER_PIECE_WINDOW && *global_in_flight < NORMAL_REQUEST_PIPELINE
+    {
+        let Some(piece_index) = ({
+            let mut work = shared.lock().await;
+            work.reserve_piece(peer_bf, piece_count)
+        }) else {
+            break;
+        };
+        let piece_len = if piece_index + 1 == piece_count {
+            meta.last_piece_length()
+        } else {
+            meta.piece_length
+        } as u32;
+        let mut download = ParallelPieceDownload::new(piece_index, piece_len);
+        if let Err(e) = download.send_more(write_half, global_in_flight).await {
+            shared.lock().await.release_piece(piece_index);
+            return Err(e);
+        }
+        downloads.insert(piece_index, download);
+        reserved_any = true;
+    }
+    if reserved_any {
+        write_half.flush().await.ok();
+    }
+    Ok(reserved_any)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn parallel_peer_session(
     binder: Arc<dyn NetworkBinder>,
     peer_addr: PeerAddr,
@@ -2064,25 +2299,17 @@ async fn parallel_peer_session(
         return Ok(false);
     }
 
-    let (stream, transport) =
-        connect_peer_stream_with_transport(binder, peer_addr, utp_enabled, utp_prefer_tcp).await?;
-    tracing::debug!(peer = %peer_addr.socket_addr(), transport = transport.as_str(), "parallel peer connected");
-    let (read_half, mut write_half) = tokio::io::split(stream);
-    record_peer_connected(&state, peer_addr).await;
-
-    let hs = Handshake {
-        info_hash: meta.info_hash,
+    let (mut reader, mut write_half, transport) = connect_peer_wire_with_transport(
+        binder,
+        peer_addr,
+        meta.info_hash,
         peer_id,
-        reserved: swarmotter_core::extensions::EXTENSION_RESERVED,
-    };
-    peer::write_handshake(&mut write_half, &hs).await?;
-    let mut reader = PeerReader::new(read_half);
-    let their_hs = timeout(Duration::from_secs(10), reader.read_handshake()).await??;
-    if their_hs.info_hash != meta.info_hash {
-        return Err(CoreError::Internal(
-            "peer handshake info hash mismatch".into(),
-        ));
-    }
+        utp_enabled,
+        utp_prefer_tcp,
+    )
+    .await?;
+    tracing::debug!(peer = %peer_addr.socket_addr(), transport = transport.as_str(), "parallel peer connected");
+    record_peer_connected(&state, peer_addr).await;
 
     let piece_count = meta.piece_count();
     let mut our_bf = Bitfield::new(piece_count);
@@ -2131,39 +2358,31 @@ async fn parallel_peer_session(
         }
 
         if !peer_choking {
-            let Some(piece_index) = ({
-                let mut work = shared.lock().await;
-                let Some(peer_bf) = peer_bf.as_ref() else {
-                    return Ok(progressed);
-                };
-                work.reserve_piece(peer_bf, piece_count)
-            }) else {
-                peer::write_message(&mut write_half, &Message::NotInterested).await?;
-                break;
+            let Some(peer_bf_snapshot) = peer_bf.clone() else {
+                return Ok(progressed);
             };
-
-            let piece_len = if piece_index + 1 == piece_count {
-                meta.last_piece_length()
-            } else {
-                meta.piece_length
-            } as u32;
-            let reqs = block_requests(piece_len);
-            let mut next_req = 0usize;
-            let mut in_flight = 0usize;
-            send_more_piece_requests(
+            let mut downloads: HashMap<usize, ParallelPieceDownload> = HashMap::new();
+            let mut global_in_flight = 0usize;
+            fill_parallel_piece_window(
                 &mut write_half,
-                piece_index as u32,
-                &reqs,
-                &mut next_req,
-                &mut in_flight,
+                &mut downloads,
+                &mut global_in_flight,
+                &shared,
+                &peer_bf_snapshot,
+                &meta,
+                piece_count,
             )
             .await?;
+            if downloads.is_empty() {
+                peer::write_message(&mut write_half, &Message::NotInterested).await?;
+                break;
+            }
 
-            let mut assembler = peer::PieceAssembler::new(piece_index as u32, piece_len as usize);
-            let mut received = 0usize;
-            let piece_deadline = Instant::now() + Duration::from_secs(20);
-            while received < reqs.len() {
-                let remaining = piece_deadline.saturating_duration_since(Instant::now());
+            let mut last_block_at = Instant::now();
+            let mut received_any = false;
+            while !downloads.is_empty() {
+                let remaining = (last_block_at + Duration::from_secs(20))
+                    .saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     break;
                 }
@@ -2177,20 +2396,67 @@ async fn parallel_peer_session(
                         offset,
                         block,
                     } => {
-                        if piece as usize == piece_index
-                            && assembler.add_block(offset, &block).is_ok()
-                        {
-                            received += 1;
-                            in_flight = in_flight.saturating_sub(1);
+                        let piece_index = piece as usize;
+                        let mut complete_data = None;
+                        if let Some(download) = downloads.get_mut(&piece_index) {
+                            let complete =
+                                download.record_block(offset, &block, &mut global_in_flight);
                             record_peer_block(&state, peer_addr, block.len() as u64).await;
-                            send_more_piece_requests(
-                                &mut write_half,
-                                piece_index as u32,
-                                &reqs,
-                                &mut next_req,
-                                &mut in_flight,
-                            )
-                            .await?;
+                            last_block_at = Instant::now();
+                            received_any = true;
+                            if complete {
+                                complete_data = Some(download.assembler.data().to_vec());
+                            } else {
+                                download
+                                    .send_more(&mut write_half, &mut global_in_flight)
+                                    .await?;
+                                write_half.flush().await.ok();
+                            }
+                        }
+                        if let Some(data) = complete_data {
+                            downloads.remove(&piece_index);
+                            if swarmotter_core::storage::verify_piece(&meta, piece_index, &data) {
+                                limiter
+                                    .acquire(RateDirection::Download, data.len() as u64)
+                                    .await;
+                                storage.write_piece(piece_index, &data).await?;
+                                let have_snapshot = {
+                                    let mut work = shared.lock().await;
+                                    if !work.have.has(piece_index) {
+                                        work.have.set(piece_index);
+                                        progressed = true;
+                                        made_progress
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    work.release_piece(piece_index);
+                                    work.have.clone()
+                                };
+                                update_progress_state(&state, &meta, &have_snapshot).await;
+                                peer::write_message(
+                                    &mut write_half,
+                                    &Message::Have {
+                                        piece: piece_index as u32,
+                                    },
+                                )
+                                .await?;
+                                fill_parallel_piece_window(
+                                    &mut write_half,
+                                    &mut downloads,
+                                    &mut global_in_flight,
+                                    &shared,
+                                    peer_bf.as_ref().unwrap_or(&peer_bf_snapshot),
+                                    &meta,
+                                    piece_count,
+                                )
+                                .await?;
+                            } else {
+                                tracing::warn!(
+                                    piece = piece_index,
+                                    "piece hash mismatch; rejecting"
+                                );
+                                record_peer_hash_failure(&state, peer_addr).await;
+                                shared.lock().await.release_piece(piece_index);
+                            }
                         }
                     }
                     Message::Choke => {
@@ -2238,43 +2504,14 @@ async fn parallel_peer_session(
                 }
             }
 
-            if received == reqs.len() {
-                let data = assembler.data().to_vec();
-                if swarmotter_core::storage::verify_piece(&meta, piece_index, &data) {
-                    limiter
-                        .acquire(RateDirection::Download, data.len() as u64)
-                        .await;
-                    storage.write_piece(piece_index, &data).await?;
-                    let have_snapshot = {
-                        let mut work = shared.lock().await;
-                        if !work.have.has(piece_index) {
-                            work.have.set(piece_index);
-                            progressed = true;
-                            made_progress.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        work.release_piece(piece_index);
-                        work.have.clone()
-                    };
-                    update_progress_state(&state, &meta, &have_snapshot).await;
-                    peer::write_message(
-                        &mut write_half,
-                        &Message::Have {
-                            piece: piece_index as u32,
-                        },
-                    )
-                    .await?;
-                    write_half.flush().await.ok();
-                } else {
-                    tracing::warn!(piece = piece_index, "piece hash mismatch; rejecting");
-                    record_peer_hash_failure(&state, peer_addr).await;
-                    shared.lock().await.release_piece(piece_index);
-                }
-            } else {
+            for piece_index in downloads.keys().copied().collect::<Vec<_>>() {
                 shared.lock().await.release_piece(piece_index);
+            }
+            if !downloads.is_empty() {
                 record_peer_timeout(&state, peer_addr).await;
-                if received == 0 {
-                    return Ok(progressed);
-                }
+            }
+            if !received_any {
+                return Ok(progressed);
             }
             continue;
         }
@@ -2592,6 +2829,66 @@ mod tests {
         assert!(recovered.has(2));
     }
 
+    #[tokio::test]
+    async fn stale_fast_resume_rechecks_resume_ahead_of_payload() {
+        let payload = b"abcdefghABCDEFGHijklmnop";
+        let bytes = build_single_file_torrent("overclaim.bin", payload, 8, None, false);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("stale-resume-overclaim");
+        let storage = StorageIo::new(meta.clone(), dir.clone());
+        storage.write_piece(0, &payload[0..8]).await.unwrap();
+
+        let mut stale = PieceBitfield::new(meta.piece_count());
+        stale.set(0);
+        stale.set(1);
+        let piece_lengths: Vec<u64> = (0..meta.piece_count())
+            .map(|i| {
+                if i + 1 == meta.piece_count() {
+                    meta.last_piece_length()
+                } else {
+                    meta.piece_length
+                }
+            })
+            .collect();
+        let resume = swarmotter_core::storage::io::build_resume(
+            meta.info_hash,
+            meta.name.clone(),
+            stale,
+            meta.piece_count(),
+            0,
+            0,
+            meta.total_length,
+            Some(dir.display().to_string()),
+            now_secs(),
+            None,
+            &vec![swarmotter_core::models::torrent::FilePriority::Normal; meta.files.len()],
+            &piece_lengths,
+        );
+        storage.save_resume(&resume).await.unwrap();
+
+        let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let engine = TorrentEngine::new(
+            meta.clone(),
+            dir.clone(),
+            [0u8; 20],
+            binder,
+            state,
+            rx,
+            vec![],
+            6881,
+        )
+        .with_preallocate(false);
+
+        let recovered = engine.load_or_recheck(&storage).await.unwrap();
+
+        assert!(recovered.has(0));
+        assert!(!recovered.has(1));
+        assert!(!recovered.has(2));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn peer_worker_limit_uses_default_when_uncapped() {
         let bytes = build_single_file_torrent("f", b"0123456789abcdef", 8, None, false);
@@ -2726,13 +3023,81 @@ mod tests {
             std::fs::read(complete_storage.file_path(0).unwrap()).unwrap(),
             content
         );
-        assert!(complete_storage
-            .load_resume(&meta.info_hash)
-            .await
-            .unwrap()
-            .is_some());
+        assert!(!active_storage.resume_path().exists());
+        assert!(!complete_storage.resume_path().exists());
         std::fs::remove_dir_all(&active_dir).ok();
         std::fs::remove_dir_all(&complete_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn completed_single_root_removes_resume_metadata() {
+        let content = b"verified data complete in place";
+        let bytes = build_single_file_torrent("single-root.bin", content, 8, None, false);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("complete-single-root");
+        let storage = StorageIo::new(meta.clone(), dir.clone());
+        storage.preallocate().await.unwrap();
+        for piece in 0..meta.piece_count() {
+            let start = piece * 8;
+            let end = std::cmp::min(start + 8, content.len());
+            storage
+                .write_block(piece, 0, &content[start..end])
+                .await
+                .unwrap();
+        }
+        let mut have = PieceBitfield::new(meta.piece_count());
+        for piece in 0..meta.piece_count() {
+            have.set(piece);
+        }
+        let piece_lengths: Vec<u64> = (0..meta.piece_count())
+            .map(|i| {
+                if i + 1 == meta.piece_count() {
+                    meta.last_piece_length()
+                } else {
+                    meta.piece_length
+                }
+            })
+            .collect();
+        let resume = swarmotter_core::storage::io::build_resume(
+            meta.info_hash,
+            meta.name.clone(),
+            have,
+            meta.piece_count(),
+            content.len() as u64,
+            0,
+            meta.total_length,
+            Some(dir.display().to_string()),
+            now_secs(),
+            Some(now_secs()),
+            &vec![swarmotter_core::models::torrent::FilePriority::Normal; meta.files.len()],
+            &piece_lengths,
+        );
+        storage.save_resume(&resume).await.unwrap();
+        assert!(storage.resume_path().exists());
+
+        let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let engine = TorrentEngine::new(
+            meta.clone(),
+            dir.clone(),
+            [0u8; 20],
+            binder,
+            state,
+            rx,
+            vec![],
+            6881,
+        );
+
+        let final_state = engine.run().await.unwrap();
+
+        assert!(final_state.finished);
+        assert_eq!(
+            std::fs::read(storage.file_path(0).unwrap()).unwrap(),
+            content
+        );
+        assert!(!storage.resume_path().exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]

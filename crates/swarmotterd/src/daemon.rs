@@ -38,6 +38,8 @@ use crate::engine::{EngineCommand, EngineState, TorrentEngine};
 use crate::netbinder::ContainedBinder;
 use crate::seeder::Seeder;
 
+const PEER_DIAGNOSTIC_RECENT_WINDOW: Duration = Duration::from_secs(30);
+
 pub struct DaemonRuntime {
     pub registry: Arc<Mutex<TorrentRegistry>>,
     pub config: Arc<Mutex<Config>>,
@@ -106,11 +108,20 @@ struct LiveTorrentDiagnostics {
 
 impl LiveTorrentDiagnostics {
     fn from_engine_state(s: &EngineState, now: Instant) -> Self {
-        let unchoked_peers = s.peer_health.values().filter(|p| p.unchoked).count();
+        let unchoked_peers = s
+            .peer_health
+            .values()
+            .filter(|p| {
+                p.unchoked
+                    && p.last_seen
+                        .map(|seen| now.duration_since(seen) < PEER_DIAGNOSTIC_RECENT_WINDOW)
+                        .unwrap_or(false)
+            })
+            .count();
         Self {
             active_peer_workers: s.active_peers,
             known_peers: s.peers.len(),
-            useful_peers: Some(useful_peer_count(&s.peer_health)),
+            useful_peers: Some(useful_peer_count(&s.peer_health, now)),
             choked_peers: None,
             unchoked_peers: Some(unchoked_peers),
             recent_peer_failures: Some(s.peer_disconnects_recent),
@@ -127,14 +138,21 @@ impl LiveTorrentDiagnostics {
     }
 }
 
-fn useful_peer_count(peer_health: &HashMap<std::net::SocketAddr, EnginePeerHealth>) -> usize {
+fn useful_peer_count(
+    peer_health: &HashMap<std::net::SocketAddr, EnginePeerHealth>,
+    now: Instant,
+) -> usize {
     peer_health
         .values()
         .filter(|p| {
+            let last_seen_recent = p
+                .last_seen
+                .map(|seen| now.duration_since(seen) < PEER_DIAGNOSTIC_RECENT_WINDOW)
+                .unwrap_or(false);
             p.has_missing_pieces
                 && !p.blocked
                 && (p.unchoked || p.useful_recently)
-                && p.last_seen.is_some()
+                && last_seen_recent
         })
         .count()
 }
@@ -1904,15 +1922,16 @@ fn build_health_input(
     for (_addr, p) in peer_health.iter() {
         let last_valid = p.last_valid_block;
         let last_seen = p.last_seen;
-        let useful_recently = p.useful_recently
-            || last_valid
-                .map(|t| now.duration_since(t) < recent_window)
-                .unwrap_or(false);
-        let unchoked = p.unchoked || useful_recently;
         let last_seen_recent = last_seen
             .map(|t| now.duration_since(t) < recent_window)
             .unwrap_or(false);
-        let has_missing = p.has_missing_pieces || (useful_recently && last_seen_recent);
+        let useful_recently = (p.useful_recently && last_seen_recent)
+            || last_valid
+                .map(|t| now.duration_since(t) < recent_window)
+                .unwrap_or(false);
+        let unchoked = (p.unchoked && last_seen_recent) || useful_recently;
+        let has_missing =
+            (p.has_missing_pieces && last_seen_recent) || (useful_recently && last_seen_recent);
         peers.push(EnginePeerHealth {
             piece_bitfield: p.piece_bitfield.clone(),
             has_missing_pieces: has_missing,
@@ -2063,6 +2082,16 @@ mod tests {
             EnginePeerHealth {
                 has_missing_pieces: true,
                 last_seen: Some(now),
+                ..Default::default()
+            },
+        );
+        peer_health.insert(
+            "127.0.0.1:6883".parse().unwrap(),
+            EnginePeerHealth {
+                has_missing_pieces: true,
+                unchoked: true,
+                useful_recently: true,
+                last_seen: Some(now - Duration::from_secs(31)),
                 ..Default::default()
             },
         );
