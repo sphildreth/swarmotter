@@ -11,9 +11,10 @@
 //! The pure KRPC/routing logic lives in `swarmotter-core::dht`. See
 //! `design/requirements.md` and ADR-0019.
 
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -25,6 +26,25 @@ use swarmotter_core::error::Result;
 use swarmotter_core::hash::InfoHash;
 use swarmotter_core::net::{ContainedUdpSocket, NetworkBinder};
 use swarmotter_core::peer::PeerAddr;
+
+const DHT_ALPHA: usize = 8;
+const DHT_QUERY_WINDOW: Duration = Duration::from_millis(1_200);
+const DHT_MAX_QUERIES: usize = 96;
+const DHT_MAX_PEERS: usize = 256;
+
+/// Summary of a bounded DHT lookup.
+#[derive(Debug, Clone, Default)]
+pub struct DhtLookupResult {
+    pub peers: Vec<PeerAddr>,
+    pub queried_nodes: usize,
+    pub responding_nodes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DhtCandidate {
+    id: Option<NodeId>,
+    addr: SocketAddr,
+}
 
 /// A live DHT runner bound to a contained UDP socket.
 pub struct DhtRunner {
@@ -99,65 +119,117 @@ impl DhtRunner {
     /// per-node timeouts so unreachable bootstrap nodes cannot stall the
     /// caller.
     pub async fn get_peers(&self, info_hash: InfoHash, max_rounds: usize) -> Result<Vec<PeerAddr>> {
+        Ok(self
+            .get_peers_with_stats(info_hash, max_rounds)
+            .await?
+            .peers)
+    }
+
+    /// Iterative `get_peers` with basic reachability counters for diagnostics.
+    pub async fn get_peers_with_stats(
+        &self,
+        info_hash: InfoHash,
+        max_rounds: usize,
+    ) -> Result<DhtLookupResult> {
         let _socket_guard = self.socket_lock.lock().await;
-        let socket = self.socket().await?;
-        let mut discovered: Vec<PeerAddr> = Vec::new();
-        let mut queried: Vec<SocketAddr> = Vec::new();
-        let mut pending: Vec<SocketAddr> = self.bootstrap.clone();
+        let socket: Arc<dyn ContainedUdpSocket> = self.socket().await?.into();
+        let mut result = DhtLookupResult::default();
+        let mut queried: HashSet<SocketAddr> = HashSet::new();
+        let mut queued: HashSet<SocketAddr> = HashSet::new();
+        let mut pending: Vec<DhtCandidate> = self
+            .bootstrap
+            .iter()
+            .copied()
+            .map(|addr| DhtCandidate { id: None, addr })
+            .collect();
+        queued.extend(self.bootstrap.iter().copied());
+        let target = NodeId::from_bytes(*info_hash.as_bytes());
         // Seed with any known routing-table nodes.
         {
             let table = self.table.lock().await;
-            for n in table.nodes() {
-                pending.push(n.addr);
+            for n in table.closest(&target, 32) {
+                if queued.insert(n.addr) {
+                    pending.push(DhtCandidate {
+                        id: Some(n.id),
+                        addr: n.addr,
+                    });
+                }
             }
         }
 
         for _ in 0..max_rounds.max(1) {
+            if queried.len() >= DHT_MAX_QUERIES || result.peers.len() >= DHT_MAX_PEERS {
+                break;
+            }
+            pending.retain(|candidate| !queried.contains(&candidate.addr));
+            sort_candidates_by_distance(&mut pending, target);
             if pending.is_empty() {
                 break;
             }
-            let batch: Vec<SocketAddr> = pending.drain(..pending.len().min(8)).collect();
-            let mut next: Vec<SocketAddr> = Vec::new();
-            for addr in batch {
-                if queried.contains(&addr) {
+
+            let remaining_budget = DHT_MAX_QUERIES.saturating_sub(queried.len());
+            let batch_len = pending.len().min(DHT_ALPHA).min(remaining_budget);
+            let batch: Vec<DhtCandidate> = pending.drain(..batch_len).collect();
+            let mut transactions: HashMap<TransactionId, SocketAddr> = HashMap::new();
+            for candidate in batch {
+                let addr = candidate.addr;
+                if !queried.insert(addr) {
                     continue;
                 }
-                queried.push(addr);
                 let txn = TransactionId::random();
                 let q = build_get_peers(txn, self.self_id, info_hash);
                 if socket.send_to(addr, &q).await.is_err() {
                     continue;
                 }
+                result.queried_nodes += 1;
+                transactions.insert(txn, addr);
+            }
+
+            let deadline = Instant::now() + DHT_QUERY_WINDOW;
+            while !transactions.is_empty() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
                 let mut buf = vec![0u8; 2048];
-                let resp =
-                    match timeout(Duration::from_millis(800), socket.recv_from(&mut buf)).await {
-                        Ok(Ok((from, n))) => match dht::parse_response(&buf[..n]) {
-                            Ok(r) => Some((from, r)),
-                            Err(_) => None,
-                        },
-                        _ => None,
-                    };
-                if let Some((from, resp)) = resp {
-                    self.handle_response(from, &resp, &mut discovered, &mut next, info_hash);
+                let Ok(Ok((from, n))) = timeout(remaining, socket.recv_from(&mut buf)).await else {
+                    break;
+                };
+                let Ok(resp) = dht::parse_response(&buf[..n]) else {
+                    continue;
+                };
+                let Some(expected_from) = transactions.get(&resp.txn).copied() else {
+                    continue;
+                };
+                if expected_from != from {
+                    continue;
+                }
+                transactions.remove(&resp.txn);
+                result.responding_nodes += 1;
+                self.handle_response(from, &resp, &mut result.peers, &mut pending, &mut queued)
+                    .await;
+                if result.peers.len() >= DHT_MAX_PEERS {
+                    result.peers.truncate(DHT_MAX_PEERS);
+                    break;
                 }
             }
-            pending.extend(next);
         }
-        Ok(discovered)
+        Ok(result)
     }
 
-    fn handle_response(
+    async fn handle_response(
         &self,
         from: SocketAddr,
         resp: &KrpcResponse,
         discovered: &mut Vec<PeerAddr>,
-        next: &mut Vec<SocketAddr>,
-        _info_hash: InfoHash,
+        pending: &mut Vec<DhtCandidate>,
+        queued: &mut HashSet<SocketAddr>,
     ) {
         if let Some(id) = resp.sender_id {
-            if let Ok(mut t) = self.table.try_lock() {
-                t.insert(dht::DhtNode { id, addr: from });
-            }
+            self.table
+                .lock()
+                .await
+                .insert(dht::DhtNode { id, addr: from });
         }
         for p in &resp.peers {
             if !discovered.contains(p) {
@@ -165,7 +237,12 @@ impl DhtRunner {
             }
         }
         for n in &resp.nodes {
-            next.push(n.addr);
+            if queued.insert(n.addr) {
+                pending.push(DhtCandidate {
+                    id: Some(n.id),
+                    addr: n.addr,
+                });
+            }
         }
     }
 
@@ -241,6 +318,15 @@ pub async fn resolve_bootstrap_with_binder(
         }
     }
     out
+}
+
+fn sort_candidates_by_distance(candidates: &mut [DhtCandidate], target: NodeId) {
+    candidates.sort_by_key(|candidate| {
+        candidate
+            .id
+            .map(|id| id.distance(&target))
+            .unwrap_or([0u8; 20])
+    });
 }
 
 #[cfg(test)]

@@ -705,7 +705,11 @@ impl UtpConnection {
 }
 
 /// Default advertised receive window.
-const RECV_WINDOW_DEFAULT: u32 = 64 * 1024;
+///
+/// A 64 KiB window caps a single uTP flow to low-MB/s throughput on normal
+/// internet RTTs. Keep this bounded, but large enough for public Linux ISO
+/// swarms to maintain useful in-flight data over higher-latency paths.
+const RECV_WINDOW_DEFAULT: u32 = 4 * 1024 * 1024;
 
 /// Wrapping comparison: is `s` at or before `ack` in u16 sequence space?
 fn seq_at_or_before(s: u16, ack: u16) -> bool {

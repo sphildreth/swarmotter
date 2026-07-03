@@ -47,6 +47,9 @@ use swarmotter_core::utp::{self, PeerTransport};
 /// public Linux distribution torrents, so the default should be high enough to
 /// keep several useful peers busy without requiring operator tuning.
 pub const DEFAULT_PEER_WORKER_LIMIT: usize = 64;
+const PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const DHT_DISCOVERY_ROUNDS: usize = 6;
 
 /// Magnet parameters for a torrent that still needs its metadata fetched
 /// (BEP 9). The placeholder `TorrentMeta` in the engine has a dummy info hash;
@@ -65,8 +68,12 @@ pub struct MagnetParams {
 pub struct EngineState {
     pub pieces_have: PieceBitfield,
     pub piece_count: usize,
+    /// Bytes received from peers over the network. This intentionally does
+    /// not include bytes found by fast-resume or disk recheck.
     pub downloaded: u64,
     pub uploaded: u64,
+    /// Verified bytes present on disk, including bytes found by fast-resume
+    /// or recheck.
     pub bytes_completed: u64,
     pub total_length: u64,
     #[allow(dead_code)]
@@ -376,31 +383,17 @@ impl TorrentEngine {
                 discovered.push(*p);
             }
         }
-        // Trackerless / supplemental DHT discovery: for non-private torrents,
-        // ask the DHT for peers holding this info hash. Bounded by a hard
-        // total cap so unreachable bootstrap nodes cannot stall the download.
-        if !self.meta.is_private() {
-            if let Some(dht) = &self.dht {
-                let dht_result = tokio::time::timeout(
-                    Duration::from_secs(10),
-                    dht.get_peers(self.meta.info_hash, 3),
-                )
-                .await;
-                if let Ok(Ok(peers)) = dht_result {
-                    for p in peers {
-                        if self.peer_allowed(&p) && !discovered.contains(&p) {
-                            discovered.push(p);
-                        }
-                    }
-                }
-            }
-        }
+        let dht_peers = self.discover_dht_peers().await;
+        merge_unique_peers(&mut discovered, dht_peers);
+        dedupe_peers(&mut discovered);
         self.state.lock().await.peers = discovered.clone();
 
         // Download loop: connect to peers, request missing pieces, write and
         // verify. Bounded by the configured per-torrent worker limit.
-        let mut bad_peers: HashSet<SocketAddr> = HashSet::new();
-        let start = Instant::now();
+        let mut bad_peers: HashMap<SocketAddr, Instant> = HashMap::new();
+        let mut peer_backoff: HashMap<SocketAddr, Instant> = HashMap::new();
+        let mut last_announce = Instant::now();
+        let mut candidate_cursor: usize = 0;
         // Bounded consecutive no-peer rounds: if we never discover any peers
         // after a bounded number of announce attempts, give up gracefully
         // rather than looping forever. This handles trackerless torrents with
@@ -410,8 +403,16 @@ impl TorrentEngine {
 
         loop {
             // Handle pending commands.
-            if self.poll_commands().await == CommandOutcome::Stop {
-                break;
+            match self.poll_commands().await {
+                CommandOutcome::Stop => break,
+                CommandOutcome::Reannounce => {
+                    let refreshed = self.refresh_discovery_peers().await;
+                    merge_unique_peers(&mut discovered, refreshed);
+                    dedupe_peers(&mut discovered);
+                    self.state.lock().await.peers = discovered.clone();
+                    last_announce = Instant::now();
+                }
+                CommandOutcome::Continue | CommandOutcome::Pause => {}
             }
             let max_concurrent = self.current_peer_worker_limit();
 
@@ -425,30 +426,33 @@ impl TorrentEngine {
             }
 
             // Periodically re-announce to refresh peers.
-            if start.elapsed() > Duration::from_secs(30) {
-                let refreshed =
-                    self.filter_allowed_peers(self.announce(AnnounceEvent::Empty).await);
-                for p in refreshed {
-                    if !discovered.contains(&p) {
-                        discovered.push(p);
-                    }
-                }
+            if last_announce.elapsed() > PEER_REFRESH_INTERVAL {
+                let refreshed = self.refresh_discovery_peers().await;
+                merge_unique_peers(&mut discovered, refreshed);
+                dedupe_peers(&mut discovered);
+                self.state.lock().await.peers = discovered.clone();
+                last_announce = Instant::now();
             }
 
             let remaining = piece_count - have.count(piece_count);
+            prune_peer_backoff(&mut bad_peers);
+            prune_peer_backoff(&mut peer_backoff);
+            let mut eligible: Vec<PeerAddr> = discovered
+                .iter()
+                .filter(|p| self.peer_allowed(p))
+                .filter(|p| !peer_is_backed_off(&bad_peers, p.socket_addr()))
+                .filter(|p| !peer_is_backed_off(&peer_backoff, p.socket_addr()))
+                .copied()
+                .collect();
+            balance_peer_families(&mut eligible);
 
             // Endgame mode: when few pieces remain, request the remaining
             // blocks from multiple peers concurrently and cancel duplicates
             // as they complete. Falls back to the normal sequential path when
             // endgame is inactive or there are too few usable peers.
             if swarmotter_core::endgame::is_endgame(remaining) {
-                let candidates: Vec<PeerAddr> = discovered
-                    .iter()
-                    .filter(|p| self.peer_allowed(p))
-                    .filter(|p| !bad_peers.contains(&p.socket_addr()))
-                    .copied()
-                    .take(max_concurrent)
-                    .collect();
+                let candidates =
+                    rotated_peer_candidates(&eligible, &mut candidate_cursor, max_concurrent);
                 if !candidates.is_empty() {
                     let progressed = self
                         .run_endgame(&candidates, &storage, &mut have, &mut bad_peers)
@@ -459,24 +463,31 @@ impl TorrentEngine {
                 }
             }
 
-            let candidates: Vec<PeerAddr> = discovered
-                .iter()
-                .filter(|p| self.peer_allowed(p))
-                .filter(|p| !bad_peers.contains(&p.socket_addr()))
-                .copied()
-                .take(max_concurrent.saturating_mul(2))
-                .collect();
+            let candidates = rotated_peer_candidates(
+                &eligible,
+                &mut candidate_cursor,
+                max_concurrent.saturating_mul(2),
+            );
             let mut made_progress = false;
 
             if candidates.len() > 1 {
-                made_progress = self
+                let (progressed, pex_peers) = self
                     .run_parallel_peer_round(
                         &candidates[..candidates.len().min(max_concurrent)],
                         &storage,
                         &mut have,
                         &mut bad_peers,
+                        &mut peer_backoff,
                     )
                     .await;
+                made_progress = progressed;
+                for peer in pex_peers {
+                    if self.peer_allowed(&peer) && !discovered.contains(&peer) {
+                        discovered.push(peer);
+                    }
+                }
+                dedupe_peers(&mut discovered);
+                self.state.lock().await.peers = discovered.clone();
             }
 
             // Single-peer fallback and diagnostic path. This also preserves
@@ -505,11 +516,13 @@ impl TorrentEngine {
                     Ok(progressed) => {
                         if progressed {
                             made_progress = true;
+                        } else {
+                            backoff_peer(&mut peer_backoff, peer_addr.socket_addr());
                         }
                     }
                     Err(e) => {
                         tracing::debug!(peer = %peer_addr.socket_addr(), error = %e, "peer failed; suppressing");
-                        bad_peers.insert(peer_addr.socket_addr());
+                        backoff_failed_peer(&mut bad_peers, peer_addr.socket_addr());
                     }
                 }
             }
@@ -518,13 +531,8 @@ impl TorrentEngine {
                 if discovered.is_empty() || bad_peers.len() >= discovered.len() {
                     // No usable peers; back off briefly and retry announce.
                     self.sleep_or_stop(Duration::from_secs(2)).await;
-                    let refreshed =
-                        self.filter_allowed_peers(self.announce(AnnounceEvent::Empty).await);
-                    for p in refreshed {
-                        if !discovered.contains(&p) {
-                            discovered.push(p);
-                        }
-                    }
+                    let refreshed = self.refresh_discovery_peers().await;
+                    merge_unique_peers(&mut discovered, refreshed);
                     if discovered.is_empty() {
                         no_peer_rounds = no_peer_rounds.saturating_add(1);
                         let mut state = self.state.lock().await;
@@ -577,6 +585,53 @@ impl TorrentEngine {
             .collect()
     }
 
+    async fn refresh_discovery_peers(&self) -> Vec<PeerAddr> {
+        let mut refreshed = self.filter_allowed_peers(self.announce(AnnounceEvent::Empty).await);
+        let dht_peers = self.discover_dht_peers().await;
+        merge_unique_peers(&mut refreshed, dht_peers);
+        dedupe_peers(&mut refreshed);
+        refreshed
+    }
+
+    async fn discover_dht_peers(&self) -> Vec<PeerAddr> {
+        if self.meta.is_private() {
+            return Vec::new();
+        }
+        let Some(dht) = &self.dht else {
+            return Vec::new();
+        };
+        let result = tokio::time::timeout(
+            DHT_DISCOVERY_TIMEOUT,
+            dht.get_peers_with_stats(self.meta.info_hash, DHT_DISCOVERY_ROUNDS),
+        )
+        .await;
+        match result {
+            Ok(Ok(lookup)) => {
+                let peers = self.filter_allowed_peers(lookup.peers);
+                if lookup.responding_nodes > 0 || !peers.is_empty() {
+                    let mut s = self.state.lock().await;
+                    s.dht_discovery_ok = !peers.is_empty();
+                    s.dht_last_seen = Some(Instant::now());
+                }
+                tracing::debug!(
+                    queried = lookup.queried_nodes,
+                    responding = lookup.responding_nodes,
+                    peers = peers.len(),
+                    "DHT peer discovery completed"
+                );
+                peers
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "DHT peer discovery failed");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::debug!("DHT peer discovery timed out");
+                Vec::new()
+            }
+        }
+    }
+
     /// Open a peer byte stream with transport selection. Tries the preferred
     /// transport first, then falls back to the other if it is available and
     /// the preferred fails. Returns the connected duplex stream and the
@@ -602,7 +657,7 @@ impl TorrentEngine {
         peer_addr: &PeerAddr,
         storage: &StorageIo,
         have: &mut PieceBitfield,
-        bad_peers: &mut HashSet<SocketAddr>,
+        bad_peers: &mut HashMap<SocketAddr, Instant>,
         discovered: &mut Vec<PeerAddr>,
     ) -> Result<bool> {
         if !self.binder.traffic_allowed() {
@@ -625,7 +680,7 @@ impl TorrentEngine {
         let mut reader = PeerReader::new(read_half);
         let their_hs = timeout(Duration::from_secs(10), reader.read_handshake()).await??;
         if their_hs.info_hash != self.meta.info_hash {
-            bad_peers.insert(peer_addr.socket_addr());
+            backoff_failed_peer(bad_peers, peer_addr.socket_addr());
             return Err(CoreError::Internal(
                 "peer handshake info hash mismatch".into(),
             ));
@@ -644,16 +699,7 @@ impl TorrentEngine {
         // Register a per-peer health entry so the daemon's health calculator
         // can see this peer. We update `last_seen`/`has_missing_pieces` on
         // every meaningful event.
-        {
-            let mut st = self.state.lock().await;
-            st.peer_health
-                .entry(peer_addr.socket_addr())
-                .or_insert(EnginePeerHealth {
-                    last_seen: Some(Instant::now()),
-                    ..Default::default()
-                })
-                .last_seen = Some(Instant::now());
-        }
+        record_peer_connected(&self.state, *peer_addr).await;
 
         // Send a BEP 10 extension handshake advertising configured extensions.
         // PEX is honored only for non-private torrents and only when enabled.
@@ -747,32 +793,43 @@ impl TorrentEngine {
                                     && assembler.add_block(offset, &block).is_ok()
                                 {
                                     received_blocks += 1;
-                                    self.record_downloaded(block.len() as u64).await;
-                                    // Per-peer health: this peer just sent a
-                                    // valid block of a piece we still needed.
-                                    let mut st = self.state.lock().await;
-                                    let entry =
-                                        st.peer_health.entry(peer_addr.socket_addr()).or_default();
-                                    entry.last_valid_block = Some(Instant::now());
-                                    entry.has_missing_pieces = true;
-                                    entry.useful_recently = true;
-                                    entry.unchoked = true;
-                                    entry.last_seen = Some(Instant::now());
-                                    drop(st);
+                                    record_peer_block(&self.state, *peer_addr, block.len() as u64)
+                                        .await;
                                 }
                             }
                             Message::Choke => {
                                 peer_choking = true;
+                                record_peer_choked(&self.state, *peer_addr).await;
                                 break;
                             }
-                            Message::Unchoke => peer_choking = false,
+                            Message::Unchoke => {
+                                peer_choking = false;
+                                record_peer_unchoked(&self.state, *peer_addr).await;
+                            }
                             Message::Have { piece } => {
-                                if let Some(bf) = &mut peer_bf {
-                                    bf.set(piece as usize);
+                                apply_peer_have(&mut peer_bf, piece_count, piece);
+                                if let Some(bf) = &peer_bf {
+                                    record_peer_availability(
+                                        &self.state,
+                                        *peer_addr,
+                                        bf,
+                                        have,
+                                        piece_count,
+                                    )
+                                    .await;
                                 }
                             }
                             Message::Bitfield { bits } => {
-                                peer_bf = Some(Bitfield::from_bytes(bits, piece_count));
+                                let bf = Bitfield::from_bytes(bits, piece_count);
+                                record_peer_availability(
+                                    &self.state,
+                                    *peer_addr,
+                                    &bf,
+                                    have,
+                                    piece_count,
+                                )
+                                .await;
+                                peer_bf = Some(bf);
                             }
                             Message::Keepalive
                             | Message::Interested
@@ -792,7 +849,7 @@ impl TorrentEngine {
                             self.limiter
                                 .acquire(RateDirection::Download, data.len() as u64)
                                 .await;
-                            storage.write_block(piece_index, 0, &data).await?;
+                            storage.write_piece(piece_index, &data).await?;
                             have.set(piece_index);
                             made_progress = true;
                             self.update_progress(have).await;
@@ -807,6 +864,7 @@ impl TorrentEngine {
                             .await?;
                         } else {
                             tracing::warn!(piece = piece_index, "piece hash mismatch; rejecting");
+                            record_peer_hash_failure(&self.state, *peer_addr).await;
                             // Bad hash: do not mark; try a different piece.
                         }
                     }
@@ -826,29 +884,22 @@ impl TorrentEngine {
             match msg {
                 Message::Unchoke => {
                     peer_choking = false;
-                    let mut st = self.state.lock().await;
-                    st.peer_health
-                        .entry(peer_addr.socket_addr())
-                        .or_default()
-                        .unchoked = true;
+                    record_peer_unchoked(&self.state, *peer_addr).await;
                 }
-                Message::Choke => peer_choking = true,
+                Message::Choke => {
+                    peer_choking = true;
+                    record_peer_choked(&self.state, *peer_addr).await;
+                }
                 Message::Bitfield { bits } => {
                     let bf = Bitfield::from_bytes(bits, piece_count);
-                    // If the peer advertises any piece we still need, record
-                    // it as having missing pieces for health purposes.
-                    let has_any_missing = (0..piece_count).any(|i| bf.has(i) && !have.has(i));
-                    if has_any_missing {
-                        let mut st = self.state.lock().await;
-                        let entry = st.peer_health.entry(peer_addr.socket_addr()).or_default();
-                        entry.has_missing_pieces = true;
-                        entry.last_seen = Some(Instant::now());
-                    }
+                    record_peer_availability(&self.state, *peer_addr, &bf, have, piece_count).await;
                     peer_bf = Some(bf);
                 }
                 Message::Have { piece } => {
-                    if let Some(bf) = &mut peer_bf {
-                        bf.set(piece as usize);
+                    apply_peer_have(&mut peer_bf, piece_count, piece);
+                    if let Some(bf) = &peer_bf {
+                        record_peer_availability(&self.state, *peer_addr, bf, have, piece_count)
+                            .await;
                     }
                 }
                 Message::Keepalive
@@ -874,12 +925,19 @@ impl TorrentEngine {
                     {
                         if let Ok(pex) = swarmotter_core::extensions::parse_pex(&payload) {
                             let max_peers = self.pex_max_peers;
+                            let before = discovered.len();
                             add_pex_peers(
                                 discovered,
                                 pex.added.into_iter().chain(pex.added6.into_iter()),
                                 self.allow_ipv6,
                                 max_peers,
                             );
+                            if discovered.len() > before {
+                                let mut st = self.state.lock().await;
+                                st.pex_discovery_ok = true;
+                                st.pex_last_seen = Some(Instant::now());
+                                st.peers = discovered.clone();
+                            }
                         }
                     }
                 }
@@ -905,7 +963,7 @@ impl TorrentEngine {
         candidates: &[PeerAddr],
         storage: &StorageIo,
         have: &mut PieceBitfield,
-        bad_peers: &mut HashSet<SocketAddr>,
+        bad_peers: &mut HashMap<SocketAddr, Instant>,
     ) -> bool {
         use swarmotter_core::endgame::{is_endgame, OutstandingRequests};
         const ENDGAME_MAX_PEERS: usize = 4;
@@ -966,11 +1024,11 @@ impl TorrentEngine {
                     }
                 }
                 Ok(Err(_)) => {
-                    bad_peers.insert(peer_addr.socket_addr());
+                    backoff_failed_peer(bad_peers, peer_addr.socket_addr());
                 }
                 // Task panic/cancellation: treat as a failed peer.
                 Err(_) => {
-                    bad_peers.insert(peer_addr.socket_addr());
+                    backoff_failed_peer(bad_peers, peer_addr.socket_addr());
                 }
             }
         }
@@ -998,15 +1056,17 @@ impl TorrentEngine {
         candidates: &[PeerAddr],
         storage: &StorageIo,
         have: &mut PieceBitfield,
-        bad_peers: &mut HashSet<SocketAddr>,
-    ) -> bool {
+        bad_peers: &mut HashMap<SocketAddr, Instant>,
+        peer_backoff: &mut HashMap<SocketAddr, Instant>,
+    ) -> (bool, Vec<PeerAddr>) {
         if candidates.len() < 2 {
-            return false;
+            return (false, Vec::new());
         }
 
-        const PARALLEL_STEP_DEADLINE: Duration = Duration::from_secs(20);
+        const PARALLEL_STEP_DEADLINE: Duration = Duration::from_secs(180);
         let shared = Arc::new(Mutex::new(ParallelPieceState::new(have.clone())));
         let made_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pex_peers = Arc::new(Mutex::new(Vec::new()));
         let storage = Arc::new(storage.clone());
         let deadline = Instant::now() + PARALLEL_STEP_DEADLINE;
         let mut handles = AbortOnDropHandles::with_capacity(candidates.len());
@@ -1025,10 +1085,13 @@ impl TorrentEngine {
             let storage = storage.clone();
             let state = self.state.clone();
             let made_progress = made_progress.clone();
+            let pex_peers = pex_peers.clone();
             let limiter = self.limiter.clone();
             let utp_enabled = self.utp_enabled;
             let utp_prefer_tcp = self.utp_prefer_tcp;
             let pex_enabled = self.pex_enabled && !self.meta.is_private();
+            let allow_ipv6 = self.allow_ipv6;
+            let pex_max_peers = self.pex_max_peers;
             handles.push(tokio::spawn(async move {
                 parallel_peer_session(
                     binder,
@@ -1040,10 +1103,13 @@ impl TorrentEngine {
                     state,
                     deadline,
                     made_progress,
+                    pex_peers,
                     limiter,
                     utp_enabled,
                     utp_prefer_tcp,
                     pex_enabled,
+                    allow_ipv6,
+                    pex_max_peers,
                 )
                 .await
             }));
@@ -1055,14 +1121,16 @@ impl TorrentEngine {
                 Ok(Ok(progressed)) => {
                     if progressed {
                         any_progress = true;
+                    } else {
+                        backoff_peer(peer_backoff, peer_addr.socket_addr());
                     }
                 }
                 Ok(Err(e)) => {
                     tracing::debug!(peer = %peer_addr.socket_addr(), error = %e, "parallel peer failed; suppressing");
-                    bad_peers.insert(peer_addr.socket_addr());
+                    backoff_failed_peer(bad_peers, peer_addr.socket_addr());
                 }
                 Err(_) => {
-                    bad_peers.insert(peer_addr.socket_addr());
+                    backoff_failed_peer(bad_peers, peer_addr.socket_addr());
                 }
             }
         }
@@ -1077,7 +1145,8 @@ impl TorrentEngine {
             }
         }
         self.state.lock().await.active_peers = 0;
-        progressed
+        let pex_peers = pex_peers.lock().await.clone();
+        (progressed, pex_peers)
     }
 
     /// Pick a piece we don't have that the peer has.
@@ -1263,13 +1332,20 @@ impl TorrentEngine {
         s.finished = true;
     }
 
-    async fn record_downloaded(&self, bytes: u64) {
-        record_downloaded_state(&self.state, bytes).await;
-    }
-
     async fn load_or_recheck(&self, storage: &StorageIo) -> Result<PieceBitfield> {
         if let Some(resume) = storage.load_resume(&self.meta.info_hash).await? {
-            Ok(resume.piece_bitfield)
+            let payload_bytes = storage.payload_bytes_on_disk().await?;
+            if self.sparse && !self.preallocate && payload_bytes > resume.bytes_completed {
+                tracing::info!(
+                    info_hash = %self.meta.info_hash,
+                    payload_bytes,
+                    resume_bytes_completed = resume.bytes_completed,
+                    "fast resume is behind on-disk payload; rechecking storage"
+                );
+                storage.recheck().await
+            } else {
+                Ok(resume.piece_bitfield)
+            }
         } else {
             storage.recheck().await
         }
@@ -1318,7 +1394,7 @@ impl TorrentEngine {
             Ok(EngineCommand::Stop) => CommandOutcome::Stop,
             Ok(EngineCommand::Pause) => CommandOutcome::Pause,
             Ok(EngineCommand::Resume) => CommandOutcome::Continue,
-            Ok(EngineCommand::Reannounce) => CommandOutcome::Continue,
+            Ok(EngineCommand::Reannounce) => CommandOutcome::Reannounce,
             Ok(EngineCommand::Recheck) => CommandOutcome::Continue,
             Ok(EngineCommand::UpdatePeerWorkerLimit(limit)) => {
                 self.set_peer_worker_limit(limit);
@@ -1337,7 +1413,222 @@ impl TorrentEngine {
 enum CommandOutcome {
     Continue,
     Pause,
+    Reannounce,
     Stop,
+}
+
+const NORMAL_REQUEST_PIPELINE: usize = 64;
+const PEER_IDLE_BACKOFF: Duration = Duration::from_secs(20);
+const PEER_FAILURE_BACKOFF: Duration = Duration::from_secs(120);
+
+fn balance_peer_families(peers: &mut Vec<PeerAddr>) {
+    if peers.len() < 2 {
+        return;
+    }
+    let mut ipv4 = Vec::new();
+    let mut ipv6 = Vec::new();
+    for peer in peers.iter().copied() {
+        if peer.ip.is_ipv6() {
+            ipv6.push(peer);
+        } else {
+            ipv4.push(peer);
+        }
+    }
+    if ipv4.is_empty() || ipv6.is_empty() {
+        return;
+    }
+
+    let mut balanced = Vec::with_capacity(peers.len());
+    let mut v4 = 0usize;
+    let mut v6 = 0usize;
+    while v4 < ipv4.len() || v6 < ipv6.len() {
+        if v4 < ipv4.len() {
+            balanced.push(ipv4[v4]);
+            v4 += 1;
+        }
+        if v6 < ipv6.len() {
+            balanced.push(ipv6[v6]);
+            v6 += 1;
+        }
+    }
+    *peers = balanced;
+}
+
+fn dedupe_peers(peers: &mut Vec<PeerAddr>) {
+    let mut seen = HashSet::new();
+    peers.retain(|peer| seen.insert(peer.socket_addr()));
+}
+
+fn merge_unique_peers<I>(discovered: &mut Vec<PeerAddr>, peers: I) -> usize
+where
+    I: IntoIterator<Item = PeerAddr>,
+{
+    let before = discovered.len();
+    for peer in peers {
+        if !discovered.contains(&peer) {
+            discovered.push(peer);
+        }
+    }
+    discovered.len().saturating_sub(before)
+}
+
+fn peer_bitfield_has_missing(peer_bf: &Bitfield, have: &PieceBitfield, piece_count: usize) -> bool {
+    (0..piece_count).any(|i| peer_bf.has(i) && !have.has(i))
+}
+
+fn peer_bitfield_snapshot(peer_bf: &Bitfield, piece_count: usize) -> PieceBitfield {
+    let mut out = PieceBitfield::new(piece_count);
+    for i in 0..piece_count {
+        if peer_bf.has(i) {
+            out.set(i);
+        }
+    }
+    out
+}
+
+fn apply_peer_have(peer_bf: &mut Option<Bitfield>, piece_count: usize, piece: u32) {
+    peer_bf
+        .get_or_insert_with(|| Bitfield::new(piece_count))
+        .set(piece as usize);
+}
+
+async fn record_peer_connected(state: &Arc<Mutex<EngineState>>, peer_addr: PeerAddr) {
+    let mut st = state.lock().await;
+    st.peer_health
+        .entry(peer_addr.socket_addr())
+        .or_default()
+        .last_seen = Some(Instant::now());
+}
+
+async fn record_peer_unchoked(state: &Arc<Mutex<EngineState>>, peer_addr: PeerAddr) {
+    let mut st = state.lock().await;
+    let entry = st.peer_health.entry(peer_addr.socket_addr()).or_default();
+    entry.unchoked = true;
+    entry.last_seen = Some(Instant::now());
+}
+
+async fn record_peer_choked(state: &Arc<Mutex<EngineState>>, peer_addr: PeerAddr) {
+    let mut st = state.lock().await;
+    let entry = st.peer_health.entry(peer_addr.socket_addr()).or_default();
+    entry.unchoked = false;
+    entry.last_seen = Some(Instant::now());
+}
+
+async fn record_peer_availability(
+    state: &Arc<Mutex<EngineState>>,
+    peer_addr: PeerAddr,
+    peer_bf: &Bitfield,
+    have: &PieceBitfield,
+    piece_count: usize,
+) {
+    let mut st = state.lock().await;
+    let entry = st.peer_health.entry(peer_addr.socket_addr()).or_default();
+    entry.piece_bitfield = Some(peer_bitfield_snapshot(peer_bf, piece_count));
+    entry.has_missing_pieces = peer_bitfield_has_missing(peer_bf, have, piece_count);
+    entry.last_seen = Some(Instant::now());
+}
+
+async fn record_peer_block(state: &Arc<Mutex<EngineState>>, peer_addr: PeerAddr, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    let mut st = state.lock().await;
+    st.downloaded = st.downloaded.saturating_add(bytes);
+    st.block_last_seen = Some(Instant::now());
+    let entry = st.peer_health.entry(peer_addr.socket_addr()).or_default();
+    entry.last_valid_block = Some(Instant::now());
+    entry.has_missing_pieces = true;
+    entry.useful_recently = true;
+    entry.unchoked = true;
+    entry.last_seen = Some(Instant::now());
+}
+
+async fn record_peer_timeout(state: &Arc<Mutex<EngineState>>, peer_addr: PeerAddr) {
+    let mut st = state.lock().await;
+    st.timeout_failures = st.timeout_failures.saturating_add(1);
+    let entry = st.peer_health.entry(peer_addr.socket_addr()).or_default();
+    entry.last_seen = Some(Instant::now());
+}
+
+async fn record_peer_hash_failure(state: &Arc<Mutex<EngineState>>, peer_addr: PeerAddr) {
+    let mut st = state.lock().await;
+    st.hash_failures = st.hash_failures.saturating_add(1);
+    let entry = st.peer_health.entry(peer_addr.socket_addr()).or_default();
+    entry.blocked = true;
+    entry.last_seen = Some(Instant::now());
+}
+
+fn prune_peer_backoff(backoff: &mut HashMap<SocketAddr, Instant>) {
+    let now = Instant::now();
+    backoff.retain(|_, until| *until > now);
+}
+
+fn peer_is_backed_off(backoff: &HashMap<SocketAddr, Instant>, peer: SocketAddr) -> bool {
+    backoff
+        .get(&peer)
+        .is_some_and(|until| *until > Instant::now())
+}
+
+fn backoff_peer_for(
+    backoff: &mut HashMap<SocketAddr, Instant>,
+    peer: SocketAddr,
+    duration: Duration,
+) {
+    backoff.insert(peer, Instant::now() + duration);
+}
+
+fn backoff_peer(backoff: &mut HashMap<SocketAddr, Instant>, peer: SocketAddr) {
+    backoff_peer_for(backoff, peer, PEER_IDLE_BACKOFF);
+}
+
+fn backoff_failed_peer(backoff: &mut HashMap<SocketAddr, Instant>, peer: SocketAddr) {
+    backoff_peer_for(backoff, peer, PEER_FAILURE_BACKOFF);
+}
+
+fn rotated_peer_candidates(
+    eligible: &[PeerAddr],
+    cursor: &mut usize,
+    limit: usize,
+) -> Vec<PeerAddr> {
+    if eligible.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let start = *cursor % eligible.len();
+    let take = eligible.len().min(limit);
+    let mut out = Vec::with_capacity(take);
+    for offset in 0..take {
+        out.push(eligible[(start + offset) % eligible.len()]);
+    }
+    *cursor = (start + take) % eligible.len();
+    out
+}
+
+async fn send_more_piece_requests<W>(
+    write_half: &mut W,
+    piece: u32,
+    reqs: &[(u32, u32)],
+    next_req: &mut usize,
+    in_flight: &mut usize,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    while *next_req < reqs.len() && *in_flight < NORMAL_REQUEST_PIPELINE {
+        let (offset, length) = reqs[*next_req];
+        peer::write_message(
+            write_half,
+            &Message::Request {
+                piece,
+                offset,
+                length,
+            },
+        )
+        .await?;
+        *next_req += 1;
+        *in_flight += 1;
+    }
+    write_half.flush().await.ok();
+    Ok(())
 }
 
 struct AbortOnDropHandles<T> {
@@ -1502,6 +1793,7 @@ async fn endgame_peer_session(
             .0
     };
     let (read_half, mut write_half) = tokio::io::split(stream);
+    record_peer_connected(&state, peer_addr).await;
 
     // Handshake.
     let hs = Handshake {
@@ -1619,17 +1911,7 @@ async fn endgame_peer_session(
                             && assembler.add_block(offset, &block).is_ok()
                         {
                             received += 1;
-                            record_downloaded_state(&state, block.len() as u64).await;
-                            {
-                                let mut st = state.lock().await;
-                                let entry =
-                                    st.peer_health.entry(peer_addr.socket_addr()).or_default();
-                                entry.last_valid_block = Some(Instant::now());
-                                entry.has_missing_pieces = true;
-                                entry.useful_recently = true;
-                                entry.unchoked = true;
-                                entry.last_seen = Some(Instant::now());
-                            }
+                            record_peer_block(&state, peer_addr, block.len() as u64).await;
                             outstanding.lock().await.delivered(piece, offset);
                         } else if piece as usize != piece_index {
                             // A block for a piece we no longer need (completed
@@ -1652,16 +1934,26 @@ async fn endgame_peer_session(
                     }
                     Message::Choke => {
                         peer_choking = true;
+                        record_peer_choked(&state, peer_addr).await;
                         break;
                     }
-                    Message::Unchoke => peer_choking = false,
+                    Message::Unchoke => {
+                        peer_choking = false;
+                        record_peer_unchoked(&state, peer_addr).await;
+                    }
                     Message::Have { piece } => {
-                        if let Some(bf) = &mut peer_bf {
-                            bf.set(piece as usize);
+                        apply_peer_have(&mut peer_bf, piece_count, piece);
+                        if let Some(bf) = &peer_bf {
+                            let have = shared_have.lock().await.clone();
+                            record_peer_availability(&state, peer_addr, bf, &have, piece_count)
+                                .await;
                         }
                     }
                     Message::Bitfield { bits } => {
-                        peer_bf = Some(Bitfield::from_bytes(bits, piece_count));
+                        let bf = Bitfield::from_bytes(bits, piece_count);
+                        let have = shared_have.lock().await.clone();
+                        record_peer_availability(&state, peer_addr, &bf, &have, piece_count).await;
+                        peer_bf = Some(bf);
                     }
                     _ => {}
                 }
@@ -1680,7 +1972,7 @@ async fn endgame_peer_session(
                         limiter
                             .acquire(RateDirection::Download, data.len() as u64)
                             .await;
-                        storage.write_block(piece_index, 0, &data).await?;
+                        storage.write_piece(piece_index, &data).await?;
                         shared_have.lock().await.set(piece_index);
                         outstanding.lock().await.clear_piece(piece_index as u32);
                         progressed = true;
@@ -1703,7 +1995,11 @@ async fn endgame_peer_session(
                         .await?;
                     }
                     write_half.flush().await.ok();
+                } else {
+                    record_peer_hash_failure(&state, peer_addr).await;
                 }
+            } else {
+                record_peer_timeout(&state, peer_addr).await;
             }
             continue;
         }
@@ -1714,14 +2010,25 @@ async fn endgame_peer_session(
             _ => break,
         };
         match msg {
-            Message::Unchoke => peer_choking = false,
-            Message::Choke => peer_choking = true,
+            Message::Unchoke => {
+                peer_choking = false;
+                record_peer_unchoked(&state, peer_addr).await;
+            }
+            Message::Choke => {
+                peer_choking = true;
+                record_peer_choked(&state, peer_addr).await;
+            }
             Message::Bitfield { bits } => {
-                peer_bf = Some(Bitfield::from_bytes(bits, piece_count));
+                let bf = Bitfield::from_bytes(bits, piece_count);
+                let have = shared_have.lock().await.clone();
+                record_peer_availability(&state, peer_addr, &bf, &have, piece_count).await;
+                peer_bf = Some(bf);
             }
             Message::Have { piece } => {
-                if let Some(bf) = &mut peer_bf {
-                    bf.set(piece as usize);
+                apply_peer_have(&mut peer_bf, piece_count, piece);
+                if let Some(bf) = &peer_bf {
+                    let have = shared_have.lock().await.clone();
+                    record_peer_availability(&state, peer_addr, bf, &have, piece_count).await;
                 }
             }
             _ => {}
@@ -1745,10 +2052,13 @@ async fn parallel_peer_session(
     state: Arc<Mutex<EngineState>>,
     deadline: Instant,
     made_progress: Arc<std::sync::atomic::AtomicBool>,
+    pex_peers: Arc<Mutex<Vec<PeerAddr>>>,
     limiter: ShapedLimiter,
     utp_enabled: bool,
     utp_prefer_tcp: bool,
     pex_enabled: bool,
+    allow_ipv6: bool,
+    pex_max_peers: usize,
 ) -> Result<bool> {
     if !binder.traffic_allowed() {
         return Ok(false);
@@ -1758,6 +2068,7 @@ async fn parallel_peer_session(
         connect_peer_stream_with_transport(binder, peer_addr, utp_enabled, utp_prefer_tcp).await?;
     tracing::debug!(peer = %peer_addr.socket_addr(), transport = transport.as_str(), "parallel peer connected");
     let (read_half, mut write_half) = tokio::io::split(stream);
+    record_peer_connected(&state, peer_addr).await;
 
     let hs = Handshake {
         info_hash: meta.info_hash,
@@ -1805,6 +2116,7 @@ async fn parallel_peer_session(
     let mut peer_bf: Option<Bitfield> = None;
     let mut peer_choking = true;
     let mut progressed = false;
+    let mut remote_pex_id: Option<u8> = None;
 
     loop {
         if Instant::now() > deadline {
@@ -1836,18 +2148,16 @@ async fn parallel_peer_session(
                 meta.piece_length
             } as u32;
             let reqs = block_requests(piece_len);
-            for (off, len) in &reqs {
-                peer::write_message(
-                    &mut write_half,
-                    &Message::Request {
-                        piece: piece_index as u32,
-                        offset: *off,
-                        length: *len,
-                    },
-                )
-                .await?;
-            }
-            write_half.flush().await.ok();
+            let mut next_req = 0usize;
+            let mut in_flight = 0usize;
+            send_more_piece_requests(
+                &mut write_half,
+                piece_index as u32,
+                &reqs,
+                &mut next_req,
+                &mut in_flight,
+            )
+            .await?;
 
             let mut assembler = peer::PieceAssembler::new(piece_index as u32, piece_len as usize);
             let mut received = 0usize;
@@ -1871,38 +2181,59 @@ async fn parallel_peer_session(
                             && assembler.add_block(offset, &block).is_ok()
                         {
                             received += 1;
-                            record_downloaded_state(&state, block.len() as u64).await;
-                            {
-                                let mut st = state.lock().await;
-                                let entry =
-                                    st.peer_health.entry(peer_addr.socket_addr()).or_default();
-                                entry.last_valid_block = Some(Instant::now());
-                                entry.has_missing_pieces = true;
-                                entry.useful_recently = true;
-                                entry.unchoked = true;
-                                entry.last_seen = Some(Instant::now());
-                            }
+                            in_flight = in_flight.saturating_sub(1);
+                            record_peer_block(&state, peer_addr, block.len() as u64).await;
+                            send_more_piece_requests(
+                                &mut write_half,
+                                piece_index as u32,
+                                &reqs,
+                                &mut next_req,
+                                &mut in_flight,
+                            )
+                            .await?;
                         }
                     }
                     Message::Choke => {
                         peer_choking = true;
+                        record_peer_choked(&state, peer_addr).await;
                         break;
                     }
-                    Message::Unchoke => peer_choking = false,
+                    Message::Unchoke => {
+                        peer_choking = false;
+                        record_peer_unchoked(&state, peer_addr).await;
+                    }
                     Message::Have { piece } => {
-                        if let Some(bf) = &mut peer_bf {
-                            bf.set(piece as usize);
+                        apply_peer_have(&mut peer_bf, piece_count, piece);
+                        if let Some(bf) = &peer_bf {
+                            let have = shared.lock().await.have.clone();
+                            record_peer_availability(&state, peer_addr, bf, &have, piece_count)
+                                .await;
                         }
                     }
                     Message::Bitfield { bits } => {
-                        peer_bf = Some(Bitfield::from_bytes(bits, piece_count));
+                        let bf = Bitfield::from_bytes(bits, piece_count);
+                        let have = shared.lock().await.have.clone();
+                        record_peer_availability(&state, peer_addr, &bf, &have, piece_count).await;
+                        peer_bf = Some(bf);
+                    }
+                    Message::Extended { id, payload } => {
+                        handle_parallel_pex_message(
+                            id,
+                            &payload,
+                            pex_enabled,
+                            &mut remote_pex_id,
+                            allow_ipv6,
+                            pex_max_peers,
+                            &pex_peers,
+                            &state,
+                        )
+                        .await;
                     }
                     Message::Keepalive
                     | Message::Interested
                     | Message::NotInterested
                     | Message::Request { .. }
                     | Message::Cancel { .. }
-                    | Message::Extended { .. }
                     | Message::Unknown { .. } => {}
                 }
             }
@@ -1913,7 +2244,7 @@ async fn parallel_peer_session(
                     limiter
                         .acquire(RateDirection::Download, data.len() as u64)
                         .await;
-                    storage.write_block(piece_index, 0, &data).await?;
+                    storage.write_piece(piece_index, &data).await?;
                     let have_snapshot = {
                         let mut work = shared.lock().await;
                         if !work.have.has(piece_index) {
@@ -1935,10 +2266,15 @@ async fn parallel_peer_session(
                     write_half.flush().await.ok();
                 } else {
                     tracing::warn!(piece = piece_index, "piece hash mismatch; rejecting");
+                    record_peer_hash_failure(&state, peer_addr).await;
                     shared.lock().await.release_piece(piece_index);
                 }
             } else {
                 shared.lock().await.release_piece(piece_index);
+                record_peer_timeout(&state, peer_addr).await;
+                if received == 0 {
+                    return Ok(progressed);
+                }
             }
             continue;
         }
@@ -1948,15 +2284,39 @@ async fn parallel_peer_session(
             _ => break,
         };
         match msg {
-            Message::Unchoke => peer_choking = false,
-            Message::Choke => peer_choking = true,
+            Message::Unchoke => {
+                peer_choking = false;
+                record_peer_unchoked(&state, peer_addr).await;
+            }
+            Message::Choke => {
+                peer_choking = true;
+                record_peer_choked(&state, peer_addr).await;
+            }
             Message::Bitfield { bits } => {
-                peer_bf = Some(Bitfield::from_bytes(bits, piece_count));
+                let bf = Bitfield::from_bytes(bits, piece_count);
+                let have = shared.lock().await.have.clone();
+                record_peer_availability(&state, peer_addr, &bf, &have, piece_count).await;
+                peer_bf = Some(bf);
             }
             Message::Have { piece } => {
-                if let Some(bf) = &mut peer_bf {
-                    bf.set(piece as usize);
+                apply_peer_have(&mut peer_bf, piece_count, piece);
+                if let Some(bf) = &peer_bf {
+                    let have = shared.lock().await.have.clone();
+                    record_peer_availability(&state, peer_addr, bf, &have, piece_count).await;
                 }
+            }
+            Message::Extended { id, payload } => {
+                handle_parallel_pex_message(
+                    id,
+                    &payload,
+                    pex_enabled,
+                    &mut remote_pex_id,
+                    allow_ipv6,
+                    pex_max_peers,
+                    &pex_peers,
+                    &state,
+                )
+                .await;
             }
             Message::Keepalive
             | Message::Interested
@@ -1964,7 +2324,6 @@ async fn parallel_peer_session(
             | Message::Request { .. }
             | Message::Piece { .. }
             | Message::Cancel { .. }
-            | Message::Extended { .. }
             | Message::Unknown { .. } => {}
         }
     }
@@ -1972,20 +2331,52 @@ async fn parallel_peer_session(
     Ok(progressed)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_parallel_pex_message(
+    id: u8,
+    payload: &[u8],
+    pex_enabled: bool,
+    remote_pex_id: &mut Option<u8>,
+    allow_ipv6: bool,
+    pex_max_peers: usize,
+    pex_peers: &Arc<Mutex<Vec<PeerAddr>>>,
+    state: &Arc<Mutex<EngineState>>,
+) {
+    if !pex_enabled {
+        return;
+    }
+    if id == swarmotter_core::extensions::EXTENSION_HANDSHAKE_ID {
+        if let Ok(hs) = swarmotter_core::extensions::parse_extension_handshake(payload) {
+            *remote_pex_id = hs.id_for(swarmotter_core::extensions::UT_PEX_NAME);
+        }
+        return;
+    }
+    if Some(id) != *remote_pex_id {
+        return;
+    }
+    let Ok(pex) = swarmotter_core::extensions::parse_pex(payload) else {
+        return;
+    };
+    let mut peers = pex_peers.lock().await;
+    let before = peers.len();
+    add_pex_peers(
+        &mut peers,
+        pex.added.into_iter().chain(pex.added6.into_iter()),
+        allow_ipv6,
+        pex_max_peers,
+    );
+    if peers.len() > before {
+        let mut s = state.lock().await;
+        s.pex_discovery_ok = true;
+        s.pex_last_seen = Some(Instant::now());
+    }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-async fn record_downloaded_state(state: &Arc<Mutex<EngineState>>, bytes: u64) {
-    if bytes == 0 {
-        return;
-    }
-    let mut s = state.lock().await;
-    s.downloaded = s.downloaded.saturating_add(bytes);
-    s.block_last_seen = Some(Instant::now());
 }
 
 async fn update_progress_state(
@@ -2002,7 +2393,6 @@ async fn update_progress_state(
     }
     completed = completed.min(meta.total_length);
     s.bytes_completed = completed;
-    s.downloaded = s.downloaded.max(completed);
 }
 
 #[cfg(test)]
@@ -2070,6 +2460,136 @@ mod tests {
         have.set(1);
         let pick = engine.pick_piece(Some(&peer_bf), &have);
         assert_eq!(pick, Some(2));
+    }
+
+    #[test]
+    fn rotated_peer_candidates_cycles_through_eligible_peers() {
+        let peers: Vec<PeerAddr> = (1..=5)
+            .map(|i| PeerAddr::from_socket_addr(([127, 0, 0, i], 6881).into()))
+            .collect();
+        let mut cursor = 0;
+
+        let first = rotated_peer_candidates(&peers, &mut cursor, 2);
+        assert_eq!(first, vec![peers[0], peers[1]]);
+        assert_eq!(cursor, 2);
+
+        let second = rotated_peer_candidates(&peers, &mut cursor, 2);
+        assert_eq!(second, vec![peers[2], peers[3]]);
+        assert_eq!(cursor, 4);
+
+        let wrapped = rotated_peer_candidates(&peers, &mut cursor, 3);
+        assert_eq!(wrapped, vec![peers[4], peers[0], peers[1]]);
+        assert_eq!(cursor, 2);
+    }
+
+    #[test]
+    fn balance_peer_families_interleaves_ipv4_and_ipv6() {
+        let mut peers = vec![
+            PeerAddr::from_socket_addr("127.0.0.1:6001".parse().unwrap()),
+            PeerAddr::from_socket_addr("127.0.0.2:6002".parse().unwrap()),
+            PeerAddr::from_socket_addr("[2001:db8::1]:6003".parse().unwrap()),
+            PeerAddr::from_socket_addr("[2001:db8::2]:6004".parse().unwrap()),
+            PeerAddr::from_socket_addr("[2001:db8::3]:6005".parse().unwrap()),
+        ];
+
+        balance_peer_families(&mut peers);
+
+        assert!(!peers[0].ip.is_ipv6());
+        assert!(peers[1].ip.is_ipv6());
+        assert!(!peers[2].ip.is_ipv6());
+        assert!(peers[3].ip.is_ipv6());
+        assert!(peers[4].ip.is_ipv6());
+    }
+
+    #[test]
+    fn merge_unique_peers_skips_duplicates() {
+        let first = PeerAddr::from_socket_addr("127.0.0.1:6001".parse().unwrap());
+        let second = PeerAddr::from_socket_addr("[2001:db8::1]:6002".parse().unwrap());
+        let mut peers = vec![first];
+
+        let added = merge_unique_peers(&mut peers, [first, second]);
+
+        assert_eq!(added, 1);
+        assert_eq!(peers, vec![first, second]);
+    }
+
+    #[tokio::test]
+    async fn progress_update_does_not_count_rechecked_bytes_as_downloaded() {
+        let bytes = build_single_file_torrent("f", b"0123456789abcdef", 8, None, false);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let state = Arc::new(Mutex::new(EngineState {
+            piece_count: meta.piece_count(),
+            total_length: meta.total_length,
+            downloaded: 123,
+            ..Default::default()
+        }));
+        let mut have = PieceBitfield::new(meta.piece_count());
+        have.set(0);
+
+        update_progress_state(&state, &meta, &have).await;
+
+        let state = state.lock().await;
+        assert_eq!(state.bytes_completed, 8);
+        assert_eq!(state.downloaded, 123);
+    }
+
+    #[tokio::test]
+    async fn stale_fast_resume_rechecks_payload_ahead_of_resume() {
+        let payload = b"abcdefghABCDEFGHijklmnop";
+        let bytes = build_single_file_torrent("stale.bin", payload, 8, None, false);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("stale-resume");
+        let storage = StorageIo::new(meta.clone(), dir.clone());
+        storage.write_piece(0, &payload[0..8]).await.unwrap();
+        storage.write_piece(2, &payload[16..24]).await.unwrap();
+
+        let mut stale = PieceBitfield::new(meta.piece_count());
+        stale.set(0);
+        let piece_lengths: Vec<u64> = (0..meta.piece_count())
+            .map(|i| {
+                if i + 1 == meta.piece_count() {
+                    meta.last_piece_length()
+                } else {
+                    meta.piece_length
+                }
+            })
+            .collect();
+        let resume = swarmotter_core::storage::io::build_resume(
+            meta.info_hash,
+            meta.name.clone(),
+            stale,
+            meta.piece_count(),
+            0,
+            0,
+            meta.total_length,
+            Some(dir.display().to_string()),
+            now_secs(),
+            None,
+            &vec![swarmotter_core::models::torrent::FilePriority::Normal; meta.files.len()],
+            &piece_lengths,
+        );
+        storage.save_resume(&resume).await.unwrap();
+
+        let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let engine = TorrentEngine::new(
+            meta.clone(),
+            dir,
+            [0u8; 20],
+            binder,
+            state,
+            rx,
+            vec![],
+            6881,
+        )
+        .with_preallocate(false);
+
+        let recovered = engine.load_or_recheck(&storage).await.unwrap();
+
+        assert!(recovered.has(0));
+        assert!(!recovered.has(1));
+        assert!(recovered.has(2));
     }
 
     #[test]

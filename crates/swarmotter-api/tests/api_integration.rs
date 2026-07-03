@@ -131,6 +131,25 @@ async fn add_and_list_torrents() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["data"]["info_hash"], hash);
     assert!(v["data"]["piece_count"].as_u64().unwrap() > 0);
+    let data = v["data"].as_object().unwrap();
+    for field in [
+        "useful_peers",
+        "choked_peers",
+        "unchoked_peers",
+        "recent_peer_failures",
+        "recent_tracker_failures",
+        "tracker_last_ok_seconds_ago",
+        "dht_discovery_ok",
+        "dht_last_seen_seconds_ago",
+        "pex_discovery_ok",
+        "pex_last_seen_seconds_ago",
+    ] {
+        assert!(data.contains_key(field), "{field} should be present");
+        assert!(
+            data[field].is_null(),
+            "{field} should be null without live engine data"
+        );
+    }
 
     // 404 for unknown.
     let resp = app

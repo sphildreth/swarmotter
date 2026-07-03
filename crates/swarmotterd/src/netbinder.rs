@@ -30,6 +30,7 @@ use swarmotter_core::net::{
 
 const MAX_TRACKER_HTTP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const HTTP_TRACKER_IO_TIMEOUT: Duration = Duration::from_secs(30);
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Perform a TLS handshake over a contained TCP stream, validating the
 /// certificate against the platform root trust store. The `server_name`
@@ -144,14 +145,21 @@ impl NetworkBinder for ContainedBinder {
         ensure_family_enforced(&cfg, addr)?;
         let socket = tokio::net::TcpSocket::new_v4_or_v6_for(addr)?;
         bind_socket_to_interface(&socket, cfg.required_interface.as_deref())?;
-        let stream = match source_for_addr(&cfg, addr) {
-            Some(ip) => {
-                let bind = SocketAddr::new(ip, 0);
-                socket.bind(bind)?;
-                socket.connect(addr).await?
+        let source = source_for_addr(&cfg, addr);
+        let stream = timeout(TCP_CONNECT_TIMEOUT, async move {
+            match source {
+                Some(ip) => {
+                    let bind = SocketAddr::new(ip, 0);
+                    socket.bind(bind)?;
+                    socket.connect(addr).await
+                }
+                None => socket.connect(addr).await,
             }
-            None => socket.connect(addr).await?,
-        };
+        })
+        .await
+        .map_err(|_| CoreError::Internal(format!("tcp connect to {addr} timed out")))?
+        .map_err(CoreError::from)?;
+        stream.set_nodelay(true).ok();
         Ok(stream)
     }
 
@@ -201,9 +209,11 @@ impl NetworkBinder for ContainedBinder {
                 "torrent data plane blocked: hostname resolution requires DNS constrained to the configured network path or a current network namespace".into(),
             ));
         }
-        let mut iter = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))?;
-        iter.next()
-            .ok_or_else(|| CoreError::Internal(format!("host {host} unresolvable")))
+        let addrs: Vec<SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))?
+            .filter(|addr| cfg.allow_ipv6 || addr.is_ipv4())
+            .collect();
+        select_resolved_addr(&cfg, host, &addrs)
+            .ok_or_else(|| CoreError::Internal(format!("host {host} has no usable address")))
     }
 
     async fn udp_socket(&self) -> Result<Box<dyn ContainedUdpSocket>> {
@@ -395,6 +405,11 @@ fn source_for_addr(cfg: &NetworkConfig, addr: SocketAddr) -> Option<IpAddr> {
 }
 
 fn ensure_family_enforced(cfg: &NetworkConfig, addr: SocketAddr) -> Result<()> {
+    if addr.is_ipv6() && !cfg.allow_ipv6 {
+        return Err(CoreError::NetworkBlocked(
+            "torrent data plane blocked: IPv6 traffic is disabled".into(),
+        ));
+    }
     if cfg.mode != NetworkContainmentMode::Strict || !cfg.fail_closed {
         return Ok(());
     }
@@ -408,6 +423,35 @@ fn ensure_family_enforced(cfg: &NetworkConfig, addr: SocketAddr) -> Result<()> {
         "torrent data plane blocked: no {} containment binding is configured",
         if addr.is_ipv6() { "IPv6" } else { "IPv4" }
     )))
+}
+
+fn select_resolved_addr(
+    cfg: &NetworkConfig,
+    host: &str,
+    addrs: &[SocketAddr],
+) -> Option<SocketAddr> {
+    let prefer_ipv6 = cfg.allow_ipv6
+        && (cfg.required_source_ipv6.is_some() && cfg.required_source_ipv4.is_none()
+            || hostname_prefers_ipv6(host));
+    if prefer_ipv6 {
+        addrs
+            .iter()
+            .copied()
+            .find(SocketAddr::is_ipv6)
+            .or_else(|| addrs.iter().copied().find(SocketAddr::is_ipv4))
+    } else {
+        addrs
+            .iter()
+            .copied()
+            .find(SocketAddr::is_ipv4)
+            .or_else(|| addrs.iter().copied().find(SocketAddr::is_ipv6))
+    }
+}
+
+fn hostname_prefers_ipv6(host: &str) -> bool {
+    host.split('.')
+        .next()
+        .is_some_and(|label| label.eq_ignore_ascii_case("ipv6"))
 }
 
 fn udp_bind_addr(cfg: &NetworkConfig, remote: Option<SocketAddr>) -> SocketAddr {
@@ -632,6 +676,21 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_disabled_blocks_ipv6_even_with_interface_binding() {
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            required_interface: Some("br0".into()),
+            allow_ipv6: false,
+            fail_closed: true,
+            ..Default::default()
+        };
+
+        let err = ensure_family_enforced(&cfg, "[2001:db8::20]:80".parse().unwrap()).unwrap_err();
+        assert!(err.is_network_blocked());
+        assert!(err.to_string().contains("IPv6 traffic is disabled"));
+    }
+
+    #[test]
     fn strict_source_config_blocks_unconfigured_family() {
         let cfg = NetworkConfig {
             mode: NetworkContainmentMode::Strict,
@@ -643,6 +702,66 @@ mod tests {
         ensure_family_enforced(&cfg, "192.0.2.20:80".parse().unwrap()).unwrap();
         let err = ensure_family_enforced(&cfg, "[2001:db8::20]:80".parse().unwrap()).unwrap_err();
         assert!(err.is_network_blocked());
+    }
+
+    #[test]
+    fn resolver_selection_prefers_ipv4_for_dual_stack_default() {
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            required_interface: Some("br0".into()),
+            allow_ipv6: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        let addrs = [
+            "[2001:db8::20]:443".parse().unwrap(),
+            "192.0.2.20:443".parse().unwrap(),
+        ];
+
+        assert_eq!(
+            select_resolved_addr(&cfg, "tracker.example", &addrs),
+            Some("192.0.2.20:443".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn resolver_selection_honors_ipv6_only_source_preference() {
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            required_source_ipv6: Some("2001:db8::10".into()),
+            allow_ipv6: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        let addrs = [
+            "192.0.2.20:443".parse().unwrap(),
+            "[2001:db8::20]:443".parse().unwrap(),
+        ];
+
+        assert_eq!(
+            select_resolved_addr(&cfg, "tracker.example", &addrs),
+            Some("[2001:db8::20]:443".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn resolver_selection_honors_explicit_ipv6_tracker_hostname() {
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            required_interface: Some("br0".into()),
+            allow_ipv6: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        let addrs = [
+            "192.0.2.20:443".parse().unwrap(),
+            "[2001:db8::20]:443".parse().unwrap(),
+        ];
+
+        assert_eq!(
+            select_resolved_addr(&cfg, "ipv6.tracker.example", &addrs),
+            Some("[2001:db8::20]:443".parse().unwrap())
+        );
     }
 
     #[test]

@@ -85,6 +85,15 @@ All routes are prefixed with `/api/v1`. A root `/health` alias also exists.
 | POST | `/torrents/:hash/labels` | Set labels (`{ labels }`) |
 | POST | `/torrents/:hash/limits` | Set per-torrent bandwidth limits (`{ download_limit, upload_limit }`, bytes/sec, 0 = unlimited; applies live) |
 
+`/torrents/:hash/stats` includes download/upload counters, rates, limits,
+`active_peer_workers`, `known_peers`, live peer diagnostics (`useful_peers`,
+`unchoked_peers`, `choked_peers`, `recent_peer_failures`), tracker diagnostics
+(`tracker_ok`, `tracker_message`, `last_announce`,
+`recent_tracker_failures`, `tracker_last_ok_seconds_ago`), and discovery
+freshness (`dht_discovery_ok`, `dht_last_seen_seconds_ago`,
+`pex_discovery_ok`, `pex_last_seen_seconds_ago`). Nullable diagnostic fields
+mean the daemon has not published that live signal.
+
 ### Files
 
 | Method | Path | Description |

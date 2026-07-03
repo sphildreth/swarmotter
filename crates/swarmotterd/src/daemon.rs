@@ -85,6 +85,64 @@ struct RateSample {
     peak_rate_down: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct LiveTorrentDiagnostics {
+    active_peer_workers: usize,
+    known_peers: usize,
+    useful_peers: Option<usize>,
+    choked_peers: Option<usize>,
+    unchoked_peers: Option<usize>,
+    recent_peer_failures: Option<u32>,
+    recent_tracker_failures: Option<u32>,
+    tracker_ok: bool,
+    tracker_message: Option<String>,
+    last_announce: Option<u64>,
+    tracker_last_ok_seconds_ago: Option<u64>,
+    dht_discovery_ok: Option<bool>,
+    dht_last_seen_seconds_ago: Option<u64>,
+    pex_discovery_ok: Option<bool>,
+    pex_last_seen_seconds_ago: Option<u64>,
+}
+
+impl LiveTorrentDiagnostics {
+    fn from_engine_state(s: &EngineState, now: Instant) -> Self {
+        let unchoked_peers = s.peer_health.values().filter(|p| p.unchoked).count();
+        Self {
+            active_peer_workers: s.active_peers,
+            known_peers: s.peers.len(),
+            useful_peers: Some(useful_peer_count(&s.peer_health)),
+            choked_peers: None,
+            unchoked_peers: Some(unchoked_peers),
+            recent_peer_failures: Some(s.peer_disconnects_recent),
+            recent_tracker_failures: Some(s.tracker_failures_recent),
+            tracker_ok: s.tracker_ok,
+            tracker_message: s.tracker_message.clone(),
+            last_announce: s.last_announce,
+            tracker_last_ok_seconds_ago: instant_age_seconds(now, s.tracker_last_ok),
+            dht_discovery_ok: Some(s.dht_discovery_ok),
+            dht_last_seen_seconds_ago: instant_age_seconds(now, s.dht_last_seen),
+            pex_discovery_ok: Some(s.pex_discovery_ok),
+            pex_last_seen_seconds_ago: instant_age_seconds(now, s.pex_last_seen),
+        }
+    }
+}
+
+fn useful_peer_count(peer_health: &HashMap<std::net::SocketAddr, EnginePeerHealth>) -> usize {
+    peer_health
+        .values()
+        .filter(|p| {
+            p.has_missing_pieces
+                && !p.blocked
+                && (p.unchoked || p.useful_recently)
+                && p.last_seen.is_some()
+        })
+        .count()
+}
+
+fn instant_age_seconds(now: Instant, seen: Option<Instant>) -> Option<u64> {
+    seen.map(|instant| now.saturating_duration_since(instant).as_secs())
+}
+
 impl DaemonRuntime {
     pub fn new(config: Config, startup_health: NetworkHealth) -> Self {
         let global_limiter = swarmotter_core::bandwidth::RateLimiter::new(
@@ -1040,10 +1098,21 @@ fn effective_peer_worker_limit(
     per_torrent.min(global_share).max(1)
 }
 
-/// Generate a stable per-daemon peer id (`-SW0001-` + 12 bytes of zeros).
+/// Generate a process-unique peer id with the SwarmOtter client prefix.
 fn make_peer_id() -> [u8; 20] {
     let mut id = [0u8; 20];
     id[..8].copy_from_slice(b"-SW0001-");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x5a17_cafe);
+    let mut x = nanos ^ ((std::process::id() as u64) << 32);
+    for byte in &mut id[8..] {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *byte = (x & 0xff) as u8;
+    }
     id
 }
 
@@ -1659,12 +1728,9 @@ impl DaemonOps for DaemonRuntime {
         let engine_state = self.engine_states.lock().await.get(hash).cloned();
         let live = if let Some(state) = engine_state {
             let s = state.lock().await;
-            Some((
-                s.active_peers,
-                s.peers.len(),
-                s.tracker_ok,
-                s.tracker_message.clone(),
-                s.last_announce,
+            Some(LiveTorrentDiagnostics::from_engine_state(
+                &s,
+                Instant::now(),
             ))
         } else {
             None
@@ -1676,8 +1742,7 @@ impl DaemonOps for DaemonRuntime {
         } else {
             t.bytes_completed() as f64 / t.meta.total_length as f64
         };
-        let (active_peer_workers, known_peers, tracker_ok, tracker_message, last_announce) =
-            live.unwrap_or((0, 0, false, None, None));
+        let live = live.unwrap_or_default();
         Some(TorrentDiagnostics {
             info_hash: t.info_hash(),
             name: t.name().to_string(),
@@ -1694,11 +1759,21 @@ impl DaemonOps for DaemonRuntime {
             rate_up: t.rate_up,
             download_limit: t.download_limit,
             upload_limit: t.upload_limit,
-            active_peer_workers,
-            known_peers,
-            tracker_ok,
-            tracker_message,
-            last_announce,
+            active_peer_workers: live.active_peer_workers,
+            known_peers: live.known_peers,
+            useful_peers: live.useful_peers,
+            choked_peers: live.choked_peers,
+            unchoked_peers: live.unchoked_peers,
+            recent_peer_failures: live.recent_peer_failures,
+            recent_tracker_failures: live.recent_tracker_failures,
+            tracker_ok: live.tracker_ok,
+            tracker_message: live.tracker_message,
+            last_announce: live.last_announce,
+            tracker_last_ok_seconds_ago: live.tracker_last_ok_seconds_ago,
+            dht_discovery_ok: live.dht_discovery_ok,
+            dht_last_seen_seconds_ago: live.dht_last_seen_seconds_ago,
+            pex_discovery_ok: live.pex_discovery_ok,
+            pex_last_seen_seconds_ago: live.pex_last_seen_seconds_ago,
             private: t.meta.is_private(),
         })
     }
@@ -1970,6 +2045,27 @@ mod tests {
             .await
             .add(Torrent::new(meta.clone(), 1))
             .unwrap();
+        let now = Instant::now();
+        let mut peer_health = HashMap::new();
+        peer_health.insert(
+            "127.0.0.1:6881".parse().unwrap(),
+            EnginePeerHealth {
+                has_missing_pieces: true,
+                unchoked: true,
+                useful_recently: true,
+                last_valid_block: Some(now),
+                last_seen: Some(now),
+                ..Default::default()
+            },
+        );
+        peer_health.insert(
+            "127.0.0.1:6882".parse().unwrap(),
+            EnginePeerHealth {
+                has_missing_pieces: true,
+                last_seen: Some(now),
+                ..Default::default()
+            },
+        );
         runtime.engine_states.lock().await.insert(
             hash,
             Arc::new(Mutex::new(EngineState {
@@ -1984,9 +2080,17 @@ mod tests {
                         "127.0.0.1:6882".parse().unwrap(),
                     ),
                 ],
+                peer_health,
                 tracker_ok: true,
                 tracker_message: Some("ok".into()),
                 last_announce: Some(123),
+                tracker_failures_recent: 3,
+                dht_discovery_ok: true,
+                pex_discovery_ok: true,
+                peer_disconnects_recent: 2,
+                dht_last_seen: Some(now - Duration::from_secs(11)),
+                pex_last_seen: Some(now - Duration::from_secs(13)),
+                tracker_last_ok: Some(now - Duration::from_secs(7)),
                 ..Default::default()
             })),
         );
@@ -1996,9 +2100,19 @@ mod tests {
         assert_eq!(stats.info_hash, hash);
         assert_eq!(stats.active_peer_workers, 4);
         assert_eq!(stats.known_peers, 2);
+        assert_eq!(stats.useful_peers, Some(1));
+        assert_eq!(stats.unchoked_peers, Some(1));
+        assert_eq!(stats.choked_peers, None);
+        assert_eq!(stats.recent_peer_failures, Some(2));
+        assert_eq!(stats.recent_tracker_failures, Some(3));
         assert!(stats.tracker_ok);
         assert_eq!(stats.tracker_message.as_deref(), Some("ok"));
         assert_eq!(stats.last_announce, Some(123));
+        assert_eq!(stats.dht_discovery_ok, Some(true));
+        assert_eq!(stats.pex_discovery_ok, Some(true));
+        assert!((7..=10).contains(&stats.tracker_last_ok_seconds_ago.unwrap()));
+        assert!((11..=14).contains(&stats.dht_last_seen_seconds_ago.unwrap()));
+        assert!((13..=16).contains(&stats.pex_last_seen_seconds_ago.unwrap()));
 
         let summary = runtime.get_torrent(&hash).await.unwrap();
         assert_eq!(summary.active_peer_workers, 4);

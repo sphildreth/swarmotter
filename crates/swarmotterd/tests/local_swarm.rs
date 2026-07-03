@@ -19,9 +19,10 @@
 
 #![allow(clippy::field_reassign_with_default)]
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -103,6 +104,115 @@ impl SeedPeer {
                     let (pstart, _) = self.meta.piece_byte_range(piece as u64).unwrap();
                     let abs = pstart + offset as u64;
                     let block = self.content[abs as usize..(abs + length as u64) as usize].to_vec();
+                    peer::write_message(
+                        &mut wr,
+                        &Message::Piece {
+                            piece,
+                            offset,
+                            block,
+                        },
+                    )
+                    .await?;
+                    wr.flush().await?;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ParallelSeedStats {
+    requests: Vec<(usize, u32)>,
+}
+
+type SharedParallelSeedStats = Arc<StdMutex<ParallelSeedStats>>;
+
+/// A seed peer variant used by the normal-mode parallelism regression test.
+/// It serves generated payload bytes like `SeedPeer`, but records which local
+/// seed handled each valid piece request and can delay each block response so
+/// simultaneous peer workers remain observable.
+struct InstrumentedSeedPeer {
+    content: Vec<u8>,
+    meta: swarmotter_core::meta::TorrentMeta,
+    info_hash: swarmotter_core::hash::InfoHash,
+    peer_id: [u8; 20],
+    peer_index: usize,
+    stats: SharedParallelSeedStats,
+    block_delay: Duration,
+}
+
+impl InstrumentedSeedPeer {
+    async fn serve_one(self, stream: tokio::net::TcpStream) -> swarmotter_core::Result<()> {
+        let (mut rd, mut wr) = tokio::io::split(stream);
+
+        let mut hs_buf = [0u8; 68];
+        rd.read_exact(&mut hs_buf).await?;
+        let their_hs = Handshake::decode(&hs_buf).unwrap();
+        if their_hs.info_hash != self.info_hash {
+            return Err(swarmotter_core::error::CoreError::Internal(
+                "info hash mismatch".into(),
+            ));
+        }
+
+        let our_hs = Handshake {
+            info_hash: self.info_hash,
+            peer_id: self.peer_id,
+            reserved: swarmotter_core::peer::RESERVED,
+        };
+        wr.write_all(&our_hs.encode()).await?;
+
+        let piece_count = self.meta.piece_count();
+        let mut bf = Bitfield::new(piece_count);
+        for i in 0..piece_count {
+            bf.set(i);
+        }
+        peer::write_message(&mut wr, &bf.encode_message()).await?;
+        wr.flush().await?;
+
+        loop {
+            let len_buf = match read_len_prefix(&mut rd).await {
+                Ok(Some(b)) => b,
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(swarmotter_core::error::CoreError::from(e)),
+            };
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len == 0 {
+                continue;
+            }
+            let mut body = vec![0u8; len];
+            rd.read_exact(&mut body).await?;
+            let id = body[0];
+            let payload = &body[1..];
+            match peer::MessageId::from_u8(id) {
+                Some(peer::MessageId::Interested) => {
+                    peer::write_message(&mut wr, &Message::Unchoke).await?;
+                    wr.flush().await?;
+                }
+                Some(peer::MessageId::Request) if payload.len() == 12 => {
+                    let piece = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+                    let offset = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                    let length = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+                    if (piece as usize) >= piece_count {
+                        continue;
+                    }
+                    let (pstart, _) = self.meta.piece_byte_range(piece as u64).unwrap();
+                    let abs = pstart + offset as u64;
+                    let end = abs + length as u64;
+                    if end as usize > self.content.len() {
+                        continue;
+                    }
+                    let block = self.content[abs as usize..end as usize].to_vec();
+                    {
+                        self.stats
+                            .lock()
+                            .unwrap()
+                            .requests
+                            .push((self.peer_index, piece));
+                    }
+                    if !self.block_delay.is_zero() {
+                        tokio::time::sleep(self.block_delay).await;
+                    }
                     peer::write_message(
                         &mut wr,
                         &Message::Piece {
@@ -742,6 +852,159 @@ async fn local_swarm_endgame_completes_from_near_complete_state() {
 
     let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
     assert_eq!(written, content);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Normal-mode swarm parallelism: a trackerless, private torrent with
+/// generated legal payload data is downloaded from several direct loopback
+/// seed peers. The synthetic seeds delay each block just enough that a
+/// single-peer architecture would be observable: the engine must run several
+/// active peer workers and accept useful pieces from multiple local peers
+/// during one download.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_swarm_parallel_download_uses_multiple_seed_peers() {
+    let piece_count = 16usize;
+    let piece_length: u64 = 8 * 1024;
+    let mut content = Vec::with_capacity(piece_count * piece_length as usize);
+    for i in 0..piece_count * piece_length as usize {
+        content.push(((i * 37 + 11) % 251) as u8);
+    }
+    let torrent_bytes =
+        build_single_file_torrent("parallel-local.bin", &content, piece_length, None, true);
+    let meta = parse_torrent(&torrent_bytes).unwrap();
+    assert_eq!(meta.piece_count(), piece_count);
+    assert!(
+        meta.is_private(),
+        "test torrent should stay trackerless/private"
+    );
+
+    let stats = Arc::new(StdMutex::new(ParallelSeedStats::default()));
+    let mut seed_peers = Vec::new();
+    let seed_ids = [*b"-SP0000-", *b"-SP0001-", *b"-SP0002-", *b"-SP0003-"];
+
+    for (peer_index, seed_id) in seed_ids.into_iter().enumerate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        seed_peers.push(PeerAddr::from_socket_addr(addr));
+
+        let content_clone = content.clone();
+        let meta_clone = meta.clone();
+        let stats_clone = stats.clone();
+        tokio::spawn(async move {
+            for _ in 0..4 {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let seed = InstrumentedSeedPeer {
+                    content: content_clone.clone(),
+                    meta: meta_clone.clone(),
+                    info_hash: meta_clone.info_hash,
+                    peer_id: peer_id(&seed_id),
+                    peer_index,
+                    stats: stats_clone.clone(),
+                    block_delay: Duration::from_millis(40),
+                };
+                tokio::spawn(async move {
+                    let _ = seed.serve_one(stream).await;
+                });
+            }
+        });
+    }
+
+    let dir = unique_dir("parallel-download");
+    let binder = Arc::new(LoopbackBinder);
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
+    let engine = TorrentEngine::new(
+        meta.clone(),
+        dir.clone(),
+        peer_id(b"-SWP000-"),
+        binder,
+        state.clone(),
+        cmd_rx,
+        seed_peers.clone(),
+        6881,
+    )
+    .with_peer_worker_limit(seed_peers.len())
+    .with_transport(false, true);
+
+    let state_for_sample = state.clone();
+    let sampler = tokio::spawn(async move {
+        let mut max_active = 0usize;
+        for _ in 0..1_000 {
+            let (active, finished) = {
+                let s = state_for_sample.lock().await;
+                (s.active_peers, s.finished)
+            };
+            max_active = max_active.max(active);
+            if finished {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        max_active
+    });
+
+    let final_state = tokio::time::timeout(Duration::from_secs(30), engine.run())
+        .await
+        .expect("parallel engine did not finish")
+        .expect("parallel engine error");
+    let max_active_peers = sampler.await.unwrap();
+
+    assert!(
+        final_state.finished,
+        "parallel swarm download did not finish"
+    );
+    assert_eq!(
+        final_state.pieces_have.count(meta.piece_count()),
+        meta.piece_count(),
+        "parallel swarm download did not verify all pieces"
+    );
+    assert!(
+        max_active_peers >= 3,
+        "expected several active peer workers in normal mode; max_active_peers={max_active_peers}"
+    );
+
+    let useful_peer_count = final_state
+        .peer_health
+        .values()
+        .filter(|p| p.useful_recently && p.last_valid_block.is_some())
+        .count();
+    assert!(
+        useful_peer_count >= 3,
+        "expected useful blocks from several peers; useful_peer_count={useful_peer_count}"
+    );
+
+    let mut pieces_by_peer = vec![BTreeSet::new(); seed_peers.len()];
+    {
+        let stats = stats.lock().unwrap();
+        for (peer_index, piece) in &stats.requests {
+            if let Some(pieces) = pieces_by_peer.get_mut(*peer_index) {
+                pieces.insert(*piece);
+            }
+        }
+    }
+    let contributing_seeds = pieces_by_peer
+        .iter()
+        .filter(|pieces| !pieces.is_empty())
+        .count();
+    assert!(
+        contributing_seeds >= 3,
+        "expected several loopback seeds to serve pieces; pieces_by_peer={pieces_by_peer:?}"
+    );
+    let unique_served_pieces: BTreeSet<u32> = pieces_by_peer
+        .iter()
+        .flat_map(|pieces| pieces.iter().copied())
+        .collect();
+    assert_eq!(
+        unique_served_pieces.len(),
+        meta.piece_count(),
+        "all pieces should be served by the local swarm"
+    );
+
+    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
+    assert_eq!(written, content, "parallel downloaded content mismatches");
     std::fs::remove_dir_all(&dir).ok();
 }
 

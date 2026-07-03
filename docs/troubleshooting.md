@@ -191,8 +191,20 @@ Useful fields:
 - `active_peer_workers`: current bounded peer download workers.
 - `known_peers`: peers currently discovered by trackers, DHT, PEX, or direct
   input.
+- `useful_peers`: connected peers observed with pieces the torrent still needs
+  and an unchoked or recently useful state.
+- `unchoked_peers`: connected peers the engine has observed as unchoked.
+- `choked_peers`: reserved for explicit choke-state telemetry; currently
+  `null` until the engine records positive per-peer choke state.
+- `recent_peer_failures`, `recent_tracker_failures`: recent failed peer
+  sessions and tracker announce failures reported by the live engine.
 - `tracker_ok`, `tracker_message`, `last_announce`: last tracker announce
   status from the live engine.
+- `tracker_last_ok_seconds_ago`, `dht_last_seen_seconds_ago`,
+  `pex_last_seen_seconds_ago`: freshness of the last successful tracker, DHT,
+  and PEX discovery signals when live engine data is available.
+- `dht_discovery_ok`, `pex_discovery_ok`: whether DHT or PEX discovery has
+  succeeded recently in the live engine.
 
 Common causes:
 

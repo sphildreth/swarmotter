@@ -37,7 +37,7 @@ const MASKABLE_ICON_512: &[u8] =
 const MSTILE_150: &[u8] = include_bytes!("../../../assets/graphics/web/mstile-150x150.png");
 const SITE_WEBMANIFEST: &[u8] = include_bytes!("../../../assets/graphics/web/site.webmanifest");
 const HEADER_LOGO: &[u8] =
-    include_bytes!("../../../assets/graphics/icons/swarmotter-icon-48x48.png");
+    include_bytes!("../../../assets/graphics/icons/swarmotter-icon-64x64.png");
 
 /// Build the web UI router, mounted at `/` (excluding `/api`).
 pub fn web_router() -> Router {
@@ -57,7 +57,7 @@ pub fn web_router() -> Router {
         .route("/maskable-icon-512x512.png", get(maskable_icon_512))
         .route("/mstile-150x150.png", get(mstile_150))
         .route("/site.webmanifest", get(site_webmanifest))
-        .route("/swarmotter-icon-48x48.png", get(header_logo))
+        .route("/swarmotter-icon-64x64.png", get(header_logo))
 }
 
 async fn index() -> Response {
@@ -317,7 +317,7 @@ mod tests {
         for (path, content_type) in [
             ("/favicon.ico", "image/x-icon"),
             ("/site.webmanifest", "application/manifest+json"),
-            ("/swarmotter-icon-48x48.png", "image/png"),
+            ("/swarmotter-icon-64x64.png", "image/png"),
         ] {
             let response = app
                 .clone()

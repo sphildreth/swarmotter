@@ -260,7 +260,13 @@ status.
   deltas instead of remaining at zero while progress changes. Downloaded byte
   counters now track received network bytes, completed byte counters continue
   to track verified pieces, and displayed rates decay smoothly across short
-  quiet samples instead of snapping immediately to zero.
+  quiet samples instead of snapping immediately to zero. Fast-resume and
+  recheck progress update verified completion without being counted as newly
+  downloaded network bytes, so resumed torrents do not produce false download
+  speed spikes. When a non-preallocated payload file is visibly ahead of its
+  fast-resume metadata, the engine now rechecks storage instead of trusting a
+  stale resume bitfield, so progress reflects verified on-disk pieces rather
+  than stale resume state.
 - Added `GET /api/v1/torrents/:hash/stats` for per-torrent troubleshooting and
   performance diagnostics, including live rates, byte counters, active peer
   workers, known peers, tracker status/message, and last announce time.
@@ -268,6 +274,30 @@ status.
   more than one peer is known, with per-piece reservations to avoid duplicate
   normal-mode downloads. Tracker announces now request more peers so heavily
   seeded torrents can fill the bounded peer worker set.
+- The normal download loop now rotates through eligible peers instead of
+  repeatedly selecting only the first tracker results, keeps normal peer
+  sessions alive longer to reduce reconnect churn, imports PEX-discovered
+  peers from parallel sessions, and uses a bounded in-flight block request
+  window while downloading each piece. Peer selection now balances IPv4 and
+  IPv6 candidates when both families are available, uses time-bound
+  suppression for failed and idle peers instead of permanent per-run exclusion,
+  and the contained TCP binder applies bounded connect timeouts plus
+  TCP_NODELAY so stalled peer dials cannot pin worker slots. Dual-stack tracker
+  hostnames now select a usable address family instead of blindly using the
+  first resolver result, while explicit `ipv6.*` tracker hostnames retain IPv6
+  preference. uTP now advertises a larger bounded receive window to avoid
+  per-flow low-MB/s caps on higher-latency public swarms. The default DHT
+  bootstrap set now includes the common `router.utorrent.com:6881` node, and
+  normal peer sessions stay open longer so useful peers are not recycled as
+  quickly. The live engine now honors manual reannounce commands by
+  immediately refreshing tracker peers, and periodic refreshes also retry DHT
+  peer discovery instead of relying on a single startup lookup.
+- Completed verified pieces are now written through a full-piece storage path
+  that validates piece bounds and preserves multi-file boundaries while
+  reducing hot-path write overhead.
+- `GET /api/v1/torrents/:hash/stats` now includes additional live performance
+  diagnostics for useful/choked/unchoked peers, recent peer/tracker failures,
+  and tracker/DHT/PEX discovery freshness.
 - `[storage].preallocate` is now honored by the live engine. When disabled, the
   engine creates required directories and writes pieces as needed instead of
   pre-sizing all files.

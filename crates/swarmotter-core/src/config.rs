@@ -169,6 +169,7 @@ impl Default for DhtConfig {
             bootstrap_nodes: vec![
                 "dht.transmissionbt.com:6881".into(),
                 "router.bittorrent.com:6881".into(),
+                "router.utorrent.com:6881".into(),
             ],
             port: default_dht_port(),
         }

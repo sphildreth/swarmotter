@@ -209,7 +209,7 @@ pub fn encode_query(txn: TransactionId, method: KrpcMethod, args: &KrpcArgs) -> 
     write_str(&mut out, method.name().as_bytes());
     // 'a' arguments
     write_str(&mut out, b"a");
-    encode_args(&mut out, args);
+    encode_args(&mut out, method, args);
     out.push(b'e');
     out
 }
@@ -227,15 +227,22 @@ pub struct KrpcArgs {
     pub token: Option<Vec<u8>>,
 }
 
-fn encode_args(out: &mut Vec<u8>, args: &KrpcArgs) {
+fn encode_args(out: &mut Vec<u8>, method: KrpcMethod, args: &KrpcArgs) {
     out.push(b'd');
     write_str(out, b"id");
     write_str(out, args.id.as_bytes());
     if let Some(t) = args.target {
-        write_str(out, b"target");
-        write_str(out, t.as_bytes());
-        write_str(out, b"info_hash");
-        write_str(out, t.as_bytes());
+        match method {
+            KrpcMethod::FindNode => {
+                write_str(out, b"target");
+                write_str(out, t.as_bytes());
+            }
+            KrpcMethod::GetPeers | KrpcMethod::AnnouncePeer => {
+                write_str(out, b"info_hash");
+                write_str(out, t.as_bytes());
+            }
+            KrpcMethod::Ping => {}
+        }
     }
     if let Some(port) = args.port {
         write_str(out, b"port");
@@ -325,7 +332,14 @@ pub fn parse_response(buf: &[u8]) -> Result<KrpcResponse> {
                 .find(|(k, _)| k == b"nodes")
                 .and_then(|(_, v)| v.as_str())
             {
-                resp.nodes = parse_compact_nodes(nodes);
+                resp.nodes.extend(parse_compact_nodes(nodes));
+            }
+            if let Some(nodes6) = r
+                .iter()
+                .find(|(k, _)| k == b"nodes6")
+                .and_then(|(_, v)| v.as_str())
+            {
+                resp.nodes.extend(parse_compact_nodes6(nodes6));
             }
             if let Some(values) = r
                 .iter()
@@ -377,6 +391,24 @@ pub fn parse_compact_nodes(bytes: &[u8]) -> Vec<DhtNode> {
         out.push(DhtNode {
             id: NodeId::from_bytes(id),
             addr: SocketAddr::new(IpAddr::V4(ip), port),
+        });
+    }
+    out
+}
+
+/// Parse compact IPv6 node info (38 bytes each: 20 id + 16 ip + 2 port).
+pub fn parse_compact_nodes6(bytes: &[u8]) -> Vec<DhtNode> {
+    let mut out = Vec::with_capacity(bytes.len() / 38);
+    for chunk in bytes.chunks_exact(38) {
+        let mut id = [0u8; 20];
+        id.copy_from_slice(&chunk[0..20]);
+        let mut octets = [0u8; 16];
+        octets.copy_from_slice(&chunk[20..36]);
+        let ip = Ipv6Addr::from(octets);
+        let port = u16::from_be_bytes([chunk[36], chunk[37]]);
+        out.push(DhtNode {
+            id: NodeId::from_bytes(id),
+            addr: SocketAddr::new(IpAddr::V6(ip), port),
         });
     }
     out
@@ -543,6 +575,40 @@ mod tests {
     }
 
     #[test]
+    fn get_peers_query_uses_info_hash_not_target() {
+        let id = NodeId::from_bytes([7; 20]);
+        let info_hash = InfoHash::from_bytes([8; 20]);
+        let q = build_get_peers(TransactionId::new([1, 2]), id, info_hash);
+        let root = bencode::decode(&q).unwrap();
+        let dict = root.as_dict().unwrap();
+        let args = dict
+            .iter()
+            .find(|(k, _)| k == b"a")
+            .and_then(|(_, v)| v.as_dict())
+            .unwrap();
+
+        assert!(args.iter().any(|(k, _)| k == b"info_hash"));
+        assert!(!args.iter().any(|(k, _)| k == b"target"));
+    }
+
+    #[test]
+    fn find_node_query_uses_target_not_info_hash() {
+        let id = NodeId::from_bytes([7; 20]);
+        let target = NodeId::from_bytes([8; 20]);
+        let q = build_find_node(TransactionId::new([1, 2]), id, target);
+        let root = bencode::decode(&q).unwrap();
+        let dict = root.as_dict().unwrap();
+        let args = dict
+            .iter()
+            .find(|(k, _)| k == b"a")
+            .and_then(|(_, v)| v.as_dict())
+            .unwrap();
+
+        assert!(args.iter().any(|(k, _)| k == b"target"));
+        assert!(!args.iter().any(|(k, _)| k == b"info_hash"));
+    }
+
+    #[test]
     fn get_peers_response_parses_peers_and_nodes() {
         // Build a get_peers response by hand.
         let mut out = Vec::new();
@@ -579,6 +645,34 @@ mod tests {
         assert_eq!(resp.nodes.len(), 1);
         assert_eq!(resp.nodes[0].id, NodeId::from_bytes([5; 20]));
         assert_eq!(resp.nodes[0].addr.port(), 6882);
+    }
+
+    #[test]
+    fn get_peers_response_parses_nodes6() {
+        let mut out = Vec::new();
+        out.push(b'd');
+        write_str(&mut out, b"t");
+        write_str(&mut out, &[9, 9]);
+        write_str(&mut out, b"y");
+        write_str(&mut out, b"r");
+        write_str(&mut out, b"r");
+        out.push(b'd');
+        write_str(&mut out, b"id");
+        write_str(&mut out, &[3; 20]);
+        write_str(&mut out, b"nodes6");
+        let mut node = Vec::new();
+        node.extend_from_slice(&[5; 20]);
+        node.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        node.extend_from_slice(&6881u16.to_be_bytes());
+        write_str(&mut out, &node);
+        out.push(b'e');
+        out.push(b'e');
+
+        let resp = parse_response(&out).unwrap();
+
+        assert_eq!(resp.nodes.len(), 1);
+        assert_eq!(resp.nodes[0].id, NodeId::from_bytes([5; 20]));
+        assert_eq!(resp.nodes[0].addr, "[2001:db8::1]:6881".parse().unwrap());
     }
 
     #[test]

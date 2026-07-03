@@ -50,6 +50,25 @@ impl StorageIo {
         &self.download_dir
     }
 
+    /// Sum the current on-disk payload file lengths, capped at each torrent
+    /// file's expected length. This is a cheap fast-resume sanity check; it
+    /// does not prove bytes are valid, only that data exists beyond what a
+    /// resume file claims is verified.
+    pub async fn payload_bytes_on_disk(&self) -> Result<u64> {
+        let mut total = 0u64;
+        for (index, file) in self.meta.files.iter().enumerate() {
+            let path = self.file_path(index)?;
+            match fs::metadata(&path).await {
+                Ok(meta) => {
+                    total = total.saturating_add(meta.len().min(file.length));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(CoreError::from(e)),
+            }
+        }
+        Ok(total.min(self.meta.total_length))
+    }
+
     /// Resolve the absolute path for a file index.
     pub fn file_path(&self, index: usize) -> Result<PathBuf> {
         let file = self
@@ -137,8 +156,48 @@ impl StorageIo {
         };
         let abs_start = piece_start + offset;
         let abs_end = abs_start + block.len() as u64;
+        self.write_file_slices(abs_start, abs_end, block).await
+    }
+
+    /// Write a complete piece to disk with one open/seek/write per touched
+    /// file slice.
+    ///
+    /// This is intended for callers that assemble and verify a piece before
+    /// flushing it to storage. The provided data must match the exact piece
+    /// length, including the shorter final piece.
+    pub async fn write_piece(&self, piece_index: usize, piece: &[u8]) -> Result<()> {
+        let (piece_start, piece_end) = self.piece_range(piece_index)?;
+        let expected_len = piece_end - piece_start;
+        let actual_len = u64::try_from(piece.len())
+            .map_err(|_| CoreError::Storage("piece write length exceeds u64".into()))?;
+        if actual_len != expected_len {
+            return Err(CoreError::Storage(format!(
+                "piece {piece_index} write length {actual_len} does not match expected {expected_len}"
+            )));
+        }
+        self.write_piece_range(piece_index, 0, piece).await
+    }
+
+    /// Write contiguous data within a piece with one open/seek/write per
+    /// touched file slice.
+    ///
+    /// Unlike [`Self::write_block`], this validates that the requested span
+    /// stays inside the piece. It is suitable for large contiguous piece data
+    /// that has already passed protocol-level bounds checks.
+    pub async fn write_piece_range(
+        &self,
+        piece_index: usize,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let (abs_start, abs_end) =
+            self.checked_piece_write_range(piece_index, offset, data.len())?;
+        self.write_file_slices(abs_start, abs_end, data).await
+    }
+
+    async fn write_file_slices(&self, abs_start: u64, abs_end: u64, data: &[u8]) -> Result<()> {
         let slices = byte_ranges_to_file_slices(&self.meta, abs_start, abs_end);
-        let mut block_off = 0usize;
+        let mut data_off = 0usize;
         for slice in slices {
             self.ensure_file_dirs(slice.file_index).await?;
             let path = self.file_path(slice.file_index)?;
@@ -152,11 +211,53 @@ impl StorageIo {
             file.seek(std::io::SeekFrom::Start(slice.offset_in_file))
                 .await
                 .map_err(CoreError::from)?;
-            let chunk = &block[block_off..block_off + slice.length as usize];
+            let chunk = &data[data_off..data_off + slice.length as usize];
             file.write_all(chunk).await.map_err(CoreError::from)?;
-            block_off += slice.length as usize;
+            data_off += slice.length as usize;
         }
         Ok(())
+    }
+
+    fn piece_range(&self, piece_index: usize) -> Result<(u64, u64)> {
+        self.meta
+            .piece_byte_range(piece_index as u64)
+            .ok_or_else(|| CoreError::Storage(format!("piece {piece_index} out of range")))
+    }
+
+    fn checked_piece_write_range(
+        &self,
+        piece_index: usize,
+        offset: u64,
+        data_len: usize,
+    ) -> Result<(u64, u64)> {
+        let (piece_start, piece_end) = self.piece_range(piece_index)?;
+        let piece_len = piece_end - piece_start;
+        if offset > piece_len {
+            return Err(CoreError::Storage(format!(
+                "piece {piece_index} write offset {offset} exceeds piece length {piece_len}"
+            )));
+        }
+        let data_len = u64::try_from(data_len)
+            .map_err(|_| CoreError::Storage("piece write length exceeds u64".into()))?;
+        let end_offset = offset.checked_add(data_len).ok_or_else(|| {
+            CoreError::Storage(format!(
+                "piece {piece_index} write range overflows piece offset"
+            ))
+        })?;
+        if end_offset > piece_len {
+            return Err(CoreError::Storage(format!(
+                "piece {piece_index} write end {end_offset} exceeds piece length {piece_len}"
+            )));
+        }
+        let abs_start = piece_start.checked_add(offset).ok_or_else(|| {
+            CoreError::Storage(format!(
+                "piece {piece_index} absolute write offset overflows"
+            ))
+        })?;
+        let abs_end = piece_start.checked_add(end_offset).ok_or_else(|| {
+            CoreError::Storage(format!("piece {piece_index} absolute write end overflows"))
+        })?;
+        Ok((abs_start, abs_end))
     }
 
     /// Read a whole piece from disk (used for verification and seeding).
@@ -579,6 +680,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn write_piece_writes_single_file_piece() {
+        let content = b"0123456789abcdeflast";
+        let bytes = build_single_file_torrent("piece.bin", content, 16, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("single-piece-write");
+        let store = StorageIo::new(meta.clone(), dir.clone());
+
+        store.write_piece(0, &content[..16]).await.unwrap();
+        store.write_piece(1, &content[16..]).await.unwrap();
+
+        assert_eq!(std::fs::read(store.file_path(0).unwrap()).unwrap(), content);
+        assert!(store.verify_piece_on_disk(0).await.unwrap());
+        assert!(store.verify_piece_on_disk(1).await.unwrap());
+        let err = store.write_piece(0, b"short").await;
+        assert!(err.is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn active_layout_creates_single_file_placeholder_without_preallocating() {
         let content = b"placeholder appears before first piece";
         let bytes = build_single_file_torrent("visible.bin", content, 16, None, false);
@@ -638,6 +758,32 @@ mod tests {
         assert!(store.verify_piece_on_disk(0).await.unwrap());
         assert!(store.verify_piece_on_disk(1).await.unwrap());
         assert!(store.verify_piece_on_disk(2).await.unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn write_piece_range_preserves_multi_file_boundaries() {
+        let files = vec![
+            (vec!["a.txt".into()], 5u64),
+            (vec!["sub".into(), "b.bin".into()], 7u64),
+        ];
+        let contents: Vec<&[u8]> = vec![b"hello", b"world!!"];
+        let bytes = build_multi_file_torrent("dir", &files, &contents, 4, None);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("multi-piece-range-write");
+        let store = StorageIo::new(meta.clone(), dir.clone());
+        store.preallocate().await.unwrap();
+
+        store.write_piece(0, b"hell").await.unwrap();
+        store.write_piece_range(1, 0, b"owor").await.unwrap();
+        store.write_piece(2, b"ld!!").await.unwrap();
+
+        let a = std::fs::read(dir.join("dir").join("a.txt")).unwrap();
+        assert_eq!(&a, b"hello");
+        let b = std::fs::read(dir.join("dir").join("sub").join("b.bin")).unwrap();
+        assert_eq!(&b, b"world!!");
+        let err = store.write_piece_range(1, 3, b"or").await;
+        assert!(err.is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
