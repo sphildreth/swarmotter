@@ -35,6 +35,7 @@ project.
 | P0 | Ecosystem Compatibility API | Operate alongside Sonarr/Radarr/Flood via qBittorrent-compatible and Transmission-compatible API shims | Deluge API parity requests, Flood UI, Sonarr/Radarr integration, self-hosting ecosystem (2026) |
 | P0 | Per-Profile / Per-Torrent Network-Path Binding | Assign a contained network path (namespace/VPN endpoint/interface) per profile, label, or torrent; fail-closed per path | rTorrent/Flood multi-user isolation, Deluge multi-profile routing, self-hosting VPN routing patterns |
 | P0 | Multi-User / Multi-Tenant Support | Role-based access control, per-user torrent isolation, per-user quotas, and shared-server deployments | qBittorrent [#3327](https://github.com/qbittorrent/qBittorrent/issues/3327), Flood multi-user, rTorrent+ruTorrent multi-user, Deluge thin-client auth |
+| P0 | Protocol Encryption / MSE-PE (BEP 8) | Interoperate with peers that refuse plaintext handshakes and protect the peer wire protocol from ISP throttling/identification | Transmission, qBittorrent, Deluge, BiglyBT all ship MSE/PE; private trackers commonly require it |
 | P1 | Metadata-first magnet preview and intake rules | Let users inspect/select files before starting data transfer and enforce file exclusion rules | Transmission [#1611](https://github.com/transmission/transmission/issues/1611), [#2366](https://github.com/transmission/transmission/issues/2366), [#7330](https://github.com/transmission/transmission/issues/7330), [#7399](https://github.com/transmission/transmission/issues/7399), [#2399](https://github.com/transmission/transmission/issues/2399), [#5582](https://github.com/transmission/transmission/issues/5582), [#8793](https://github.com/transmission/transmission/issues/8793), qBittorrent [#23674](https://github.com/qbittorrent/qBittorrent/issues/23674) |
 | P1 | File cleanup, trash, and retention safety | Avoid accidental data loss while making unwanted/obsolete partial data easy to remove | qBittorrent [#23575](https://github.com/qbittorrent/qBittorrent/issues/23575), [#23353](https://github.com/qbittorrent/qBittorrent/issues/23353), [#24102](https://github.com/qbittorrent/qBittorrent/issues/24102), [#24601](https://github.com/qbittorrent/qBittorrent/issues/24601), Transmission [#1722](https://github.com/transmission/transmission/issues/1722), [#6513](https://github.com/transmission/transmission/issues/6513) |
 | P1 | Tracker and peer operations workbench | Diagnose weak swarms, prioritize trackers, expose known peers, webseeds, and retry state | Transmission [#996](https://github.com/transmission/transmission/issues/996), [#6425](https://github.com/transmission/transmission/issues/6425), [#8326](https://github.com/transmission/transmission/issues/8326), [#8413](https://github.com/transmission/transmission/issues/8413), [#5234](https://github.com/transmission/transmission/issues/5234), qBittorrent [#24013](https://github.com/qbittorrent/qBittorrent/issues/24013), [#24014](https://github.com/qbittorrent/qBittorrent/issues/24014) |
@@ -49,7 +50,7 @@ project.
 | P1 | Seed Prioritization (Low-Seed First) | Prefer seeding torrents with few available seeds to improve swarm health and distribution efficiency | qBittorrent [#9063](https://github.com/qbittorrent/qBittorrent/issues/9063), Transmission seed-priority discussions |
 | P1 | OpenAPI Specification & Interactive API Docs | Auto-generated OpenAPI/JSON Schema with Swagger UI for native and compatibility API surfaces | Flood Swagger UI, Deluge API docs, self-hosting automation integration |
 | P1 | User-Configured Lawful RSS Feeds | Ingest content from user-supplied lawful RSS feeds as part of lawful distribution workflows | Deluge RSS plugin, rTorrent RSS, self-hosting RSS workflows; see lawful-use policy |
-| P1/P2 | Native Cross-Seed & Hardlink-Aware Storage | Match on-disk data to new torrents by piece layout; link instead of re-download | cross-seed (external tool), self-hosting hardlink layouts, BiglyBT |
+| P1 | Native Cross-Seed & Hardlink-Aware Storage | Match on-disk data to new torrents by piece layout; link instead of re-download | cross-seed (external tool), self-hosting hardlink layouts, BiglyBT |
 | P1 | Trust and Provenance Signals for Torrents and Trackers | Per-tracker trust state, tracker allowlists/denylists, and signed-`.torrent` provenance verification for lawful-distribution workflows | eMule/PeerGuardian blocklists, signed-release workflows, transmission tracker whitelists |
 | P1 | Operator Audit Log for Torrent Lifecycle Events | Structured, exportable, optionally hash-chained audit trail for privileged operations; combines with multi-user for compliance | qBittorrent activity log, rTorrent XMLRPC, Flood multi-user, self-hosting compliance |
 | P1 | Explainability API: Structured Reasons for Non-Trivial Decisions | Unified, machine-readable reasons across autopilot, disk optimizer, fail-closed, and bandwidth decisions | Sonarr/Radarr import failure reasons, Flood API exploration, operator tooling |
@@ -57,6 +58,11 @@ project.
 | P1 | Production Health / Availability Surface | Liveness/readiness endpoints, synthetic end-to-end check torrent, SLO-style summaries for orchestrators | Kubernetes liveness/readiness, Consul/Nomad health, cloud-native SLO conventions |
 | P1 | Filesystem Snapshot Integration | Opt-in snapshot hooks on Btrfs subvolumes, ZFS, and Snapper; rollback for torrent roots and state | Snapper, ZFS, Btrfs subvolume workflows, self-hosting rollback patterns |
 | P1 | Client-Identity Fingerprinting and Rollups | Per-torrent and per-tracker client rollups for swarm composition visibility and prioritization | qBittorrent peer client string, BiglyBT peer view, rTorrent peer text |
+| P1 | HTTP / HTTPS Proxy Support | Egress through HTTP/CONNECT proxies common in corporate and filtered environments where SOCKS5 is unavailable | qBittorrent HTTP proxy, aria2 HTTP proxy |
+| P1 | Scriptable CLI (`swarmotterctl`) | Add/list/pause/resume/limits with JSON output for automation and SSH workflows without a browser | `transmission-remote`, rTorrent CLI, aria2 CLI-first operation |
+| P1 | Seedbox Pre-Seed Warm-Up | Pre-read and pre-hash a new lawful release before announcing so the first peer is served instantly | BiglyBT pre-seed concepts, superseeding efficiency |
+| P1 | Idempotent Re-Add / Content-Addressed Import | Recognize re-added torrents whose data already exists and skip re-download and re-verify automatically | qBittorrent re-add friction, large-library operator workflows |
+| P1 | Durable State Store (SQLite) | Single durable store enabling cheap queue, health, audit, and history queries beyond per-torrent resume files | Self-hosting operators, Long-Horizon Observability (P2), Operator Audit Log (P1) |
 | P2 | Sequential Download / Streaming / File Preview | Sequential/priority-first fetch; in-place preview and verify; metadata-first preview | qBittorrent sequential download, aria2, WebTorrent streaming, Deluge |
 | P2 | Protocol modernization roadmap | Stay ahead of compatibility and swarm reachability changes; BEP 52 v2/hybrid handling | qBittorrent [#23421](https://github.com/qbittorrent/qBittorrent/issues/23421), [#24600](https://github.com/qbittorrent/qBittorrent/issues/24600), Transmission [#3387](https://github.com/transmission/transmission/issues/3387), [#3705](https://github.com/transmission/transmission/issues/3705), [#993](https://github.com/transmission/transmission/issues/993) |
 | P2 | Long-horizon observability | Preserve useful history beyond current live status and make operational events auditable | Transmission [#5591](https://github.com/transmission/transmission/issues/5591), qBittorrent [#22832](https://github.com/qbittorrent/qBittorrent/issues/22832), [#18525](https://github.com/qbittorrent/qBittorrent/issues/18525), [#24330](https://github.com/qbittorrent/qBittorrent/issues/24330) |
@@ -65,6 +71,9 @@ project.
 | P2 | Backup / Restore & Bulk Import/Export | Export/import torrent list and state for migration and disaster recovery of large libraries | qBittorrent backup, Deluge export, Flood backup/restore |
 | P2 | Thin Client / Remote Session Architecture | Connect a native or web client to a remote daemon via a streaming RPC protocol without SSH tunneling | Deluge thin-client architecture, qBittorrent remote session requests, Flood multi-backend |
 | P2 | OpenTelemetry Observability | Distributed tracing, span export, and OTLP metrics export for cloud-native monitoring | OpenTelemetry standard, Flood OpenAPI+Swagger, cloud-native deployment patterns |
+| P2 | Cloud / Object-Storage-Backed Storage Root | S3/WebDAV/rclone-backed torrent storage for institutional lawful distributors of datasets and archives | Institutional dataset distribution, rclone mount patterns, no mainstream client owns this |
+| P2 | Local GeoIP / ASN Peer Rollups | On-device geographic and ASN distribution of legal-swarm peers for distribution planning | MaxMind local DB, complements Client-Identity Fingerprinting (P1) |
+| P2 | Responsive / Mobile-Friendly Web UI | Touch and small-viewport operation for homelab phone-check workflows | qBittorrent and Transmission Web UIs are minimally responsive |
 | P3 | Permissioned extension system | Enable integrations only if permissions, sandboxing, and lawful-use constraints are clear | qBittorrent [#24530](https://github.com/qbittorrent/qBittorrent/issues/24530), [#24531](https://github.com/qbittorrent/qBittorrent/issues/24531) |
 | P3 | Alternate privacy-preserving transports | Evaluate only if strict containment, lawful-use messaging, and operational risk are solved | Transmission [#7230](https://github.com/transmission/transmission/issues/7230), qBittorrent [#23665](https://github.com/qbittorrent/qBittorrent/issues/23665), [#24241](https://github.com/qbittorrent/qBittorrent/issues/24241), [#23064](https://github.com/qbittorrent/qBittorrent/issues/23064) |
 | P3 | Swarm Merging (BiglyBT-style) | Complete or accelerate a torrent using matching content from other torrents or HTTP sources | BiglyBT swarm merging, self-hosting seedbox workflows |
@@ -357,6 +366,61 @@ Acceptance direction:
 - Per-user storage roots and per-user network paths together constitute the
   seedbox-grade isolation model that shared-server deployments require.
 - Implementing this requires an ADR (new auth model + user isolation semantics).
+
+### Protocol Encryption / MSE-PE (BEP 8)
+
+Problem: every mainstream torrent client (Transmission, qBittorrent, Deluge,
+BiglyBT) implements Message Stream Encryption / Protocol Encryption
+(BEP 8). Many peers refuse plaintext handshakes, and private trackers
+commonly *require* encrypted connections. ISPs routinely throttle or
+shape plain-text BitTorrent handshakes. SwarmOtter's network containment
+model constrains routing, not wire-level obfuscation: a contained peer
+connection is still a plaintext handshake on the wire. Without MSE/PE
+SwarmOtter cannot fully interoperate with a large fraction of swarms, and
+the comparison matrix should reflect that honestly rather than imply
+parity. This is arguably a core interoperability gap rather than a
+differentiator.
+
+Requested elsewhere:
+
+- Transmission, qBittorrent, Deluge, and BiglyBT all ship MSE/PE and have
+  for years; it is treated as table stakes.
+- Private tracker ecosystems commonly require encryption; peers that do
+  not offer it are rejected at the handshake.
+- ISPs commonly throttle or deprioritize traffic identified by the
+  plaintext BitTorrent handshake, affecting legitimate Linux ISO and
+  open-source release distribution.
+
+SwarmOtter feature shape:
+
+- Implement BEP 8 obfuscated handshake plus the encrypted-stream
+  negotiation (plaintext fallback, RC4/AES encrypted modes per BEP 8).
+- Make the encryption mode configurable: disabled, opportunistic
+  (plaintext handshake fallback allowed), and forced (refuse plaintext).
+- Per-profile (existing P0) and per-torrent overrides for encryption
+  mode.
+- Encryption negotiation goes through the existing contained peer
+  connection path; no separate socket creation.
+- Surface the negotiated encryption state per peer in the API, UI, and
+  the client-identity rollup (existing P1).
+
+Acceptance direction:
+
+- Framing is interoperability and wire-level integrity, consistent with
+  the lawful-use posture already applied to VPN/NIC containment. This is
+  not piracy-evasion framing; SwarmOtter does not advertise or document
+  this as a way to evade copyright enforcement.
+- Encryption never weakens network containment; the encrypted stream runs
+  over the existing contained TCP/uTP transport.
+- Forced-encryption mode must not silently fall back to plaintext; it
+  must refuse or close the connection.
+- Local swarm fixtures exercise encrypted, opportunistic, and
+  forced-encryption handshakes before the default mode is set.
+- When implemented, `design/COMPARISON.md` must add a "Peer encryption
+  (MSE/PE)" row that previously showed an unstated gap; the matrix stays
+  truthful.
+- Implementing this requires an ADR (new wire-protocol surface and a
+  default-mode decision with interop trade-offs).
 
 ## P1 Features
 
@@ -1065,6 +1129,197 @@ Acceptance direction:
 - A failing snapshot is reported and does not cause data loss; the
   underlying torrent operation continues.
 
+### HTTP / HTTPS Proxy Support
+
+Problem: the backlog already covers SOCKS5 (P1), but corporate and
+egress-filtered environments frequently expose only HTTP/CONNECT proxies.
+Users in those environments cannot route SwarmOtter traffic without an
+HTTP proxy option. qBittorrent and aria2 both support HTTP proxies
+alongside SOCKS5.
+
+Requested elsewhere:
+
+- qBittorrent ships HTTP proxy support alongside SOCKS5.
+- aria2 ships HTTP/HTTPS proxy support as a first-class option.
+- Corporate and educational networks commonly block SOCKS5 but allow
+  authenticated HTTP egress proxies.
+
+SwarmOtter feature shape:
+
+- Add optional HTTP/CONNECT (and HTTPS CONNECT) proxy configuration for
+  torrent traffic.
+- Route peer TCP connections, tracker announces, webseed requests, and
+  DHT where applicable through the configured HTTP proxy.
+- Support authenticated and unauthenticated modes.
+- Per-profile (existing P0) proxy configuration for multi-path
+  deployments.
+- HTTP proxy is distinct from SOCKS5 and from network containment; all
+  three can coexist with documented precedence rules.
+
+Acceptance direction:
+
+- Proxy configuration is explicit and auditable.
+- When both HTTP proxy and network containment are configured,
+  containment takes precedence; proxy traffic still goes through the
+  contained path.
+- DNS resolution for the proxy hostname respects containment.
+- Implementing this may share the connection-egress abstraction with the
+  existing SOCKS5 work (P1).
+
+### Scriptable CLI (`swarmotterctl`)
+
+Problem: SwarmOtter's API-first posture targets automation, but the only
+operator interface beyond the API is the Web UI. Operators working over
+SSH, in CI pipelines, or in `*arr`-style automation want a lightweight
+scriptable CLI that mirrors the most common daemon operations without a
+browser or a full TUI. The TUI entry (P3) mentions a `swarmotterctl`
+alternative; pulling the CLI out as its own item lets it ship sooner and
+reinforce the Compatibility API (P0) and Sonarr/Radarr automation story.
+
+Requested elsewhere:
+
+- `transmission-remote` is Transmission's long-standing scriptable CLI.
+- rTorrent and aria2 are CLI-first.
+- Self-hosting operators routinely script torrent operations from shell.
+
+SwarmOtter feature shape:
+
+- Add a `swarmotterctl` binary that talks to the daemon via the same
+  REST API as the Web UI; no direct daemon state access.
+- Cover the high-frequency operations: add magnet/torrent, list
+  torrents (with filters and sorting), pause/resume/stop, remove,
+  recheck, reannounce, set per-torrent limits, show details, show health.
+- Machine-readable JSON output mode for scripting and piping.
+- Human-readable default output for interactive SSH use.
+- Reuses the same auth (API keys, scoped permissions) and Multi-User
+  (existing P0) model as the API.
+
+Acceptance direction:
+
+- All CLI operations go through the API; no separate daemon code path.
+- JSON output is stable and versioned alongside the API.
+- The CLI is a first-class build artifact and documented in `docs/`.
+- Implementing this may require an ADR (new user-facing binary and an
+  output-stability contract).
+
+### Seedbox Pre-Seed Warm-Up
+
+Problem: when a lawful release is newly created and seeded, the first
+peers to connect find a seeder that has not yet read or hashed its pieces,
+so the first serving round is slow and the swarm's initial health looks
+poor. Pre-reading and pre-hashing all pieces *before* the torrent is
+announced lets the first peer be served instantly and improves the
+measured health of a fresh swarm. No mainstream client markets this as
+a deliberate first-distribution optimization.
+
+Requested elsewhere:
+
+- BiglyBT has related pre-seed and swarm-warmup concepts.
+- Superseeding / initial seeding (existing P1) benefits from a warm
+  seeder because piece distribution is the bottleneck.
+- Legal distributors of Linux ISOs, open-source releases, and datasets
+  care about first-hour swarm health.
+
+SwarmOtter feature shape:
+
+- Add an optional pre-seed warm-up mode: when a torrent is added in a
+  seeding-from-complete state (created content or re-verified complete
+  data), pre-read and verify all pieces in the background before the
+  tracker announce and DHT announce go out.
+- Integrate with superseeding / initial seeding (existing P1) and the
+  disk-aware storage optimizer (existing P0) so warm-up respects disk
+  pressure and concurrency limits.
+- Surface warm-up progress and completion in the API, UI, and the
+  explainability API (existing P1).
+
+Acceptance direction:
+
+- Warm-up is opt-in and never blocks a user-initiated start.
+- Warm-up respects disk pressure and never degrades other active
+  torrents.
+- Warm-up traffic stays on the contained network path (it is local I/O
+  plus optional local hash, not network egress).
+
+### Idempotent Re-Add / Content-Addressed Import
+
+Problem: operators re-adding a torrent whose data already exists on disk
+are forced through a full re-download or full re-verify cycle even when
+nothing has changed. This is friction for large libraries and for the
+cross-seed (existing P1/P2) workflow. Recognizing that the on-disk
+content already satisfies the torrent and skipping re-download/re-verify
+automatically reduces operator load and disk wear.
+
+Requested elsewhere:
+
+- qBittorrent re-add workflows require manual re-verify steps.
+- cross-seed (external tool) users routinely re-add matching torrents and
+  want instant reuse of existing data.
+- Self-hosting operators migrating or restoring libraries want re-add to
+  be a no-op when data is already present.
+
+SwarmOtter feature shape:
+
+- On add, detect whether the target data already exists at a configured
+  or inferred path and matches the expected piece layout.
+- Skip re-download where data is present and verified; skip full re-verify
+  where the fast-resume hash matches.
+- Surface the recognition decision in the explainability API (existing
+  P1): "re-add recognized existing complete data, skipped verify."
+- Integrate with cross-seed (existing P1/P2) and the disk-aware storage
+  optimizer (existing P0).
+
+Acceptance direction:
+
+- Recognition is conservative: when in doubt, verify; never silently
+  mark unverified data as complete.
+- The decision is auditable and explainable.
+- No silent data loss; a misrecognized re-add falls back to normal
+  download/verify.
+
+### Durable State Store (SQLite)
+
+Problem: SwarmOtter's current persistent state is built from per-torrent
+JSON resume files plus an in-memory registry. This works for v1.0.0 but
+does not scale cheaply for the operations that the backlog already
+targets: the large-library operations console (P0), the operator audit
+log (P1), long-horizon observability (P2), and queue/health history all
+want indexed, queryable history. Reconstructing that history from resume
+files on every restart is wasteful and slow for thousands of torrents.
+A single durable store would make those features far cheaper and more
+robust.
+
+Requested elsewhere:
+
+- No mainstream torrent client ships a queryable historical state store;
+  this is a SwarmOtter opportunity enabled by the API-first, server
+  positioning.
+- Self-hosting operators managing large libraries expect fast list,
+  filter, and history queries that resume files do not provide.
+
+SwarmOtter feature shape:
+
+- Introduce an optional durable state store (SQLite) as the backing
+  store for the registry, queue state, health snapshots, audit events,
+  and rolling metrics.
+- Keep per-torrent fast-resume files as the authoritative recovery format;
+  the store is a queryable index and history layer, not a replacement
+  for fast resume.
+- Provide migration from the resume-file-only model so existing
+  deployments upgrade without losing state.
+- Integrate with long-horizon observability (existing P2), the operator
+  audit log (existing P1), and the large-library operations console
+  (existing P0).
+
+Acceptance direction:
+
+- Fast resume remains the crash-recovery source of truth; the store is
+  rebuildable from resume files if corrupted.
+- The store never weakens network containment; it is local-only and not
+  network-addressable.
+- Schema changes are versioned and migrated.
+- Implementing this requires an ADR (new persistent format, migration
+  path, and a query model decision).
+
 ## P2 Features
 
 ### Protocol Modernization Roadmap
@@ -1285,6 +1540,125 @@ Acceptance direction:
 - Tracing must not leak sensitive data (info hashes in spans are acceptable;
   peer IPs and file paths require configurable redaction).
 - All telemetry export respects network containment.
+
+### Cloud / Object-Storage-Backed Storage Root
+
+Problem: institutional lawful distributors (datasets, public archives,
+open-source release mirrors) increasingly keep their publishable content
+in object storage (S3, S3-compatible, WebDAV) rather than on a local disk.
+No mainstream torrent client treats object storage as a first-class
+torrent storage root, so these operators must mount the bucket and
+accept the limitations of a POSIX-over-object layer. A native
+object-storage-backed storage root fits SwarmOtter's lawful-distribution
+mission and complements the disk-aware storage optimizer (existing P0)
+and torrent creation (existing P1).
+
+Requested elsewhere:
+
+- rclone mount patterns are widely used to back torrent clients with
+  object storage, but they introduce a lossy POSIX emulation layer.
+- Institutional dataset distribution increasingly lives in S3-compatible
+  buckets.
+- No mainstream client owns object-storage-backed seeding as a native
+  feature.
+
+SwarmOtter feature shape:
+
+- Add an optional object-storage-backed storage root type for S3,
+  S3-compatible, and WebDAV targets.
+- Support both seeding-from-existing-object-data and
+  download-to-object-storage workflows for lawful distribution.
+- Reuse the existing piece-hash verification path; an object-storage
+  root is treated like any other storage root by the disk-aware storage
+  optimizer (existing P0).
+- All object-storage access respects network containment; the bucket
+  endpoint is resolved and reached through the contained network path.
+
+Acceptance direction:
+
+- Object-storage reads/writes never bypass the piece-verification path;
+  no unverified data is served to peers.
+- Containment applies to object-storage egress just as it does to peer
+  traffic.
+- ADR required: new I/O backend, credential handling, and containment
+  implications for a non-POSIX storage root.
+
+### Local GeoIP / ASN Peer Rollups
+
+Problem: operators running legal swarms (Linux ISOs, open-source
+releases, public archives) want to understand the geographic and ASN
+distribution of the peers connecting to their seeders, both for
+distribution planning and for abuse detection. Today they get a per-peer
+IP string at most. Complementing the existing client-identity
+fingerprinting (P1), an on-device GeoIP/ASN rollup gives legal-swarm
+operators a view no mainstream client provides, with no third-party
+lookup.
+
+Requested elsewhere:
+
+- qBittorrent and BiglyBT show per-peer IP strings but no aggregate
+  geographic or ASN view.
+- Self-hosting operators ask for swarm composition visibility beyond the
+  client string.
+- Legal distributors want to know whether their release is reaching the
+  regions they expect.
+
+SwarmOtter feature shape:
+
+- Add an optional local GeoIP/ASN lookup (operator-supplied MaxMind or
+  equivalent local database; no third-party network lookup).
+- Surface per-torrent and per-tracker rollups: top countries, top ASNs,
+  and the intersection with the client-identity rollup (existing P1).
+- Integrate with the per-torrent health score (existing delivered
+  feature) so a swarm concentrated in a single region or ASN can surface
+  as a health or diversity factor.
+- GeoIP/ASN rollups are purely informational; they do not change
+  download/upload behavior and are not used to enforce policy.
+
+Acceptance direction:
+
+- No third-party network lookup; the database is operator-supplied and
+  local.
+- Operators can disable the rollup or restrict it to specific torrents.
+- IP addresses are not exported by the rollup; only aggregated
+  country/ASN counts.
+- This complements the IP filtering / blocklists workbench (existing P1)
+  for abuse mitigation.
+
+### Responsive / Mobile-Friendly Web UI
+
+Problem: SwarmOtter is positioned for homelab and server operators, a
+large fraction of whom check torrent status from a phone. Nothing in the
+backlog addresses touch or small-viewport operation. qBittorrent and
+Transmission Web UIs are at least minimally responsive. For the stated
+positioning, mobile-friendly checking is a common expectation, not a
+cosmetic nicety.
+
+Requested elsewhere:
+
+- qBittorrent and Transmission Web UIs are minimally responsive and
+  usable from a phone.
+- Self-hosting operators routinely check daemon status from mobile
+  devices.
+
+SwarmOtter feature shape:
+
+- Make the torrent list, details, health, and basic lifecycle actions
+  usable on small/touch viewports.
+- Keep the function-over-form posture (see ADR-0006): no heavy UI
+  framework, no animation work, no theme marketplace.
+- Reuse the existing large-library operations console (existing P0)
+  server-side filtering and pagination so the mobile view does not load
+  the full list.
+
+Acceptance direction:
+
+- Core operations (view list, open details, pause/resume/stop, basic
+  add) work without horizontal scrolling on common phone widths.
+- No new framework dependency; CSS-only or minimal-adjustment changes
+  preferred.
+- This may be folded into the settings search and UI personalization
+  item (existing P2) if a shared UI polish pass is planned.
 
 ## P3 Research Features
 

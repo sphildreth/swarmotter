@@ -36,6 +36,16 @@ authoritative scope.
 
 ## Footnotes
 
+- **Peer encryption (SwarmOtter Roadmap P0):** SwarmOtter does not yet
+  implement BEP 8 Message Stream Encryption / Protocol Encryption. This
+  is a core interoperability gap rather than a policy decision: every
+  other client in this matrix ships MSE/PE, many swarms refuse plaintext
+  handshakes, and private trackers commonly require encryption. It is
+  tracked at P0 in `design/BACKLOG.md` with framing as interoperability
+  and wire-level integrity, consistent with the lawful-use posture applied
+  to VPN/NIC containment. The matrix row is marked `Roadmap P0` so the
+  comparison stays truthful; it is not an unstated parity assumption.
+
 - **Local peer discovery (SwarmOtter ❌):** SwarmOtter deliberately does
   not implement local-network peer discovery. Local discovery is a
   convenience feature for finding peers on the same LAN; for a daemon
@@ -76,7 +86,7 @@ authoritative scope.
 | Desktop GUI | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
 | Web UI | ✅ | ✅ | ✅ | ✅ | Plugin | ❌ bundled Web UI | ✅ via ruTorrent |
 | Headless/server mode | ✅ | ✅ | ✅ | ✅ | Partial | ✅ | ✅ |
-| CLI/TUI | Roadmap P3 TUI | `transmission-remote` and tools | Partial server binary | Console UI | ❌ primary CLI/TUI | ✅ | ✅ |
+| CLI/TUI | Roadmap P1 CLI, Roadmap P3 TUI | `transmission-remote` and tools | Partial server binary | Console UI | ❌ primary CLI/TUI | ✅ | ✅ |
 | Native API/RPC | REST, WebSocket, SSE | Transmission RPC | WebUI API | Deluge RPC/Web API | Plugin/remote APIs | JSON-RPC, XML-RPC | XMLRPC |
 | Compatibility API | Transmission RPC; qBittorrent API Roadmap P0 | Native Transmission RPC | Native qBittorrent WebUI API | ❌ | Transmission-style remote control support | ❌ | ❌ |
 | Plugin/extension model | Roadmap P3 | Limited add-ons | Search plugins | ✅ | ✅ | ❌ | ruTorrent plugins and scripts |
@@ -96,6 +106,7 @@ authoritative scope.
 | Webseeds | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Partial |
 | uTP | ✅ | ✅ | ✅ | ✅ | Plugin/core plugin | ❌ | ❌ |
 | IPv6 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Partial |
+| Peer encryption (MSE/PE, BEP 8) | Roadmap P0 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Private torrent handling | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | File selection/priorities | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Queueing/priorities | ✅ | ✅ | ✅ | ✅ | ✅ | Partial | ✅ |
@@ -116,6 +127,7 @@ authoritative scope.
 | IP filtering/blocklists | Roadmap P1 | ✅ | ✅ | Plugin | ✅ | ❌ | Partial |
 | UPnP/NAT-PMP | Roadmap P1 | ✅ | ✅ | ✅ | ✅ | ❌ | Partial |
 | SOCKS/proxy support | Roadmap P1 | ❌ | ✅ | ✅ | ✅ | ✅ | Partial |
+| HTTP/HTTPS proxy support | Roadmap P1 | ❌ | ✅ | ❌ | ❌ | ✅ | Partial |
 | Categories/tags/policy groups | Roadmap P0 policy profiles | Partial | ✅ | Plugin | ✅ | ❌ | Partial |
 | Large-library UI operations | Roadmap P0 | Partial | Partial | Partial | Partial | ❌ | Partial |
 | Bulk import/export and backup | Roadmap P2 | Partial | Partial | Partial | Migration tooling | Session files | Session files |
@@ -157,6 +169,12 @@ usable, remove it from `design/BACKLOG.md` and update this comparison.
 | P0 | Ecosystem Compatibility API | Adds qBittorrent-compatible API support beside the existing Transmission RPC compatibility layer. |
 | P0 | Per-Profile / Per-Torrent Network-Path Binding | Extends containment from one daemon-wide path to contained network paths by profile or torrent. |
 | P0 | Multi-User / Multi-Tenant Support | Adds role-based access, isolation, quotas, and shared-server workflows. |
+| P0 | Protocol Encryption / MSE-PE (BEP 8) | Closes a core interop gap: every mainstream client ships MSE/PE and many swarms refuse plaintext. Adds a truthful comparison row that previously understated the gap. |
+| P1 | HTTP / HTTPS Proxy Support | Adds egress through corporate/filtered HTTP proxies alongside the existing SOCKS5 (P1) entry. |
+| P1 | Scriptable CLI (`swarmotterctl`) | Adds a scriptable, JSON-output CLI mirroring the API for SSH and automation workflows without a browser. |
+| P1 | Seedbox Pre-Seed Warm-Up | Adds first-peer serving optimization for new lawful releases; complements superseeding (P1). |
+| P1 | Idempotent Re-Add / Content-Addressed Import | Reduces re-add/re-verify friction for large libraries and cross-seed workflows. |
+| P1 | Durable State Store (SQLite) | Enables cheap queue, health, audit, and history queries beyond per-torrent resume files; underpins several other roadmap items. |
 | P1 | Metadata-first magnet preview and intake rules | Closes the gap with clients that let users inspect magnet metadata before data transfer. |
 | P1 | File cleanup, trash, and retention safety | Improves destructive-operation safety and partial-data management. |
 | P1 | Tracker and peer operations workbench | Improves swarm diagnostics beyond current summary health and log events. |
@@ -178,7 +196,7 @@ usable, remove it from `design/BACKLOG.md` and update this comparison.
 | P1 | Production Health / Availability Surface | Adds `/healthz/live` and `/healthz/ready` plus a synthetic end-to-end check torrent and SLO-style summaries, making SwarmOtter the first torrent daemon suitable as a Kubernetes/CI workload. |
 | P1 | Filesystem Snapshot Integration | Adds opt-in snapshot hooks for Btrfs subvolumes, ZFS, and Snapper so operators get rollback for torrent roots and state directories. No mainstream client offers this. |
 | P1 | Client-Identity Fingerprinting and Rollups | Adds per-torrent and per-tracker client composition rollups so operators of legal swarms can prioritize compatibility and understand their contribution. |
-| P1/P2 | Native Cross-Seed & Hardlink-Aware Storage | Reduces duplicate downloading and improves storage efficiency for legal multi-torrent libraries. |
+| P1 | Native Cross-Seed & Hardlink-Aware Storage | Reduces duplicate downloading and improves storage efficiency for legal multi-torrent libraries. |
 | P2 | Sequential Download / Streaming / File Preview | Closes a common qBittorrent/BiglyBT/aria2-style user workflow gap. |
 | P2 | Protocol modernization roadmap | Tracks BEP 52 v2/hybrid and other protocol compatibility improvements. |
 | P2 | Long-horizon observability | Adds historical metrics beyond current live status and peak log events. |
@@ -187,6 +205,9 @@ usable, remove it from `design/BACKLOG.md` and update this comparison.
 | P2 | Backup / Restore & Bulk Import/Export | Improves migration and disaster recovery for large libraries. |
 | P2 | Thin Client / Remote Session Architecture | Adds a richer remote-client model beyond the Web UI and API. |
 | P2 | OpenTelemetry Observability | Adds cloud-native metrics and tracing export. |
+| P2 | Cloud / Object-Storage-Backed Storage Root | Adds S3/WebDAV-backed torrent storage for institutional lawful distributors; no mainstream client owns this. |
+| P2 | Local GeoIP / ASN Peer Rollups | Adds on-device geographic and ASN rollups for legal-swarm operators; complements Client-Identity Fingerprinting (P1). |
+| P2 | Responsive / Mobile-Friendly Web UI | Adds touch and small-viewport operation for homelab phone-check workflows. |
 | P3 | Permissioned extension system | Adds a plugin model only if permissions, sandboxing, and lawful-use constraints are resolved. |
 | P3 | Alternate privacy-preserving transports | Requires containment, lawful-use, and operational-risk review before acceptance. |
 | P3 | Swarm Merging (BiglyBT-style) | Adds matching-content acceleration across torrents or lawful HTTP sources. |
