@@ -9,7 +9,15 @@ is project documentation and policy, not legal advice.
 - The project does not provide content.
 - The project does not index content.
 - The project does not encourage infringement.
-- Users are responsible for lawful use.
+- Users are solely responsible for their own compliance with applicable law.
+
+## Project scope
+
+The SwarmOtter project defines what it will and will not include in its
+repositories, documentation, examples, release artifacts, and project-hosted
+assets. This is a statement of project scope, not a mechanism for monitoring
+or policing user behavior. The project has no observability into how users
+deploy the software.
 
 ## Prohibited project content
 
