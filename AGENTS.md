@@ -16,7 +16,7 @@ when every required feature in `design/requirements.md` is implemented, tested,
 documented, and usable. The live torrent data-plane engine, network containment,
 API, and Web UI are implemented; remaining work is tracked by completed
 capability and acceptance criteria in `design/requirements.md` and
-`docs/v1-completion-tracker.md`.
+`design/v1-completion-tracker.md`.
 
 ## Non-negotiable rules
 
@@ -180,10 +180,3 @@ sequential four-digit number, kebab-case title, and fill out every section.
 Create an ADR when a change introduces, removes, or materially alters an
 architectural decision. See the ADR requirements section above and
 `design/adr/README.md`.
-
-## Piracy-oriented features are not accepted
-
-Do not implement piracy-oriented features, indexers, search for infringing
-content, bundled copyrighted torrents, infringing magnet links, or
-documentation encouraging copyright infringement. Such contributions will be
-rejected. See `design/content-policy.md`.

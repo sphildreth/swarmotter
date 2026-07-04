@@ -1,188 +1,50 @@
-# Configuration
+# Configuration Design Notes
 
-This document describes SwarmOtter's configuration model. The implementation
-lives in `swarmotter-core::config`.
+This document records SwarmOtter's configuration architecture and compatibility
+contract. User-facing examples and option reference belong in the published
+mdBook page: `../docs/configuration.md`.
 
-For operator-facing examples and option reference, see
-`docs/configuration.md`.
+The implementation lives in `swarmotter-core::config`.
 
 ## Sources
 
 SwarmOtter is configured through a TOML configuration file plus environment
-variable overrides. Invalid required configuration produces clear startup
-errors. Safe defaults are provided where possible. Runtime updates use two modes:
+variable overrides. Environment overrides use the `SWARMOTTER_` prefix with
+nested fields separated by `__`.
 
-- **Runtime-safe settings patch (`PATCH /api/v1/settings`)**: updates live bandwidth,
-  queue, and seeding fields without restarting.
-- **Full config replacement (`PUT /api/v1/settings`)**: validates the full config
-  before persistence, persists atomically, and reports fields that require restart.
+Invalid required configuration must produce clear startup errors. Runtime
+updates use two API paths:
 
-## Environment variable overrides
+- `PATCH /api/v1/settings` for live-safe partial updates.
+- `PUT /api/v1/settings` for full config replacement after validation.
 
-Settings can be overridden via environment variables using the prefix
-`SWARMOTTER_` with nested fields separated by `__`. Values are parsed as
-integers, booleans, or strings as appropriate. Examples:
+## Design constraints
 
-```bash
-SWARMOTTER_API__BIND_ADDRESS=0.0.0.0:9091
-SWARMOTTER_TORRENT__LISTEN_PORT=51414
-SWARMOTTER_NETWORK__MODE=strict
-SWARMOTTER_NETWORK__REQUIRED_INTERFACE=br0
-SWARMOTTER_NETWORK__ALLOW_IPV6=true
-SWARMOTTER_TORRENT__ALLOW_IPV6=true
-SWARMOTTER_API__MAX_REQUEST_BODY_BYTES=16777216
-SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED=true
-```
+- Defaults should be safe and operator-friendly.
+- Strict network containment must require an enforceable data-plane path.
+- API auth must require a non-empty token when enabled.
+- `GET /api/v1/settings` must redact `api.auth_token`.
+- Full config replacement must preserve the existing auth token when the
+  request omits it.
+- Runtime updates must report fields that require restart.
+- Environment overrides must pass through the same validation as file config.
 
-## Configuration areas
+## Compatibility boundaries
 
-- **API** (`api`): `bind_address`, `require_auth`, `auth_token`,
-  `max_request_body_bytes`. When `require_auth` is true, `auth_token` is
-  required and all `/api/v1` routes require either
-  `Authorization: Bearer <token>` or `X-SwarmOtter-Auth: <token>`.
-  `GET /api/v1/settings` redacts the token. `max_request_body_bytes` bounds API
-  request bodies, including torrent file uploads. Full config updates through
-  `PUT /api/v1/settings` preserve an existing `api.auth_token` if omitted in
-  the request body.
-- **Compatibility** (`compatibility`): optional API compatibility adapters.
-  `[compatibility.transmission]` controls whether `/transmission/rpc` is enabled.
-  The adapter is off by default and uses `DaemonOps` semantics rather than a
-  separate torrent engine. Compatibility adapters are isolated so additional
-  surfaces can be added intentionally later.
-- **Storage** (`storage`): `download_dir`, `incomplete_dir`, `preallocate`,
-  `sparse`. Incomplete data is written under `incomplete_dir` when configured
-  and moved to `download_dir` after all pieces verify. When `preallocate` is
-  true, the engine sizes files before downloading. When `preallocate` is false
-  and `sparse` is true, it creates a visible active layout without pre-sizing
-  payload files and writes pieces as needed. When `sparse` is false, active
-  payload files are sized up front.
-- **Network containment** (`network`): see `vpn-network-containment.md`
-  (`mode`, `required_interface`, `required_source_ipv4`,
-  `required_source_ipv6`, `required_network_namespace`, `allow_ipv6`,
-  `fail_closed`, `validate_route`, `validate_dns`). `required_interface`
-  binds torrent data-plane sockets to all current addresses on that interface
-  on supported platforms, which is the DHCP/SLAAC-safe configuration. Source
-  address fields are optional refinements for static-address deployments.
-- **Torrent** (`torrent`): `listen_port`, `allow_ipv6`, `utp_enabled`,
-  `utp_prefer_tcp`, `selfish`. `allow_ipv6` filters IPv6 peer addresses when
-  false and must also be allowed by network containment. When `utp_enabled` is
-  true the engine attempts uTP (BEP 29) peer connections through the contained
-  UDP socket alongside TCP; uTP traffic fail-closes with the rest of the data
-  plane. `utp_prefer_tcp` selects which transport is tried first (with the
-  other as a fallback). When `utp_enabled` is false, only TCP is used.
-  `selfish` is an optional completion policy: when `true`, SwarmOtter removes
-  a torrent from the daemon immediately after its download completes (all
-  pieces verified), stops its engine and seeder, and preserves the downloaded
-  data on disk (no delete-data behavior); SwarmOtter will not seed the torrent
-  after completion. When `false` (the default), normal completion and seeding
-  behavior is unchanged.
-- **Bandwidth** (`bandwidth`): global/per-torrent download/upload limits,
-  alternate speed mode, max peers. Global limits live in this section and are
-  enforced as a shared aggregate across all active torrents; per-torrent limits
-  (`download_limit`/`upload_limit`, 0 = unlimited) live on each torrent record
-  and are set/changed live via `POST /api/v1/torrents/:hash/limits`. Both are
-  enforced live by the engine/seeder rate shapers.
-  `max_peers` is a global peer worker cap divided across active downloads.
-  `max_peers_per_torrent` controls the engine's simultaneous download peer
-  worker cap; `0` uses the daemon default worker pool of 64.
-- **Queue** (`queue`): `max_active_downloads`, `max_active_seeds`,
-  `auto_start`. The daemon scheduler enforces active download slots, queue
-  ordering, start-now/resume bypass, and completed seeding slots.
-- **Seeding** (`seeding`): `global_ratio_limit`, `global_idle_limit`.
-- **DHT** (`dht`): `enabled`, `port`, `bootstrap_nodes`. The shared DHT
-  runner binds the configured local UDP port.
-- **PEX** (`pex`): `enabled`, `max_peers`. The engine advertises/imports PEX
-  only when enabled and the torrent is non-private.
-- **Watch folders** (`watch`): array of `{ path, recursive, download_dir,
-  label, start_behavior, archive_dir, failure_dir, delete_after_import }`.
-- **Logging** (`logging`): `level`, `json`, `file`, `file_path`. File logging
-  is enabled by default so daemon logs are recorded even for direct terminal
-  starts.
+Configuration table names, field names, environment override names, defaults,
+and validation behavior are release-facing. Breaking changes should follow
+`VERSIONING_GUIDE.md`.
 
-## Example
+Compatibility adapter settings belong under `[compatibility.*]` so optional
+adapter surfaces remain isolated from native daemon configuration.
 
-A complete annotated example is in `config/swarmotter.toml.example`. A short
-form:
+## Maintenance
 
-```toml
-[api]
-bind_address = "0.0.0.0:9091"
-max_request_body_bytes = 16777216
+When configuration behavior changes:
 
-[storage]
-download_dir = "/data/downloads"
-incomplete_dir = "/data/incomplete"
-preallocate = false
-
-[network]
-mode = "strict"
-required_interface = "br0"
-allow_ipv6 = true
-fail_closed = true
-validate_route = true
-# Reports dns_not_constrained if DNS cannot be proven on br0.
-validate_dns = true
-
-[torrent]
-listen_port = 51413
-allow_ipv6 = true
-```
-
-For this layout, `incomplete_dir` is the active write root for partial torrent
-data. Once all pieces verify, SwarmOtter moves the completed files to
-`download_dir`. If `incomplete_dir` is omitted, both active and completed data
-use `download_dir`.
-
-## Validation rules
-
-- Strict fail-closed network containment requires an enforceable torrent socket
-  path: `required_interface`, `required_source_ipv4`,
-  `required_source_ipv6`, or `required_network_namespace`.
-- `required_interface` means "bind torrent data-plane sockets to this
-  interface." On Linux this uses `SO_BINDTODEVICE`; if the daemon cannot enforce
-  the bind, torrent traffic fails closed.
-- `required_source_ipv6` requires `allow_ipv6 = true`.
-- `api.bind_address` must not be empty and must parse as a socket address.
-- `api.auth_token` must be set when `api.require_auth = true`.
-- `api.max_request_body_bytes` must be > 0.
-- `torrent.listen_port` must be > 0.
-- Watch folder paths must not be empty.
-- `compatibility.transmission.enabled` may only enable documented adapter features.
-  Mutating calls map to native daemon operations, including delete-data behavior
-  for `torrent-remove`. `torrent-add` inputs are constrained to magnet links and
-  base64 `metainfo`; remote HTTP/HTTPS torrent URLs are rejected.
-
-Validation runs at load time and on env-override merge; failures abort startup
-with a clear error message.
-
-## DHCP/SLAAC Interface Binding
-
-For an interface whose IPv4 or IPv6 addresses can change, configure the
-interface name and omit fixed source addresses:
-
-```toml
-[network]
-mode = "strict"
-required_interface = "br0"
-allow_ipv6 = true
-fail_closed = true
-validate_route = true
-# Reports dns_not_constrained if DNS cannot be proven on br0.
-validate_dns = true
-
-[torrent]
-listen_port = 51413
-allow_ipv6 = true
-```
-
-This constrains torrent peer TCP, uTP/UDP, UDP trackers, DHT UDP, and inbound
-peer listening to `br0` while allowing the kernel to choose the current source
-address for each address family. The API/Web UI control plane remains
-separate; `[api].bind_address` still takes a socket address, not an interface
-name.
-
-DNS containment is separate from socket binding. In strict fail-closed mode,
-hostname resolution for torrent operations is blocked unless DNS containment
-can be validated or supplied by the current network namespace. Linux interface
-mode validates common systemd-resolved link DNS with `resolvectl dns <iface>`
-and static resolver routes that go through the required interface.
+1. Update `swarmotter-core::config` and validation tests.
+2. Update any affected API settings handlers.
+3. Update `../docs/configuration.md` for user-facing examples and option
+   reference.
+4. Update this document only when the configuration model or compatibility
+   contract changes.

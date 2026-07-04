@@ -4,9 +4,14 @@ authors = ["SwarmOtter contributors"]
 description = "User-facing documentation for configuring and operating SwarmOtter."
 src = "docs"
 language = "en"
-multilingual = false
 
 [output.html]
 git-repository-url = "https://github.com/sphildreth/swarmotter"
 edit-url-template = "https://github.com/sphildreth/swarmotter/edit/main/{path}"
-site-url = "/"
+site-url = "/swarmotter/"
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"

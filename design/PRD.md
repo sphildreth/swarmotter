@@ -191,8 +191,8 @@ The public GitHub repository must include the following documentation before `v1
 - `CODE_OF_CONDUCT.md` if the project will accept public community contributions.
 - `docs/lawful-use.md` explaining intended legal use cases and prohibited project use patterns.
 - `docs/legal.md` summarizing project legal posture, disclaimers, and user responsibility.
-- `docs/content-policy.md` stating that the project does not host or link to unauthorized copyrighted content.
-- `docs/vpn-network-containment.md` documenting VPN/NIC containment as routing control, privacy-preserving network design, and fail-closed safety, not as piracy evasion.
+- `docs/legal.md` stating that the project does not host or link to unauthorized copyrighted content.
+- `docs/network-containment.md` documenting VPN/NIC containment as routing control, privacy-preserving network design, and fail-closed safety, not as piracy evasion.
 
 ### Prohibited Project Content
 
@@ -1404,7 +1404,7 @@ The following workstreams describe dependency order and feature grouping. They a
 - Add lawful-use statement to `README.md`.
 - Add `docs/lawful-use.md`.
 - Add `docs/legal.md`.
-- Add `docs/content-policy.md`.
+- Add legal/content-policy guidance to `docs/legal.md`.
 - Add dependency license report.
 - Add security reporting instructions.
 - Add contribution guidelines.

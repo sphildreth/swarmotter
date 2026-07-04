@@ -46,7 +46,7 @@ Adopt a per-torrent task model in `swarmotterd`:
   error state.
 - Endgame mode, live bandwidth shaping (global and per-torrent), and inbound
   peer listening/seeding upload are implemented and tested; see
-  `docs/v1-completion-tracker.md`.
+  `../v1-completion-tracker.md`.
 
 ## Related Documents
 

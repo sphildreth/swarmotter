@@ -1,0 +1,64 @@
+# SwarmOtter container configuration.
+#
+# This profile is intended for Docker Compose deployments where SwarmOtter
+# shares a VPN sidecar network namespace. In that layout, the VPN sidecar is
+# the fail-closed boundary for torrent data-plane traffic.
+
+[api]
+bind_address = "0.0.0.0:9091"
+require_auth = true
+# Override this placeholder with SWARMOTTER_API__AUTH_TOKEN.
+auth_token = "replace-with-a-long-random-token"
+max_request_body_bytes = 16777216
+
+[storage]
+download_dir = "/data/downloads"
+incomplete_dir = "/data/incomplete"
+preallocate = false
+sparse = true
+
+[network]
+mode = "disabled"
+
+[torrent]
+listen_port = 51413
+allow_ipv6 = true
+utp_enabled = true
+utp_prefer_tcp = true
+selfish = false
+
+[bandwidth]
+global_download = 0
+global_upload = 0
+alt_download = 0
+alt_upload = 0
+alt_enabled = false
+max_peers = 0
+max_peers_per_torrent = 0
+
+[queue]
+max_active_downloads = 5
+max_active_seeds = 5
+auto_start = true
+
+[seeding]
+global_ratio_limit = 2.0
+global_idle_limit = 1800
+
+[dht]
+enabled = true
+port = 51413
+bootstrap_nodes = [
+    "dht.transmissionbt.com:6881",
+    "router.bittorrent.com:6881",
+]
+
+[pex]
+enabled = true
+max_peers = 0
+
+[logging]
+level = "info"
+json = false
+file = true
+file_path = "/var/lib/swarmotter/swarmotterd.log"

@@ -8,7 +8,7 @@ and roadmap gaps as SwarmOtter matures.
 
 This is a living product comparison, not a release checklist. SwarmOtter
 feature status is based on this repository's `README.md`,
-`design/requirements.md`, `docs/v1-completion-tracker.md`, and
+`design/requirements.md`, `design/v1-completion-tracker.md`, and
 `design/BACKLOG.md`. Other client status is based on official project sites,
 project-owned documentation, and project repositories listed in
 [Sources](#sources).
@@ -221,7 +221,7 @@ SwarmOtter sources:
 
 - [`README.md`](../README.md)
 - [`design/requirements.md`](requirements.md)
-- [`docs/v1-completion-tracker.md`](../docs/v1-completion-tracker.md)
+- [`design/v1-completion-tracker.md`](v1-completion-tracker.md)
 - [`design/BACKLOG.md`](BACKLOG.md)
 
 Project-owned external sources:

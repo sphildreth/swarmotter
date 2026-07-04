@@ -8,7 +8,7 @@ This document is a statement of project scope and intent, not legal advice. It
 does not create any obligation on the part of users and does not replace review
 by qualified legal counsel where needed.
 
-For user-facing lawful-use guidance, see `docs/lawful-use.md`.
+For user-facing lawful-use guidance, see `../docs/lawful-use.md`.
 
 ## Project scope
 
@@ -51,7 +51,8 @@ artifacts as a matter of project scope:
 - Example screenshots based on copyrighted movies, shows, commercial games,
   music albums, ROM collections, or cracked software.
 
-See `content-policy.md` for the full list.
+See `content-policy.md` for the project artifact policy and
+`../docs/legal.md` for the published user-facing summary.
 
 ## Network containment framing
 

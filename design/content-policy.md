@@ -8,7 +8,7 @@ assets.
 SwarmOtter is a lawful, general-purpose BitTorrent client. See `lawful-use.md`
 for appropriate use cases and `legal.md` for project legal posture.
 
-For user-facing legal and content policy guidance, see `docs/legal.md`.
+For user-facing legal and content policy guidance, see `../docs/legal.md`.
 
 ## Prohibited project content
 

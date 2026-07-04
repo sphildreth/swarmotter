@@ -44,6 +44,133 @@ sudo systemctl enable --now swarmotterd
 Make sure the service user can read the config and write the storage
 directories.
 
+## Homelab Docker Compose with Gluetun
+
+The production container image is published to:
+
+```text
+ghcr.io/sphildreth/swarmotter
+```
+
+The repository workflow builds pull requests without publishing and publishes a
+multi-architecture image on successful pushes to `main`. Main builds are tagged
+as `latest`, `main`, and `sha-<shortsha>`. After the first GHCR publish, set the
+package visibility to public in GitHub Packages if anonymous homelab pulls are
+desired.
+
+### What is Gluetun?
+
+[Gluetun](https://github.com/qdm12/gluetun) is a containerized VPN client,
+firewall, and network namespace boundary. The official image is
+`qmcgaw/gluetun`. It supports common VPN providers and custom VPN
+configuration, including OpenVPN and WireGuard.
+
+SwarmOtter uses Gluetun in the provided Compose stack because it gives the
+homelab deployment a clear torrent data-plane boundary:
+
+- VPN credentials live in `deploy/gluetun.env`, separate from the SwarmOtter
+  API token.
+- The Gluetun container owns the tunnel device and firewall rules.
+- The SwarmOtter container joins Gluetun's network namespace with
+  `network_mode: "service:vpn"`.
+- The API/Web UI port is published by the `vpn` service, while torrent peer,
+  tracker, DHT, webseed, and torrent DNS traffic share Gluetun's contained
+  network path.
+
+In this layout, Gluetun is the fail-closed boundary. If the VPN namespace or
+firewall is unhealthy, SwarmOtter's torrent data plane cannot use the normal
+Docker bridge as a fallback. This follows Gluetun's documented pattern for
+[connecting another container to Gluetun's network
+stack](https://github.com/qdm12/gluetun-wiki/blob/main/setup/connect-a-container-to-gluetun.md).
+
+The provided Compose stack runs SwarmOtter in the Gluetun network namespace:
+
+```text
+deploy/compose.yml
+```
+
+The SwarmOtter container config used by this stack disables in-app network
+containment because all SwarmOtter traffic shares Gluetun's VPN namespace and
+firewall.
+
+The traffic layout looks like this:
+
+```mermaid
+flowchart TB
+    lan["LAN browser or API client"]
+    host["Docker host<br/>Port 9091 is published by the vpn service"]
+
+    subgraph ns["Shared network namespace"]
+        gluetun["Gluetun service: vpn<br/>owns /dev/net/tun<br/>manages the VPN tunnel<br/>enforces firewall and kill switch behavior"]
+        swarmotter["SwarmOtter service<br/>network_mode: service:vpn<br/>API/Web UI listens on :9091<br/>torrent data plane shares the namespace"]
+    end
+
+    outside["Peers, trackers, DHT, and webseeds"]
+
+    lan -->|"http://docker-host:9091"| host
+    host --> swarmotter
+    swarmotter -->|"torrent data-plane traffic"| gluetun
+    gluetun -->|"VPN tunnel only"| outside
+```
+
+See [Network Containment](network-containment.md) for the general
+fail-closed model and the difference between control-plane and data-plane
+traffic.
+
+Prepare host directories:
+
+```bash
+sudo install -d -m 0755 /srv/swarmotter/config
+sudo install -d -o 10001 -g 10001 /srv/swarmotter/state
+sudo install -d -o 10001 -g 10001 /srv/swarmotter/downloads
+sudo install -d -o 10001 -g 10001 /srv/swarmotter/incomplete
+sudo install -d /srv/swarmotter/gluetun
+sudo install -m 0644 config/swarmotter.container.toml.example /srv/swarmotter/config/swarmotter.toml
+```
+
+Create and edit the Compose environment file:
+
+```bash
+cd deploy
+cp .env.example .env
+cp gluetun.env.example gluetun.env
+openssl rand -hex 32
+```
+
+Set `SWARMOTTER_API_TOKEN` in `.env` to the generated token. Fill in
+`gluetun.env` with the settings required by your VPN provider. For custom
+WireGuard providers, this usually includes `WIREGUARD_PRIVATE_KEY`,
+`WIREGUARD_ADDRESSES`, `WIREGUARD_PUBLIC_KEY`, `WIREGUARD_ENDPOINT_IP`, and
+`WIREGUARD_ENDPOINT_PORT`. The split keeps the SwarmOtter API token out of the
+Gluetun container environment.
+
+Validate and start the stack:
+
+```bash
+docker compose --env-file .env -f compose.yml config
+docker compose --env-file .env -f compose.yml pull
+docker compose --env-file .env -f compose.yml up -d
+```
+
+Verify the API and image:
+
+```bash
+curl -fsS http://localhost:9091/health
+docker buildx imagetools inspect ghcr.io/sphildreth/swarmotter:latest
+docker compose --env-file .env -f compose.yml exec swarmotter curl -fsS https://ifconfig.me
+```
+
+Update explicitly when a new `main` image is published:
+
+```bash
+cd deploy
+docker compose --env-file .env -f compose.yml pull swarmotter
+docker compose --env-file .env -f compose.yml up -d swarmotter
+```
+
+For a pinned rollback, set `SWARMOTTER_IMAGE` in `deploy/.env` to a
+`sha-<shortsha>` tag and run the update commands again.
+
 ## LAN Web UI with contained torrents
 
 This exposes the control plane to the LAN while binding torrent data-plane
@@ -85,11 +212,13 @@ whose only torrent data-plane path is the intended VPN or NIC path.
 Container sketch:
 
 ```bash
-docker build -t swarmotter .
+docker build -f deploy/Dockerfile -t swarmotter .
 docker run -d --name swarmotter \
   -p 9091:9091 \
+  -e SWARMOTTER_API__AUTH_TOKEN="$(openssl rand -hex 32)" \
   -v /data/downloads:/data/downloads \
   -v /data/incomplete:/data/incomplete \
+  -v /var/lib/swarmotter:/var/lib/swarmotter \
   -v /etc/swarmotter:/etc/swarmotter:ro \
   swarmotter
 ```

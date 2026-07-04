@@ -503,6 +503,22 @@ listen_port = 51413
     }
 
     #[test]
+    fn parses_container_example_toml() {
+        let toml = include_str!("../../../config/swarmotter.container.toml.example");
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.api.bind_address, "0.0.0.0:9091");
+        assert!(cfg.api.require_auth);
+        assert_eq!(
+            cfg.network.mode,
+            crate::models::network::NetworkContainmentMode::Disabled
+        );
+        assert_eq!(
+            cfg.logging.file_path.as_deref(),
+            Some("/var/lib/swarmotter/swarmotterd.log")
+        );
+    }
+
+    #[test]
     fn transmission_compatibility_parses_and_env_overrides() {
         let toml = r#"
 [compatibility.transmission]

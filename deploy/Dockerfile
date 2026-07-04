@@ -1,23 +1,43 @@
-# Example Dockerfile for SwarmOtter.
-#
-# Build: docker build -t swarmotter .
-# Run:   see docker-compose example in design/deployment.md
-#
-# For strict network containment, run the daemon inside a VPN network
-# namespace or a container attached to a VPN network so torrent traffic
-# cannot use the default route. The control plane (API/Web UI) should be
-# exposed separately on the LAN.
+ARG RUST_VERSION=1.96.1
 
-FROM rust:1-bookworm AS builder
+FROM rust:${RUST_VERSION}-bookworm AS builder
 WORKDIR /src
+
+ARG SWARMOTTER_BUILD_COMMIT=unknown
+ENV CARGO_TERM_COLOR=always
+ENV SWARMOTTER_BUILD_COMMIT=${SWARMOTTER_BUILD_COMMIT}
+
 COPY . .
-RUN cargo build --release --bin swarmotterd
+RUN cargo build --locked --release --bin swarmotterd
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /src/target/release/swarmotterd /usr/local/bin/swarmotterd
-COPY config/swarmotter.toml.example /etc/swarmotter/swarmotter.toml
+
+ARG SWARMOTTER_BUILD_COMMIT=unknown
+ARG SWARMOTTER_IMAGE_CREATED=unknown
+ARG SWARMOTTER_VERSION=1.0.0
+
+LABEL org.opencontainers.image.title="SwarmOtter" \
+      org.opencontainers.image.description="SwarmOtter BitTorrent daemon and web UI" \
+      org.opencontainers.image.version="${SWARMOTTER_VERSION}" \
+      org.opencontainers.image.created="${SWARMOTTER_IMAGE_CREATED}" \
+      org.opencontainers.image.revision="${SWARMOTTER_BUILD_COMMIT}" \
+      org.opencontainers.image.source="https://github.com/sphildreth/swarmotter" \
+      org.opencontainers.image.url="https://github.com/sphildreth/swarmotter" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 swarmotter \
+    && useradd --system --uid 10001 --gid swarmotter --home-dir /var/lib/swarmotter --shell /usr/sbin/nologin swarmotter \
+    && install -d -o swarmotter -g swarmotter /etc/swarmotter /var/lib/swarmotter /data/downloads /data/incomplete
+
+COPY --from=builder --chown=root:root /src/target/release/swarmotterd /usr/local/bin/swarmotterd
+COPY --chown=root:root config/swarmotter.container.toml.example /etc/swarmotter/swarmotter.toml
+
 VOLUME ["/data/downloads", "/data/incomplete", "/var/lib/swarmotter"]
 EXPOSE 9091
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl -fsS http://127.0.0.1:9091/health >/dev/null || exit 1
+USER swarmotter:swarmotter
 ENTRYPOINT ["/usr/local/bin/swarmotterd"]
 CMD ["--config", "/etc/swarmotter/swarmotter.toml"]

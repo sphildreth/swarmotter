@@ -57,6 +57,15 @@ foundational dependency stack rationale.
 | rcgen | 0.13 | MIT/Apache-2.0 | Self-signed certificate generation for the local HTTPS tracker fixture only |
 | rustls-pemfile | 2 | Apache-2.0/MIT | PEM parsing for test TLS fixtures |
 
+## Documentation tooling and vendored assets
+
+| Component | Version | License | Justification |
+|-----------|---------|---------|---------------|
+| mdBook | 0.5.0 | MPL-2.0 | Build-time user-guide site generator for `docs/` |
+| mdbook-mermaid | 0.17.0 | MPL-2.0 | Build-time mdBook preprocessor for Mermaid diagrams |
+| Mermaid.js | Bundled by mdbook-mermaid 0.17.0 | MIT | Browser runtime for rendered Mermaid diagrams in the published user guide |
+| mermaid-init.js | Bundled by mdbook-mermaid 0.17.0 | MPL-2.0 | Theme-aware Mermaid initialization script for mdBook |
+
 ## Network containment note
 
 None of the direct dependencies above create torrent data-plane network

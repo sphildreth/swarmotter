@@ -1,0 +1,37 @@
+services:
+  vpn:
+    image: qmcgaw/gluetun:latest
+    container_name: swarmotter-vpn
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    env_file:
+      - ${GLUETUN_ENV_FILE:-gluetun.env}
+    environment:
+      TZ: ${TZ:-America/Chicago}
+      FIREWALL: "on"
+      UPDATER_PERIOD: ${UPDATER_PERIOD:-24h}
+    ports:
+      - "${SWARMOTTER_WEB_PORT:-9091}:9091"
+    volumes:
+      - "${GLUETUN_STATE_DIR:-/srv/swarmotter/gluetun}:/gluetun"
+    restart: unless-stopped
+
+  swarmotter:
+    image: ${SWARMOTTER_IMAGE:-ghcr.io/sphildreth/swarmotter:latest}
+    container_name: swarmotter
+    depends_on:
+      vpn:
+        condition: service_healthy
+    network_mode: "service:vpn"
+    environment:
+      SWARMOTTER_API__AUTH_TOKEN: ${SWARMOTTER_API_TOKEN:?set SWARMOTTER_API_TOKEN in deploy/.env}
+    volumes:
+      - "${SWARMOTTER_CONFIG:-/srv/swarmotter/config/swarmotter.toml}:/etc/swarmotter/swarmotter.toml:ro"
+      - "${SWARMOTTER_DOWNLOADS:-/srv/swarmotter/downloads}:/data/downloads"
+      - "${SWARMOTTER_INCOMPLETE:-/srv/swarmotter/incomplete}:/data/incomplete"
+      - "${SWARMOTTER_STATE:-/srv/swarmotter/state}:/var/lib/swarmotter"
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped

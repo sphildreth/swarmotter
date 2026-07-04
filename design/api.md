@@ -1,319 +1,54 @@
-# API
+# API Design Notes
 
-This document describes SwarmOtter's API surface. The API is a first-class
-product surface (see ADR-0004) and is implemented in the `swarmotter-api`
-crate on top of `axum` (see ADR-0009, ADR-0010).
+This document records the design contract for SwarmOtter's API. User-facing
+endpoint documentation belongs in the published mdBook page:
+`../docs/api.md`.
 
-## Principles
+The API is a first-class product surface (ADR-0004). It is implemented in the
+`swarmotter-api` crate on top of `axum`; foundational decisions are recorded in
+ADR-0009 and ADR-0010.
+
+## Design principles
 
 - JSON request/response by default.
-- Consistent envelope with machine-readable error codes and human-readable
-  messages.
-- Stable object identifiers (info hashes).
-- API versioning via the `/api/v1` prefix.
-- Complete coverage of user-facing features.
-- Suitable for scripts and browser integrations.
-- The Web UI uses the same API as external automation.
+- Consistent `{ success, data, error }` response envelope.
+- Stable snake_case machine-readable error codes.
+- Stable object identifiers based on torrent info hashes.
+- Native API versioning through the `/api/v1` prefix.
+- Complete coverage of user-facing daemon features.
+- Suitable for scripts, browser integrations, and the built-in Web UI.
+- The Web UI uses the same API as external automation; it does not have a
+  privileged internal channel.
 
-## Response format
+## Compatibility contract
 
-All responses use:
+- Breaking native API changes require a new version prefix, such as `/api/v2`,
+  rather than changing `/api/v1` in place.
+- Error codes are part of the automation contract. Rename or removal requires
+  the same compatibility treatment as a breaking API field change.
+- SSE and WebSocket events share the same event object shape.
+- Optional compatibility endpoints, currently `/transmission/rpc`, are isolated
+  from the native API and delegate to native daemon operations rather than a
+  second torrent engine.
+- Authentication policy is shared: when API auth is enabled, compatibility
+  adapters must map their auth mechanism back to `api.auth_token`.
 
-```json
-{ "success": true, "data": {}, "error": null }
-```
+## Implementation ownership
 
-Errors:
+- Route assembly lives in `crates/swarmotter-api/src/routes.rs`.
+- Handler modules live under `crates/swarmotter-api/src/handlers/`.
+- Shared daemon-facing traits and response state live in
+  `crates/swarmotter-api/src/state.rs`.
+- API-visible model structs should come from stable core/domain models where
+  practical, not ad hoc handler-local shapes.
 
-```json
-{
-  "success": false,
-  "data": null,
-  "error": {
-    "code": "network_blocked",
-    "message": "Required torrent network interface tun0 is not available."
-  }
-}
-```
+## Maintenance
 
-HTTP status codes reflect the error class: 400 (bad input), 404 (not found),
-409 (duplicate), 503 (network/containment blocked), 500 (internal). Stable
-error codes are derived from the core error model
-(`swarmotter-core::error::CoreError`).
+When API behavior changes:
 
-## Authentication and Limits
-
-When `api.require_auth = true`, every `/api/v1` route requires the configured
-token via either `Authorization: Bearer <token>` or
-`X-SwarmOtter-Auth: <token>`. Startup validation rejects this mode unless
-`api.auth_token` is set. `GET /api/v1/settings` never returns the token value.
-
-API request bodies are capped by `api.max_request_body_bytes`; this applies to
-JSON requests and raw `.torrent` uploads. The root `/health` alias remains a
-control-plane health endpoint outside `/api/v1`.
-
-Optional Transmission compatibility is intentionally isolated from the native API:
-when enabled, `POST /transmission/rpc` is a compatibility adapter over existing
-`DaemonOps`, not a second torrent engine. Authentication and failure behavior
-for this endpoint must match SwarmOtter policy:
-
-- When `api.require_auth = true`, HTTP Basic auth is accepted and maps to API auth.
-  The Basic password must equal `api.auth_token`; the username is not security-
-  significant.
-- When `api.require_auth = false`, auth headers are not required for this endpoint.
-- The endpoint participates in `X-Transmission-Session-Id` enforcement:
-  requests without a current session ID header are rejected and return a session
-  mismatch response with a new `X-Transmission-Session-Id` header.
-- Only Transmission RPC is in scope. No qBittorrent API compatibility is added in
-  this phase.
-
-## Endpoints
-
-All routes are prefixed with `/api/v1`. A root `/health` alias also exists.
-
-### Health, version, stats
-
-| Method | Path | Description |
-| --- | --- | --- |
-| GET | `/health` | Daemon + network health |
-| GET | `/version` | Version/build info |
-| GET | `/stats` | Global stats |
-
-### Compatibility endpoints
-
-Optional adapters that are not part of the native API are served in this section:
-
-| Method | Path | Description |
-| --- | --- | --- |
-| POST | `/transmission/rpc` | Transmission RPC compatibility endpoint when enabled |
-
-The Transmission adapter currently supports:
-
-- session reads/writes for mapped live-safe settings: `session-get`,
-  `session-set`, `session-stats`, `session-close`
-- torrent reads and lifecycle actions: `torrent-get`, `torrent-start`,
-  `torrent-start-now`, `torrent-stop`, `torrent-verify`, `torrent-reannounce`
-- torrent mutation: `torrent-add`, `torrent-remove`, `torrent-set`,
-  `torrent-set-location`, `torrent-rename-path`
-- queue movement: `queue-move-top`, `queue-move-up`, `queue-move-down`,
-  `queue-move-bottom`
-- compatibility helpers: `free-space`, `port-test`, `blocklist-update`
-
-`torrent-remove` maps `delete-local-data` / `delete_local_data` to the native
-delete-data option, so clients using that flag can delete payload data.
-
-`torrent-add` supports:
-
-- magnet links via `filename`
-- base64 torrent metadata via `metainfo`
-
-For `torrent-add`, remote HTTP/HTTPS URLs are explicitly rejected to preserve
-containment while retaining local metadata intake through existing engine-backed
-operations.
-
-### Torrent management
-
-| Method | Path | Description |
-| --- | --- | --- |
-| GET | `/torrents` | List torrents |
-| POST | `/torrents` | Add magnet (JSON) or torrent file (raw body) |
-| POST | `/torrents/magnet` | Add magnet (JSON `{ magnet, download_dir? }`) |
-| POST | `/torrents/file` | Upload `.torrent` (raw body) |
-| GET | `/torrents/:hash` | Torrent details |
-| GET | `/torrents/:hash/stats` | Per-torrent counters and live engine diagnostics |
-| DELETE | `/torrents/:hash?delete_data=bool` | Remove (optionally delete data) |
-| POST | `/torrents/:hash/pause` | Pause |
-| POST | `/torrents/:hash/resume` | Resume |
-| POST | `/torrents/:hash/start` | Start now (bypass queue) |
-| POST | `/torrents/:hash/stop` | Stop |
-| POST | `/torrents/:hash/recheck` | Force recheck |
-| POST | `/torrents/:hash/reannounce` | Reannounce |
-| POST | `/torrents/:hash/move` | Move data (`{ path }`) |
-| POST | `/torrents/:hash/labels` | Set labels (`{ labels }`) |
-| POST | `/torrents/:hash/limits` | Set per-torrent bandwidth limits (`{ download_limit, upload_limit }`, bytes/sec, 0 = unlimited; applies live) |
-
-`/torrents/:hash/stats` includes download/upload counters, rates, limits,
-`active_peer_workers`, `known_peers`, live peer diagnostics (`peer_scheduler`,
-`useful_peers`, `unchoked_peers`, `choked_peers`, `recent_peer_failures`),
-tracker diagnostics (`tracker_ok`, `tracker_message`, `last_announce`,
-`recent_tracker_failures`, `tracker_last_ok_seconds_ago`), and discovery
-freshness (`dht_discovery_ok`, `dht_last_seen_seconds_ago`,
-`pex_discovery_ok`, `pex_last_seen_seconds_ago`). Nullable diagnostic fields
-mean the daemon has not published that live signal.
-
-### Files
-
-| Method | Path | Description |
-| --- | --- | --- |
-| GET | `/torrents/:hash/files` | List files |
-| PATCH | `/torrents/:hash/files` | Alias for set wanted |
-| POST | `/torrents/:hash/files/wanted` | Set wanted (`{ file_indices, wanted }`) |
-| POST | `/torrents/:hash/files/priority` | Set priority (`{ file_indices, priority }`) |
-| POST | `/torrents/:hash/files/:index/rename` | Rename path (`{ new_path }`) |
-
-### Trackers
-
-| Method | Path | Description |
-| --- | --- | --- |
-| GET | `/torrents/:hash/trackers` | List trackers |
-| POST | `/torrents/:hash/trackers` | Add tracker (`{ url }`) |
-| DELETE | `/torrents/:hash/trackers/:url` | Remove tracker |
-| POST | `/torrents/:hash/trackers/edit` | Edit tracker (`{ old_url, new_url }`) |
-
-Tracker rows expose per-URL announce status. `last_error` is populated only for
-failed announces, while `last_message` carries the latest successful announce
-message. `seeders`, `leechers`, `downloads`, and `last_announce` are populated
-from the last live announce result for that tracker URL when the engine has
-reported one.
-
-### Peers
-
-| Method | Path | Description |
-| --- | --- | --- |
-| GET | `/torrents/:hash/peers` | List peers |
-
-### Queue
-
-| Method | Path | Description |
-| --- | --- | --- |
-| POST | `/torrents/:hash/queue/move-up` | Move up |
-| POST | `/torrents/:hash/queue/move-down` | Move down |
-| POST | `/torrents/:hash/queue/move-top` | Move to top |
-| POST | `/torrents/:hash/queue/move-bottom` | Move to bottom |
-
-### Settings
-
-| Method | Path | Description |
-| --- | --- | --- |
-| GET | `/settings` | Get configuration (API auth token redacted) |
-| PATCH | `/settings` | Update safe runtime settings (bandwidth/queue/seeding) |
-| PUT | `/settings` | Replace full configuration atomically after validation; reports restart-required fields |
-
-### Network
-
-| Method | Path | Description |
-| --- | --- | --- |
-| GET | `/network/health` | Network containment health |
-| GET | `/network/diagnostics` | Detailed network/path diagnostics for health troubleshooting |
-
-### Watch folders
-
-| Method | Path | Description |
-| --- | --- | --- |
-| POST | `/watch/scan` | Trigger a scan |
-| GET | `/watch/history` | Import history |
-| GET | `/watch/status` | Watch-folder status, folder readiness, and recent imports |
-
-### Logs and health checks
-
-| Method | Path | Description |
-| --- | --- | --- |
-| GET | `/logs/recent` | Recent daemon logs (`lines=1..500`, default 100) |
-| GET | `/doctor` | Consolidated operational health report for diagnostics panels |
-| POST | `/reset` | Stop all torrent work, remove torrent records, delete contents of configured download/incomplete directories, and clear daemon log files |
-
-`POST /reset` is destructive and must be presented by clients with an explicit
-confirmation step. The daemon preserves the configured `download_dir` and
-`incomplete_dir` root directories themselves, removes registered torrent
-payloads from per-torrent override locations, clears in-memory torrent/queue
-state, and truncates the active daemon log file so the running logger can
-continue writing to the same path.
-
-## Events (WebSocket/SSE)
-
-Required event types (per `design/PRD.md`): `torrent_added`,
-`torrent_changed`, `torrent_removed`, `torrent_error`,
-`torrent_metadata_received`, `torrent_completed`, `torrent_files_changed`,
-`torrent_trackers_changed`, `torrent_peers_changed`, `stats_updated`,
-`network_status_changed`, `watch_folder_imported`, `watch_folder_failed`,
-`settings_changed`, `daemon_health_changed`.
-
-- SSE: `GET /api/v1/events` (text/event-stream). Each event carries the event
-  `kind` and a JSON `payload`.
-- WebSocket: `GET /api/v1/ws`. Sends JSON `Event` objects
-  (`{ kind, info_hash, payload }`).
-- Both support per-torrent filtering via `?info_hash=<40-hex>`.
-
-Clients may subscribe to all torrents or filter to a specific torrent.
-
-## Per-torrent health
-
-Every torrent list row and detail response includes a `health` object that
-answers the question "can this torrent complete, and is it downloading well
-right now?" Health is computed from real engine state — piece availability,
-peer usefulness, throughput, recent stability, and discovery — and is not a
-proxy for seed count or completion percentage.
-
-Torrent summaries also include `active_peer_workers` and `known_peers` so UI
-and API clients can show current peer activity without making a separate
-diagnostics request for every row.
-
-```json
-{
-  "health": {
-    "score": 82,
-    "bars": 4,
-    "label": "good",
-    "availability_score": 91,
-    "throughput_score": 76,
-    "peer_score": 80,
-    "stability_score": 88,
-    "discovery_score": 70,
-    "reasons": [
-      "all missing pieces are available",
-      "6 useful peers are active"
-    ]
-  }
-}
-```
-
-Fields:
-
-- `score` (`0..100`): weighted health score. `0` = stalled / blocked /
-  paused (inactive), `100` = complete.
-- `bars` (`0..5`): UI mapping for signal-bars rendering.
-- `label`: one of `unknown`, `network_blocked`, `stalled`, `critical`,
-  `poor`, `fair`, `good`, `excellent`, `paused`, `complete`.
-- `availability_score` / `throughput_score` / `peer_score` /
-  `stability_score` / `discovery_score` (`0..100` each): the five
-  component sub-scores that combine into the overall score.
-- `reasons`: short human-readable strings explaining the score. Surfaced in
-  the Web UI as a tooltip and a list under the bars.
-
-Score formula:
-
-```text
-health_score =
-    availability_score * 0.40
-  + throughput_score   * 0.25
-  + peer_score         * 0.15
-  + stability_score    * 0.10
-  + discovery_score    * 0.10
-```
-
-Bar/label mapping:
-
-| Score  | Bars | Label             |
-| ---    | ---  | ---               |
-| 0      | 0    | `stalled`         |
-| 1..34  | 1    | `critical`        |
-| 35..54 | 2    | `poor`            |
-| 55..74 | 3    | `fair`            |
-| 75..89 | 4    | `good`            |
-| 90..100| 5    | `excellent`       |
-
-Hard caps override the weighted score: network containment blocking
-(`network_blocked`), paused (`paused`), or complete (`complete`) always
-short-circuit to their own label and score. Incomplete torrents with missing
-pieces that have zero known sources cap at 35; incomplete torrents with no
-useful peer cap at 30; incomplete torrents with no recently received valid
-block cap at 25; torrents with no discovery and no connected peers cap at
-20.
-
-Why health is not seed count: a torrent can have many seeders but no
-piece the client can actually fetch (choked, banned, slow, unidirectional
-NAT), or the client can be network-blocked. Health looks at whether the
-missing pieces are actually reachable from connected peers that are
-sending data right now. Health is also distinct from completion
-percentage: a 99% torrent with one missing piece that no connected peer
-has is stalled, not excellent, even though almost everything is on disk.
+1. Update handlers and tests.
+2. Update `../docs/api.md` for user-facing endpoint or payload changes.
+3. Update ADRs or this design note only when the compatibility contract or
+   architecture changes.
+4. Treat `/api/v1` compatibility as release-facing behavior; see
+   `VERSIONING_GUIDE.md`.

@@ -18,7 +18,7 @@ magnet metadata fetch, inbound seeding/upload, endgame mode, live bandwidth
 shaping, real disk I/O with fast resume, watch folders, browser magnet
 submission, queue/ratio/seeding controls, fail-closed VPN/NIC network
 containment, the complete REST API with WebSocket/SSE events, and a practical
-Web UI. See `docs/v1-completion-tracker.md` for the capability-by-capability
+Web UI. See `design/v1-completion-tracker.md` for the capability-by-capability
 status.
 
 ### Added
@@ -47,7 +47,7 @@ status.
   percentage. The Web UI renders a signal-bars indicator on the torrent
   list row and on the details header using CSS-only bars (no image
   asset), with a tooltip and a per-component sub-score table on the
-  details view. See `design/api.md` and `docs/v1-completion-tracker.md`.
+  details view. See `docs/api.md` and `design/v1-completion-tracker.md`.
 - **Web UI layout and peer counts:** the main Web UI content now uses the
   available window width instead of a centered 1200px cap, and the torrent
   list Peers column shows active peer workers / known peers from the summary
@@ -413,6 +413,9 @@ status.
   `swarmotter-api`, `swarmotter-web`).
 - Updated architecture, API, configuration, and deployment docs to reflect
   the implemented design.
+- Expanded the user-facing deployment and network-containment docs with
+  Gluetun guidance, Mermaid diagrams, and a GitHub Pages publishing workflow
+  for the mdBook output. ADR-0028 records the decision.
 - Updated `THIRD_PARTY_LICENSES.md` with the full direct dependency list and
   containment review notes.
 - Fixed `piece_file_ranges` to use the correct file index (it previously used
@@ -435,8 +438,8 @@ status.
   live bandwidth shaping, real disk I/O with fast resume, and the local-swarm
   download harness are implemented and tested end to end against local fixtures.
   All required `v1.0.0` data-plane capabilities are complete; see
-  `docs/v1-completion-tracker.md`.
+  `design/v1-completion-tracker.md`.
 - The single documented non-blocking limitation is OS-level DNS enforcement,
   which is platform-specific and not implemented in-process; the application
   fails closed (surfacing `dns_not_constrained`) when it cannot confirm DNS is
-  constrained in strict mode. See `docs/v1-completion-tracker.md`.
+  constrained in strict mode. See `design/v1-completion-tracker.md`.

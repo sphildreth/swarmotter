@@ -177,7 +177,7 @@ ADRs. When in doubt, create one. See
 
 ## Simple Homelab Deployment
 
-A typical homelab deployment will look like:
+A typical homelab deployment:
 
 1. Run a VPN container or VPN-enabled network namespace.
 2. Run `swarmotterd` inside that network path.
@@ -185,63 +185,20 @@ A typical homelab deployment will look like:
 4. Expose only the Web UI/API port to the LAN.
 5. Keep torrent peer / tracker / DHT traffic constrained to the VPN path.
 
-### Running the daemon
-
-```bash
-swarmotterd --config /etc/swarmotter/swarmotter.toml
-```
-
-### Example configuration
-
-```toml
-[api]
-bind_address = "0.0.0.0:9091"
-
-[storage]
-download_dir = "/data/downloads"
-incomplete_dir = "/data/incomplete"
-
-[network]
-mode = "strict"
-required_interface = "tun0"
-fail_closed = true
-allow_ipv6 = false
-
-[torrent]
-listen_port = 51413
-```
-
-When strict traffic containment matters, homelab admins should prefer a
-container / network namespace or VPN-routed deployment so the daemon cannot
-reach peers, trackers, or DHT except through the configured path.
-
-### Containers
-
-A conceptual Podman/Docker-style layout:
-
-```text
-┌─────────────────────────┐      ┌──────────────────────────┐
-│  VPN namespace / tun0    │◄────│  swarmotterd             │
-│  (default route for the  │      │  - API/UI on 0.0.0.0:9091│
-│   torrent data plane)    │      │  - peer/DHT on 51413     │
-└─────────────────────────┘      └──────────────────────────┘
-            │                                  │
-            ▼                                  ▼
-   torrent peers / trackers            LAN only (Web UI/API)
-```
-
-An example Dockerfile is provided in `deploy/Dockerfile`; see
-[`docs/deployment.md`](docs/deployment.md) for container, VPN
-network-namespace, and reverse-proxy setup.
-
-See [`docs/deployment.md`](docs/deployment.md).
+The full runbook lives in [`docs/deployment.md`](docs/deployment.md). Common
+configuration patterns live in [`docs/configuration.md`](docs/configuration.md).
 
 ## Documentation
+
+Published user guide:
+
+- <https://sphildreth.github.io/swarmotter/>
 
 User-facing documentation:
 
 - [User guide](docs/index.md)
 - [Configuration](docs/configuration.md)
+- [API reference](docs/api.md)
 - [Network containment](docs/network-containment.md)
 - [Deployment](docs/deployment.md)
 - [Troubleshooting](docs/troubleshooting.md)

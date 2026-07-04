@@ -4,7 +4,7 @@ This document summarizes SwarmOtter's plain-language legal posture. It is
 project policy and documentation, **not legal advice**. It does not replace
 review by qualified legal counsel where needed.
 
-For user-facing legal and content policy guidance, see `docs/legal.md`.
+For user-facing legal and content policy guidance, see `../docs/legal.md`.
 
 ## Project posture
 
@@ -31,8 +31,8 @@ Lawful-use expectations are documented in:
 - `design/lawful-use.md`
 - `design/content-policy.md`
 - This document.
-- `docs/lawful-use.md`
-- `docs/legal.md`
+- `../docs/lawful-use.md`
+- `../docs/legal.md`
 
 ## Branding and trademark
 

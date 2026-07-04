@@ -1,0 +1,16 @@
+.git
+.github
+.kilo
+.idea
+.vscode
+target
+debug
+**/*.rs.bk
+**/mutants.out*
+*.pdb
+*.log
+*.tmp
+*.swp
+*.swo
+deploy/.env
+deploy/gluetun.env

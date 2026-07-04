@@ -11,7 +11,7 @@ directory.
 
 - A daemon process, `swarmotterd`.
 - A Web UI served by the daemon.
-- A REST API under `/api/v1`.
+- A REST API under [`/api/v1`](api.md).
 - `.torrent`, magnet, tracker, DHT, PEX, TCP, UDP tracker, and uTP support.
 - IPv4 and IPv6 torrent networking when enabled by configuration.
 - Strict data-plane containment through an interface, source address, or network
@@ -34,4 +34,5 @@ torrent network configuration explicitly allows and enforces it.
 
 Use [Getting Started](getting-started.md) for a local run, then read
 [Configuration](configuration.md) for the common `br0`, VPN, and container
-configurations.
+configurations. Use [API Reference](api.md) for scripting and integration
+work.

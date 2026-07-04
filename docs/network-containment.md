@@ -17,11 +17,57 @@ It applies to torrent-related traffic:
 The API and Web UI are separate control-plane traffic and use
 `api.bind_address`.
 
+## Traffic planes
+
+SwarmOtter separates API/Web UI control traffic from torrent data-plane
+traffic. Network containment applies to the torrent data plane.
+
+```mermaid
+flowchart LR
+    subgraph control["Control plane"]
+        client["Browser or API client"] -->|"api.bind_address"| api["SwarmOtter API / Web UI"]
+    end
+
+    subgraph data["Torrent data plane"]
+        engine["SwarmOtter torrent engine"] -->|"containment boundary"| boundary["Required interface, source address, or contained namespace"]
+        boundary --> torrentNet["Peers, trackers, DHT, PEX peers, webseeds, and torrent DNS"]
+    end
+```
+
+For the Docker Compose deployment, the containment boundary is Gluetun:
+
+```mermaid
+flowchart TB
+    lan["LAN browser or API client"]
+
+    subgraph host["Docker host"]
+        published["Published port 9091"]
+        subgraph ns["Shared Gluetun network namespace"]
+            swarmotter["SwarmOtter service<br/>network_mode: service:vpn"]
+            firewall["Gluetun firewall"]
+        end
+    end
+
+    vpn["VPN tunnel"]
+
+    lan -->|"API / Web UI"| published --> swarmotter
+    swarmotter -->|"torrent data plane"| firewall --> vpn
+```
+
 ## Fail-closed behavior
 
 When strict containment is enabled and the configured path is unavailable,
 SwarmOtter blocks torrent networking instead of falling back to the default
 route.
+
+```mermaid
+flowchart TB
+    operation["Torrent operation"] --> check{"Required path healthy?"}
+    check -->|"yes"| path["Contained network path"]
+    check -->|"no"| blocked["Blocked fail closed"]
+
+    api["API / Web UI"] --> status["Status and remediation remain available"]
+```
 
 Common fail-closed conditions:
 

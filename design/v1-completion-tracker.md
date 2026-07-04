@@ -259,7 +259,7 @@ UDP socket (see ADR-0020).
       with a tooltip and a per-component sub-score table on the details
       view. The same `health` object is exposed in the API and rendered by
       the Web UI; the UI is CSS-only (no image asset). See
-      `design/api.md` for the score formula and bar/label mapping.
+      `../docs/api.md` for the score formula and bar/label mapping.
 
 ### Deployment
 
