@@ -1,6 +1,6 @@
 # SwarmOtter Comparison Matrix
 
-Last reviewed: 2026-07-04
+Last reviewed: 2026-07-03
 
 This document compares SwarmOtter with popular free and open-source torrent
 clients. It is intended to help users understand product fit, feature coverage,
@@ -16,6 +16,35 @@ project-owned documentation, and project repositories listed in
 SwarmOtter is not a torrent indexer, search engine, piracy assistant, or
 content-discovery tool. Features involving feeds or automation are framed for
 lawful, user-configured distribution workflows only.
+
+## Why the policy exclusions are a feature, not a gap
+
+Several cells in this matrix show `❌ Policy` for built-in search, bundled
+indexers, and content-discovery integrations. This is a deliberate product
+posture, not a missing feature. Many institutional, educational,
+public-sector, enterprise-adjacent, and family-shared-server deployments
+cannot adopt a client that ships search plugins, default indexers, or
+content-discovery surfaces, regardless of how those features are framed.
+By refusing to ship those surfaces, SwarmOtter fits a deployment niche
+that mainstream clients cannot occupy: the daemon is safe to hand to
+non-technical operators and to run in policy-restricted environments
+without per-deployment content scrubbing. The lawful-use and content-
+policy posture is therefore a market-differentiating feature, not a
+limitation, and it is one of the project's primary competitive moats.
+See `design/lawful-use.md` and `design/content-policy.md` for the
+authoritative scope.
+
+## Footnotes
+
+- **Local peer discovery (SwarmOtter ❌):** SwarmOtter deliberately does
+  not implement local-network peer discovery. Local discovery is a
+  convenience feature for finding peers on the same LAN; for a daemon
+  that targets fail-closed network containment, the failure modes
+  (unintended broadcast, multicast on hostile LANs, discovery on
+  networks the operator did not approve) outweigh the benefit. Operators
+  who need LAN-local peer sharing can configure a private tracker or a
+  known peer set explicitly. This is a scope decision, not a roadmap
+  item.
 
 ## Legend
 
@@ -142,12 +171,19 @@ usable, remove it from `design/BACKLOG.md` and update this comparison.
 | P1 | Seed Prioritization (Low-Seed First) | Improves swarm-health-aware seeding behavior. |
 | P1 | OpenAPI Specification & Interactive API Docs | Improves automation discoverability for native and compatibility APIs. |
 | P1 | User-Configured Lawful RSS Feeds | Adds feed automation for lawful user-supplied sources without making SwarmOtter a content-discovery product. |
+| P1 | Trust and Provenance Signals for Torrents and Trackers | Adds per-tracker trust state, allow/deny integration, and signed-`.torrent` provenance verification for institutional lawful-distribution workflows. No mainstream client offers a comparable tracker-trust surface. |
+| P1 | Operator Audit Log for Torrent Lifecycle Events | Adds a structured, exportable, optionally hash-chained audit trail for privileged operations. Combined with Multi-User (P0) this is the compliance story shared-server and seedbox deployments need. No mainstream client offers a comparable surface. |
+| P1 | Explainability API: Structured Reasons for Non-Trivial Decisions | Unifies "why is this slow / dead / rejected / blocked" across autopilot, disk optimizer, fail-closed, and bandwidth decisions behind one machine-readable code-and-message surface. No mainstream client offers this. |
+| P1 | Container / Sandbox-First Deployment Story | Promotes the OCI image, rootless operation, read-only-filesystem operation, Helm chart, and Compose file to first-class artifacts in this repository. Matches the "Linux/server and homelab" positioning in the Project Positioning table. |
+| P1 | Production Health / Availability Surface | Adds `/healthz/live` and `/healthz/ready` plus a synthetic end-to-end check torrent and SLO-style summaries, making SwarmOtter the first torrent daemon suitable as a Kubernetes/CI workload. |
+| P1 | Filesystem Snapshot Integration | Adds opt-in snapshot hooks for Btrfs subvolumes, ZFS, and Snapper so operators get rollback for torrent roots and state directories. No mainstream client offers this. |
+| P1 | Client-Identity Fingerprinting and Rollups | Adds per-torrent and per-tracker client composition rollups so operators of legal swarms can prioritize compatibility and understand their contribution. |
 | P1/P2 | Native Cross-Seed & Hardlink-Aware Storage | Reduces duplicate downloading and improves storage efficiency for legal multi-torrent libraries. |
 | P2 | Sequential Download / Streaming / File Preview | Closes a common qBittorrent/BiglyBT/aria2-style user workflow gap. |
 | P2 | Protocol modernization roadmap | Tracks BEP 52 v2/hybrid and other protocol compatibility improvements. |
 | P2 | Long-horizon observability | Adds historical metrics beyond current live status and peak log events. |
 | P2 | Settings search and low-risk UI personalization | Improves dense configuration UX without changing project priorities. |
-| P2 | Calendar-Based Bandwidth Scheduler | Adds time-of-day limits to complement static and adaptive bandwidth controls. |
+| P2 | Time-of-Day and Adaptive Bandwidth Policies | Combines calendar-style schedules with the Adaptive Swarm Performance Autopilot (P0) into a single per-profile bandwidth policy surface; the user mental model is one feature, not two. |
 | P2 | Backup / Restore & Bulk Import/Export | Improves migration and disaster recovery for large libraries. |
 | P2 | Thin Client / Remote Session Architecture | Adds a richer remote-client model beyond the Web UI and API. |
 | P2 | OpenTelemetry Observability | Adds cloud-native metrics and tracing export. |
@@ -155,6 +191,8 @@ usable, remove it from `design/BACKLOG.md` and update this comparison.
 | P3 | Alternate privacy-preserving transports | Requires containment, lawful-use, and operational-risk review before acceptance. |
 | P3 | Swarm Merging (BiglyBT-style) | Adds matching-content acceleration across torrents or lawful HTTP sources. |
 | P3 | Terminal UI / Console Interface | Adds a terminal-first operator interface similar in spirit to rTorrent or Deluge Console. |
+| P3 | Localization Strategy for the Web UI, API Errors, and Docs | Adds a documented translation workflow and source-string extraction without localizing structured logs. |
+| P3 | Documentation Discoverability | Adds a search index for `docs/` and a built-in help pane in the Web UI tied to the daemon version. |
 
 ## Sources
 

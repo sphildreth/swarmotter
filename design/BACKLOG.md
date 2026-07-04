@@ -50,11 +50,18 @@ project.
 | P1 | OpenAPI Specification & Interactive API Docs | Auto-generated OpenAPI/JSON Schema with Swagger UI for native and compatibility API surfaces | Flood Swagger UI, Deluge API docs, self-hosting automation integration |
 | P1 | User-Configured Lawful RSS Feeds | Ingest content from user-supplied lawful RSS feeds as part of lawful distribution workflows | Deluge RSS plugin, rTorrent RSS, self-hosting RSS workflows; see lawful-use policy |
 | P1/P2 | Native Cross-Seed & Hardlink-Aware Storage | Match on-disk data to new torrents by piece layout; link instead of re-download | cross-seed (external tool), self-hosting hardlink layouts, BiglyBT |
+| P1 | Trust and Provenance Signals for Torrents and Trackers | Per-tracker trust state, tracker allowlists/denylists, and signed-`.torrent` provenance verification for lawful-distribution workflows | eMule/PeerGuardian blocklists, signed-release workflows, transmission tracker whitelists |
+| P1 | Operator Audit Log for Torrent Lifecycle Events | Structured, exportable, optionally hash-chained audit trail for privileged operations; combines with multi-user for compliance | qBittorrent activity log, rTorrent XMLRPC, Flood multi-user, self-hosting compliance |
+| P1 | Explainability API: Structured Reasons for Non-Trivial Decisions | Unified, machine-readable reasons across autopilot, disk optimizer, fail-closed, and bandwidth decisions | Sonarr/Radarr import failure reasons, Flood API exploration, operator tooling |
+| P1 | Container / Sandbox-First Deployment Story | First-class OCI image, rootless and read-only-filesystem operation, Helm chart and Compose file as in-repo artifacts | Sonarr/Radarr container deployment, *arr community images, Podman/Kubernetes patterns |
+| P1 | Production Health / Availability Surface | Liveness/readiness endpoints, synthetic end-to-end check torrent, SLO-style summaries for orchestrators | Kubernetes liveness/readiness, Consul/Nomad health, cloud-native SLO conventions |
+| P1 | Filesystem Snapshot Integration | Opt-in snapshot hooks on Btrfs subvolumes, ZFS, and Snapper; rollback for torrent roots and state | Snapper, ZFS, Btrfs subvolume workflows, self-hosting rollback patterns |
+| P1 | Client-Identity Fingerprinting and Rollups | Per-torrent and per-tracker client rollups for swarm composition visibility and prioritization | qBittorrent peer client string, BiglyBT peer view, rTorrent peer text |
 | P2 | Sequential Download / Streaming / File Preview | Sequential/priority-first fetch; in-place preview and verify; metadata-first preview | qBittorrent sequential download, aria2, WebTorrent streaming, Deluge |
 | P2 | Protocol modernization roadmap | Stay ahead of compatibility and swarm reachability changes; BEP 52 v2/hybrid handling | qBittorrent [#23421](https://github.com/qbittorrent/qBittorrent/issues/23421), [#24600](https://github.com/qbittorrent/qBittorrent/issues/24600), Transmission [#3387](https://github.com/transmission/transmission/issues/3387), [#3705](https://github.com/transmission/transmission/issues/3705), [#993](https://github.com/transmission/transmission/issues/993) |
 | P2 | Long-horizon observability | Preserve useful history beyond current live status and make operational events auditable | Transmission [#5591](https://github.com/transmission/transmission/issues/5591), qBittorrent [#22832](https://github.com/qbittorrent/qBittorrent/issues/22832), [#18525](https://github.com/qbittorrent/qBittorrent/issues/18525), [#24330](https://github.com/qbittorrent/qBittorrent/issues/24330) |
 | P2 | Settings search and low-risk UI personalization | Make dense configuration easier to operate without turning the UI into a theme project | qBittorrent [#23654](https://github.com/qbittorrent/qBittorrent/issues/23654), [#22877](https://github.com/qbittorrent/qBittorrent/issues/22877), [#22913](https://github.com/qbittorrent/qBittorrent/issues/22913), Transmission [#4304](https://github.com/transmission/transmission/issues/4304), [#5648](https://github.com/transmission/transmission/issues/5648) |
-| P2 | Calendar-Based Bandwidth Scheduler | Time-of-day alt-speed/limit schedules to complement the adaptive autopilot | qBittorrent scheduler, aria2 bandwidth scheduling, Deluge scheduler |
+| P2 | Time-of-Day and Adaptive Bandwidth Policies | Time-of-day schedules merged with the adaptive autopilot into a single per-profile bandwidth policy surface | qBittorrent scheduler, aria2 bandwidth scheduling, Deluge scheduler, adaptive autopilot (P0) |
 | P2 | Backup / Restore & Bulk Import/Export | Export/import torrent list and state for migration and disaster recovery of large libraries | qBittorrent backup, Deluge export, Flood backup/restore |
 | P2 | Thin Client / Remote Session Architecture | Connect a native or web client to a remote daemon via a streaming RPC protocol without SSH tunneling | Deluge thin-client architecture, qBittorrent remote session requests, Flood multi-backend |
 | P2 | OpenTelemetry Observability | Distributed tracing, span export, and OTLP metrics export for cloud-native monitoring | OpenTelemetry standard, Flood OpenAPI+Swagger, cloud-native deployment patterns |
@@ -62,6 +69,8 @@ project.
 | P3 | Alternate privacy-preserving transports | Evaluate only if strict containment, lawful-use messaging, and operational risk are solved | Transmission [#7230](https://github.com/transmission/transmission/issues/7230), qBittorrent [#23665](https://github.com/qbittorrent/qBittorrent/issues/23665), [#24241](https://github.com/qbittorrent/qBittorrent/issues/24241), [#23064](https://github.com/qbittorrent/qBittorrent/issues/23064) |
 | P3 | Swarm Merging (BiglyBT-style) | Complete or accelerate a torrent using matching content from other torrents or HTTP sources | BiglyBT swarm merging, self-hosting seedbox workflows |
 | P3 | Terminal UI / Console Interface | ncurses-based TUI for low-resource headless environments and terminal-first workflows | rTorrent ncurses TUI, Deluge `deluge-console`, aria2 CLI |
+| P3 | Localization Strategy for the Web UI, API Errors, and Docs | Documented translation workflow, source-string extraction, and an explicit English-authoritative policy | qBittorrent translations, Deluge and ruTorrent community translations |
+| P3 | Documentation Discoverability | Search index for `docs/` and a built-in help pane in the Web UI tied to daemon version | mdBook search, DocSearch, Sonarr/Radarr in-app help |
 
 ## P0 Features
 
@@ -254,7 +263,13 @@ SwarmOtter feature shape:
 - Support multiple auth modes: Bearer API key (Sonarr/Radarr preferred, as of
   2026), session cookie (`/api/v2/auth/login`), and HTTP Basic Auth as fallback.
 - Map category/label semantics, completion/import semantics, and torrent-state
-  transitions to match client expectations.
+  transitions to match client expectations. qBittorrent's category model maps
+  to SwarmOtter policy profiles and labels with explicit per-compatibility-
+  endpoint parity; Sonarr/Radarr workflows that key off qBittorrent categories
+  work without manual translation.
+- Map Sonarr/Radarr "import" semantics: the import path returns the
+  expected torrent state transition, label, and download root so *arr
+  pipelines complete the import step without custom scripting.
 - Native API remains the source of truth; compatibility endpoints delegate to it.
 - No indexer, search, or content-discovery surface is exposed through
   compatibility endpoints.
@@ -323,6 +338,10 @@ SwarmOtter feature shape:
 - Add role-based access control: read-only, operator, and admin roles.
 - Add per-user torrent isolation: each user sees only their own torrents.
 - Add per-user quotas: storage, active torrents, bandwidth caps.
+- Add per-user storage roots: each user has their own download,
+  incomplete, and state directories; roots are configurable per user and
+  can be combined with per-profile network-path binding (existing P0)
+  for full per-user isolation on a shared host.
 - Add per-user API keys with scoped permissions.
 - Integrate with policy profiles (existing P0) for per-user default settings.
 - Integrate with per-profile network-path binding (existing P0) for per-user
@@ -332,8 +351,11 @@ SwarmOtter feature shape:
 Acceptance direction:
 
 - Multi-user support must not weaken network containment; each user's traffic
-  remains bound to their assigned network path.
+  remains bound to their assigned network path, and per-user storage roots
+  are enforced at the daemon level rather than at the API layer alone.
 - User isolation must be enforced at the daemon level, not just the API layer.
+- Per-user storage roots and per-user network paths together constitute the
+  seedbox-grade isolation model that shared-server deployments require.
 - Implementing this requires an ADR (new auth model + user isolation semantics).
 
 ## P1 Features
@@ -478,6 +500,10 @@ SwarmOtter feature shape:
 - Add notification transports: webhook, ntfy, Apprise, and email — to extend
   automation with user-preferred delivery channels without requiring per-hook
   scripting.
+- Webhook transports support HMAC-signed payloads, configurable retry with
+  exponential backoff, replay protection via timestamp and nonce, and
+  per-transport rate limits so a noisy upstream cannot exhaust the daemon's
+  automation budget.
 
 ### Content Organization Controls
 
@@ -753,6 +779,292 @@ Acceptance direction:
 - No silent data loss; link vs copy decision is explicit and auditable.
 - Implementing this likely requires an ADR (persistent storage conventions).
 
+### Trust and Provenance Signals for Torrents and Trackers
+
+Problem: lawful distributors and operators managing legitimate content need
+to know whether a torrent or a tracker host is one they can rely on. Mainstream
+clients treat every `.torrent` and every tracker host as equally trusted. For
+institutional, educational, public-sector, and enterprise-adjacent deployments
+this is a real gap and a real differentiator for a lawful-use daemon.
+
+Requested elsewhere:
+
+- eMule/PeerGuardian blocklists encode CIDR ranges of untrusted peers but do
+  not encode tracker host trust.
+- Linux distributions, open-source projects, and public archives sign their
+  release artifacts; there is no standard `signed-torrent` workflow in
+  mainstream clients.
+- Operators have asked for tracker whitelists and trusted-tracker workflows
+  in transmission and qBittorrent discussions.
+
+SwarmOtter feature shape:
+
+- Add a per-tracker trust state: trusted, neutral, untrusted, or blocked,
+  with an explicit operator-controlled source (manual, imported, learned).
+- Support tracker allowlists and denylists integrated with the existing IP
+  filtering workbench (P1) and policy profiles (P0).
+- Surface, for every torrent, the trust state of every active tracker and
+  the effective upload/download policy the daemon is applying because of it.
+- Support a content provenance mode: import `.torrent` files and magnets
+  with an attached cryptographic signature (current-signing-community formats
+  plus a documented SwarmOtter-side verification helper) so operators can
+  verify a release matches a publisher-signed manifest before intake.
+- The provenance mode is opt-in and is not a new bundled indexer or content-
+  discovery surface; it verifies what the operator already has.
+
+Acceptance direction:
+
+- Trust state is auditable in the API, the UI, and the operator audit log.
+- No tracker host is silently blocked; changes to trust state are surfaced.
+- Provenance verification never weakens containment; signature fetch follows
+  the same network path as webseeds.
+- Implementing this likely requires an ADR (introduces a new metadata
+  surface and an operator trust model).
+
+### Operator Audit Log for Torrent Lifecycle Events
+
+Problem: long-horizon observability (existing P2) covers metrics. Operators
+of shared servers, seedbox platforms, and institutional deployments also need
+**who-did-what-when** records for torrent lifecycle events. Mainstream
+clients keep at most a small activity log; there is no structured audit
+trail.
+
+Requested elsewhere:
+
+- qBittorrent, rTorrent, Deluge, and Transmission all keep short, plain-text
+  activity logs. None ship a structured, exportable, tamper-evident audit
+  trail.
+- Flood ships multi-user backends with no per-user audit surface beyond log
+  files.
+- Self-hosting operators running Sonarr/Radarr against a torrent daemon
+  frequently want to know which user added, removed, or modified which
+  torrent at which time.
+
+SwarmOtter feature shape:
+
+- Emit a structured audit event for every privileged or destructive
+  operation: add, remove, delete-data, move, recheck, profile change,
+  tracker edit, settings change, user management, automation hook
+  execution, and network-binding state change.
+- Each event includes actor (user, API key, system), timestamp, target
+  (torrent, profile, storage root, user, setting), operation, parameters,
+  outcome, and the request identifier that produced it.
+- Persist to a dedicated append-only log file with optional hash chaining
+  so tampering is detectable.
+- Support operator-controlled retention and export (JSON Lines) and
+  integration with syslog and OpenTelemetry (P2) as additional sinks.
+- Read access is permissioned; only operators with the audit role see the
+  full event stream.
+
+Acceptance direction:
+
+- Audit events never include payloads, file contents, or peer IPs by
+  default; info hashes, profile names, setting keys, and user identifiers
+  are sufficient for compliance and operations.
+- Hash chaining is documented; missing or inconsistent chains are reported
+  in the Doctor and in the audit API.
+- This is the compliance story that combines with Multi-User Support (P0)
+  for shared-server and seedbox deployments.
+
+### Explainability API: Structured Reasons for Non-Trivial Decisions
+
+Problem: operators and advanced users want a single, machine-readable way
+to ask "why is this torrent dead?", "why was this add request rejected?",
+"why is my path fail-closed right now?", and "why is global throughput
+limited right now?" Today the data is spread across the API, the logs, the
+Doctor report, and individual torrent stats. Mainstream clients have no
+unified explainability surface.
+
+Requested elsewhere:
+
+- qBittorrent, rTorrent, Deluge, and Transmission all surface decisions as
+  human-readable log lines or tooltips; none expose structured reasons
+  suitable for automation.
+- Sonarr/Radarr operators want machine-readable reasons for failed imports.
+
+SwarmOtter feature shape:
+
+- Add a `/api/v1/explain/*` surface that returns structured reasons for
+  non-trivial decisions: per-torrent, per-add, per-network-path, per-
+  bandwidth-cap, per-storage-root, and per-autopilot action.
+- Each reason includes a stable code, a human-readable message, the
+  measured inputs that produced the decision, the timestamp of the last
+  decision, and the relevant subsystem.
+- The autopilot "why is this slow?" report, the disk-aware storage
+  optimizer decisions, the per-path fail-closed states, and the bandwidth
+  scheduler all share the same explainability shape.
+- Reasons are versioned; downstream automation can rely on stable codes.
+
+Acceptance direction:
+
+- The same code and shape appear in logs, the API, the UI, and the audit
+  log so operators and automation never have to reconcile different
+  vocabularies.
+- No reason exposes peer IPs or user content; only operational state.
+- This is a unique differentiator; no mainstream client offers a unified
+  explainability surface.
+
+### Container / Sandbox-First Deployment Story
+
+Problem: the positioning in `design/COMPARISON.md` calls SwarmOtter a
+"Linux/server and homelab torrent daemon," but the deployment artifacts in
+`docs/` are still a config file, a systemd unit, a Dockerfile, and an nginx
+example. Rootless container deployment, OCI image distribution, Helm/
+Compose charts, and read-only-filesystem operation are not first-class
+deliverables. For a daemon that targets server and homelab users, this is
+a real gap.
+
+Requested elsewhere:
+
+- Transmission, qBittorrent, rTorrent, and Deluge all ship native packages
+  and have community container images; none of those images is a
+  first-class artifact of the upstream project.
+- Sonarr/Radarr and the *arr ecosystem treat container deployment as the
+  default and require rootless operation and read-only filesystems.
+
+SwarmOtter feature shape:
+
+- Treat the OCI image as a first-class artifact: built and tested in CI,
+  published to a documented registry, signed with cosign, and accompanied
+  by a SBOM.
+- Document and test rootless operation with the existing network
+  containment model; add a non-root user and capability set to the
+  Dockerfile and verify it.
+- Document and test read-only-filesystem operation: state, logs, and
+  download roots live on mounted volumes only; the daemon refuses to
+  write to `/tmp` or the container filesystem.
+- Publish and test a Helm chart and a Compose file as first-class
+  artifacts in this repository, with the same containment configuration
+  examples that the systemd unit ships.
+- Document and test Podman, Docker, and Kubernetes deployments, including
+  NetworkPolicy examples for the control plane.
+
+Acceptance direction:
+
+- The CI pipeline builds, signs, and tests the OCI image on every
+  release; image digest and SBOM are published alongside the binary.
+- Helm chart and Compose file are versioned in lockstep with the daemon
+  and are covered by deployment tests.
+- Container deployment does not weaken containment; namespace and
+  capability configuration is part of the deployment contract.
+
+### Production Health / Availability Surface
+
+Problem: SwarmOtter already has a Doctor/health report and a Prometheus
+metrics endpoint, but neither of them is suitable for an orchestrator's
+liveness/readiness probe, and neither gives an operator a synthetic
+end-to-end check of the data plane. qBittorrent, rTorrent, Deluge, and
+Transmission have no equivalent surface; this is a clean differentiator
+for a daemon that targets production server deployment.
+
+Requested elsewhere:
+
+- qBittorrent's status endpoints are ad hoc; no liveness/readiness split.
+- Flood ships API exploration but no synthetic health checks.
+- Kubernetes, Consul, Nomad, and the cloud-native ecosystem treat
+  liveness/readiness probes as a baseline expectation.
+
+SwarmOtter feature shape:
+
+- Add explicit `/healthz/live` and `/healthz/ready` HTTP endpoints. Live
+  returns 200 as long as the daemon process is up and the API is serving.
+  Ready returns 200 only when the data plane is operational and at least
+  one torrent can be added and downloaded through the contained network
+  path.
+- Add a synthetic end-to-end check torrent: a small, locally generated
+  torrent the daemon advertises to itself through the contained path on
+  a configurable interval; ready=true requires the check torrent to
+  complete a full download round-trip.
+- Add SLO-style summaries: rolling uptime, ready ratio, and a configurable
+  ready-ratio alert threshold.
+- Honor Kubernetes liveness/readiness conventions and document probe
+  configurations in the deployment docs.
+
+Acceptance direction:
+
+- Liveness and readiness are independent; a torrent stuck in
+  `network_blocked` does not trigger a liveness failure.
+- The synthetic check torrent is generated locally; it does not depend on
+  any third-party tracker, peer, or content.
+- Ready and live endpoints are unauthenticated by default but bound to
+  the control plane only; the data plane is never probed by the orchestrator.
+
+### Client-Identity Fingerprinting and Rollups
+
+Problem: operators running legal swarms (Linux ISOs, open-source releases,
+public archives) want to know what other clients are connecting to their
+seeders so they can prioritize compatibility fixes and understand their
+contribution to the broader ecosystem. Most clients display a peer-client
+string per peer but offer no rollups; the data is effectively invisible
+once a swarm has more than a few dozen peers.
+
+Requested elsewhere:
+
+- qBittorrent displays the peer client string per peer; no rollup view.
+- BiglyBT ships per-peer client visibility but no aggregate rollup.
+- rTorrent's peer view is text-based and does not roll up.
+
+SwarmOtter feature shape:
+
+- Parse and bucket peer client identifiers (Azureus-style `AZ####` and
+  other common forms) at session and torrent boundaries.
+- Surface per-torrent and per-tracker rollups: top client families,
+  percentage share, useful-vs-choked breakdown, and historical trend.
+- Add a UI section and API endpoint for the rollup; integrate with the
+  per-torrent health score (existing delivered feature) so a swarm
+  dominated by legacy or misbehaving clients surfaces as a health
+  factor.
+- Client identification is purely informational; it never changes
+  download/upload behavior, and it is not used to enforce policy.
+
+Acceptance direction:
+
+- Rollups are computed locally from the engine's peer log; no third-
+  party lookup.
+- Operators can disable the rollup or restrict it to specific torrents
+  if they prefer.
+- This complements the IP filtering / blocklists workbench (P1) for
+  abuse mitigation.
+
+### Filesystem Snapshot Integration
+
+Problem: the disk-aware storage optimizer (P0) and the Btrfs/CoW
+discussion in the backlog already recognize that torrent clients run on
+sophisticated filesystems. There is no native integration with filesystem
+snapshots, so an operator who wants rollback for a torrent root or a
+state directory has to script it externally. This is invisible in
+mainstream clients and is a natural differentiator on Linux.
+
+Requested elsewhere:
+
+- qBittorrent users have requested CoW-aware behavior but not snapshot
+  integration; see qBittorrent CoW discussion in the disk-aware storage
+  optimizer entry.
+- Self-hosting operators using Snapper, ZFS, or Btrfs subvolumes for
+  `/var/lib/swarmotter` and download roots have to script snapshot
+  workflows by hand.
+
+SwarmOtter feature shape:
+
+- Detect filesystem type per configured storage root and per state
+  directory.
+- Add opt-in snapshot hooks: pre-update, post-update, pre-delete-data,
+  and operator-invoked.
+- Document and test the integration with Btrfs subvolumes, Snapper
+  timelines, and ZFS snapshots; expose a snapshot history view in the
+  Doctor and the API.
+- Snapshot integration is opt-in per root; the daemon never creates
+  snapshots unless explicitly configured to do so.
+
+Acceptance direction:
+
+- Snapshot creation is never on the hot path; it is invoked at
+  configurable points and never blocks a piece write.
+- No bundled Snapper or ZFS tooling is required; the daemon invokes
+  the operator-configured command.
+- A failing snapshot is reported and does not cause data loss; the
+  underlying torrent operation continues.
+
 ## P2 Features
 
 ### Protocol Modernization Roadmap
@@ -849,27 +1161,37 @@ Acceptance direction:
 - Controls are surfaced in API and UI per torrent and per file.
 - Streaming/preview behavior is deterministic and contained.
 
-### Calendar-Based Bandwidth Scheduler
+### Time-of-Day and Adaptive Bandwidth Policies
 
-Problem: users want time-of-day bandwidth schedules to complement the adaptive
-autopilot, for example limiting upload during business hours or scheduling
-full-speed downloads overnight.
+Problem: the Adaptive Swarm Performance Autopilot (P0) tunes global
+bandwidth live based on measured throughput, latency, and queue state.
+Operators also want time-of-day schedules (e.g. limit upload during
+business hours, full-speed downloads overnight). These are two facets of
+the same operational concern and should be implemented as a single
+bandwidth-policy surface so the user mental model is one feature.
 
 Requested elsewhere:
 
 - qBittorrent, aria2, and Deluge ship bandwidth scheduling features.
+- The adaptive autopilot (P0) is the SwarmOtter counterpart to live
+  throughput tuning; combining it with scheduling makes the policy surface
+  complete.
 
 SwarmOtter feature shape:
 
-- Add time-of-day alt-speed and bandwidth-limit schedules.
-- Multiple named schedules with start/end times and assigned bandwidth profiles.
+- Add time-of-day alt-speed and bandwidth-limit schedules: multiple named
+  schedules with start/end times and assigned bandwidth profiles.
 - Schedule assignment per torrent, label, or profile.
-- Complements (does not replace) the adaptive autopilot (existing P0).
+- Schedule and adaptive autopilot share the same per-profile bandwidth
+  resolution; the operator chooses the active mode per profile (adaptive,
+  scheduled, or both with explicit precedence).
+- Complements (does not replace) the adaptive autopilot (P0).
 
 Acceptance direction:
 
 - Schedules are deterministic and clearly reflected in the API and UI.
-- Adaptive autopilot and scheduler interact predictably.
+- Adaptive autopilot and scheduler interact predictably; precedence is
+  documented and surfaced in the explainability API (P1).
 
 ### Backup / Restore & Bulk Import/Export
 
@@ -932,6 +1254,9 @@ Acceptance direction:
 Problem: Prometheus metrics (v1.0.0) provide point-in-time data, but cloud-native
 deployments need distributed tracing, span export, and OTLP-based metrics for
 integration with modern observability stacks (Jaeger, Grafana Tempo, Honeycomb).
+The long-term direction is for OTLP metrics to be the primary export, with the
+Prometheus scrape endpoint kept as a compatibility surface for operators who
+already have a Prometheus stack.
 
 Requested elsewhere:
 
@@ -946,10 +1271,13 @@ SwarmOtter feature shape:
   fetch, tracker announce, peer connection, piece download, disk write, and
   API request handling.
 - Add OTLP metrics export as an alternative to the existing Prometheus scrape
-  endpoint.
+  endpoint, with the OTLP path planned as the primary export and the
+  Prometheus endpoint retained for compatibility.
 - Add configurable sampling and export targets.
 - Integrate with Long-Horizon Observability (existing P2) for unified
   metrics + traces.
+- Integrate with the Operator Audit Log (P1) so audit events can be exported
+  over the same observability pipeline as metrics and traces.
 
 Acceptance direction:
 
@@ -1054,6 +1382,76 @@ Acceptance direction:
 - All TUI operations go through the API; no direct daemon state manipulation.
 - CLI tool must be scriptable with machine-readable output (JSON).
 - Implementing this requires an ADR (new user interface surface).
+
+### Localization Strategy for the Web UI, API Errors, and Docs
+
+Problem: qBittorrent ships translations into 70+ languages; rTorrent and
+ruTorrent rely on community translations. SwarmOtter's Web UI is currently
+English-only. International operators and self-hosters expect at least
+a documented localization story before adopting a new daemon.
+
+Requested elsewhere:
+
+- qBittorrent, Deluge, and ruTorrent all maintain community translation
+  workflows.
+- Self-hosting operators in non-English-speaking regions routinely evaluate
+  clients on the strength of their localization.
+
+SwarmOtter research direction:
+
+- Pick a translation workflow that fits the project's CI and governance
+  posture: tooling, source string extraction, and contribution rules.
+- Define the localization scope: Web UI strings, API error messages,
+  documentation, and which of those are localized first.
+- Decide how localization interacts with lawful-use policy: error
+  messages and docs remain authoritative in English; translations are
+  best-effort with an explicit "untranslated" fallback.
+- Do not localize log messages; structured logs use stable English codes
+  for automation compatibility.
+
+Acceptance direction:
+
+- A translation contribution guide is published before any locale is
+  accepted.
+- Source strings are extracted at build time and missing strings fail
+  the build for in-scope locales.
+- Implementing this requires an ADR (introduces a new contributor
+  surface and a content policy decision).
+
+### Documentation Discoverability
+
+Problem: long-horizon observability (P2) covers operational history;
+settings search and UI personalization (P2) covers the Web UI. There is no
+parallel row for the **public documentation** (`docs/` mdBook and any
+external operator guides) that operators read alongside the daemon.
+Search, indexing, and a built-in help affordance in the Web UI are
+absent.
+
+Requested elsewhere:
+
+- Sonarr, Radarr, and rTorrent/ruTorrent all publish user guides; few
+  surface in-app search.
+- Self-hosting operators with large libraries routinely want to search
+  their own documentation as much as their settings.
+
+SwarmOtter research direction:
+
+- Add a search index for `docs/` (mdBook search or an external indexer
+  such as DocSearch) and a built-in help pane in the Web UI that surfaces
+  relevant documentation pages for the current view.
+- Keep documentation versioning tied to the daemon version so a search
+  result always matches the daemon release it documents.
+- The documentation search is read-only and does not phone home; if an
+  external indexer is used, the deployment story is documented and
+  opt-in.
+
+Acceptance direction:
+
+- The built-in help pane reuses existing in-UI conventions and does not
+  introduce a new framework.
+- No telemetry, no third-party analytics, no required external service.
+- The search index is a build artifact of the same docs source; no
+  parallel content.
 
 ## Excluded From This Backlog
 
