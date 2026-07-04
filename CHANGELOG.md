@@ -294,6 +294,8 @@ status.
 - **mdBook publishing workflow:** renamed documentation tool version variables
   so mdBook does not treat them as `MDBOOK_*` configuration overrides during
   the GitHub Pages build.
+- **GitHub Pages deploy action:** updated the Pages publishing workflow to the
+  current Pages action major versions used by GitHub's Node 24 Actions runtime.
 
 ### Changed
 
