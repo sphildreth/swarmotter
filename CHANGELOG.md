@@ -23,6 +23,10 @@ status.
 
 ### Added
 
+- **FOSS torrent client comparison:** added `design/COMPARISON.md` as a living
+  comparison matrix for SwarmOtter versus popular FOSS torrent clients,
+  including feature parity, differentiators, source links, and roadmap gaps
+  mapped to `design/BACKLOG.md`.
 - **Optional Transmission RPC compatibility adapter:** added `POST /transmission/rpc` as an optional compatibility layer over existing `DaemonOps` when enabled. The adapter implements `X-Transmission-Session-Id` enforcement, maps Transmission Basic auth password to `api.auth_token` when API auth is required (username is ignored), supports common session/torrent/queue/helper calls including mutating remove/set/move operations, maps Transmission delete-data removal flags to native delete-data behavior, supports magnet and base64 metainfo `torrent-add`, and rejects remote HTTP/HTTPS torrent URL intake.
 - **Contained webseed downloads:** torrent metadata now preserves BEP 19
   `url-list` webseeds, and the engine can fetch missing pieces from HTTP/HTTPS

@@ -34,6 +34,7 @@ project.
 | P0 | Large-library Web UI operations console | Keep the UI fast and useful with hundreds or thousands of torrents | qBittorrent [#24558](https://github.com/qbittorrent/qBittorrent/issues/24558), [#23127](https://github.com/qbittorrent/qBittorrent/issues/23127), [#23449](https://github.com/qbittorrent/qBittorrent/issues/23449), [#9796](https://github.com/qbittorrent/qBittorrent/issues/9796), [#22111](https://github.com/qbittorrent/qBittorrent/issues/22111), Transmission [#3813](https://github.com/transmission/transmission/issues/3813), [#8237](https://github.com/transmission/transmission/issues/8237) |
 | P0 | Ecosystem Compatibility API | Operate alongside Sonarr/Radarr/Flood via qBittorrent-compatible and Transmission-compatible API shims | Deluge API parity requests, Flood UI, Sonarr/Radarr integration, self-hosting ecosystem (2026) |
 | P0 | Per-Profile / Per-Torrent Network-Path Binding | Assign a contained network path (namespace/VPN endpoint/interface) per profile, label, or torrent; fail-closed per path | rTorrent/Flood multi-user isolation, Deluge multi-profile routing, self-hosting VPN routing patterns |
+| P0 | Multi-User / Multi-Tenant Support | Role-based access control, per-user torrent isolation, per-user quotas, and shared-server deployments | qBittorrent [#3327](https://github.com/qbittorrent/qBittorrent/issues/3327), Flood multi-user, rTorrent+ruTorrent multi-user, Deluge thin-client auth |
 | P1 | Metadata-first magnet preview and intake rules | Let users inspect/select files before starting data transfer and enforce file exclusion rules | Transmission [#1611](https://github.com/transmission/transmission/issues/1611), [#2366](https://github.com/transmission/transmission/issues/2366), [#7330](https://github.com/transmission/transmission/issues/7330), [#7399](https://github.com/transmission/transmission/issues/7399), [#2399](https://github.com/transmission/transmission/issues/2399), [#5582](https://github.com/transmission/transmission/issues/5582), [#8793](https://github.com/transmission/transmission/issues/8793), qBittorrent [#23674](https://github.com/qbittorrent/qBittorrent/issues/23674) |
 | P1 | File cleanup, trash, and retention safety | Avoid accidental data loss while making unwanted/obsolete partial data easy to remove | qBittorrent [#23575](https://github.com/qbittorrent/qBittorrent/issues/23575), [#23353](https://github.com/qbittorrent/qBittorrent/issues/23353), [#24102](https://github.com/qbittorrent/qBittorrent/issues/24102), [#24601](https://github.com/qbittorrent/qBittorrent/issues/24601), Transmission [#1722](https://github.com/transmission/transmission/issues/1722), [#6513](https://github.com/transmission/transmission/issues/6513) |
 | P1 | Tracker and peer operations workbench | Diagnose weak swarms, prioritize trackers, expose known peers, webseeds, and retry state | Transmission [#996](https://github.com/transmission/transmission/issues/996), [#6425](https://github.com/transmission/transmission/issues/6425), [#8326](https://github.com/transmission/transmission/issues/8326), [#8413](https://github.com/transmission/transmission/issues/8413), [#5234](https://github.com/transmission/transmission/issues/5234), qBittorrent [#24013](https://github.com/qbittorrent/qBittorrent/issues/24013), [#24014](https://github.com/qbittorrent/qBittorrent/issues/24014) |
@@ -42,7 +43,11 @@ project.
 | P1 | Content organization controls | Keep download directories orderly through folder rules, preset paths, and path normalization | Transmission [#5614](https://github.com/transmission/transmission/issues/5614), [#8225](https://github.com/transmission/transmission/issues/8225), [#6044](https://github.com/transmission/transmission/issues/6044), [#6045](https://github.com/transmission/transmission/issues/6045), qBittorrent [#24239](https://github.com/qbittorrent/qBittorrent/issues/24239) |
 | P1 | Torrent Creation (BEP 52 v2/hybrid) | Create `.torrent` files from local lawful content with piece hashing, tracker tiers, and webseed support | BiglyBT torrent creation, aria2 torrent creation, Transmission [#5794](https://github.com/transmission/transmission/issues/5794), Deluge create plugin |
 | P1 | Superseeding / Initial Seeding (BEP 16) | Efficient first distribution of new lawful releases via initial-seeding mode | BEP 16, qBittorrent [#20098](https://github.com/qbittorrent/qBittorrent/issues/20098), BiglyBT initial seeding |
-| P1 | IP Filtering / Blocklists / Peer Banning | Filter unwanted peers via CIDR/range lists, blocklist import, and manual peer bans | qBittorrent IP filtering, Deluge IP filtering, eMule/PeerGuardian blocklist formats |
+| P1 | IP Filtering / Blocklists / Peer Banning | Filter unwanted peers via CIDR/range lists, blocklist import, manual peer bans, and client-ID-based blocking | qBittorrent IP filtering, Deluge IP filtering, eMule/PeerGuardian blocklist formats, qBittorrent [#10258](https://github.com/qbittorrent/qBittorrent/issues/10258) |
+| P1 | UPnP / NAT-PMP Port Forwarding | Automatic port mapping for reachability behind NAT without manual router configuration | qBittorrent UPnP/NAT-PMP, Transmission port forwarding, Deluge UPnP/NAT-PMP |
+| P1 | SOCKS5 Proxy Support | Route torrent traffic through a SOCKS5 proxy for seedbox and restricted-network deployments | Transmission [#1250](https://github.com/transmission/transmission/issues/1250), qBittorrent SOCKS5, Deluge proxy support |
+| P1 | Seed Prioritization (Low-Seed First) | Prefer seeding torrents with few available seeds to improve swarm health and distribution efficiency | qBittorrent [#9063](https://github.com/qbittorrent/qBittorrent/issues/9063), Transmission seed-priority discussions |
+| P1 | OpenAPI Specification & Interactive API Docs | Auto-generated OpenAPI/JSON Schema with Swagger UI for native and compatibility API surfaces | Flood Swagger UI, Deluge API docs, self-hosting automation integration |
 | P1 | User-Configured Lawful RSS Feeds | Ingest content from user-supplied lawful RSS feeds as part of lawful distribution workflows | Deluge RSS plugin, rTorrent RSS, self-hosting RSS workflows; see lawful-use policy |
 | P1/P2 | Native Cross-Seed & Hardlink-Aware Storage | Match on-disk data to new torrents by piece layout; link instead of re-download | cross-seed (external tool), self-hosting hardlink layouts, BiglyBT |
 | P2 | Sequential Download / Streaming / File Preview | Sequential/priority-first fetch; in-place preview and verify; metadata-first preview | qBittorrent sequential download, aria2, WebTorrent streaming, Deluge |
@@ -51,9 +56,12 @@ project.
 | P2 | Settings search and low-risk UI personalization | Make dense configuration easier to operate without turning the UI into a theme project | qBittorrent [#23654](https://github.com/qbittorrent/qBittorrent/issues/23654), [#22877](https://github.com/qbittorrent/qBittorrent/issues/22877), [#22913](https://github.com/qbittorrent/qBittorrent/issues/22913), Transmission [#4304](https://github.com/transmission/transmission/issues/4304), [#5648](https://github.com/transmission/transmission/issues/5648) |
 | P2 | Calendar-Based Bandwidth Scheduler | Time-of-day alt-speed/limit schedules to complement the adaptive autopilot | qBittorrent scheduler, aria2 bandwidth scheduling, Deluge scheduler |
 | P2 | Backup / Restore & Bulk Import/Export | Export/import torrent list and state for migration and disaster recovery of large libraries | qBittorrent backup, Deluge export, Flood backup/restore |
+| P2 | Thin Client / Remote Session Architecture | Connect a native or web client to a remote daemon via a streaming RPC protocol without SSH tunneling | Deluge thin-client architecture, qBittorrent remote session requests, Flood multi-backend |
+| P2 | OpenTelemetry Observability | Distributed tracing, span export, and OTLP metrics export for cloud-native monitoring | OpenTelemetry standard, Flood OpenAPI+Swagger, cloud-native deployment patterns |
 | P3 | Permissioned extension system | Enable integrations only if permissions, sandboxing, and lawful-use constraints are clear | qBittorrent [#24530](https://github.com/qbittorrent/qBittorrent/issues/24530), [#24531](https://github.com/qbittorrent/qBittorrent/issues/24531) |
 | P3 | Alternate privacy-preserving transports | Evaluate only if strict containment, lawful-use messaging, and operational risk are solved | Transmission [#7230](https://github.com/transmission/transmission/issues/7230), qBittorrent [#23665](https://github.com/qbittorrent/qBittorrent/issues/23665), [#24241](https://github.com/qbittorrent/qBittorrent/issues/24241), [#23064](https://github.com/qbittorrent/qBittorrent/issues/23064) |
 | P3 | Swarm Merging (BiglyBT-style) | Complete or accelerate a torrent using matching content from other torrents or HTTP sources | BiglyBT swarm merging, self-hosting seedbox workflows |
+| P3 | Terminal UI / Console Interface | ncurses-based TUI for low-resource headless environments and terminal-first workflows | rTorrent ncurses TUI, Deluge `deluge-console`, aria2 CLI |
 
 ## P0 Features
 
@@ -129,6 +137,9 @@ SwarmOtter feature shape:
   preallocation policy, sparse policy, and clearly surfaced trade-offs.
 - Add UI/API storage diagnostics showing free space, active write rate, active
   recheck rate, and torrents mapped to each root.
+- Add disk-space pre-check enforcement: prevent starting new downloads when
+  free space on the target storage root falls below a configurable threshold.
+  Reject add requests with a clear error before any data is written.
 - Add state-directory controls for logs, resume files, database/state, and
   temporary files so high-write paths can be placed intentionally.
 
@@ -290,6 +301,41 @@ Acceptance direction:
   document per-path fail-closed conditions.
 - Implementing this requires an ADR (changes containment behavior).
 
+### Multi-User / Multi-Tenant Support
+
+Problem: shared-server and seedbox deployments need per-user isolation, quotas,
+and role-based access control. Running separate daemon instances per user is
+wasteful and operationally complex. This is the #1 most-requested missing feature
+across the qBittorrent, rTorrent, and Flood ecosystems.
+
+Requested elsewhere:
+
+- qBittorrent's multi-user WebUI request
+  [qbittorrent#3327](https://github.com/qbittorrent/qBittorrent/issues/3327)
+  has been open since 2015 and is one of the highest-voted issues.
+- Flood ships built-in multi-user support with per-user backend connections.
+- rTorrent + ruTorrent multi-user setups are standard in seedbox platforms
+  (QuickBox, Swizzin, Saltbox).
+- Deluge's thin-client architecture supports per-user daemon connections.
+
+SwarmOtter feature shape:
+
+- Add role-based access control: read-only, operator, and admin roles.
+- Add per-user torrent isolation: each user sees only their own torrents.
+- Add per-user quotas: storage, active torrents, bandwidth caps.
+- Add per-user API keys with scoped permissions.
+- Integrate with policy profiles (existing P0) for per-user default settings.
+- Integrate with per-profile network-path binding (existing P0) for per-user
+  network isolation on shared hosts.
+- Add user management via API and Web UI.
+
+Acceptance direction:
+
+- Multi-user support must not weaken network containment; each user's traffic
+  remains bound to their assigned network path.
+- User isolation must be enforced at the daemon level, not just the API layer.
+- Implementing this requires an ADR (new auth model + user isolation semantics).
+
 ## P1 Features
 
 ### Metadata-First Magnet Preview and Intake Rules
@@ -405,11 +451,7 @@ SwarmOtter feature shape:
 - Add certificate path reload for API/UI TLS when SwarmOtter terminates TLS
   directly.
 - Add optional Unix socket listener for local reverse proxies.
-- Publish OpenAPI/JSON Schema for native API and compatibility endpoints.
 - Add event/log deduplication controls for noisy repeated errors.
-- Add multi-user support with role-based access control (read-only, operator,
-  admin) to support shared-server deployments without requiring separate
-  daemon instances.
 
 ### Safe Automation Hooks
 
@@ -527,6 +569,8 @@ SwarmOtter feature shape:
 - Support CIDR and range-based peer filters.
 - Import eMule/PeerGuardian `.dat` blocklist formats.
 - Add manual per-peer ban controls.
+- Add client-ID-based peer blocking (e.g., Xunlei/Thunder, known bad actors)
+  as a complement to IP-based filtering.
 - Integrate with the tracker and peer operations workbench (existing P1).
 - Filtering is framed as abuse mitigation and operational safety, not evasion.
 
@@ -535,6 +579,121 @@ Acceptance direction:
 - Framing is consistent with lawful-use policy: filtering is abuse mitigation.
 - Applies to all peer sources through the contained network path.
 - Filters are auditable in logs and API.
+
+### UPnP / NAT-PMP Port Forwarding
+
+Problem: users behind NAT routers cannot accept inbound peer connections without
+manual port forwarding configuration. This cripples seeding and swarm contribution
+for non-VPN users. Every major client ships this as table-stakes functionality.
+
+Requested elsewhere:
+
+- qBittorrent, Transmission, and Deluge all ship UPnP and NAT-PMP support.
+- libtorrent-rasterbar (qBittorrent's backend) has mature UPnP/NAT-PMP
+  implementation.
+- This is expected baseline functionality, not a differentiator.
+
+SwarmOtter feature shape:
+
+- Add UPnP (Universal Plug and Play) and NAT-PMP (NAT Port Mapping Protocol)
+  support for automatic port mapping on supported routers.
+- Map the configured peer listen port; refresh mappings on lease expiry.
+- Surface mapping status in the API and network health UI.
+- Respect network containment: port mappings must only be requested on the
+  contained network interface, not the default route.
+
+Acceptance direction:
+
+- Port mapping must be opt-in and clearly surfaced.
+- Mapping must respect network containment; no mappings on uncontained interfaces.
+- UPnP/NAT-PMP traffic must go through the contained network path.
+
+### SOCKS5 Proxy Support
+
+Problem: seedbox and restricted-network users rely on SOCKS5 proxies as a
+simpler alternative to full VPN/namespace containment. Many users want both
+SOCKS5 and VPN containment for different use cases.
+
+Requested elsewhere:
+
+- Transmission [#1250](https://github.com/transmission/transmission/issues/1250)
+  is a top-voted feature request.
+- qBittorrent and Deluge ship built-in SOCKS5 proxy support.
+- Common in seedbox deployments where VPN is not available or practical.
+
+SwarmOtter feature shape:
+
+- Add optional SOCKS5 proxy configuration for torrent traffic.
+- Route peer TCP connections, tracker announces, and webseed requests through
+  the proxy.
+- Support authentication (username/password) and unauthenticated modes.
+- Proxy configuration is per-profile (existing P0) for multi-path deployments.
+- SOCKS5 proxy is distinct from network containment; both can coexist with
+  clear precedence rules.
+
+Acceptance direction:
+
+- Proxy configuration must be explicit and auditable.
+- When both SOCKS5 and network containment are configured, containment takes
+  precedence; proxy traffic must still go through the contained path.
+- DNS resolution for proxy hostname must respect containment.
+
+### Seed Prioritization (Low-Seed First)
+
+Problem: torrents with few seeds are at risk of dying. Clients should prioritize
+seeding bandwidth toward torrents that need it most, improving overall swarm
+health and distribution efficiency.
+
+Requested elsewhere:
+
+- qBittorrent [#9063](https://github.com/qbittorrent/qBittorrent/issues/9063)
+  requests seed-priority-based seeding.
+- Transmission users have discussed seed-count-aware seeding policies.
+- Aligns with SwarmOtter's lawful-distribution mission: keeping lawful swarms
+  healthy.
+
+SwarmOtter feature shape:
+
+- Add a seed-priority seeding mode that allocates upload bandwidth
+  proportionally to torrents with the fewest available seeds.
+- Configurable per-torrent and per-profile (existing P0).
+- Complements (does not replace) ratio-based and time-based seeding limits.
+- Surface seed-count data from trackers, DHT, and PEX in the API and UI.
+
+Acceptance direction:
+
+- Seed-priority mode is opt-in and clearly documented.
+- Does not override explicit ratio or time-based stop conditions.
+- All seeding traffic remains contained through the configured network path.
+
+### OpenAPI Specification & Interactive API Docs
+
+Problem: the Ecosystem Compatibility API (P0) and native API need clear,
+machine-readable documentation for automation and integration. Flood's
+auto-generated Swagger UI is the gold standard for torrent client APIs.
+
+Requested elsewhere:
+
+- Flood ships OpenAPI spec with interactive Swagger UI explorer.
+- Deluge and qBittorrent have community-maintained API documentation.
+- Self-hosting automation pipelines (Sonarr, Radarr, cross-seed) need accurate
+  API specs for integration testing.
+
+SwarmOtter feature shape:
+
+- Generate OpenAPI 3.x specification for the native `/api/v1` surface.
+- Generate OpenAPI specification for qBittorrent `/api/v2` and Transmission RPC
+  compatibility surfaces.
+- Serve interactive Swagger UI at `/api/docs` for exploration and testing.
+- Publish JSON Schema for configuration, request, and response types.
+- Keep specs in sync with implementation via code generation or compile-time
+  verification.
+
+Acceptance direction:
+
+- Specs must be accurate and versioned alongside the API.
+- Compatibility surface specs must document parity gaps explicitly.
+- No indexer, search, or content-discovery endpoints are documented.
 
 ### User-Configured Lawful RSS Feeds
 
@@ -734,6 +893,71 @@ Acceptance direction:
 - Export includes enough state for reproducible restoration.
 - Import is idempotent and handles conflicts explicitly.
 
+### Thin Client / Remote Session Architecture
+
+Problem: SwarmOtter's Web UI is the only remote interface. Users coming from
+Deluge expect a thin-client model where a native or web client connects to a
+remote daemon via a streaming RPC protocol without SSH tunneling. This is
+Deluge's defining feature and a frequent request across qBittorrent and
+Transmission.
+
+Requested elsewhere:
+
+- Deluge's thin-client architecture (daemon/client split with native GTK GUI)
+  is its primary differentiator.
+- qBittorrent and Transmission users have requested remote session support.
+- Flood demonstrates multi-backend Web UI connections to remote daemons.
+
+SwarmOtter feature shape:
+
+- Add a streaming RPC protocol (gRPC or WebSocket-based) for low-latency
+  bidirectional daemon communication.
+- Support remote daemon connections from the Web UI and potential future
+  native clients.
+- Connection authentication via API keys with scoped permissions (integrates
+  with Multi-User Support, P0).
+- Maintain the existing REST API for HTTP-based integration; the streaming
+  protocol is an additional surface for real-time operations.
+
+Acceptance direction:
+
+- Remote connections must use the same auth and permission model as the
+  local API.
+- Network containment is not weakened; remote control-plane connections are
+  separate from the torrent data plane.
+- Implementing this requires an ADR (new RPC surface + connection model).
+
+### OpenTelemetry Observability
+
+Problem: Prometheus metrics (v1.0.0) provide point-in-time data, but cloud-native
+deployments need distributed tracing, span export, and OTLP-based metrics for
+integration with modern observability stacks (Jaeger, Grafana Tempo, Honeycomb).
+
+Requested elsewhere:
+
+- OpenTelemetry is the CNCF standard for cloud-native observability.
+- Flood ships OpenAPI + Swagger UI for API exploration.
+- Self-hosting operators increasingly use OpenTelemetry for multi-service
+  monitoring.
+
+SwarmOtter feature shape:
+
+- Add OpenTelemetry tracing spans for key operations: torrent add, metadata
+  fetch, tracker announce, peer connection, piece download, disk write, and
+  API request handling.
+- Add OTLP metrics export as an alternative to the existing Prometheus scrape
+  endpoint.
+- Add configurable sampling and export targets.
+- Integrate with Long-Horizon Observability (existing P2) for unified
+  metrics + traces.
+
+Acceptance direction:
+
+- OpenTelemetry is opt-in and does not add overhead when disabled.
+- Tracing must not leak sensitive data (info hashes in spans are acceptable;
+  peer IPs and file paths require configurable redaction).
+- All telemetry export respects network containment.
+
 ## P3 Research Features
 
 ### Permissioned Extension System
@@ -799,6 +1023,37 @@ SwarmOtter research direction:
   for peer traffic.
 - Requires design and containment review before acceptance.
 - No piracy-oriented content matching is permitted.
+
+### Terminal UI / Console Interface
+
+Problem: headless server and low-resource environments benefit from a
+terminal-based interface that does not require a browser or X11/Wayland.
+rTorrent's ncurses TUI and Deluge's `deluge-console` are valued by operators
+who work primarily over SSH.
+
+Requested elsewhere:
+
+- rTorrent's ncurses TUI is its primary user interface and a key reason for
+  its adoption in seedbox environments.
+- Deluge ships `deluge-console` for terminal-based management.
+- aria2 is CLI-first with no built-in GUI.
+
+SwarmOtter research direction:
+
+- Evaluate a ratatui-based (Rust ncurses) TUI for the daemon.
+- Scope: torrent list, add/remove/pause/resume, basic settings, and health
+  status. Full settings management may remain Web UI / API only.
+- The TUI connects to the daemon via the same API as the Web UI; no separate
+  code path.
+- Consider a CLI subcommand (`swarmotterctl`) for scriptable operations
+  (add magnet, list torrents, pause/resume) as a lighter-weight alternative.
+
+Acceptance direction:
+
+- TUI must not require a display server; pure terminal rendering.
+- All TUI operations go through the API; no direct daemon state manipulation.
+- CLI tool must be scriptable with machine-readable output (JSON).
+- Implementing this requires an ADR (new user interface surface).
 
 ## Excluded From This Backlog
 
