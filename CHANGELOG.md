@@ -291,6 +291,9 @@ status.
 - **Delete-data storage cleanup:** removing a torrent with delete-data enabled
   now removes only the torrent payload and fast-resume metadata while preserving
   the configured `download_dir` and `incomplete_dir` root directories.
+- **mdBook publishing workflow:** renamed documentation tool version variables
+  so mdBook does not treat them as `MDBOOK_*` configuration overrides during
+  the GitHub Pages build.
 
 ### Changed
 

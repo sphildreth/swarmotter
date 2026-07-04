@@ -10,8 +10,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  MDBOOK_VERSION: 0.5.0
-  MDBOOK_MERMAID_VERSION: 0.17.0
+  DOCS_MDBOOK_VERSION: 0.5.0
+  DOCS_MDBOOK_MERMAID_VERSION: 0.17.0
 
 jobs:
   build-test:
@@ -42,8 +42,8 @@ jobs:
 
       - name: Install mdBook tooling
         run: |
-          cargo install mdbook --version "$MDBOOK_VERSION" --locked
-          cargo install mdbook-mermaid --version "$MDBOOK_MERMAID_VERSION" --locked
+          cargo install mdbook --version "$DOCS_MDBOOK_VERSION" --locked
+          cargo install mdbook-mermaid --version "$DOCS_MDBOOK_MERMAID_VERSION" --locked
 
       - name: Build mdBook
         run: mdbook build
