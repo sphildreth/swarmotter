@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 ARG RUST_VERSION=1.96.1
 
 FROM rust:${RUST_VERSION}-bookworm AS builder
@@ -8,7 +9,11 @@ ENV CARGO_TERM_COLOR=always
 ENV SWARMOTTER_BUILD_COMMIT=${SWARMOTTER_BUILD_COMMIT}
 
 COPY . .
-RUN cargo build --locked --release --bin swarmotterd
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    cargo build --locked --release --bin swarmotterd \
+    && cp /src/target/release/swarmotterd /tmp/swarmotterd
 
 FROM debian:bookworm-slim
 
@@ -32,7 +37,7 @@ RUN apt-get update \
     && useradd --system --uid 10001 --gid swarmotter --home-dir /var/lib/swarmotter --shell /usr/sbin/nologin swarmotter \
     && install -d -o swarmotter -g swarmotter /etc/swarmotter /var/lib/swarmotter /data/downloads /data/incomplete
 
-COPY --from=builder --chown=root:root /src/target/release/swarmotterd /usr/local/bin/swarmotterd
+COPY --from=builder --chown=root:root /tmp/swarmotterd /usr/local/bin/swarmotterd
 COPY --chown=root:root config/swarmotter.container.toml.example /etc/swarmotter/swarmotter.toml
 
 VOLUME ["/data/downloads", "/data/incomplete", "/var/lib/swarmotter"]

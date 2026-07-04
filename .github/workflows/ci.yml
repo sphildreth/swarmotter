@@ -128,5 +128,7 @@ jobs:
           build-args: |
             SWARMOTTER_BUILD_COMMIT=${{ github.sha }}
             SWARMOTTER_IMAGE_CREATED=${{ steps.build_timestamp.outputs.created }}
+          cache-from: type=gha,scope=container-image
+          cache-to: type=gha,mode=max,scope=container-image
           provenance: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
           sbom: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}

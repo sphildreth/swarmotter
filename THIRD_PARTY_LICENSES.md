@@ -63,8 +63,8 @@ foundational dependency stack rationale.
 |-----------|---------|---------|---------------|
 | mdBook | 0.5.0 | MPL-2.0 | Build-time user-guide site generator for `docs/` |
 | mdbook-mermaid | 0.17.0 | MPL-2.0 | Build-time mdBook preprocessor for Mermaid diagrams |
-| Mermaid.js | Bundled by mdbook-mermaid 0.17.0 | MIT | Browser runtime for rendered Mermaid diagrams in the published user guide |
-| mermaid-init.js | Bundled by mdbook-mermaid 0.17.0 | MPL-2.0 | Theme-aware Mermaid initialization script for mdBook |
+| `assets/mermaid.min.js` | Bundled by mdbook-mermaid 0.17.0 | MIT | Browser runtime for rendered Mermaid diagrams in the published user guide |
+| `assets/mermaid-init.js` | Bundled by mdbook-mermaid 0.17.0 | MPL-2.0 | Theme-aware Mermaid initialization script for mdBook |
 
 ## Network containment note
 

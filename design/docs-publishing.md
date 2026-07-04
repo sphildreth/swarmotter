@@ -34,10 +34,10 @@ should not be committed.
 Mermaid support is provided by
 [`mdbook-mermaid`](https://github.com/badboy/mdbook-mermaid). The preprocessor
 configuration lives in `book.toml`, and the browser runtime assets are checked
-in at the repository root:
+in under `assets/`:
 
-- `mermaid.min.js`
-- `mermaid-init.js`
+- `assets/mermaid.min.js`
+- `assets/mermaid-init.js`
 
 Use standard Mermaid fences in files under `docs/`:
 
@@ -53,10 +53,15 @@ version in `.github/workflows/ci.yml`:
 
 ```bash
 mdbook-mermaid install .
+mkdir -p assets
+mv mermaid.min.js mermaid-init.js assets/
 ```
 
-Review and commit any resulting changes to `book.toml`, `mermaid.min.js`, and
-`mermaid-init.js`.
+Review and commit any resulting changes to `book.toml`,
+`assets/mermaid.min.js`, and `assets/mermaid-init.js`.
+
+Keep the `book.toml` `additional-js` entries pointed at the `assets/` paths.
+Do not leave the generated Mermaid runtime files at the repository root.
 
 ## GitHub Actions flow
 

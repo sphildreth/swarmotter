@@ -9,7 +9,7 @@ language = "en"
 git-repository-url = "https://github.com/sphildreth/swarmotter"
 edit-url-template = "https://github.com/sphildreth/swarmotter/edit/main/{path}"
 site-url = "/swarmotter/"
-additional-js = ["mermaid.min.js", "mermaid-init.js"]
+additional-js = ["assets/mermaid.min.js", "assets/mermaid-init.js"]
 
 [preprocessor]
 
