@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 FROM scratch AS binary
 COPY --from=builder /tmp/swarmotterd /swarmotterd
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim AS runtime-base
 
 ARG SWARMOTTER_BUILD_COMMIT=unknown
 ARG SWARMOTTER_IMAGE_CREATED=unknown
@@ -40,7 +40,6 @@ RUN apt-get update \
     && useradd --system --uid 10001 --gid swarmotter --home-dir /var/lib/swarmotter --shell /usr/sbin/nologin swarmotter \
     && install -d -o swarmotter -g swarmotter /etc/swarmotter /var/lib/swarmotter /data/downloads /data/incomplete
 
-COPY --from=builder --chown=root:root /tmp/swarmotterd /usr/local/bin/swarmotterd
 COPY --chown=root:root config/swarmotter.container.toml.example /etc/swarmotter/swarmotter.toml
 
 VOLUME ["/data/downloads", "/data/incomplete", "/var/lib/swarmotter"]
@@ -49,3 +48,10 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl 
 USER swarmotter:swarmotter
 ENTRYPOINT ["/usr/local/bin/swarmotterd"]
 CMD ["--config", "/etc/swarmotter/swarmotter.toml"]
+
+FROM runtime-base AS runtime-prebuilt
+ARG TARGETARCH
+COPY --chown=root:root image-binaries/linux-${TARGETARCH}/swarmotterd /usr/local/bin/swarmotterd
+
+FROM runtime-base AS runtime
+COPY --from=builder --chown=root:root /tmp/swarmotterd /usr/local/bin/swarmotterd

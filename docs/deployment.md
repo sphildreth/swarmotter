@@ -82,9 +82,9 @@ ghcr.io/sphildreth/swarmotter
 The repository workflow builds pull requests without publishing and publishes a
 multi-architecture image on successful pushes to `main`. Main builds are tagged
 as `main` and `sha-<shortsha>`. Version-tag releases publish `linux/amd64` and
-`linux/arm64` images tagged as `vX.Y.Z`, `X.Y.Z`, `X.Y`, `X`, `latest`, and
-`sha-<shortsha>`. After the first GHCR publish, set the package visibility to
-public in GitHub Packages if anonymous homelab pulls are desired.
+`linux/arm64` images tagged as `vX.Y.Z`, `X.Y.Z`, `X.Y`, `X`, and `latest`.
+After the first GHCR publish, set the package visibility to public in GitHub
+Packages if anonymous homelab pulls are desired.
 
 ### What is Gluetun?
 

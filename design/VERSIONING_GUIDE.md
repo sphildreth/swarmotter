@@ -84,8 +84,8 @@ The build commit is separate from the release version. CI/container builds pass
   Main-branch image tags are `main` and `sha-<shortsha>`.
 - `.github/workflows/release.yml`
   Stable `vX.Y.Z` tags publish Linux tarballs, `.deb`/`.rpm` packages,
-  `SHA256SUMS`, and GHCR image tags `vX.Y.Z`, `X.Y.Z`, `X.Y`, `X`, `latest`,
-  and `sha-<shortsha>`.
+  `SHA256SUMS`, and GHCR image tags `vX.Y.Z`, `X.Y.Z`, `X.Y`, `X`, and
+  `latest`.
 - `deploy/compose.yml` and `deploy/.env.example`
   These usually do not need a version bump because the default image tracks
   `latest`. Update them only if a release requires a new image name, port,

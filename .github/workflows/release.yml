@@ -38,11 +38,11 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            platform: linux/amd64
             nfpm_arch: amd64
+            rust_target: x86_64-unknown-linux-gnu
           - arch: aarch64
-            platform: linux/arm64
             nfpm_arch: arm64
+            rust_target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v7
 
@@ -56,11 +56,16 @@ jobs:
           fi
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+      - uses: dtolnay/rust-toolchain@stable
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+      - name: Add Rust target
+        run: rustup target add "${{ matrix.rust_target }}"
+
+      - name: Install aarch64 linker
+        if: matrix.rust_target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -68,15 +73,15 @@ jobs:
           go-version: stable
 
       - name: Build release binary
+        env:
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          SWARMOTTER_BUILD_COMMIT: ${{ github.sha }}
         run: |
           mkdir -p dist/binary dist/packages
-          docker buildx build \
-            --platform "${{ matrix.platform }}" \
-            --target binary \
-            --build-arg "SWARMOTTER_BUILD_COMMIT=${{ github.sha }}" \
-            --output type=local,dest=dist/binary \
-            -f deploy/Dockerfile .
-          test -x dist/binary/swarmotterd
+          cargo build --locked --release --target "${{ matrix.rust_target }}" --bin swarmotterd
+          install -m 0755 "target/${{ matrix.rust_target }}/release/swarmotterd" dist/binary/swarmotterd
 
       - name: Package tarball
         run: |
@@ -121,7 +126,7 @@ jobs:
 
   container-image:
     runs-on: ubuntu-latest
-    needs: validate
+    needs: linux-artifacts
     permissions:
       contents: read
       packages: write
@@ -146,6 +151,25 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: image-artifacts
+          pattern: linux-*-artifacts
+          merge-multiple: true
+
+      - name: Stage image binaries
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          mkdir -p image-binaries/linux-amd64 image-binaries/linux-arm64
+          mkdir -p /tmp/swarmotter-release-extract
+
+          tar -xzf "image-artifacts/swarmotter-v${version}-linux-x86_64.tar.gz" -C /tmp/swarmotter-release-extract
+          install -m 0755 "/tmp/swarmotter-release-extract/swarmotter-v${version}-linux-x86_64/bin/swarmotterd" image-binaries/linux-amd64/swarmotterd
+
+          tar -xzf "image-artifacts/swarmotter-v${version}-linux-aarch64.tar.gz" -C /tmp/swarmotter-release-extract
+          install -m 0755 "/tmp/swarmotter-release-extract/swarmotter-v${version}-linux-aarch64/bin/swarmotterd" image-binaries/linux-arm64/swarmotterd
+
       - name: Log in to GHCR
         uses: docker/login-action@v4
         with:
@@ -165,7 +189,6 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
             type=raw,value=latest
-            type=sha,prefix=sha-,format=short
 
       - name: Build timestamp
         id: build_timestamp
@@ -176,6 +199,7 @@ jobs:
         with:
           context: .
           file: deploy/Dockerfile
+          target: runtime-prebuilt
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}

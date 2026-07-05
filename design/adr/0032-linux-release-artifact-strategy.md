@@ -26,11 +26,17 @@ Stable `vX.Y.Z` tags publish these release artifacts:
 - `SHA256SUMS` for GitHub Release assets.
 - A multi-architecture GHCR image for `linux/amd64` and `linux/arm64`.
 
-The release workflow builds native binaries through the same Docker build
-context as the container image by using a `binary` export target in
-`deploy/Dockerfile`. The packages install the daemon, default configuration,
-systemd unit, service account, and standard state/download directories, but
-they do not start the daemon automatically.
+The release workflow builds native binaries with Rust release targets on the
+GitHub runner. `x86_64-unknown-linux-gnu` builds natively, while
+`aarch64-unknown-linux-gnu` uses the aarch64 GNU linker and Linux target
+sysroot. The release container image downloads the release tarballs and stages
+those same prebuilt binaries through the `runtime-prebuilt` Dockerfile target,
+so release image publication does not compile Rust inside emulated Docker
+builds.
+
+The packages install the daemon, default configuration, systemd unit, service
+account, and standard state/download directories, but they do not start the
+daemon automatically.
 
 Windows and macOS native packages are not supported release artifacts.
 Operators on those hosts should use the Linux container image through their
@@ -45,8 +51,8 @@ hosts.
 
 Release tags now have a durable artifact contract: native Linux packages,
 tarballs, checksums, and semver-tagged container images. Changes to installed
-paths, package behavior, or image tag strategy are release-facing compatibility
-changes.
+paths, package behavior, image tag strategy, or the supported release build
+targets are release-facing compatibility changes.
 
 ## Related Documents
 
