@@ -81,10 +81,10 @@ ghcr.io/sphildreth/swarmotter
 
 The repository workflow builds pull requests without publishing and publishes a
 multi-architecture image on successful pushes to `main`. Main builds are tagged
-as `latest`, `main`, and `sha-<shortsha>`. Version-tag releases publish
-`linux/amd64` and `linux/arm64` images tagged as `vX.Y.Z`, `X.Y.Z`, `X.Y`, `X`,
-`latest`, and `sha-<shortsha>`. After the first GHCR publish, set the package
-visibility to public in GitHub Packages if anonymous homelab pulls are desired.
+as `main` and `sha-<shortsha>`. Version-tag releases publish `linux/amd64` and
+`linux/arm64` images tagged as `vX.Y.Z`, `X.Y.Z`, `X.Y`, `X`, `latest`, and
+`sha-<shortsha>`. After the first GHCR publish, set the package visibility to
+public in GitHub Packages if anonymous homelab pulls are desired.
 
 ### What is Gluetun?
 
@@ -188,7 +188,7 @@ docker buildx imagetools inspect ghcr.io/sphildreth/swarmotter:latest
 docker compose --env-file .env -f compose.yml exec swarmotter curl -fsS https://ifconfig.me
 ```
 
-Update explicitly when a new `main` image is published:
+Update explicitly when a new stable release image is published:
 
 ```bash
 cd deploy
@@ -196,7 +196,7 @@ docker compose --env-file .env -f compose.yml pull swarmotter
 docker compose --env-file .env -f compose.yml up -d swarmotter
 ```
 
-For a pinned rollback, set `SWARMOTTER_IMAGE` in `deploy/.env` to a
+For a pinned rollback, set `SWARMOTTER_IMAGE` in `deploy/.env` to a `vX.Y.Z` or
 `sha-<shortsha>` tag and run the update commands again.
 
 ## LAN Web UI with contained torrents
