@@ -10,6 +10,7 @@
 //! Routes are prefixed with `/api/v1`. Events are delivered via Server-Sent
 //! Events (SSE) at `/api/v1/events` and WebSocket at `/api/v1/ws`.
 
+pub(crate) mod encoding;
 pub mod envelope;
 pub mod error;
 pub mod handlers;

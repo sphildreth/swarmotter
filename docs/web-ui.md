@@ -38,6 +38,11 @@ summary response. The main UI area uses the available browser width so wide
 tables can show operational details without being capped to a narrow centered
 column. Per-row torrent actions are icon buttons with accessible labels.
 
+Torrent rows can be selected with checkboxes. The torrent toolbar can select
+all currently visible rows, clear the current selection, and remove all selected
+torrents. Bulk removal removes torrent records through `POST
+/api/v1/torrents/remove` and keeps downloaded data.
+
 ## Notifications
 
 Transient operation feedback is shown as toast notifications instead of inline
@@ -73,6 +78,7 @@ Operational diagnostics in the UI come from:
 - `GET /api/v1/watch/status` for enabled folders and recent watch-folder activity.
 - `GET /api/v1/logs/recent` for live-tail style log snapshots.
 - `GET /api/v1/doctor` for a consolidated operational check summary.
+- `GET /api/v1/version` for the application version shown in the Doctor view.
 
 The Settings view also exposes a destructive Reset action. After confirmation,
 it calls `POST /api/v1/reset` to stop torrent activity, remove torrent records,

@@ -65,11 +65,11 @@ Do not leave the generated Mermaid runtime files at the repository root.
 
 ## GitHub Actions flow
 
-The `CI` workflow builds the user guide as part of the normal main and pull
-request checks:
+The `CI` workflow builds the user guide for manual runs and pushes to `main`:
 
 - `docs-site` installs pinned mdBook tooling and runs `mdbook build`.
-- Pull requests build the book but do not publish it.
+- Pull requests run the Rust validation job and do not build or publish the
+  book.
 - Pushes to `main` upload the generated `book/` directory as a GitHub Pages
   artifact.
 - `deploy-pages` deploys that artifact to the `github-pages` environment.

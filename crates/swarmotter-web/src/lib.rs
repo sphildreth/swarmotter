@@ -229,6 +229,64 @@ mod tests {
     }
 
     #[test]
+    fn web_ui_supports_bulk_torrent_selection() {
+        for id in [
+            "select-all-torrents-btn",
+            "deselect-all-torrents-btn",
+            "remove-selected-torrents-btn",
+            "selection-summary",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{}\"", id)),
+                "Torrent selection toolbar is missing field id {id}"
+            );
+        }
+        for needle in [
+            "class=\"selection-column\"",
+            "aria-label=\"Torrent selection actions\"",
+            "Remove Selected",
+        ] {
+            assert!(
+                INDEX_HTML.contains(needle),
+                "Torrent selection markup is missing {needle}"
+            );
+        }
+        for needle in [
+            "let selectedTorrents = new Map();",
+            "let visibleTorrents = [];",
+            "let bulkRemoveInFlight = false;",
+            "function renderTorrentSelection(",
+            "function bindSelectionInputs(",
+            "function updateSelectionControls(",
+            "function selectAllVisibleTorrents(",
+            "function deselectAllTorrents(",
+            "async function removeSelectedTorrents(",
+            "Downloaded data will be kept.",
+            "api(\"/torrents/remove\"",
+            "info_hashes: selected.map(([hash]) => hash)",
+            "not_found",
+            "selectedTorrents.delete(hash);",
+            "$(\"#select-all-torrents-btn\").addEventListener(\"click\", selectAllVisibleTorrents);",
+            "$(\"#deselect-all-torrents-btn\").addEventListener(\"click\", deselectAllTorrents);",
+            "$(\"#remove-selected-torrents-btn\").addEventListener(\"click\", removeSelectedTorrents);",
+        ] {
+            assert!(APP_JS.contains(needle), "Web UI is missing bulk selection JS {needle}");
+        }
+        for needle in [
+            ".bulk-actions",
+            ".selection-summary",
+            "td.selection-column",
+            ".torrent-select",
+            "tr.torrent.selected",
+        ] {
+            assert!(
+                STYLE_CSS.contains(needle),
+                "style.css is missing bulk selection support {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn web_ui_uses_toast_notifications() {
         for needle in [
             "const DEFAULT_TOAST_DISPLAY_MS = 5000",
@@ -301,6 +359,7 @@ mod tests {
             "log-controls",
             "log-stream",
             "doctor-summary",
+            "doctor-application",
             "doctor-checks",
         ] {
             assert!(
@@ -320,6 +379,24 @@ mod tests {
             assert!(
                 INDEX_HTML.contains(needle),
                 "Web UI is missing markup marker {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_doctor_displays_application_version() {
+        for needle in [
+            "id=\"doctor-application\"",
+            "<h3>Application</h3>",
+            "api(\"/version\")",
+            "function renderDoctor(report, version = null)",
+            "[\"Version\", version?.version || \"unknown\"]",
+            "[\"Commit\", version?.commit || \"unknown\"]",
+            "[\"Target\", version?.target || \"unknown\"]",
+        ] {
+            assert!(
+                APP_JS.contains(needle) || INDEX_HTML.contains(needle),
+                "Web UI is missing Doctor version support {needle}"
             );
         }
     }

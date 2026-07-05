@@ -4,6 +4,8 @@
 .idea
 .vscode
 target
+book
+dist
 debug
 **/*.rs.bk
 **/mutants.out*

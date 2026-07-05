@@ -78,12 +78,14 @@ The build commit is separate from the release version. CI/container builds pass
 ### Container and GHCR metadata
 
 - `deploy/Dockerfile`
-  Keep `ARG SWARMOTTER_VERSION` aligned with the workspace release version
-  unless the workflow is changed to pass it automatically from Cargo metadata.
+  `ARG SWARMOTTER_VERSION` defaults to the current workspace release version for
+  local builds. Release workflows pass the tag-derived version explicitly.
 - `.github/workflows/ci.yml`
-  Main-branch image tags are `latest`, `main`, and `sha-<shortsha>`. If release
-  tags are added later, keep the workflow tag rules aligned with the release
-  tag format in this guide.
+  Main-branch image tags are `latest`, `main`, and `sha-<shortsha>`.
+- `.github/workflows/release.yml`
+  Stable `vX.Y.Z` tags publish Linux tarballs, `.deb`/`.rpm` packages,
+  `SHA256SUMS`, and GHCR image tags `vX.Y.Z`, `X.Y.Z`, `X.Y`, `X`, `latest`,
+  and `sha-<shortsha>`.
 - `deploy/compose.yml` and `deploy/.env.example`
   These usually do not need a version bump because the default image tracks
   `latest`. Update them only if a release requires a new image name, port,
@@ -128,8 +130,8 @@ Examples:
    cargo metadata --format-version 1 >/dev/null
    ```
 
-4. Update `deploy/Dockerfile` `SWARMOTTER_VERSION` if it still hard-codes the
-   release version.
+4. Check whether `deploy/Dockerfile` `SWARMOTTER_VERSION` default should change
+   for local image metadata.
 5. Update `CHANGELOG.md`.
 6. Re-scan the repository for stale release-version strings.
 7. Validate that package metadata, tests, Docker build metadata, and docs still
@@ -172,11 +174,9 @@ Replace `OLD_VERSION` with the version you are replacing.
 
 ## 6. Release tag rules
 
-When publishing a release, use Git tags with a leading `v`:
+When publishing a stable release, use Git tags with a leading `v`:
 
 - Stable release: `v1.0.0`
-- Release candidate: `v1.1.0-rc.1`
 
-If CI starts publishing release tags to GHCR, image tags should include the
-SemVer tag without the leading `v` in addition to the existing branch and SHA
-tags.
+Stable release tags publish native Linux artifacts and GHCR tags with both the
+leading-`v` tag and SemVer tags without the leading `v`.

@@ -8,7 +8,7 @@ All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates. SwarmOtter's first release is `v1.0.0`; there is no
 MVP release.
 
-## [1.0.0] - unreleased
+## [1.0.0] - [2026-07-04]
 
 This is the active `v1.0.0` initial-release branch. It records completed
 capabilities that are part of the first public release scope defined in
@@ -23,6 +23,31 @@ status.
 
 ### Added
 
+- **Bulk torrent API operations:** native clients can add many torrents with
+  `POST /api/v1/torrents/bulk` using magnet links and/or base64 `.torrent`
+  payloads, with per-item success and failure results. Clients can also remove
+  many torrents with `POST /api/v1/torrents/remove`, which reports removed and
+  missing hashes while the daemon reconciles queue state once for the batch.
+- **Rapid API torrent add handling:** API torrent adds continue to return after
+  registration and queue insertion instead of waiting for engine startup. Queue
+  reconciliation now coalesces rapid add bursts before starting work, with
+  coverage for 200 fast API add requests and 200 daemon queue inserts.
+- **Paused torrent add API:** native add-torrent requests now accept
+  `paused: true` or `start_behavior: "paused"` for JSON magnet adds and
+  `?paused=true` or `?start_behavior=paused` for raw `.torrent` uploads. The
+  daemon inserts paused adds into queue order without scheduling immediate
+  startup, and the Transmission compatibility adapter now uses the same
+  add-time paused path.
+- **Web UI bulk torrent selection:** torrent list rows can now be selected with
+  checkboxes, the toolbar can select all visible rows or clear the selection,
+  and selected torrents are removed through the bulk remove API in one
+  confirmed operation while keeping downloaded data.
+- **Web UI application version display:** the Doctor view now shows SwarmOtter
+  version, commit, and target details from the native version API.
+- **Linux release artifacts:** stable release tags now build Linux `x86_64`
+  and `aarch64` tarballs, `.deb`/`.rpm` packages, checksums, and semver-tagged
+  GHCR images for `linux/amd64` and `linux/arm64`. ADR-0032 records the release
+  artifact strategy.
 - **FOSS torrent client comparison:** added `design/COMPARISON.md` as a living
   comparison matrix for SwarmOtter versus popular FOSS torrent clients,
   including feature parity, differentiators, source links, and roadmap gaps
@@ -284,6 +309,11 @@ status.
 
 ### Fixed
 
+- **Bulk torrent add responsiveness:** native magnet and `.torrent` add calls now
+  return after registering and queueing the torrent instead of waiting for queue
+  reconciliation and engine startup. Rapid add bursts coalesce queue
+  reconciliation in the background, and engine startup no longer holds the
+  registry lock while resolving runtime paths.
 - **Tracker announce diagnostics:** tracker API rows now use per-tracker
   announce results instead of copying a torrent-level status message to every
   tracker. Successful announces populate `last_message`, seeders, leechers, and

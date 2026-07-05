@@ -1,0 +1,73 @@
+name: swarmotter
+arch: "@NFPM_ARCH@"
+platform: linux
+version: "@SWARMOTTER_VERSION@"
+release: "1"
+section: net
+priority: optional
+maintainer: SwarmOtter maintainers
+description: |-
+  Performance-first BitTorrent daemon with Web UI and fail-closed network containment.
+vendor: SwarmOtter
+homepage: https://github.com/sphildreth/swarmotter
+license: Apache-2.0
+scripts:
+  preinstall: deploy/package/preinstall.sh
+  postinstall: deploy/package/postinstall.sh
+  postremove: deploy/package/postremove.sh
+contents:
+  - src: "@SWARMOTTER_BINARY@"
+    dst: /usr/bin/swarmotterd
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
+  - src: config/swarmotter.toml.example
+    dst: /etc/swarmotter/swarmotter.toml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: deploy/swarmotterd.service
+    dst: /usr/lib/systemd/system/swarmotterd.service
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: LICENSE
+    dst: /usr/share/doc/swarmotter/LICENSE
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: README.md
+    dst: /usr/share/doc/swarmotter/README.md
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - src: THIRD_PARTY_LICENSES.md
+    dst: /usr/share/doc/swarmotter/THIRD_PARTY_LICENSES.md
+    file_info:
+      mode: 0644
+      owner: root
+      group: root
+  - dst: /var/lib/swarmotter
+    type: dir
+    file_info:
+      mode: 0755
+      owner: swarmotter
+      group: swarmotter
+  - dst: /data/downloads
+    type: dir
+    file_info:
+      mode: 0755
+      owner: swarmotter
+      group: swarmotter
+  - dst: /data/incomplete
+    type: dir
+    file_info:
+      mode: 0755
+      owner: swarmotter
+      group: swarmotter

@@ -39,11 +39,18 @@
     <section id="view-torrents" class="view">
       <div class="toolbar">
         <input id="search" type="search" placeholder="Filter torrents...">
+        <div class="bulk-actions" aria-label="Torrent selection actions">
+          <button id="select-all-torrents-btn" type="button" class="secondary">Select All</button>
+          <button id="deselect-all-torrents-btn" type="button" class="secondary" disabled>Deselect All</button>
+          <button id="remove-selected-torrents-btn" type="button" class="danger" disabled>Remove Selected</button>
+          <span id="selection-summary" class="muted selection-summary">0 selected</span>
+        </div>
         <span id="stats-summary" class="muted"></span>
       </div>
       <table id="torrent-table">
         <thead>
           <tr>
+            <th class="selection-column"><span class="sr-only">Selected</span></th>
             <th>Name</th><th>Size</th><th>Progress</th><th>Status</th>
             <th>Health</th>
             <th>Down</th><th>Up</th><th>Ratio</th><th>Peers</th><th>Actions</th>
@@ -311,6 +318,10 @@
         <div id="doctor-summary" class="card">
           <h3>Health summary</h3>
           <p class="muted">System diagnostics summary appears here.</p>
+        </div>
+        <div id="doctor-application" class="card">
+          <h3>Application</h3>
+          <p class="muted">Version and build details appear here.</p>
         </div>
         <div id="doctor-checks" class="card">
           <h3>Checks</h3>

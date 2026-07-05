@@ -55,8 +55,9 @@ time or duration estimates.
 - **Configuration:** config file plus environment variable overrides,
   validation, safe defaults, startup failure on invalid required settings,
   runtime updates where safe.
-- **Deployment:** Linux daemon, systemd, containers (Podman/Docker where
-  practical), VPN network namespace, reverse proxy, persistent volumes.
+- **Deployment:** Linux daemon, systemd, Linux release tarballs and packages,
+  containers (Podman/Docker where practical), VPN network namespace, reverse
+  proxy, persistent volumes.
 - **Observability:** structured logs, health endpoints, global/per-torrent
   stats, network/DHT/tracker/watch-folder state, optional Prometheus metrics.
 

@@ -15,6 +15,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --locked --release --bin swarmotterd \
     && cp /src/target/release/swarmotterd /tmp/swarmotterd
 
+FROM scratch AS binary
+COPY --from=builder /tmp/swarmotterd /swarmotterd
+
 FROM debian:bookworm-slim
 
 ARG SWARMOTTER_BUILD_COMMIT=unknown

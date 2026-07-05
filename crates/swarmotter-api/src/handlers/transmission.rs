@@ -22,8 +22,9 @@ use swarmotter_core::models::peer::{Peer, PeerDirection};
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{TrackerInfo, TrackerStatus};
 
+use crate::encoding::decode_base64;
 use crate::routes::constant_time_eq;
-use crate::state::SharedState;
+use crate::state::{AddTorrentOptions, SharedState};
 
 const SESSION_HEADER: &str = "x-transmission-session-id";
 
@@ -492,19 +493,20 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
     let download_dir = string_arg(&args, &["download_dir", "download-dir"]);
     let labels = string_array_arg(&args, &["labels"]).unwrap_or_default();
     let paused = bool_arg(&args, &["paused"]).unwrap_or(false);
+    let add_options = AddTorrentOptions::new(download_dir.clone(), paused);
 
     let add_result = if let Some(metainfo) = string_arg(&args, &["metainfo"]) {
         let bytes = decode_base64(&metainfo)
             .ok_or_else(|| RpcFailure::invalid("metainfo must be valid base64"))?;
         state
             .daemon
-            .add_torrent_file(bytes, download_dir.clone())
+            .add_torrent_file(bytes, add_options.clone())
             .await
     } else if let Some(filename) = string_arg(&args, &["filename"]) {
         if filename.starts_with("magnet:?") {
             state
                 .daemon
-                .add_magnet(&filename, download_dir.clone())
+                .add_magnet(&filename, add_options.clone())
                 .await
         } else if filename.starts_with("http://") || filename.starts_with("https://") {
             return Err(RpcFailure::invalid(
@@ -512,7 +514,7 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
             ));
         } else if filename.len() == 40 && filename.chars().all(|c| c.is_ascii_hexdigit()) {
             let magnet = format!("magnet:?xt=urn:btih:{filename}");
-            state.daemon.add_magnet(&magnet, download_dir.clone()).await
+            state.daemon.add_magnet(&magnet, add_options.clone()).await
         } else {
             return Err(RpcFailure::invalid(
                 "filename must be a magnet link; use metainfo for torrent file bytes",
@@ -537,13 +539,6 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
         state
             .daemon
             .set_labels(&hash, labels)
-            .await
-            .map_err(RpcFailure::from_core)?;
-    }
-    if paused {
-        state
-            .daemon
-            .pause(&hash)
             .await
             .map_err(RpcFailure::from_core)?;
     }
@@ -1392,45 +1387,6 @@ fn basic_password(header_value: &str) -> Option<String> {
     decoded
         .split_once(':')
         .map(|(_, password)| password.to_string())
-}
-
-fn decode_base64(input: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buffer = 0u32;
-    let mut bits = 0u32;
-    let mut saw_padding = false;
-    for c in input.chars() {
-        if c.is_ascii_whitespace() {
-            continue;
-        }
-        if c == '=' {
-            saw_padding = true;
-            continue;
-        }
-        if saw_padding {
-            return None;
-        }
-        let value = base64_value(c)? as u32;
-        buffer = (buffer << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((buffer >> bits) & 0xff) as u8);
-            buffer &= (1 << bits) - 1;
-        }
-    }
-    Some(out)
-}
-
-fn base64_value(c: char) -> Option<u8> {
-    match c {
-        'A'..='Z' => Some(c as u8 - b'A'),
-        'a'..='z' => Some(26 + c as u8 - b'a'),
-        '0'..='9' => Some(52 + c as u8 - b'0'),
-        '+' | '-' => Some(62),
-        '/' | '_' => Some(63),
-        _ => None,
-    }
 }
 
 fn clamped_progress(summary: &TorrentSummary) -> f64 {

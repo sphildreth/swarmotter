@@ -30,6 +30,8 @@ use swarmotter_core::torrent::{Torrent, TorrentRegistry};
 use swarmotter_core::watch::ImportResult;
 use tokio::sync::Mutex;
 
+use swarmotter_api::state::AddTorrentOptions;
+
 pub struct FakeDaemon {
     registry: Arc<Mutex<TorrentRegistry>>,
     config: Arc<Mutex<Config>>,
@@ -100,14 +102,17 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
     async fn add_torrent_file(
         &self,
         bytes: Vec<u8>,
-        download_dir: Option<String>,
+        options: AddTorrentOptions,
     ) -> Result<InfoHash> {
         let meta = meta::parse_torrent(&bytes)?;
         let mut t = Torrent::new(meta, now());
-        t.download_dir = download_dir;
+        t.download_dir = options.download_dir;
+        if options.paused {
+            t.state = TorrentState::Paused;
+        }
         self.insert(t).await
     }
-    async fn add_magnet(&self, magnet: &str, download_dir: Option<String>) -> Result<InfoHash> {
+    async fn add_magnet(&self, magnet: &str, options: AddTorrentOptions) -> Result<InfoHash> {
         let m = Magnet::parse(magnet)?;
         // Build a minimal single-file meta from the magnet for testing.
         let bytes = meta::build_single_file_torrent(
@@ -119,8 +124,12 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         );
         let meta = meta::parse_torrent(&bytes)?;
         let mut t = Torrent::new(meta, now());
-        t.state = TorrentState::DownloadingMetadata;
-        t.download_dir = download_dir;
+        t.state = if options.paused {
+            TorrentState::Paused
+        } else {
+            TorrentState::DownloadingMetadata
+        };
+        t.download_dir = options.download_dir;
         self.insert(t).await
     }
     async fn remove_torrent(&self, hash: &InfoHash, _delete_data: bool) -> Result<()> {

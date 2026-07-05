@@ -286,13 +286,49 @@ main {
   padding: 1rem;
   overflow-x: auto;
 }
-.toolbar { display: flex; gap: 1rem; align-items: center; margin-bottom: 0.8rem; }
+.toolbar {
+  display: flex;
+  gap: 0.75rem 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 0.8rem;
+}
+.toolbar input[type="search"] {
+  min-width: min(18rem, 100%);
+}
+.bulk-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.selection-summary {
+  display: inline-block;
+  min-width: 5.5rem;
+}
+#stats-summary {
+  margin-left: auto;
+}
 .muted { color: var(--muted); }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-weight: 600; }
+th.selection-column,
+td.selection-column {
+  width: 2.8rem;
+  text-align: center;
+}
+.torrent-select {
+  width: 1rem;
+  height: 1rem;
+  margin: 0;
+  cursor: pointer;
+  vertical-align: middle;
+}
 tr.torrent { cursor: pointer; }
 tr.torrent:hover { background: #2a2a2a; }
+tr.torrent.selected { background: #22302d; }
+tr.torrent.selected:hover { background: #293936; }
 progress { width: 120px; }
 .card {
   background: var(--card);

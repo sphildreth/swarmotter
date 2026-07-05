@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use swarmotter_core::config::Config;
-use swarmotter_core::error::Result;
+use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
 use swarmotter_core::models::diagnostics::{
     ConfigUpdateResult, DoctorReport, LogSnapshot, NetworkDiagnostics, ResetResult, WatchStatus,
@@ -24,6 +24,22 @@ use swarmotter_core::models::torrent::TorrentFile;
 use swarmotter_core::models::torrent::TorrentSummary;
 use swarmotter_core::models::tracker::TrackerInfo;
 use tokio::sync::Mutex;
+
+/// Options applied when registering a newly added torrent.
+#[derive(Debug, Clone, Default)]
+pub struct AddTorrentOptions {
+    pub download_dir: Option<String>,
+    pub paused: bool,
+}
+
+impl AddTorrentOptions {
+    pub fn new(download_dir: Option<String>, paused: bool) -> Self {
+        Self {
+            download_dir,
+            paused,
+        }
+    }
+}
 
 /// Operations the API requires from the daemon runtime.
 ///
@@ -39,12 +55,28 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn add_torrent_file(
         &self,
         bytes: Vec<u8>,
-        download_dir: Option<String>,
+        options: AddTorrentOptions,
     ) -> Result<InfoHash>;
     /// Add a torrent from a magnet URI.
-    async fn add_magnet(&self, magnet: &str, download_dir: Option<String>) -> Result<InfoHash>;
+    async fn add_magnet(&self, magnet: &str, options: AddTorrentOptions) -> Result<InfoHash>;
     /// Remove a torrent, optionally deleting its data.
     async fn remove_torrent(&self, hash: &InfoHash, delete_data: bool) -> Result<()>;
+    /// Remove multiple torrents, optionally deleting their data.
+    async fn remove_torrents(
+        &self,
+        hashes: Vec<InfoHash>,
+        delete_data: bool,
+    ) -> Result<Vec<InfoHash>> {
+        let mut removed = Vec::new();
+        for hash in hashes {
+            match self.remove_torrent(&hash, delete_data).await {
+                Ok(()) => removed.push(hash),
+                Err(CoreError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
+    }
     /// Pause a torrent.
     async fn pause(&self, hash: &InfoHash) -> Result<()>;
     /// Resume a torrent.
