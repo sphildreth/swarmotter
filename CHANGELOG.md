@@ -8,6 +8,17 @@ All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates. SwarmOtter's first release is `v1.0.0`; there is no
 MVP release.
 
+## [UNRELEASED]
+
+### Added
+
+- **Web UI sortable and filterable torrent table:** the torrent list now uses
+  a vendored Tabulator grid with clickable column sorting, reversible sort
+  direction, status/health header filters, numeric comparison filters for
+  columns such as progress, rates, ratio, size, and peers, and a Clear Filters
+  control while preserving existing row actions and bulk selection behavior.
+  ADR-0033 records the Tabulator dependency decision.
+
 ## [1.0.0] - [2026-07-04]
 
 This is the active `v1.0.0` initial-release branch. It records completed

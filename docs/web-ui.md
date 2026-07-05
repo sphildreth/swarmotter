@@ -38,6 +38,14 @@ summary response. The main UI area uses the available browser width so wide
 tables can show operational details without being capped to a narrow centered
 column. Per-row torrent actions are icon buttons with accessible labels.
 
+The torrent list is an interactive table. Click a column header to sort by
+that column, and click it again to reverse the direction. Header filters can
+filter individual columns: status and health use list filters, while numeric
+columns such as size, progress, rates, ratio, and peers accept comparisons
+such as `> 0`, `>= 50`, `< 10`, or `= 1`. The toolbar search remains a global
+filter across common torrent summary fields, and Clear Filters resets both the
+toolbar search and column filters.
+
 Torrent rows can be selected with checkboxes. The torrent toolbar can select
 all currently visible rows, clear the current selection, and remove all selected
 torrents. Bulk removal removes torrent records through `POST

@@ -5,7 +5,9 @@
 //! Serves a practical, function-over-form Web UI that consumes the same API
 //! exposed to external automation (ADR-0004, ADR-0006). The UI is plain HTML +
 //! vanilla JS with no heavy framework, prioritizing fast load and complete
-//! operational coverage.
+//! operational coverage. The torrent list uses a vendored Tabulator grid for
+//! standard table sorting, filtering, and refresh behavior without requiring a
+//! runtime CDN or frontend build step.
 //!
 //! The UI assets are embedded at compile time so the daemon serves a single
 //! binary with no external static files.
@@ -21,6 +23,9 @@ use axum::{
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_JS: &str = include_str!("../assets/app.js");
 const STYLE_CSS: &str = include_str!("../assets/style.css");
+const TABULATOR_JS: &str = include_str!("../assets/vendor/tabulator/tabulator.min.js");
+const TABULATOR_CSS: &str = include_str!("../assets/vendor/tabulator/tabulator_midnight.min.css");
+const TABULATOR_LICENSE: &str = include_str!("../assets/vendor/tabulator/LICENSE");
 const FAVICON_ICO: &[u8] = include_bytes!("../../../assets/graphics/web/favicon.ico");
 const FAVICON_16: &[u8] = include_bytes!("../../../assets/graphics/web/favicon-16x16.png");
 const FAVICON_32: &[u8] = include_bytes!("../../../assets/graphics/web/favicon-32x32.png");
@@ -46,6 +51,12 @@ pub fn web_router() -> Router {
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
         .route("/style.css", get(style_css))
+        .route("/vendor/tabulator/tabulator.min.js", get(tabulator_js))
+        .route(
+            "/vendor/tabulator/tabulator_midnight.min.css",
+            get(tabulator_css),
+        )
+        .route("/vendor/tabulator/LICENSE", get(tabulator_license))
         .route("/favicon.ico", get(favicon_ico))
         .route("/favicon-16x16.png", get(favicon_16))
         .route("/favicon-32x32.png", get(favicon_32))
@@ -79,6 +90,33 @@ async fn style_css() -> Response {
     (
         [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
         STYLE_CSS,
+    )
+        .into_response()
+}
+
+async fn tabulator_js() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        TABULATOR_JS,
+    )
+        .into_response()
+}
+
+async fn tabulator_css() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        TABULATOR_CSS,
+    )
+        .into_response()
+}
+
+async fn tabulator_license() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        TABULATOR_LICENSE,
     )
         .into_response()
 }
@@ -151,6 +189,9 @@ mod tests {
         assert!(!INDEX_HTML.is_empty());
         assert!(!APP_JS.is_empty());
         assert!(!STYLE_CSS.is_empty());
+        assert!(!TABULATOR_JS.is_empty());
+        assert!(!TABULATOR_CSS.is_empty());
+        assert!(!TABULATOR_LICENSE.is_empty());
         assert!(!FAVICON_ICO.is_empty());
         assert!(!FAVICON_48.is_empty());
         assert!(!SITE_WEBMANIFEST.is_empty());
@@ -187,9 +228,9 @@ mod tests {
             "function renderDetailsHealth(",
             "function healthLabelName(",
             "torrent-health${healthClass}",
-            "<th>Health</th>",
+            "title: \"Health\"",
             "function renderPeerCount(",
-            "${renderPeerCount(t)}",
+            "formatter: cell => renderPeerCount(cell.getRow().getData())",
             "function renderTorrentActions(",
         ] {
             assert!(
@@ -242,21 +283,23 @@ mod tests {
             );
         }
         for needle in [
-            "class=\"selection-column\"",
+            "cssClass: \"selection-column\"",
             "aria-label=\"Torrent selection actions\"",
             "Remove Selected",
         ] {
             assert!(
-                INDEX_HTML.contains(needle),
+                INDEX_HTML.contains(needle) || APP_JS.contains(needle),
                 "Torrent selection markup is missing {needle}"
             );
         }
         for needle in [
             "let selectedTorrents = new Map();",
             "let visibleTorrents = [];",
+            "let torrentTable = null;",
             "let bulkRemoveInFlight = false;",
+            "new Tabulator(\"#torrent-table\"",
+            "function torrentSelectionFormatter(",
             "function renderTorrentSelection(",
-            "function bindSelectionInputs(",
             "function updateSelectionControls(",
             "function selectAllVisibleTorrents(",
             "function deselectAllTorrents(",
@@ -275,13 +318,65 @@ mod tests {
         for needle in [
             ".bulk-actions",
             ".selection-summary",
-            "td.selection-column",
+            ".torrent-table",
             ".torrent-select",
-            "tr.torrent.selected",
+            ".tabulator-row.selected",
         ] {
             assert!(
                 STYLE_CSS.contains(needle),
                 "style.css is missing bulk selection support {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_uses_tabulator_for_torrent_table_features() {
+        for needle in [
+            "/vendor/tabulator/tabulator_midnight.min.css",
+            "/vendor/tabulator/tabulator.min.js",
+            "id=\"torrent-table\" class=\"torrent-table\"",
+            "id=\"clear-torrent-filters-btn\"",
+        ] {
+            assert!(
+                INDEX_HTML.contains(needle),
+                "Web UI is missing Tabulator markup {needle}"
+            );
+        }
+        for needle in ["Tabulator v6.5.0", "The MIT License (MIT)"] {
+            assert!(
+                TABULATOR_JS.contains(needle)
+                    || TABULATOR_CSS.contains(needle)
+                    || TABULATOR_LICENSE.contains(needle),
+                "Vendored Tabulator asset is missing {needle}"
+            );
+        }
+        for needle in [
+            "layout: \"fitDataStretch\"",
+            "movableColumns: true",
+            "initialSort: [{ column: \"name\", dir: \"asc\" }]",
+            "headerFilter: \"input\"",
+            "headerFilter: \"list\"",
+            "headerFilterParams: { valuesLookup: true, clearable: true }",
+            "headerFilterFunc: numericHeaderFilter",
+            "function parseNumericFilter(",
+            "function clearTorrentFilters(",
+            "torrentTable.replaceData(rows)",
+            "torrentTable.getRows(\"active\")",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "Torrent table is missing Tabulator feature support {needle}"
+            );
+        }
+        for needle in [
+            ".tabulator.torrent-table",
+            ".torrent-table .tabulator-header-filter input",
+            ".torrent-table .tabulator-header-filter select",
+            ".torrent-table .tabulator-row.selected",
+        ] {
+            assert!(
+                STYLE_CSS.contains(needle),
+                "style.css is missing Tabulator table styling {needle}"
             );
         }
     }
@@ -591,6 +686,15 @@ mod tests {
             ("/favicon.ico", "image/x-icon"),
             ("/site.webmanifest", "application/manifest+json"),
             ("/swarmotter-icon-64x64.png", "image/png"),
+            (
+                "/vendor/tabulator/tabulator.min.js",
+                "application/javascript; charset=utf-8",
+            ),
+            (
+                "/vendor/tabulator/tabulator_midnight.min.css",
+                "text/css; charset=utf-8",
+            ),
+            ("/vendor/tabulator/LICENSE", "text/plain; charset=utf-8"),
         ] {
             let response = app
                 .clone()

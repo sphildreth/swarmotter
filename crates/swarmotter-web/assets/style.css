@@ -313,6 +313,75 @@ main {
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-weight: 600; }
+.torrent-table {
+  min-width: 88rem;
+}
+.tabulator.torrent-table {
+  background: #181818;
+  border-color: var(--border);
+  color: var(--fg);
+}
+.torrent-table .tabulator-header {
+  background: #161616;
+  border-bottom-color: var(--border);
+  color: var(--muted);
+}
+.torrent-table .tabulator-header .tabulator-col {
+  background: #161616;
+  border-right-color: var(--border);
+}
+.torrent-table .tabulator-header .tabulator-col.tabulator-sortable:hover {
+  background: #202020;
+}
+.torrent-table .tabulator-header .tabulator-col-title {
+  color: var(--muted);
+  font-weight: 600;
+}
+.torrent-table .tabulator-header-filter input,
+.torrent-table .tabulator-header-filter select {
+  width: 100%;
+  min-width: 0;
+  height: 1.85rem;
+  padding: 0.15rem 0.35rem;
+  font-size: 0.82rem;
+  background: #111;
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+}
+.torrent-table .tabulator-tableholder {
+  background: #181818;
+}
+.torrent-table .tabulator-row {
+  background: #181818;
+  border-bottom-color: var(--border);
+  color: var(--fg);
+}
+.torrent-table .tabulator-row.tabulator-row-even {
+  background: #1c1c1c;
+}
+.torrent-table .tabulator-row:hover {
+  background: #2a2a2a;
+}
+.torrent-table .tabulator-row.selected,
+.torrent-table .tabulator-row.selected.tabulator-row-even {
+  background: #22302d;
+}
+.torrent-table .tabulator-row.selected:hover {
+  background: #293936;
+}
+.torrent-table .tabulator-cell {
+  display: inline-flex;
+  align-items: center;
+  min-height: 2.65rem;
+  border-right-color: var(--border);
+}
+.torrent-table .tabulator-cell[tabulator-field="name"] {
+  overflow-wrap: anywhere;
+}
+.torrent-table .tabulator-placeholder {
+  color: var(--muted);
+}
 th.selection-column,
 td.selection-column {
   width: 2.8rem;

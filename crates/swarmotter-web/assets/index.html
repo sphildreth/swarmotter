@@ -10,6 +10,7 @@
   <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48x48.png">
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="manifest" href="/site.webmanifest">
+  <link rel="stylesheet" href="/vendor/tabulator/tabulator_midnight.min.css">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -39,6 +40,7 @@
     <section id="view-torrents" class="view">
       <div class="toolbar">
         <input id="search" type="search" placeholder="Filter torrents...">
+        <button id="clear-torrent-filters-btn" type="button" class="secondary" disabled>Clear Filters</button>
         <div class="bulk-actions" aria-label="Torrent selection actions">
           <button id="select-all-torrents-btn" type="button" class="secondary">Select All</button>
           <button id="deselect-all-torrents-btn" type="button" class="secondary" disabled>Deselect All</button>
@@ -47,17 +49,7 @@
         </div>
         <span id="stats-summary" class="muted"></span>
       </div>
-      <table id="torrent-table">
-        <thead>
-          <tr>
-            <th class="selection-column"><span class="sr-only">Selected</span></th>
-            <th>Name</th><th>Size</th><th>Progress</th><th>Status</th>
-            <th>Health</th>
-            <th>Down</th><th>Up</th><th>Ratio</th><th>Peers</th><th>Actions</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+      <div id="torrent-table" class="torrent-table" aria-label="Torrent list"></div>
     </section>
 
     <!-- Add view -->
@@ -331,6 +323,7 @@
     </section>
   </main>
 
+  <script src="/vendor/tabulator/tabulator.min.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

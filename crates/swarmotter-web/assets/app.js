@@ -13,6 +13,7 @@ let knownTorrents = new Map();
 let expectedRemovedTorrents = new Map();
 let selectedTorrents = new Map();
 let visibleTorrents = [];
+let torrentTable = null;
 let bulkRemoveInFlight = false;
 let magnetAddInFlight = false;
 let logEventSource = null;
@@ -201,48 +202,332 @@ $$(".nav").forEach(btn => btn.addEventListener("click", () => {
 // --- Torrents ---
 async function refreshTorrents() {
   try {
-    const list = await api("/torrents");
-    const stats = await api("/stats");
-    observeTorrentRemovals(list);
-    syncSelectedTorrents(list);
-    const tbody = $("#torrent-table tbody");
-    tbody.innerHTML = "";
-    const filter = $("#search").value.toLowerCase();
-    const filtered = list.filter(t => String(t.name || "").toLowerCase().includes(filter));
-    visibleTorrents = filtered.map(t => ({
-      hash: t.info_hash,
-      name: torrentDisplayName(t),
-    }));
-    filtered.forEach(t => {
-      const tr = document.createElement("tr");
-      tr.className = "torrent";
-      tr.classList.toggle("selected", selectedTorrents.has(t.info_hash));
-      tr.dataset.hash = t.info_hash;
-      tr.innerHTML = `
-        <td class="selection-column">${renderTorrentSelection(t)}</td>
-        <td>${escapeHtml(t.name)}</td>
-        <td>${fmtBytes(t.total_length)}</td>
-        <td>${renderProgressCell(t.bytes_completed, t.total_length)}</td>
-        <td>${escapeHtml(t.state)}</td>
-        <td>${renderHealth(t.health)}</td>
-        <td>${fmtRate(t.rate_down)}</td>
-        <td>${fmtRate(t.rate_up)}</td>
-        <td>${fmtRatio(t.ratio)}</td>
-        <td>${renderPeerCount(t)}</td>
-        <td>${renderTorrentActions()}</td>`;
-      tr.addEventListener("click", (e) => {
-        if (e.target.closest("button, input, label")) return;
-        openDetails(t.info_hash);
-      });
-      tbody.appendChild(tr);
-    });
+    const [list, stats] = await Promise.all([api("/torrents"), api("/stats")]);
+    const torrents = list || [];
+    observeTorrentRemovals(torrents);
+    syncSelectedTorrents(torrents);
+    const rows = torrents.map(normalizeTorrentRow);
+    ensureTorrentTable();
+    await setTorrentTableData(rows);
     $("#stats-summary").textContent = renderStatsSummary(stats);
-    bindSelectionInputs();
-    bindActionButtons();
-    updateSelectionControls();
+    updateTorrentTableViewState();
   } catch (e) {
     log("torrent list error: " + e.message);
   }
+}
+
+function normalizeTorrentRow(t) {
+  const total = finiteNumber(t.total_length);
+  const completed = finiteNumber(t.bytes_completed);
+  const progress = completed === null || total === null || total <= 0
+    ? null
+    : Math.min(completed, total) / total * 100;
+  const rawHealthLabel = t?.health?.label || "unknown";
+  return {
+    ...t,
+    info_hash: String(t.info_hash || ""),
+    name: torrentDisplayName(t),
+    progress_percent: progress === null ? 0 : progress,
+    health_label: healthLabelName(rawHealthLabel),
+    health_score: finiteNumber(t?.health?.score) ?? 0,
+    active_peers: finiteNumber(t.active_peer_workers) ?? 0,
+    known_peer_count: finiteNumber(t.known_peers) ?? 0,
+  };
+}
+
+function ensureTorrentTable() {
+  if (torrentTable) return;
+  if (typeof Tabulator === "undefined") {
+    throw new Error("Tabulator asset did not load");
+  }
+  torrentTable = new Tabulator("#torrent-table", {
+    data: [],
+    index: "info_hash",
+    layout: "fitDataStretch",
+    height: "calc(100vh - 11rem)",
+    movableColumns: true,
+    placeholder: "No torrents match the current filters.",
+    columnHeaderVertAlign: "bottom",
+    headerFilterLiveFilterDelay: 250,
+    initialSort: [{ column: "name", dir: "asc" }],
+    columns: torrentTableColumns(),
+    rowFormatter(row) {
+      const data = row.getData();
+      const element = row.getElement();
+      element.classList.add("torrent");
+      element.classList.toggle("selected", selectedTorrents.has(data.info_hash));
+    },
+  });
+  torrentTable.on("rowClick", (event, row) => {
+    if (event.target.closest("button, input, label, select")) return;
+    openDetails(row.getData().info_hash);
+  });
+  torrentTable.on("dataFiltered", updateTorrentTableViewState);
+  torrentTable.on("dataSorted", updateTorrentTableViewState);
+  torrentTable.on("renderComplete", updateTorrentTableViewState);
+}
+
+function torrentTableColumns() {
+  return [
+    {
+      title: "",
+      field: "_selected",
+      width: 44,
+      minWidth: 44,
+      frozen: true,
+      headerSort: false,
+      resizable: false,
+      hozAlign: "center",
+      cssClass: "selection-column",
+      titleFormatter: () => `<span class="sr-only">Selected</span>`,
+      formatter: torrentSelectionFormatter,
+    },
+    {
+      title: "Name",
+      field: "name",
+      minWidth: 260,
+      sorter: "string",
+      headerFilter: "input",
+      headerFilterPlaceholder: "Filter name",
+      formatter: textCellFormatter,
+    },
+    {
+      title: "Size",
+      field: "total_length",
+      width: 105,
+      hozAlign: "right",
+      sorter: "number",
+      headerFilter: "input",
+      headerFilterPlaceholder: "> 0",
+      headerFilterFunc: numericHeaderFilter,
+      formatter: cell => fmtBytes(cell.getValue()),
+    },
+    {
+      title: "Progress",
+      field: "progress_percent",
+      width: 180,
+      sorter: "number",
+      headerFilter: "input",
+      headerFilterPlaceholder: "> 50",
+      headerFilterFunc: numericHeaderFilter,
+      formatter: cell => {
+        const data = cell.getRow().getData();
+        return renderProgressCell(data.bytes_completed, data.total_length);
+      },
+    },
+    {
+      title: "Status",
+      field: "state",
+      width: 145,
+      sorter: "string",
+      headerFilter: "list",
+      headerFilterParams: { valuesLookup: true, clearable: true },
+      headerFilterPlaceholder: "All",
+      formatter: textCellFormatter,
+    },
+    {
+      title: "Health",
+      field: "health_label",
+      width: 165,
+      sorter: healthSorter,
+      headerFilter: "list",
+      headerFilterParams: { valuesLookup: true, clearable: true },
+      headerFilterPlaceholder: "All",
+      formatter: cell => renderHealth(cell.getRow().getData().health),
+    },
+    {
+      title: "Down",
+      field: "rate_down",
+      width: 105,
+      hozAlign: "right",
+      sorter: "number",
+      headerFilter: "input",
+      headerFilterPlaceholder: "> 0",
+      headerFilterFunc: numericHeaderFilter,
+      formatter: cell => fmtRate(cell.getValue()),
+    },
+    {
+      title: "Up",
+      field: "rate_up",
+      width: 105,
+      hozAlign: "right",
+      sorter: "number",
+      headerFilter: "input",
+      headerFilterPlaceholder: "> 0",
+      headerFilterFunc: numericHeaderFilter,
+      formatter: cell => fmtRate(cell.getValue()),
+    },
+    {
+      title: "Ratio",
+      field: "ratio",
+      width: 95,
+      hozAlign: "right",
+      sorter: "number",
+      headerFilter: "input",
+      headerFilterPlaceholder: "> 1",
+      headerFilterFunc: numericHeaderFilter,
+      formatter: cell => fmtRatio(cell.getValue()),
+    },
+    {
+      title: "Peers",
+      field: "active_peers",
+      width: 105,
+      hozAlign: "right",
+      sorter: peerCountSorter,
+      headerFilter: "input",
+      headerFilterPlaceholder: "> 0",
+      headerFilterFunc: numericHeaderFilter,
+      formatter: cell => renderPeerCount(cell.getRow().getData()),
+    },
+    {
+      title: "Actions",
+      field: "_actions",
+      width: 150,
+      headerSort: false,
+      resizable: false,
+      formatter: () => renderTorrentActions(),
+      cellClick: handleTorrentActionCellClick,
+    },
+  ];
+}
+
+function setTorrentTableData(rows) {
+  if (!torrentTable) return Promise.resolve();
+  const result = torrentTable.replaceData(rows);
+  return result && typeof result.then === "function" ? result : Promise.resolve();
+}
+
+function textCellFormatter(cell) {
+  return escapeHtml(cell.getValue());
+}
+
+function healthSorter(_a, _b, aRow, bRow) {
+  return compareNumbers(aRow.getData().health_score, bRow.getData().health_score);
+}
+
+function peerCountSorter(_a, _b, aRow, bRow) {
+  const a = aRow.getData();
+  const b = bRow.getData();
+  return compareNumbers(a.active_peers, b.active_peers)
+    || compareNumbers(a.known_peer_count, b.known_peer_count);
+}
+
+function compareNumbers(a, b) {
+  return (finiteNumber(a) ?? 0) - (finiteNumber(b) ?? 0);
+}
+
+function numericHeaderFilter(headerValue, rowValue) {
+  const parsed = parseNumericFilter(headerValue);
+  if (!parsed) return true;
+  const value = finiteNumber(rowValue);
+  if (value === null) return false;
+  switch (parsed.operator) {
+    case ">": return value > parsed.value;
+    case ">=": return value >= parsed.value;
+    case "<": return value < parsed.value;
+    case "<=": return value <= parsed.value;
+    case "!=": return value !== parsed.value;
+    default: return value === parsed.value;
+  }
+}
+
+function parseNumericFilter(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  const match = text.match(/^(<=|>=|!=|==|=|<|>)?\s*(-?(?:\d+(?:\.\d+)?|\.\d+))$/);
+  if (!match) return null;
+  return {
+    operator: match[1] === "==" ? "=" : (match[1] || "="),
+    value: Number(match[2]),
+  };
+}
+
+function torrentSelectionFormatter(cell, _formatterParams, onRendered) {
+  onRendered(() => bindTorrentSelectionCheckbox(cell));
+  return renderTorrentSelection(cell.getRow().getData());
+}
+
+function bindTorrentSelectionCheckbox(cell) {
+  const checkbox = cell.getElement().querySelector(".torrent-select");
+  if (!checkbox) return;
+  checkbox.addEventListener("click", event => event.stopPropagation());
+  checkbox.addEventListener("change", () => {
+    const row = cell.getRow();
+    const data = row.getData();
+    if (checkbox.checked) selectedTorrents.set(data.info_hash, torrentDisplayName(data));
+    else selectedTorrents.delete(data.info_hash);
+    row.getElement().classList.toggle("selected", checkbox.checked);
+    updateSelectionControls();
+  });
+}
+
+function handleTorrentActionCellClick(event, cell) {
+  const button = event.target.closest("button");
+  if (!button) return;
+  event.stopPropagation();
+  const data = cell.getRow().getData();
+  handleTorrentAction(button.dataset.act, data.info_hash, torrentDisplayName(data));
+}
+
+function activeTorrentRows() {
+  if (!torrentTable) return [];
+  try {
+    return torrentTable.getRows("active");
+  } catch {
+    return torrentTable.getRows();
+  }
+}
+
+function updateVisibleTorrentsFromTable() {
+  visibleTorrents = activeTorrentRows().map(row => {
+    const data = row.getData();
+    return {
+      hash: data.info_hash,
+      name: torrentDisplayName(data),
+    };
+  }).filter(t => t.hash);
+}
+
+function updateTorrentTableViewState() {
+  updateVisibleTorrentsFromTable();
+  updateRenderedSelection();
+  updateSelectionControls();
+  updateClearFiltersButton();
+}
+
+function torrentGlobalFilter(data) {
+  const query = $("#search").value.trim().toLowerCase();
+  if (!query) return true;
+  return [
+    data.name,
+    data.info_hash,
+    data.state,
+    data.health_label,
+  ].some(value => String(value || "").toLowerCase().includes(query));
+}
+
+function applyTorrentSearchFilter() {
+  if (!torrentTable) return;
+  if ($("#search").value.trim()) torrentTable.setFilter(torrentGlobalFilter);
+  else torrentTable.clearFilter();
+  updateTorrentTableViewState();
+}
+
+function clearTorrentFilters() {
+  $("#search").value = "";
+  if (torrentTable) torrentTable.clearFilter(true);
+  updateTorrentTableViewState();
+}
+
+function updateClearFiltersButton() {
+  const button = $("#clear-torrent-filters-btn");
+  if (!button) return;
+  const hasSearch = !!$("#search").value.trim();
+  let hasHeaderFilters = false;
+  if (torrentTable) {
+    try { hasHeaderFilters = torrentTable.getHeaderFilters().length > 0; } catch {}
+  }
+  button.disabled = !hasSearch && !hasHeaderFilters;
 }
 
 function observeTorrentRemovals(list) {
@@ -306,27 +591,13 @@ function renderTorrentSelection(t) {
   return `<input type="checkbox" class="torrent-select" data-hash="${escapeHtml(t.info_hash)}"${checked} aria-label="Select ${escapeHtml(name)}">`;
 }
 
-function bindSelectionInputs() {
-  $$("#torrent-table tbody .torrent-select").forEach(cb => {
-    cb.addEventListener("click", e => e.stopPropagation());
-    cb.addEventListener("change", () => {
-      const tr = cb.closest("tr");
-      const hash = cb.dataset.hash;
-      const name = tr?.querySelector("td:nth-child(2)")?.textContent || hash;
-      if (cb.checked) selectedTorrents.set(hash, name);
-      else selectedTorrents.delete(hash);
-      tr?.classList.toggle("selected", cb.checked);
-      updateSelectionControls();
-    });
-  });
-}
-
 function updateRenderedSelection() {
-  $$("#torrent-table tbody tr").forEach(tr => {
-    const hash = tr.dataset.hash;
-    const selected = selectedTorrents.has(hash);
-    tr.classList.toggle("selected", selected);
-    const cb = tr.querySelector(".torrent-select");
+  if (!torrentTable) return;
+  torrentTable.getRows().forEach(row => {
+    const data = row.getData();
+    const selected = selectedTorrents.has(data.info_hash);
+    row.getElement().classList.toggle("selected", selected);
+    const cb = row.getElement().querySelector(".torrent-select");
     if (cb) cb.checked = selected;
   });
 }
@@ -404,29 +675,22 @@ async function removeSelectedTorrents() {
   }
 }
 
-function bindActionButtons() {
-  $$("#torrent-table tbody button").forEach(btn => {
-    btn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      const tr = btn.closest("tr");
-      const hash = tr.dataset.hash;
-      const name = tr.querySelector("td:nth-child(2)")?.textContent || hash;
-      const act = btn.dataset.act;
-      try {
-        if (act === "pause") await api(`/torrents/${hash}/pause`, { method: "POST" });
-        else if (act === "resume") await api(`/torrents/${hash}/resume`, { method: "POST" });
-        else if (act === "recheck") await api(`/torrents/${hash}/recheck`, { method: "POST" });
-        else if (act === "remove") {
-          if (confirm("Remove torrent? Delete data too?")) await api(`/torrents/${hash}?delete_data=true`, { method: "DELETE" });
-          else await api(`/torrents/${hash}`, { method: "DELETE" });
-          expectedRemovedTorrents.set(hash, name);
-          selectedTorrents.delete(hash);
-          showToast("Torrent removed", name, "info");
-        }
-        refreshTorrents();
-      } catch (e) { showError("Torrent action failed", e); }
-    });
-  });
+async function handleTorrentAction(act, hash, name) {
+  try {
+    if (act === "pause") await api(`/torrents/${hash}/pause`, { method: "POST" });
+    else if (act === "resume") await api(`/torrents/${hash}/resume`, { method: "POST" });
+    else if (act === "recheck") await api(`/torrents/${hash}/recheck`, { method: "POST" });
+    else if (act === "remove") {
+      if (confirm("Remove torrent? Delete data too?")) await api(`/torrents/${hash}?delete_data=true`, { method: "DELETE" });
+      else await api(`/torrents/${hash}`, { method: "DELETE" });
+      expectedRemovedTorrents.set(hash, name);
+      selectedTorrents.delete(hash);
+      showToast("Torrent removed", name, "info");
+    }
+    refreshTorrents();
+  } catch (e) {
+    showError("Torrent action failed", e);
+  }
 }
 
 // --- Details ---
@@ -1395,7 +1659,8 @@ function log(msg) {
   else console.log(msg);
 }
 
-$("#search").addEventListener("input", refreshTorrents);
+$("#search").addEventListener("input", applyTorrentSearchFilter);
+$("#clear-torrent-filters-btn").addEventListener("click", clearTorrentFilters);
 $("#select-all-torrents-btn").addEventListener("click", selectAllVisibleTorrents);
 $("#deselect-all-torrents-btn").addEventListener("click", deselectAllTorrents);
 $("#remove-selected-torrents-btn").addEventListener("click", removeSelectedTorrents);
