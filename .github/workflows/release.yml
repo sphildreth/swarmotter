@@ -62,6 +62,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
       - name: Build release binary
         run: |
           mkdir -p dist/binary dist/packages
@@ -99,16 +104,10 @@ jobs:
             deploy/nfpm.yaml > dist/nfpm.yaml
 
       - name: Package deb
-        uses: goreleaser/nfpm-action@v2
-        with:
-          version: v2.47.0
-          args: package --config dist/nfpm.yaml --packager deb --target dist/packages
+        run: go run github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0 package --config dist/nfpm.yaml --packager deb --target dist/packages
 
       - name: Package rpm
-        uses: goreleaser/nfpm-action@v2
-        with:
-          version: v2.47.0
-          args: package --config dist/nfpm.yaml --packager rpm --target dist/packages
+        run: go run github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.47.0 package --config dist/nfpm.yaml --packager rpm --target dist/packages
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
