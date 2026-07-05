@@ -90,6 +90,7 @@ function applyTheme(theme, { persist = true } = {}) {
   const next = normalizeTheme(theme);
   currentTheme = next;
   document.documentElement.dataset.theme = next;
+  refreshTorrentTableTheme(next);
   const button = $("#theme-toggle");
   if (button) {
     button.dataset.theme = next;
@@ -101,6 +102,15 @@ function applyTheme(theme, { persist = true } = {}) {
   try {
     window.localStorage.setItem(THEME_STORAGE_KEY, next);
   } catch {}
+}
+
+function refreshTorrentTableTheme(theme) {
+  const tableElement = $("#torrent-table");
+  if (tableElement) tableElement.dataset.theme = theme;
+  if (!isTorrentTableReady() || typeof torrentTable.redraw !== "function") return;
+  const redraw = () => torrentTable.redraw(true);
+  if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(redraw);
+  else window.setTimeout(redraw, 0);
 }
 
 function toggleTheme() {
@@ -306,6 +316,7 @@ function ensureTorrentTable() {
   torrentTable.on("tableBuilt", () => {
     torrentTableBuilt = true;
     resolveReady(torrentTable);
+    refreshTorrentTableTheme(currentTheme);
     updateTorrentTableViewState();
   });
   torrentTable.on("rowClick", (event, row) => {

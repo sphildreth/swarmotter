@@ -28,6 +28,9 @@ MVP release.
 - **Web UI Tabulator initialization:** the torrent table now waits for
   Tabulator's `tableBuilt` event before replacing data or reading table
   filters, avoiding first-load console warnings and initialization races.
+- **Web UI Tabulator theme switching:** the torrent table now applies stronger
+  theme-aware Tabulator overrides and redraws the grid when the light/dark
+  theme icon is toggled.
 - **Retryable magnet metadata discovery:** magnets that discover no peers while
   fetching BEP 9 metadata now remain in `downloading_metadata` with a retry
   backoff instead of being moved to terminal `error`. Completed and failed

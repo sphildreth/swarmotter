@@ -373,9 +373,9 @@ mod tests {
         }
         for needle in [
             ".tabulator.torrent-table",
-            ".torrent-table .tabulator-header-filter input",
-            ".torrent-table .tabulator-header-filter select",
-            ".torrent-table .tabulator-row.selected",
+            ".tabulator.torrent-table .tabulator-header .tabulator-col .tabulator-header-filter input",
+            ".tabulator.torrent-table .tabulator-header .tabulator-col .tabulator-header-filter select",
+            ".tabulator.torrent-table .tabulator-row.selected",
         ] {
             assert!(
                 STYLE_CSS.contains(needle),
@@ -405,8 +405,11 @@ mod tests {
             "const DEFAULT_THEME = THEME_DARK;",
             "function loadThemePreference(",
             "function applyTheme(",
+            "function refreshTorrentTableTheme(",
             "function toggleTheme(",
             "document.documentElement.dataset.theme = next;",
+            "tableElement.dataset.theme = theme;",
+            "torrentTable.redraw(true)",
             "window.localStorage.setItem(THEME_STORAGE_KEY, next);",
             "themeToggle.addEventListener(\"click\", toggleTheme);",
         ] {
@@ -424,6 +427,8 @@ mod tests {
             "[data-theme=\"dark\"] #theme-toggle .theme-icon-sun",
             "[data-theme=\"light\"] #theme-toggle .theme-icon-moon",
             ".tabulator.torrent-table",
+            ".tabulator.torrent-table .tabulator-tableholder .tabulator-table",
+            ".tabulator.torrent-table .tabulator-header .tabulator-col .tabulator-header-filter input",
         ] {
             assert!(
                 STYLE_CSS.contains(needle),

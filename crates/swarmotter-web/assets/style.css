@@ -409,69 +409,126 @@ th { color: var(--muted); font-weight: 600; }
 }
 .tabulator.torrent-table {
   background: var(--tile-bg);
+  background-color: var(--tile-bg);
   border-color: var(--border);
   color: var(--fg);
 }
-.torrent-table .tabulator-header {
+.tabulator.torrent-table .tabulator-header {
   background: var(--tile-soft-bg);
+  background-color: var(--tile-soft-bg);
   border-bottom-color: var(--border);
   color: var(--muted);
 }
-.torrent-table .tabulator-header .tabulator-col {
+.tabulator.torrent-table .tabulator-header .tabulator-col {
   background: var(--tile-soft-bg);
+  background-color: var(--tile-soft-bg);
   border-right-color: var(--border);
+  color: var(--muted);
 }
-.torrent-table .tabulator-header .tabulator-col.tabulator-sortable:hover {
+.tabulator.torrent-table .tabulator-header .tabulator-col.tabulator-sortable:hover {
   background: var(--tile-hover-bg);
+  background-color: var(--tile-hover-bg);
 }
-.torrent-table .tabulator-header .tabulator-col-title {
+.tabulator.torrent-table .tabulator-header .tabulator-col-title {
   color: var(--muted);
   font-weight: 600;
 }
-.torrent-table .tabulator-header-filter input,
-.torrent-table .tabulator-header-filter select {
+.tabulator.torrent-table .tabulator-header .tabulator-col .tabulator-header-filter input,
+.tabulator.torrent-table .tabulator-header .tabulator-col .tabulator-header-filter select {
   width: 100%;
   min-width: 0;
   height: 1.85rem;
   padding: 0.15rem 0.35rem;
   font-size: 0.82rem;
   background: var(--field-bg);
+  background-color: var(--field-bg);
   color: var(--fg);
   border: 1px solid var(--border);
   border-radius: 3px;
 }
-.torrent-table .tabulator-tableholder {
+.tabulator.torrent-table .tabulator-tableholder,
+.tabulator.torrent-table .tabulator-tableholder .tabulator-table {
   background: var(--tile-bg);
+  background-color: var(--tile-bg);
+  color: var(--fg);
 }
-.torrent-table .tabulator-row {
+.tabulator.torrent-table .tabulator-row {
   background: var(--row-bg);
+  background-color: var(--row-bg);
   border-bottom-color: var(--border);
   color: var(--fg);
 }
-.torrent-table .tabulator-row.tabulator-row-even {
+.tabulator.torrent-table .tabulator-row.tabulator-row-even {
   background: var(--row-even-bg);
+  background-color: var(--row-even-bg);
 }
-.torrent-table .tabulator-row:hover {
+.tabulator.torrent-table .tabulator-row:hover,
+.tabulator.torrent-table .tabulator-row.tabulator-selectable:hover {
   background: var(--row-hover-bg);
+  background-color: var(--row-hover-bg);
 }
-.torrent-table .tabulator-row.selected,
-.torrent-table .tabulator-row.selected.tabulator-row-even {
+.tabulator.torrent-table .tabulator-row.selected,
+.tabulator.torrent-table .tabulator-row.selected.tabulator-row-even,
+.tabulator.torrent-table .tabulator-row.tabulator-selected {
   background: var(--row-selected-bg);
+  background-color: var(--row-selected-bg);
 }
-.torrent-table .tabulator-row.selected:hover {
+.tabulator.torrent-table .tabulator-row.selected:hover,
+.tabulator.torrent-table .tabulator-row.tabulator-selected:hover {
   background: var(--row-selected-hover-bg);
+  background-color: var(--row-selected-hover-bg);
 }
-.torrent-table .tabulator-cell {
+.tabulator.torrent-table .tabulator-cell {
   display: inline-flex;
   align-items: center;
   min-height: 2.65rem;
   border-right-color: var(--border);
+  color: var(--fg);
 }
-.torrent-table .tabulator-cell[tabulator-field="name"] {
+.tabulator.torrent-table .tabulator-cell[tabulator-field="name"] {
   overflow-wrap: anywhere;
 }
-.torrent-table .tabulator-placeholder {
+.tabulator.torrent-table .tabulator-placeholder,
+.tabulator.torrent-table .tabulator-placeholder .tabulator-placeholder-contents {
   color: var(--muted);
+}
+.tabulator.torrent-table .tabulator-col-resize-guide,
+.tabulator.torrent-table .tabulator-row-resize-guide {
+  background-color: var(--muted);
+}
+.tabulator.torrent-table .tabulator-alert {
+  background: var(--drop-overlay-bg);
+}
+.tabulator.torrent-table .tabulator-alert .tabulator-alert-msg {
+  background: var(--card);
+  color: var(--fg);
+  border-color: var(--border);
+}
+.tabulator.torrent-table .tabulator-header .tabulator-col .tabulator-col-content .tabulator-col-sorter .tabulator-arrow {
+  border-bottom-color: var(--muted);
+}
+.tabulator.torrent-table .tabulator-header .tabulator-col.tabulator-sortable[aria-sort="ascending"] .tabulator-col-content .tabulator-col-sorter .tabulator-arrow {
+  border-bottom-color: var(--fg);
+}
+.tabulator.torrent-table .tabulator-header .tabulator-col.tabulator-sortable[aria-sort="descending"] .tabulator-col-content .tabulator-col-sorter .tabulator-arrow {
+  border-top-color: var(--fg);
+}
+.tabulator-popup-container,
+.tabulator-edit-list {
+  background: var(--card);
+  background-color: var(--card);
+  border-color: var(--border);
+  color: var(--fg);
+}
+.tabulator-edit-list .tabulator-edit-list-item,
+.tabulator-edit-list .tabulator-edit-list-placeholder,
+.tabulator-edit-list .tabulator-edit-list-group {
+  color: var(--fg);
+}
+.tabulator-edit-list .tabulator-edit-list-item.active,
+.tabulator-edit-list .tabulator-edit-list-item:hover {
+  background: var(--row-hover-bg);
+  color: var(--fg);
 }
 th.selection-column,
 td.selection-column {
