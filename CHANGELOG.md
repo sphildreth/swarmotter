@@ -18,9 +18,16 @@ MVP release.
   columns such as progress, rates, ratio, size, and peers, and a Clear Filters
   control while preserving existing row actions and bulk selection behavior.
   ADR-0033 records the Tabulator dependency decision.
+- **Web UI light and dark theme toggle:** the header now includes a theme icon
+  that toggles between the default dark theme and a light theme, persists the
+  browser preference locally, and applies theme-aware Tabulator table colors.
+  ADR-0034 records the browser preference decision.
 
 ### Fixed
 
+- **Web UI Tabulator initialization:** the torrent table now waits for
+  Tabulator's `tableBuilt` event before replacing data or reading table
+  filters, avoiding first-load console warnings and initialization races.
 - **Retryable magnet metadata discovery:** magnets that discover no peers while
   fetching BEP 9 metadata now remain in `downloading_metadata` with a retry
   backoff instead of being moved to terminal `error`. Completed and failed

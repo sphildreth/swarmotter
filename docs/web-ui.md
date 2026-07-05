@@ -96,4 +96,6 @@ root directories, and clear daemon log files.
 ## Browser assets
 
 The daemon serves the Web UI favicon set and app manifest from the embedded
-graphics assets. The header uses the SwarmOtter icon next to the app name.
+graphics assets. The header uses the SwarmOtter icon next to the app name and
+includes a light/dark theme icon. The Web UI defaults to dark mode and stores
+the selected theme in browser `localStorage` under `swarmotter.theme`.

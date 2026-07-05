@@ -360,6 +360,9 @@ mod tests {
             "headerFilterFunc: numericHeaderFilter",
             "function parseNumericFilter(",
             "function clearTorrentFilters(",
+            "let torrentTableReady = Promise.resolve();",
+            "torrentTable.on(\"tableBuilt\"",
+            "await torrentTableReady;",
             "torrentTable.replaceData(rows)",
             "torrentTable.getRows(\"active\")",
         ] {
@@ -377,6 +380,54 @@ mod tests {
             assert!(
                 STYLE_CSS.contains(needle),
                 "style.css is missing Tabulator table styling {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_supports_light_dark_theme_toggle() {
+        for needle in [
+            "<html lang=\"en\" data-theme=\"dark\">",
+            "id=\"theme-toggle\"",
+            "class=\"icon-button theme-toggle\"",
+            "theme-icon-sun",
+            "theme-icon-moon",
+            "swarmotter.theme",
+            "document.documentElement.dataset.theme = theme;",
+        ] {
+            assert!(
+                INDEX_HTML.contains(needle),
+                "Web UI is missing theme toggle markup {needle}"
+            );
+        }
+        for needle in [
+            "const THEME_STORAGE_KEY = \"swarmotter.theme\";",
+            "const DEFAULT_THEME = THEME_DARK;",
+            "function loadThemePreference(",
+            "function applyTheme(",
+            "function toggleTheme(",
+            "document.documentElement.dataset.theme = next;",
+            "window.localStorage.setItem(THEME_STORAGE_KEY, next);",
+            "themeToggle.addEventListener(\"click\", toggleTheme);",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "Web UI is missing theme toggle behavior {needle}"
+            );
+        }
+        for needle in [
+            "[data-theme=\"light\"]",
+            "--header-bg",
+            "--field-bg",
+            "--row-selected-bg",
+            ".header-actions",
+            "[data-theme=\"dark\"] #theme-toggle .theme-icon-sun",
+            "[data-theme=\"light\"] #theme-toggle .theme-icon-moon",
+            ".tabulator.torrent-table",
+        ] {
+            assert!(
+                STYLE_CSS.contains(needle),
+                "style.css is missing theme styling {needle}"
             );
         }
     }

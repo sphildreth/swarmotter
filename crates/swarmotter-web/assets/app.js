@@ -6,14 +6,21 @@ const MAX_TOAST_DISPLAY_MS = 60000;
 const MAX_VISIBLE_TOASTS = 3;
 const MAX_LOG_LINES = 500;
 const TOAST_DISPLAY_STORAGE_KEY = "swarmotter.toastDisplayMs";
+const THEME_STORAGE_KEY = "swarmotter.theme";
+const THEME_DARK = "dark";
+const THEME_LIGHT = "light";
+const DEFAULT_THEME = THEME_DARK;
 let currentHash = null;
 let toastDisplayMs = loadToastDisplayMs();
+let currentTheme = loadThemePreference();
 let torrentsLoaded = false;
 let knownTorrents = new Map();
 let expectedRemovedTorrents = new Map();
 let selectedTorrents = new Map();
 let visibleTorrents = [];
 let torrentTable = null;
+let torrentTableBuilt = false;
+let torrentTableReady = Promise.resolve();
 let bulkRemoveInFlight = false;
 let magnetAddInFlight = false;
 let logEventSource = null;
@@ -64,6 +71,41 @@ const TORRENT_ACTIONS = [
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+function loadThemePreference() {
+  try {
+    return normalizeTheme(window.localStorage.getItem(THEME_STORAGE_KEY));
+  } catch {
+    return DEFAULT_THEME;
+  }
+}
+
+function normalizeTheme(rawTheme) {
+  return rawTheme === THEME_LIGHT || rawTheme === THEME_DARK
+    ? rawTheme
+    : DEFAULT_THEME;
+}
+
+function applyTheme(theme, { persist = true } = {}) {
+  const next = normalizeTheme(theme);
+  currentTheme = next;
+  document.documentElement.dataset.theme = next;
+  const button = $("#theme-toggle");
+  if (button) {
+    button.dataset.theme = next;
+    const label = next === THEME_DARK ? "Switch to light theme" : "Switch to dark theme";
+    button.setAttribute("aria-label", label);
+    button.title = label;
+  }
+  if (!persist) return;
+  try {
+    window.localStorage.setItem(THEME_STORAGE_KEY, next);
+  } catch {}
+}
+
+function toggleTheme() {
+  applyTheme(currentTheme === THEME_DARK ? THEME_LIGHT : THEME_DARK);
+}
 
 function loadToastDisplayMs() {
   try {
@@ -236,10 +278,13 @@ function normalizeTorrentRow(t) {
 }
 
 function ensureTorrentTable() {
-  if (torrentTable) return;
+  if (torrentTable) return torrentTableReady;
   if (typeof Tabulator === "undefined") {
     throw new Error("Tabulator asset did not load");
   }
+  let resolveReady;
+  torrentTableBuilt = false;
+  torrentTableReady = new Promise(resolve => { resolveReady = resolve; });
   torrentTable = new Tabulator("#torrent-table", {
     data: [],
     index: "info_hash",
@@ -258,6 +303,11 @@ function ensureTorrentTable() {
       element.classList.toggle("selected", selectedTorrents.has(data.info_hash));
     },
   });
+  torrentTable.on("tableBuilt", () => {
+    torrentTableBuilt = true;
+    resolveReady(torrentTable);
+    updateTorrentTableViewState();
+  });
   torrentTable.on("rowClick", (event, row) => {
     if (event.target.closest("button, input, label, select")) return;
     openDetails(row.getData().info_hash);
@@ -265,6 +315,7 @@ function ensureTorrentTable() {
   torrentTable.on("dataFiltered", updateTorrentTableViewState);
   torrentTable.on("dataSorted", updateTorrentTableViewState);
   torrentTable.on("renderComplete", updateTorrentTableViewState);
+  return torrentTableReady;
 }
 
 function torrentTableColumns() {
@@ -391,8 +442,13 @@ function torrentTableColumns() {
   ];
 }
 
-function setTorrentTableData(rows) {
+function isTorrentTableReady() {
+  return !!torrentTable && torrentTableBuilt;
+}
+
+async function setTorrentTableData(rows) {
   if (!torrentTable) return Promise.resolve();
+  await torrentTableReady;
   const result = torrentTable.replaceData(rows);
   return result && typeof result.then === "function" ? result : Promise.resolve();
 }
@@ -470,7 +526,7 @@ function handleTorrentActionCellClick(event, cell) {
 }
 
 function activeTorrentRows() {
-  if (!torrentTable) return [];
+  if (!isTorrentTableReady()) return [];
   try {
     return torrentTable.getRows("active");
   } catch {
@@ -506,16 +562,20 @@ function torrentGlobalFilter(data) {
   ].some(value => String(value || "").toLowerCase().includes(query));
 }
 
-function applyTorrentSearchFilter() {
+async function applyTorrentSearchFilter() {
   if (!torrentTable) return;
+  await torrentTableReady;
   if ($("#search").value.trim()) torrentTable.setFilter(torrentGlobalFilter);
   else torrentTable.clearFilter();
   updateTorrentTableViewState();
 }
 
-function clearTorrentFilters() {
+async function clearTorrentFilters() {
   $("#search").value = "";
-  if (torrentTable) torrentTable.clearFilter(true);
+  if (torrentTable) {
+    await torrentTableReady;
+    torrentTable.clearFilter(true);
+  }
   updateTorrentTableViewState();
 }
 
@@ -524,7 +584,7 @@ function updateClearFiltersButton() {
   if (!button) return;
   const hasSearch = !!$("#search").value.trim();
   let hasHeaderFilters = false;
-  if (torrentTable) {
+  if (isTorrentTableReady()) {
     try { hasHeaderFilters = torrentTable.getHeaderFilters().length > 0; } catch {}
   }
   button.disabled = !hasSearch && !hasHeaderFilters;
@@ -592,7 +652,7 @@ function renderTorrentSelection(t) {
 }
 
 function updateRenderedSelection() {
-  if (!torrentTable) return;
+  if (!isTorrentTableReady()) return;
   torrentTable.getRows().forEach(row => {
     const data = row.getData();
     const selected = selectedTorrents.has(data.info_hash);
@@ -1664,9 +1724,12 @@ $("#clear-torrent-filters-btn").addEventListener("click", clearTorrentFilters);
 $("#select-all-torrents-btn").addEventListener("click", selectAllVisibleTorrents);
 $("#deselect-all-torrents-btn").addEventListener("click", deselectAllTorrents);
 $("#remove-selected-torrents-btn").addEventListener("click", removeSelectedTorrents);
+const themeToggle = $("#theme-toggle");
+if (themeToggle) themeToggle.addEventListener("click", toggleTheme);
 
 // --- Init ---
 (async function init() {
+  applyTheme(currentTheme, { persist: false });
   await refreshTorrents();
   await refreshDoctorBadge();
   setInterval(refreshTorrents, 5000);
