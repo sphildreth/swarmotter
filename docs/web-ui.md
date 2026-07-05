@@ -38,6 +38,11 @@ summary response. The main UI area uses the available browser width so wide
 tables can show operational details without being capped to a narrow centered
 column. Per-row torrent actions are icon buttons with accessible labels.
 
+Torrent rows can be selected with checkboxes. The torrent toolbar can select
+all currently visible rows, clear the current selection, and remove all selected
+torrents. Bulk removal removes torrent records through `DELETE
+/api/v1/torrents/:hash` and keeps downloaded data.
+
 ## Notifications
 
 Transient operation feedback is shown as toast notifications instead of inline

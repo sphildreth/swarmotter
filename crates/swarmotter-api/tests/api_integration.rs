@@ -8,6 +8,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use serde::de::DeserializeOwned;
+use std::collections::BTreeSet;
 use swarmotter_core::config::{Config, StartBehavior, WatchFolderConfig};
 use swarmotter_core::meta::build_single_file_torrent;
 use swarmotter_core::models::network::NetworkContainmentStatus;
@@ -18,6 +19,10 @@ use tower::ServiceExt;
 
 fn known_magnet() -> String {
     "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062ba1f7a4e&dn=test".to_string()
+}
+
+fn bulk_magnet(index: usize) -> String {
+    format!("magnet:?xt=urn:btih:{:040x}&dn=bulk-{index}", index + 1)
 }
 
 async fn transmission_session(app: Router, auth: Option<&str>) -> String {
@@ -275,6 +280,152 @@ async fn add_torrent_file_raw_body() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v["data"].as_str().unwrap().len() == 40);
+}
+
+#[tokio::test]
+async fn add_magnet_can_start_paused() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let body = serde_json::json!({
+        "magnet": known_magnet(),
+        "paused": true
+    })
+    .to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/magnet")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let hash = v["data"].as_str().unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/torrents/{hash}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["data"]["state"], "paused");
+}
+
+#[tokio::test]
+async fn add_torrent_file_can_start_paused_from_query() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let bytes = build_single_file_torrent("paused-file.bin", b"paused payload", 8, None, false);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/file?start_behavior=paused")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(bytes))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let hash = v["data"].as_str().unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/torrents/{hash}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["data"]["state"], "paused");
+}
+
+#[tokio::test]
+async fn rapid_api_magnet_adds_all_register() {
+    const ADD_COUNT: usize = 200;
+
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let mut handles = Vec::with_capacity(ADD_COUNT);
+
+    for index in 0..ADD_COUNT {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            let body = serde_json::json!({ "magnet": bulk_magnet(index) }).to_string();
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/torrents/magnet")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            v["data"].as_str().unwrap().to_string()
+        }));
+    }
+
+    let mut hashes = BTreeSet::new();
+    for handle in handles {
+        hashes.insert(handle.await.unwrap());
+    }
+    assert_eq!(hashes.len(), ADD_COUNT);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["data"].as_array().unwrap().len(), ADD_COUNT);
 }
 
 #[tokio::test]

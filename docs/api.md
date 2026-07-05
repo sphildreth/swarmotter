@@ -67,7 +67,7 @@ The root `/health` path is also available without the `/api/v1` prefix.
 | --- | --- | --- |
 | GET | `/torrents` | List torrents. |
 | POST | `/torrents` | Add magnet JSON or raw `.torrent` body. |
-| POST | `/torrents/magnet` | Add magnet JSON: `{ magnet, download_dir? }`. |
+| POST | `/torrents/magnet` | Add magnet JSON: `{ magnet, download_dir?, paused?, start_behavior? }`. |
 | POST | `/torrents/file` | Upload raw `.torrent` body. |
 | GET | `/torrents/:hash` | Torrent details. |
 | GET | `/torrents/:hash/stats` | Per-torrent counters and live engine diagnostics. |
@@ -81,6 +81,19 @@ The root `/health` path is also available without the `/api/v1` prefix.
 | POST | `/torrents/:hash/move` | Move data: `{ path }`. |
 | POST | `/torrents/:hash/labels` | Set labels: `{ labels }`. |
 | POST | `/torrents/:hash/limits` | Set per-torrent bandwidth limits: `{ download_limit, upload_limit }`, bytes/sec, `0` = unlimited. |
+
+Add requests can start paused while still inserting the torrent into queue
+order. For JSON magnet adds, set either `paused: true` or
+`start_behavior: "paused"`. For raw `.torrent` uploads, use
+`?paused=true` or `?start_behavior=paused` on `/torrents` or
+`/torrents/file`. `paused` and `start_behavior` must agree when both are
+provided. Strict fail-closed network blocking can still put the new torrent in
+`network_blocked` instead of `paused`.
+
+Successful add responses mean the torrent record was registered and inserted
+into queue order. The daemon does not wait for queue reconciliation, metadata
+fetching, tracker announces, peer connections, or engine startup before
+returning. Rapid add bursts are coalesced by the daemon scheduler.
 
 `/torrents/:hash/stats` includes counters, rates, limits, active peer workers,
 known peers, live peer scheduler diagnostics, tracker diagnostics, and DHT/PEX

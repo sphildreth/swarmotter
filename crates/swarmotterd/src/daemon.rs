@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use swarmotter_api::state::DaemonOps;
+use swarmotter_api::state::{AddTorrentOptions, DaemonOps};
 use swarmotter_core::config::Config;
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
@@ -47,6 +47,7 @@ use crate::netbinder::ContainedBinder;
 use crate::seeder::Seeder;
 
 const PEER_DIAGNOSTIC_RECENT_WINDOW: Duration = Duration::from_secs(30);
+const QUEUE_RECONCILE_DEBOUNCE: Duration = Duration::from_millis(25);
 
 #[derive(Clone)]
 pub struct DaemonRuntime {
@@ -233,6 +234,125 @@ impl DaemonRuntime {
         }
     }
 
+    #[allow(dead_code)]
+    pub async fn add_torrent_file(
+        &self,
+        bytes: Vec<u8>,
+        download_dir: Option<String>,
+    ) -> Result<InfoHash> {
+        self.add_torrent_file_with_options(bytes, AddTorrentOptions::new(download_dir, false))
+            .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn add_magnet(&self, magnet: &str, download_dir: Option<String>) -> Result<InfoHash> {
+        self.add_magnet_with_options(magnet, AddTorrentOptions::new(download_dir, false))
+            .await
+    }
+
+    async fn add_torrent_file_with_options(
+        &self,
+        bytes: Vec<u8>,
+        options: AddTorrentOptions,
+    ) -> Result<InfoHash> {
+        let parsed = match meta::parse_torrent(&bytes) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    error_code = %e.code(),
+                    "torrent file add rejected"
+                );
+                return Err(e);
+            }
+        };
+        let hash = parsed.info_hash;
+        let mut t = Torrent::new(parsed, now());
+        if let Some(d) = options.download_dir {
+            t.download_dir = Some(d);
+        }
+        apply_network_state(&mut t, &self.network_health).await;
+        let blocked = t.state == TorrentState::NetworkBlocked;
+        let start_paused = options.paused && !blocked;
+        if start_paused {
+            t.state = TorrentState::Paused;
+        }
+        {
+            let mut reg = self.registry.lock().await;
+            if reg.add(t).is_err() {
+                tracing::warn!(
+                    info_hash = %hash,
+                    error_code = %CoreError::DuplicateTorrent(hash.to_hex()).code(),
+                    "torrent file add rejected: duplicate"
+                );
+                return Err(CoreError::DuplicateTorrent(hash.to_hex()));
+            }
+        }
+        self.queue.lock().await.add(hash);
+        if !blocked && !start_paused {
+            self.schedule_reconcile_queue("torrent_file_added").await;
+        }
+        tracing::info!(
+            info_hash = %hash,
+            network_blocked = blocked,
+            paused = start_paused,
+            "torrent file added"
+        );
+        Ok(hash)
+    }
+
+    async fn add_magnet_with_options(
+        &self,
+        magnet: &str,
+        options: AddTorrentOptions,
+    ) -> Result<InfoHash> {
+        let m = Magnet::parse(magnet)?;
+        let hash = m.info_hash;
+        let name = m.display_name.clone().unwrap_or_else(|| hash.to_hex());
+        // Build a placeholder single-file torrent so the registry has a record;
+        // the real metadata is fetched via BEP 9 from peers once the engine
+        // starts. The registry is keyed by the magnet's real info hash.
+        let bytes = meta::build_single_file_torrent(
+            &name,
+            b"magnet placeholder data",
+            16,
+            m.trackers.first().map(|s| s.as_str()),
+            false,
+        );
+        let parsed = meta::parse_torrent(&bytes)?;
+        let mut t = Torrent::new(parsed, now());
+        t.needs_metadata = true;
+        t.magnet_info_hash = Some(hash);
+        t.magnet_name = Some(name);
+        t.magnet_trackers = m.trackers.clone();
+        if let Some(d) = options.download_dir {
+            t.download_dir = Some(d);
+        }
+        apply_network_state(&mut t, &self.network_health).await;
+        let blocked = t.state == TorrentState::NetworkBlocked;
+        let start_paused = options.paused && !blocked;
+        if start_paused {
+            t.state = TorrentState::Paused;
+        }
+        {
+            let mut reg = self.registry.lock().await;
+            reg.add(t)
+                .map_err(|_| CoreError::DuplicateTorrent(hash.to_hex()))?;
+        }
+        tracing::info!(
+            info_hash = %hash,
+            network_blocked = blocked,
+            paused = start_paused,
+            tracker_count = m.trackers.len(),
+            "magnet added"
+        );
+        self.queue.lock().await.add(hash);
+        if !blocked && !start_paused {
+            self.schedule_reconcile_queue("magnet_added").await;
+        }
+        Ok(hash)
+    }
+
     /// Resolve the download directory for a torrent: per-torrent override,
     /// then global config, then a default temp dir.
     async fn resolve_download_dir(&self, t: &Torrent) -> String {
@@ -377,7 +497,12 @@ impl DaemonRuntime {
     }
 
     async fn run_scheduled_reconcile_queue(self, reason: &'static str) {
+        tokio::time::sleep(QUEUE_RECONCILE_DEBOUNCE).await;
         loop {
+            {
+                let mut state = self.queue_reconcile.lock().await;
+                state.dirty = false;
+            }
             tracing::debug!(reason, "queue reconciliation started");
             self.reconcile_queue().await;
 
@@ -1722,90 +1847,13 @@ impl DaemonOps for DaemonRuntime {
     async fn add_torrent_file(
         &self,
         bytes: Vec<u8>,
-        download_dir: Option<String>,
+        options: AddTorrentOptions,
     ) -> Result<InfoHash> {
-        let parsed = match meta::parse_torrent(&bytes) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    error_code = %e.code(),
-                    "torrent file add rejected"
-                );
-                return Err(e);
-            }
-        };
-        let hash = parsed.info_hash;
-        let mut t = Torrent::new(parsed, now());
-        if let Some(d) = download_dir {
-            t.download_dir = Some(d);
-        }
-        apply_network_state(&mut t, &self.network_health).await;
-        let blocked = t.state == TorrentState::NetworkBlocked;
-        {
-            let mut reg = self.registry.lock().await;
-            if reg.add(t).is_err() {
-                tracing::warn!(
-                    info_hash = %hash,
-                    error_code = %CoreError::DuplicateTorrent(hash.to_hex()).code(),
-                    "torrent file add rejected: duplicate"
-                );
-                return Err(CoreError::DuplicateTorrent(hash.to_hex()));
-            }
-        }
-        self.queue.lock().await.add(hash);
-        if !blocked {
-            self.schedule_reconcile_queue("torrent_file_added").await;
-        }
-        tracing::info!(
-            info_hash = %hash,
-            network_blocked = blocked,
-            "torrent file added"
-        );
-        Ok(hash)
+        self.add_torrent_file_with_options(bytes, options).await
     }
 
-    async fn add_magnet(&self, magnet: &str, download_dir: Option<String>) -> Result<InfoHash> {
-        let m = Magnet::parse(magnet)?;
-        let hash = m.info_hash;
-        let name = m.display_name.clone().unwrap_or_else(|| hash.to_hex());
-        // Build a placeholder single-file torrent so the registry has a record;
-        // the real metadata is fetched via BEP 9 from peers once the engine
-        // starts. The registry is keyed by the magnet's real info hash.
-        let bytes = meta::build_single_file_torrent(
-            &name,
-            b"magnet placeholder data",
-            16,
-            m.trackers.first().map(|s| s.as_str()),
-            false,
-        );
-        let parsed = meta::parse_torrent(&bytes)?;
-        let mut t = Torrent::new(parsed, now());
-        t.needs_metadata = true;
-        t.magnet_info_hash = Some(hash);
-        t.magnet_name = Some(name);
-        t.magnet_trackers = m.trackers.clone();
-        if let Some(d) = download_dir {
-            t.download_dir = Some(d);
-        }
-        apply_network_state(&mut t, &self.network_health).await;
-        let blocked = t.state == TorrentState::NetworkBlocked;
-        {
-            let mut reg = self.registry.lock().await;
-            reg.add(t)
-                .map_err(|_| CoreError::DuplicateTorrent(hash.to_hex()))?;
-        }
-        tracing::info!(
-            info_hash = %hash,
-            network_blocked = blocked,
-            tracker_count = m.trackers.len(),
-            "magnet added"
-        );
-        self.queue.lock().await.add(hash);
-        if !blocked {
-            self.schedule_reconcile_queue("magnet_added").await;
-        }
-        Ok(hash)
+    async fn add_magnet(&self, magnet: &str, options: AddTorrentOptions) -> Result<InfoHash> {
+        self.add_magnet_with_options(magnet, options).await
     }
 
     async fn remove_torrent(&self, hash: &InfoHash, delete_data: bool) -> Result<()> {
@@ -3624,6 +3672,70 @@ mod tests {
             assert!(state.scheduled);
             assert!(state.dirty);
         }
+    }
+
+    #[tokio::test]
+    async fn rapid_adds_queue_without_waiting_for_reconcile() {
+        const ADD_COUNT: usize = 200;
+
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+
+        {
+            let mut state = runtime.queue_reconcile.lock().await;
+            state.scheduled = true;
+            state.dirty = false;
+        }
+
+        for index in 0..ADD_COUNT {
+            let magnet = format!("magnet:?xt=urn:btih:{:040x}&dn=rapid-{index}", index + 1);
+            let hash = runtime.add_magnet(&magnet, None).await.unwrap();
+            assert_eq!(runtime.queue.lock().await.position(&hash), Some(index + 1));
+        }
+
+        assert_eq!(runtime.registry.lock().await.torrents.len(), ADD_COUNT);
+        assert_eq!(runtime.queue.lock().await.order.len(), ADD_COUNT);
+        assert!(runtime.engine_handles.lock().await.is_empty());
+        {
+            let state = runtime.queue_reconcile.lock().await;
+            assert!(state.scheduled);
+            assert!(state.dirty);
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_add_is_queued_without_reconcile_start() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "paused-add.bin",
+            b"paused add payload",
+            4,
+            None,
+            false,
+        );
+
+        let hash = runtime
+            .add_torrent_file_with_options(bytes, AddTorrentOptions::new(None, true))
+            .await
+            .unwrap();
+
+        let summary = runtime.get_torrent(&hash).await.unwrap();
+        assert_eq!(summary.state, TorrentState::Paused);
+        assert_eq!(summary.queue_position, Some(1));
+        assert!(runtime.desired_download_hashes().await.is_empty());
+        assert!(runtime.engine_handles.lock().await.is_empty());
+        assert!(!runtime.queue_reconcile.lock().await.scheduled);
     }
 
     #[test]

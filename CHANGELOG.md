@@ -23,6 +23,20 @@ status.
 
 ### Added
 
+- **Rapid API torrent add handling:** API torrent adds continue to return after
+  registration and queue insertion instead of waiting for engine startup. Queue
+  reconciliation now coalesces rapid add bursts before starting work, with
+  coverage for 200 fast API add requests and 200 daemon queue inserts.
+- **Paused torrent add API:** native add-torrent requests now accept
+  `paused: true` or `start_behavior: "paused"` for JSON magnet adds and
+  `?paused=true` or `?start_behavior=paused` for raw `.torrent` uploads. The
+  daemon inserts paused adds into queue order without scheduling immediate
+  startup, and the Transmission compatibility adapter now uses the same
+  add-time paused path.
+- **Web UI bulk torrent selection:** torrent list rows can now be selected with
+  checkboxes, the toolbar can select all visible rows or clear the selection,
+  and selected torrents can be removed in one confirmed bulk operation while
+  keeping downloaded data.
 - **FOSS torrent client comparison:** added `design/COMPARISON.md` as a living
   comparison matrix for SwarmOtter versus popular FOSS torrent clients,
   including feature parity, differentiators, source links, and roadmap gaps

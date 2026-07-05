@@ -27,6 +27,11 @@ ADR-0009 and ADR-0010.
 - Error codes are part of the automation contract. Rename or removal requires
   the same compatibility treatment as a breaking API field change.
 - SSE and WebSocket events share the same event object shape.
+- Native torrent add requests support add-time options such as paused start
+  behavior without requiring add-then-pause sequencing; see ADR-0029.
+- Add requests return after registration and queue insertion; expensive queue
+  reconciliation and engine startup are asynchronous and coalesced for rapid
+  add bursts; see ADR-0030.
 - Optional compatibility endpoints, currently `/transmission/rpc`, are isolated
   from the native API and delegate to native daemon operations rather than a
   second torrent engine.

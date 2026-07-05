@@ -25,6 +25,22 @@ use swarmotter_core::models::torrent::TorrentSummary;
 use swarmotter_core::models::tracker::TrackerInfo;
 use tokio::sync::Mutex;
 
+/// Options applied when registering a newly added torrent.
+#[derive(Debug, Clone, Default)]
+pub struct AddTorrentOptions {
+    pub download_dir: Option<String>,
+    pub paused: bool,
+}
+
+impl AddTorrentOptions {
+    pub fn new(download_dir: Option<String>, paused: bool) -> Self {
+        Self {
+            download_dir,
+            paused,
+        }
+    }
+}
+
 /// Operations the API requires from the daemon runtime.
 ///
 /// The daemon implements this trait against its real state. Tests can provide
@@ -39,10 +55,10 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn add_torrent_file(
         &self,
         bytes: Vec<u8>,
-        download_dir: Option<String>,
+        options: AddTorrentOptions,
     ) -> Result<InfoHash>;
     /// Add a torrent from a magnet URI.
-    async fn add_magnet(&self, magnet: &str, download_dir: Option<String>) -> Result<InfoHash>;
+    async fn add_magnet(&self, magnet: &str, options: AddTorrentOptions) -> Result<InfoHash>;
     /// Remove a torrent, optionally deleting its data.
     async fn remove_torrent(&self, hash: &InfoHash, delete_data: bool) -> Result<()>;
     /// Pause a torrent.

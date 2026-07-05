@@ -8,18 +8,31 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use swarmotter_core::config::StartBehavior;
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
 
 use crate::error::{err_response, into_response, ok_empty_response};
 use crate::routes::{parse_hash, DeleteQuery};
-use crate::state::SharedState;
+use crate::state::{AddTorrentOptions, SharedState};
 
 #[derive(Debug, Deserialize)]
 pub struct AddMagnetBody {
     pub magnet: String,
     #[serde(default)]
     pub download_dir: Option<String>,
+    #[serde(default)]
+    pub paused: Option<bool>,
+    #[serde(default)]
+    pub start_behavior: Option<StartBehavior>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct AddTorrentQuery {
+    #[serde(default)]
+    pub paused: Option<bool>,
+    #[serde(default)]
+    pub start_behavior: Option<StartBehavior>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +64,7 @@ pub async fn list_torrents(State(state): State<SharedState>) -> Response {
 /// on content-type: application/json -> magnet; multipart -> file.
 pub async fn add_torrent_file_or_magnet(
     State(state): State<SharedState>,
+    Query(query): Query<AddTorrentQuery>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -61,22 +75,35 @@ pub async fn add_torrent_file_or_magnet(
     if ct.contains("application/json") {
         match serde_json::from_slice::<AddMagnetBody>(&body) {
             Ok(b) => {
+                let options = match add_options(
+                    b.download_dir.clone(),
+                    b.paused,
+                    b.start_behavior,
+                    Some(&query),
+                ) {
+                    Ok(options) => options,
+                    Err(e) => return err_response(e),
+                };
                 return into_response(
                     state
                         .daemon
-                        .add_magnet(&b.magnet, b.download_dir)
+                        .add_magnet(&b.magnet, options)
                         .await
                         .map(|h| h.to_hex()),
-                )
+                );
             }
             Err(e) => return err_response(CoreError::InvalidArgument(e.to_string())),
         }
     }
     // Treat raw body as torrent file bytes.
+    let options = match add_options(None, None, None, Some(&query)) {
+        Ok(options) => options,
+        Err(e) => return err_response(e),
+    };
     into_response(
         state
             .daemon
-            .add_torrent_file(body.to_vec(), None)
+            .add_torrent_file(body.to_vec(), options)
             .await
             .map(|h| h.to_hex()),
     )
@@ -84,12 +111,22 @@ pub async fn add_torrent_file_or_magnet(
 
 pub async fn add_magnet(
     State(state): State<SharedState>,
+    Query(query): Query<AddTorrentQuery>,
     Json(body): Json<AddMagnetBody>,
 ) -> Response {
+    let options = match add_options(
+        body.download_dir.clone(),
+        body.paused,
+        body.start_behavior,
+        Some(&query),
+    ) {
+        Ok(options) => options,
+        Err(e) => return err_response(e),
+    };
     into_response(
         state
             .daemon
-            .add_magnet(&body.magnet, body.download_dir)
+            .add_magnet(&body.magnet, options)
             .await
             .map(|h| h.to_hex()),
     )
@@ -97,15 +134,83 @@ pub async fn add_magnet(
 
 pub async fn add_torrent_file(
     State(state): State<SharedState>,
+    Query(query): Query<AddTorrentQuery>,
     body: axum::body::Bytes,
 ) -> Response {
+    let options = match add_options(None, None, None, Some(&query)) {
+        Ok(options) => options,
+        Err(e) => return err_response(e),
+    };
     into_response(
         state
             .daemon
-            .add_torrent_file(body.to_vec(), None)
+            .add_torrent_file(body.to_vec(), options)
             .await
             .map(|h| h.to_hex()),
     )
+}
+
+fn add_options(
+    download_dir: Option<String>,
+    body_paused: Option<bool>,
+    body_start_behavior: Option<StartBehavior>,
+    query: Option<&AddTorrentQuery>,
+) -> Result<AddTorrentOptions> {
+    let paused = merge_paused(body_paused, query.and_then(|q| q.paused), "paused")?;
+    let start_behavior =
+        merge_start_behavior(body_start_behavior, query.and_then(|q| q.start_behavior))?;
+    Ok(AddTorrentOptions::new(
+        download_dir,
+        resolve_start_paused(paused, start_behavior)?,
+    ))
+}
+
+fn merge_paused(body: Option<bool>, query: Option<bool>, field: &str) -> Result<Option<bool>> {
+    match (body, query) {
+        (Some(a), Some(b)) if a != b => Err(CoreError::InvalidArgument(format!(
+            "body and query {field} values conflict"
+        ))),
+        (Some(a), _) => Ok(Some(a)),
+        (_, Some(b)) => Ok(Some(b)),
+        _ => Ok(None),
+    }
+}
+
+fn merge_start_behavior(
+    body: Option<StartBehavior>,
+    query: Option<StartBehavior>,
+) -> Result<Option<StartBehavior>> {
+    match (body, query) {
+        (Some(a), Some(b)) if !start_behavior_eq(a, b) => Err(CoreError::InvalidArgument(
+            "body and query start_behavior values conflict".into(),
+        )),
+        (Some(a), _) => Ok(Some(a)),
+        (_, Some(b)) => Ok(Some(b)),
+        _ => Ok(None),
+    }
+}
+
+fn start_behavior_eq(a: StartBehavior, b: StartBehavior) -> bool {
+    matches!(
+        (a, b),
+        (StartBehavior::Start, StartBehavior::Start)
+            | (StartBehavior::Paused, StartBehavior::Paused)
+    )
+}
+
+fn resolve_start_paused(
+    paused: Option<bool>,
+    start_behavior: Option<StartBehavior>,
+) -> Result<bool> {
+    if let (Some(paused), Some(start_behavior)) = (paused, start_behavior) {
+        let behavior_paused = matches!(start_behavior, StartBehavior::Paused);
+        if paused != behavior_paused {
+            return Err(CoreError::InvalidArgument(
+                "paused and start_behavior values conflict".into(),
+            ));
+        }
+    }
+    Ok(paused.unwrap_or_else(|| matches!(start_behavior, Some(StartBehavior::Paused))))
 }
 
 async fn require_hash(hash: &str) -> Result<InfoHash> {

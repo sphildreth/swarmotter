@@ -11,6 +11,9 @@ let toastDisplayMs = loadToastDisplayMs();
 let torrentsLoaded = false;
 let knownTorrents = new Map();
 let expectedRemovedTorrents = new Map();
+let selectedTorrents = new Map();
+let visibleTorrents = [];
+let bulkRemoveInFlight = false;
 let magnetAddInFlight = false;
 let logEventSource = null;
 let lastEventStreamErrorAt = 0;
@@ -201,14 +204,22 @@ async function refreshTorrents() {
     const list = await api("/torrents");
     const stats = await api("/stats");
     observeTorrentRemovals(list);
+    syncSelectedTorrents(list);
     const tbody = $("#torrent-table tbody");
     tbody.innerHTML = "";
     const filter = $("#search").value.toLowerCase();
-    list.filter(t => String(t.name || "").toLowerCase().includes(filter)).forEach(t => {
+    const filtered = list.filter(t => String(t.name || "").toLowerCase().includes(filter));
+    visibleTorrents = filtered.map(t => ({
+      hash: t.info_hash,
+      name: torrentDisplayName(t),
+    }));
+    filtered.forEach(t => {
       const tr = document.createElement("tr");
       tr.className = "torrent";
+      tr.classList.toggle("selected", selectedTorrents.has(t.info_hash));
       tr.dataset.hash = t.info_hash;
       tr.innerHTML = `
+        <td class="selection-column">${renderTorrentSelection(t)}</td>
         <td>${escapeHtml(t.name)}</td>
         <td>${fmtBytes(t.total_length)}</td>
         <td>${renderProgressCell(t.bytes_completed, t.total_length)}</td>
@@ -220,13 +231,15 @@ async function refreshTorrents() {
         <td>${renderPeerCount(t)}</td>
         <td>${renderTorrentActions()}</td>`;
       tr.addEventListener("click", (e) => {
-        if (e.target.closest("button")) return;
+        if (e.target.closest("button, input, label")) return;
         openDetails(t.info_hash);
       });
       tbody.appendChild(tr);
     });
     $("#stats-summary").textContent = renderStatsSummary(stats);
+    bindSelectionInputs();
     bindActionButtons();
+    updateSelectionControls();
   } catch (e) {
     log("torrent list error: " + e.message);
   }
@@ -246,6 +259,18 @@ function observeTorrentRemovals(list) {
   }
   knownTorrents = current;
   torrentsLoaded = true;
+}
+
+function torrentDisplayName(t) {
+  return String(t?.name || t?.info_hash || "");
+}
+
+function syncSelectedTorrents(list) {
+  const current = new Map((list || []).map(t => [t.info_hash, torrentDisplayName(t)]));
+  for (const hash of Array.from(selectedTorrents.keys())) {
+    if (current.has(hash)) selectedTorrents.set(hash, current.get(hash));
+    else selectedTorrents.delete(hash);
+  }
 }
 
 function renderPeerCount(t) {
@@ -275,13 +300,108 @@ function renderTorrentActions() {
   }).join("")}</div>`;
 }
 
+function renderTorrentSelection(t) {
+  const checked = selectedTorrents.has(t.info_hash) ? " checked" : "";
+  const name = torrentDisplayName(t);
+  return `<input type="checkbox" class="torrent-select" data-hash="${escapeHtml(t.info_hash)}"${checked} aria-label="Select ${escapeHtml(name)}">`;
+}
+
+function bindSelectionInputs() {
+  $$("#torrent-table tbody .torrent-select").forEach(cb => {
+    cb.addEventListener("click", e => e.stopPropagation());
+    cb.addEventListener("change", () => {
+      const tr = cb.closest("tr");
+      const hash = cb.dataset.hash;
+      const name = tr?.querySelector("td:nth-child(2)")?.textContent || hash;
+      if (cb.checked) selectedTorrents.set(hash, name);
+      else selectedTorrents.delete(hash);
+      tr?.classList.toggle("selected", cb.checked);
+      updateSelectionControls();
+    });
+  });
+}
+
+function updateRenderedSelection() {
+  $$("#torrent-table tbody tr").forEach(tr => {
+    const hash = tr.dataset.hash;
+    const selected = selectedTorrents.has(hash);
+    tr.classList.toggle("selected", selected);
+    const cb = tr.querySelector(".torrent-select");
+    if (cb) cb.checked = selected;
+  });
+}
+
+function updateSelectionControls() {
+  const selectedCount = selectedTorrents.size;
+  const visibleCount = visibleTorrents.length;
+  const allVisibleSelected = visibleCount > 0 && visibleTorrents.every(t => selectedTorrents.has(t.hash));
+  const selectAll = $("#select-all-torrents-btn");
+  const deselectAll = $("#deselect-all-torrents-btn");
+  const removeSelected = $("#remove-selected-torrents-btn");
+  const summary = $("#selection-summary");
+  if (selectAll) selectAll.disabled = visibleCount === 0 || allVisibleSelected || bulkRemoveInFlight;
+  if (deselectAll) deselectAll.disabled = selectedCount === 0 || bulkRemoveInFlight;
+  if (removeSelected) removeSelected.disabled = selectedCount === 0 || bulkRemoveInFlight;
+  if (summary) summary.textContent = `${selectedCount} selected`;
+}
+
+function selectAllVisibleTorrents() {
+  visibleTorrents.forEach(t => selectedTorrents.set(t.hash, t.name));
+  updateRenderedSelection();
+  updateSelectionControls();
+}
+
+function deselectAllTorrents() {
+  selectedTorrents.clear();
+  updateRenderedSelection();
+  updateSelectionControls();
+}
+
+async function removeSelectedTorrents() {
+  if (bulkRemoveInFlight) return;
+  const selected = Array.from(selectedTorrents.entries());
+  if (selected.length === 0) return;
+  const noun = selected.length === 1 ? "torrent" : "torrents";
+  const confirmed = window.confirm(`Remove ${selected.length} selected ${noun} from SwarmOtter? Downloaded data will be kept.`);
+  if (!confirmed) return;
+  bulkRemoveInFlight = true;
+  updateSelectionControls();
+  let removed = 0;
+  let failed = 0;
+  try {
+    for (const [hash, name] of selected) {
+      try {
+        await api(`/torrents/${encodeURIComponent(hash)}`, { method: "DELETE" });
+        expectedRemovedTorrents.set(hash, name);
+        selectedTorrents.delete(hash);
+        removed++;
+      } catch (e) {
+        failed++;
+        showToast("Torrent remove failed", `${name}: ${e.message}`, "error");
+        log(`bulk remove error (${hash}): ${e.message}`);
+      }
+    }
+    await refreshTorrents();
+    if (removed > 0 && failed > 0) {
+      showToast(`Removed ${removed} ${removed === 1 ? "torrent" : "torrents"}`, `${failed} failed`, "warning");
+    } else if (removed > 0) {
+      showToast(`Removed ${removed} ${removed === 1 ? "torrent" : "torrents"}`, "Downloaded data kept", "info");
+    } else if (failed > 0) {
+      showToast("No selected torrents removed", `${failed} failed`, "error");
+    }
+  } finally {
+    bulkRemoveInFlight = false;
+    updateSelectionControls();
+  }
+}
+
 function bindActionButtons() {
   $$("#torrent-table tbody button").forEach(btn => {
     btn.addEventListener("click", async (e) => {
       e.stopPropagation();
       const tr = btn.closest("tr");
       const hash = tr.dataset.hash;
-      const name = tr.querySelector("td")?.textContent || hash;
+      const name = tr.querySelector("td:nth-child(2)")?.textContent || hash;
       const act = btn.dataset.act;
       try {
         if (act === "pause") await api(`/torrents/${hash}/pause`, { method: "POST" });
@@ -291,6 +411,7 @@ function bindActionButtons() {
           if (confirm("Remove torrent? Delete data too?")) await api(`/torrents/${hash}?delete_data=true`, { method: "DELETE" });
           else await api(`/torrents/${hash}`, { method: "DELETE" });
           expectedRemovedTorrents.set(hash, name);
+          selectedTorrents.delete(hash);
           showToast("Torrent removed", name, "info");
         }
         refreshTorrents();
@@ -1254,6 +1375,9 @@ function log(msg) {
 }
 
 $("#search").addEventListener("input", refreshTorrents);
+$("#select-all-torrents-btn").addEventListener("click", selectAllVisibleTorrents);
+$("#deselect-all-torrents-btn").addEventListener("click", deselectAllTorrents);
+$("#remove-selected-torrents-btn").addEventListener("click", removeSelectedTorrents);
 
 // --- Init ---
 (async function init() {
