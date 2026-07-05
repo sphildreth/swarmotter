@@ -81,7 +81,7 @@ The build commit is separate from the release version. CI/container builds pass
   `ARG SWARMOTTER_VERSION` defaults to the current workspace release version for
   local builds. Release workflows pass the tag-derived version explicitly.
 - `.github/workflows/ci.yml`
-  Main-branch image tags are `latest`, `main`, and `sha-<shortsha>`.
+  Main-branch image tags are `main` and `sha-<shortsha>`.
 - `.github/workflows/release.yml`
   Stable `vX.Y.Z` tags publish Linux tarballs, `.deb`/`.rpm` packages,
   `SHA256SUMS`, and GHCR image tags `vX.Y.Z`, `X.Y.Z`, `X.Y`, `X`, `latest`,
