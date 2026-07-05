@@ -284,6 +284,11 @@ status.
 
 ### Fixed
 
+- **Bulk torrent add responsiveness:** native magnet and `.torrent` add calls now
+  return after registering and queueing the torrent instead of waiting for queue
+  reconciliation and engine startup. Rapid add bursts coalesce queue
+  reconciliation in the background, and engine startup no longer holds the
+  registry lock while resolving runtime paths.
 - **Tracker announce diagnostics:** tracker API rows now use per-tracker
   announce results instead of copying a torrent-level status message to every
   tracker. Successful announces populate `last_message`, seeders, leechers, and

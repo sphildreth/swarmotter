@@ -48,6 +48,7 @@ use crate::seeder::Seeder;
 
 const PEER_DIAGNOSTIC_RECENT_WINDOW: Duration = Duration::from_secs(30);
 
+#[derive(Clone)]
 pub struct DaemonRuntime {
     pub registry: Arc<Mutex<TorrentRegistry>>,
     pub config: Arc<Mutex<Config>>,
@@ -80,6 +81,9 @@ pub struct DaemonRuntime {
     /// Shared DHT runner so the configured DHT port is bound by one runner
     /// instead of once per active torrent.
     dht_runner: Arc<Mutex<Option<Arc<crate::dht::DhtRunner>>>>,
+    /// Coalesces queue reconciliation requests triggered by rapid add/import
+    /// bursts so API add calls do not wait for engine startup.
+    queue_reconcile: Arc<Mutex<QueueReconcileState>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -121,6 +125,12 @@ struct LiveTorrentDiagnostics {
     dht_last_seen_seconds_ago: Option<u64>,
     pex_discovery_ok: Option<bool>,
     pex_last_seen_seconds_ago: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct QueueReconcileState {
+    scheduled: bool,
+    dirty: bool,
 }
 
 impl LiveTorrentDiagnostics {
@@ -219,6 +229,7 @@ impl DaemonRuntime {
             engine_limiters: Arc::new(Mutex::new(HashMap::new())),
             rate_samples: Arc::new(Mutex::new(HashMap::new())),
             dht_runner: Arc::new(Mutex::new(None)),
+            queue_reconcile: Arc::new(Mutex::new(QueueReconcileState::default())),
         }
     }
 
@@ -344,6 +355,46 @@ impl DaemonRuntime {
         self.apply_peer_worker_limits().await;
     }
 
+    async fn schedule_reconcile_queue(&self, reason: &'static str) {
+        let mut state = self.queue_reconcile.lock().await;
+        if state.scheduled {
+            state.dirty = true;
+            tracing::debug!(
+                reason,
+                "queue reconciliation already scheduled; marked dirty"
+            );
+            return;
+        }
+
+        state.scheduled = true;
+        state.dirty = false;
+        drop(state);
+
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            runtime.run_scheduled_reconcile_queue(reason).await;
+        });
+    }
+
+    async fn run_scheduled_reconcile_queue(self, reason: &'static str) {
+        loop {
+            tracing::debug!(reason, "queue reconciliation started");
+            self.reconcile_queue().await;
+
+            let mut state = self.queue_reconcile.lock().await;
+            if state.dirty {
+                state.dirty = false;
+                tracing::debug!(reason, "queue reconciliation dirty; running again");
+                drop(state);
+                continue;
+            }
+
+            state.scheduled = false;
+            tracing::debug!(reason, "queue reconciliation complete");
+            break;
+        }
+    }
+
     async fn shared_dht_runner(
         &self,
         binder: Arc<dyn swarmotter_core::net::NetworkBinder>,
@@ -392,6 +443,14 @@ impl DaemonRuntime {
             return;
         }
 
+        let torrent = {
+            let reg = self.registry.lock().await;
+            let Some(t) = reg.get(&hash) else {
+                return;
+            };
+            t.clone()
+        };
+
         let (
             meta,
             active_dir,
@@ -406,17 +465,16 @@ impl DaemonRuntime {
             magnet,
             needs_metadata,
         ) = {
-            let reg = self.registry.lock().await;
-            let Some(t) = reg.get(&hash) else {
-                return;
-            };
-            let complete_dir = self.resolve_download_dir(t).await;
+            let complete_dir = self.resolve_download_dir(&torrent).await;
             let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
-            let magnet = if t.needs_metadata {
+            let magnet = if torrent.needs_metadata {
                 Some(crate::engine::MagnetParams {
-                    info_hash: t.magnet_info_hash.unwrap_or(t.meta.info_hash),
-                    name: t.magnet_name.clone().unwrap_or_else(|| t.meta.name.clone()),
-                    trackers: t.magnet_trackers.clone(),
+                    info_hash: torrent.magnet_info_hash.unwrap_or(torrent.meta.info_hash),
+                    name: torrent
+                        .magnet_name
+                        .clone()
+                        .unwrap_or_else(|| torrent.meta.name.clone()),
+                    trackers: torrent.magnet_trackers.clone(),
                 })
             } else {
                 None
@@ -433,7 +491,7 @@ impl DaemonRuntime {
                 1,
             );
             (
-                t.meta.clone(),
+                torrent.meta.clone(),
                 active_dir,
                 complete_dir,
                 cfg.torrent.listen_port,
@@ -444,9 +502,13 @@ impl DaemonRuntime {
                 pex_enabled,
                 pex_max_peers,
                 magnet,
-                t.needs_metadata,
+                torrent.needs_metadata,
             )
         };
+
+        if !self.registry.lock().await.contains(&hash) {
+            return;
+        }
 
         let state = Arc::new(Mutex::new(EngineState::default()));
         self.engine_states.lock().await.insert(hash, state.clone());
@@ -576,6 +638,11 @@ impl DaemonRuntime {
             let _ = state_for_summary;
         });
         self.engine_handles.lock().await.insert(hash, handle);
+
+        if !self.registry.lock().await.contains(&hash) {
+            self.force_stop_engine(&hash).await;
+            return;
+        }
 
         // Start the inbound peer listener / seeder alongside the download
         // engine, sharing the same live state. It serves verified pieces to
@@ -1688,7 +1755,7 @@ impl DaemonOps for DaemonRuntime {
         }
         self.queue.lock().await.add(hash);
         if !blocked {
-            self.reconcile_queue().await;
+            self.schedule_reconcile_queue("torrent_file_added").await;
         }
         tracing::info!(
             info_hash = %hash,
@@ -1736,7 +1803,7 @@ impl DaemonOps for DaemonRuntime {
         );
         self.queue.lock().await.add(hash);
         if !blocked {
-            self.reconcile_queue().await;
+            self.schedule_reconcile_queue("magnet_added").await;
         }
         Ok(hash)
     }
@@ -3500,6 +3567,63 @@ mod tests {
         }
         runtime.config.lock().await.queue.auto_start = true;
         assert_eq!(runtime.desired_download_hashes().await, vec![first_hash]);
+    }
+
+    #[tokio::test]
+    async fn add_operations_mark_existing_queue_reconcile_dirty() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+
+        {
+            let mut state = runtime.queue_reconcile.lock().await;
+            state.scheduled = true;
+            state.dirty = false;
+        }
+
+        let magnet_hash = runtime
+            .add_magnet(
+                "magnet:?xt=urn:btih:dd8255ecdc7ca55fb0bbf81323d87062ba1f7a4e&dn=bulk-one",
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(runtime.registry.lock().await.contains(&magnet_hash));
+        assert_eq!(runtime.queue.lock().await.position(&magnet_hash), Some(1));
+        assert!(runtime.engine_handles.lock().await.is_empty());
+        {
+            let state = runtime.queue_reconcile.lock().await;
+            assert!(state.scheduled);
+            assert!(state.dirty);
+        }
+
+        {
+            let mut state = runtime.queue_reconcile.lock().await;
+            state.dirty = false;
+        }
+
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "bulk-two.bin",
+            b"bulk torrent file payload",
+            4,
+            None,
+            false,
+        );
+        let file_hash = runtime.add_torrent_file(bytes, None).await.unwrap();
+
+        assert!(runtime.registry.lock().await.contains(&file_hash));
+        assert_eq!(runtime.queue.lock().await.position(&file_hash), Some(2));
+        assert!(runtime.engine_handles.lock().await.is_empty());
+        {
+            let state = runtime.queue_reconcile.lock().await;
+            assert!(state.scheduled);
+            assert!(state.dirty);
+        }
     }
 
     #[test]
