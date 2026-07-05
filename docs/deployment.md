@@ -25,6 +25,33 @@ Logs are written to stderr and to the configured daemon log file. With default
 logging, the per-user file is `~/.local/state/swarmotter/swarmotterd.log`
 unless `XDG_STATE_HOME` is set.
 
+## Release Artifacts
+
+Version tags publish Linux-native artifacts on GitHub Releases:
+
+- Linux `x86_64` and `aarch64` tarballs.
+- `.deb` packages for `amd64` and `arm64`.
+- `.rpm` packages for `x86_64` and `aarch64`.
+- `SHA256SUMS` for the release assets.
+
+The tarballs include `bin/swarmotterd`, configuration examples, deployment
+examples, and the user-guide pages needed for local install review. The
+packages install:
+
+- `/usr/bin/swarmotterd`
+- `/etc/swarmotter/swarmotter.toml`
+- `/usr/lib/systemd/system/swarmotterd.service`
+- `/var/lib/swarmotter`, `/data/downloads`, and `/data/incomplete`
+
+Package installation creates the `swarmotter` service account and reloads
+systemd metadata. It does not start the daemon automatically. Review
+`/etc/swarmotter/swarmotter.toml`, make sure the configured containment path
+exists, then enable the service:
+
+```bash
+sudo systemctl enable --now swarmotterd
+```
+
 ## Systemd
 
 An example unit is provided in:
@@ -54,9 +81,10 @@ ghcr.io/sphildreth/swarmotter
 
 The repository workflow builds pull requests without publishing and publishes a
 multi-architecture image on successful pushes to `main`. Main builds are tagged
-as `latest`, `main`, and `sha-<shortsha>`. After the first GHCR publish, set the
-package visibility to public in GitHub Packages if anonymous homelab pulls are
-desired.
+as `latest`, `main`, and `sha-<shortsha>`. Version-tag releases publish
+`linux/amd64` and `linux/arm64` images tagged as `vX.Y.Z`, `X.Y.Z`, `X.Y`, `X`,
+`latest`, and `sha-<shortsha>`. After the first GHCR publish, set the package
+visibility to public in GitHub Packages if anonymous homelab pulls are desired.
 
 ### What is Gluetun?
 

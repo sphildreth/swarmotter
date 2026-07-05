@@ -44,6 +44,10 @@ status.
   confirmed operation while keeping downloaded data.
 - **Web UI application version display:** the Doctor view now shows SwarmOtter
   version, commit, and target details from the native version API.
+- **Linux release artifacts:** stable release tags now build Linux `x86_64`
+  and `aarch64` tarballs, `.deb`/`.rpm` packages, checksums, and semver-tagged
+  GHCR images for `linux/amd64` and `linux/arm64`. ADR-0032 records the release
+  artifact strategy.
 - **FOSS torrent client comparison:** added `design/COMPARISON.md` as a living
   comparison matrix for SwarmOtter versus popular FOSS torrent clients,
   including feature parity, differentiators, source links, and roadmap gaps

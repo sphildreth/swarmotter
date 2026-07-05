@@ -1264,6 +1264,8 @@ The application must support:
 
 - Linux daemon deployment.
 - Systemd service deployment.
+- Linux `x86_64` and `aarch64` release tarballs.
+- Linux `.deb` and `.rpm` packages for supported release architectures.
 - Container deployment.
 - Podman deployment.
 - Docker-compatible deployment where practical.

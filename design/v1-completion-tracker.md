@@ -265,6 +265,7 @@ UDP socket (see ADR-0020).
 
 - [x] Linux daemon setup docs
 - [x] Example systemd service
+- [x] Linux release tarballs and `.deb`/`.rpm` package workflow
 - [x] Container (Podman/Docker) setup docs + Dockerfile
 - [x] VPN network namespace deployment guide
 - [x] Reverse proxy example

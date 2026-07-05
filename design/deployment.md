@@ -10,7 +10,10 @@ SwarmOtter supports these deployment surfaces:
 
 - `swarmotterd` as a direct Linux daemon.
 - `deploy/swarmotterd.service` for systemd.
-- `deploy/Dockerfile` for container images.
+- GitHub Release tarballs for Linux `x86_64` and `aarch64`.
+- `.deb` packages for Linux `amd64` and `arm64`.
+- `.rpm` packages for Linux `x86_64` and `aarch64`.
+- `deploy/Dockerfile` for multi-architecture Linux container images.
 - `deploy/compose.yml` for Docker Compose homelab deployments.
 - Reverse proxy deployments in front of the API/Web UI control plane.
 
@@ -41,6 +44,27 @@ The release-facing container contract includes:
 
 Changes to this contract are release-facing and should be handled through
 `VERSIONING_GUIDE.md`.
+
+## Release artifact contract
+
+Stable `vX.Y.Z` release tags publish these artifacts:
+
+- Linux `x86_64` and `aarch64` tarballs containing the daemon binary,
+  configuration examples, deployment examples, license files, and user-guide
+  pages.
+- Native `.deb` packages for `amd64` and `arm64`.
+- Native `.rpm` packages for `x86_64` and `aarch64`.
+- A `SHA256SUMS` file for GitHub Release assets.
+- A GHCR image manifest for `linux/amd64` and `linux/arm64`.
+
+The native packages install `/usr/bin/swarmotterd`,
+`/etc/swarmotter/swarmotter.toml`, and the systemd unit at
+`/usr/lib/systemd/system/swarmotterd.service`. Package scripts create the
+`swarmotter` service account and reload systemd metadata but do not start the
+daemon automatically.
+
+Windows and macOS native packages are not release surfaces. Operators on those
+hosts should use the Linux container image through their container runtime.
 
 ## Maintenance
 
