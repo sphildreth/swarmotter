@@ -48,6 +48,9 @@ use crate::seeder::Seeder;
 
 const PEER_DIAGNOSTIC_RECENT_WINDOW: Duration = Duration::from_secs(30);
 const QUEUE_RECONCILE_DEBOUNCE: Duration = Duration::from_millis(25);
+const MAGNET_METADATA_NO_PEERS_RETRY_DELAY: Duration = Duration::from_secs(60);
+const MAGNET_METADATA_NO_PEERS_RETRY_MESSAGE: &str =
+    "magnet metadata fetch: no peers discovered; will retry";
 
 #[derive(Clone)]
 pub struct DaemonRuntime {
@@ -77,6 +80,8 @@ pub struct DaemonRuntime {
     engine_limiters: Arc<Mutex<HashMap<InfoHash, swarmotter_core::bandwidth::RateLimiter>>>,
     /// Last byte-counter samples used to calculate API/UI transfer rates.
     rate_samples: Arc<Mutex<HashMap<InfoHash, RateSample>>>,
+    /// Per-torrent retry suppression for transient engine failures.
+    engine_retry_after: Arc<Mutex<HashMap<InfoHash, Instant>>>,
     /// Runtime queue state backing queue positions and queue move operations.
     queue: Arc<Mutex<QueueState>>,
     /// Shared DHT runner so the configured DHT port is bound by one runner
@@ -267,6 +272,7 @@ impl DaemonRuntime {
             global_limiter,
             engine_limiters: Arc::new(Mutex::new(HashMap::new())),
             rate_samples: Arc::new(Mutex::new(HashMap::new())),
+            engine_retry_after: Arc::new(Mutex::new(HashMap::new())),
             dht_runner: Arc::new(Mutex::new(None)),
             queue_reconcile: Arc::new(Mutex::new(QueueReconcileState::default())),
         }
@@ -497,18 +503,17 @@ impl DaemonRuntime {
     }
 
     async fn active_download_hashes(&self) -> Vec<InfoHash> {
+        let running: Vec<InfoHash> = self.engine_handles.lock().await.keys().copied().collect();
         let reg = self.registry.lock().await;
-        reg.torrents
-            .iter()
-            .filter_map(|(hash, t)| {
-                if matches!(
-                    t.state,
-                    TorrentState::Downloading | TorrentState::DownloadingMetadata
-                ) {
-                    Some(*hash)
-                } else {
-                    None
-                }
+        running
+            .into_iter()
+            .filter(|hash| {
+                reg.get(hash).is_some_and(|t| {
+                    matches!(
+                        t.state,
+                        TorrentState::Downloading | TorrentState::DownloadingMetadata
+                    )
+                })
             })
             .collect()
     }
@@ -518,6 +523,8 @@ impl DaemonRuntime {
         let mut queue = self.queue.lock().await;
         queue.limits = cfg.queue.clone();
         let reg = self.registry.lock().await;
+        let retry_after = self.engine_retry_after.lock().await.clone();
+        let now = Instant::now();
         queue.order.retain(|hash| reg.contains(hash));
         queue.bypass.retain(|hash| reg.contains(hash));
 
@@ -528,6 +535,12 @@ impl DaemonRuntime {
                 break;
             }
             if active.contains(hash) {
+                continue;
+            }
+            if retry_after
+                .get(hash)
+                .is_some_and(|retry_at| *retry_at > now)
+            {
                 continue;
             }
             let Some(t) = reg.get(hash) else {
@@ -596,6 +609,14 @@ impl DaemonRuntime {
         });
     }
 
+    fn schedule_delayed_reconcile_queue(&self, reason: &'static str, delay: Duration) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            runtime.schedule_reconcile_queue(reason).await;
+        });
+    }
+
     async fn run_scheduled_reconcile_queue(self, reason: &'static str) {
         tokio::time::sleep(QUEUE_RECONCILE_DEBOUNCE).await;
         loop {
@@ -618,6 +639,52 @@ impl DaemonRuntime {
             tracing::debug!(reason, "queue reconciliation complete");
             break;
         }
+    }
+
+    async fn engine_task_finished(&self, hash: InfoHash) {
+        self.engine_cmds.lock().await.remove(&hash);
+        self.engine_handles.lock().await.remove(&hash);
+        self.engine_limiters.lock().await.remove(&hash);
+    }
+
+    async fn handle_engine_task_error(
+        &self,
+        hash: InfoHash,
+        needs_metadata: bool,
+        error: CoreError,
+    ) -> bool {
+        let retry_metadata = needs_metadata && is_retryable_magnet_metadata_discovery_error(&error);
+        if retry_metadata {
+            tracing::debug!(
+                info_hash = %hash,
+                error = %error,
+                "magnet metadata discovery found no peers; retry scheduled"
+            );
+            let mut reg = self.registry.lock().await;
+            if let Some(t) = reg.get_mut(&hash) {
+                t.state = TorrentState::DownloadingMetadata;
+                t.error = Some(MAGNET_METADATA_NO_PEERS_RETRY_MESSAGE.into());
+            }
+            drop(reg);
+            self.engine_retry_after
+                .lock()
+                .await
+                .insert(hash, Instant::now() + MAGNET_METADATA_NO_PEERS_RETRY_DELAY);
+            return true;
+        }
+
+        let state = if error.is_network_blocked() {
+            TorrentState::NetworkBlocked
+        } else {
+            TorrentState::Error
+        };
+        tracing::warn!(info_hash = %hash, error = %error, "engine task failed");
+        let mut reg = self.registry.lock().await;
+        if let Some(t) = reg.get_mut(&hash) {
+            t.state = state;
+            t.error = Some(error.to_string());
+        }
+        false
     }
 
     async fn shared_dht_runner(
@@ -667,6 +734,7 @@ impl DaemonRuntime {
         if self.engine_handles.lock().await.contains_key(&hash) {
             return;
         }
+        self.engine_retry_after.lock().await.remove(&hash);
 
         let snapshot = {
             let reg = self.registry.lock().await;
@@ -766,6 +834,7 @@ impl DaemonRuntime {
         let engine_limiters_arc = self.engine_limiters.clone();
         let seeder_shutdowns_arc = self.seeder_shutdowns.clone();
         let seeder_handles_arc = self.seeder_handles.clone();
+        let runtime_for_task = self.clone();
         // DHT runner for trackerless peer discovery. Gated by config and
         // containment; the engine disables DHT for private torrents.
         let dht_runner = self.shared_dht_runner(binder.clone(), peer_id).await;
@@ -840,14 +909,18 @@ impl DaemonRuntime {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(info_hash = %hash_for_task, error = %e, "engine task failed");
-                    let mut reg = registry.lock().await;
-                    if let Some(t) = reg.get_mut(&hash_for_task) {
-                        t.state = TorrentState::Error;
-                        t.error = Some(e.to_string());
+                    let retry_metadata = runtime_for_task
+                        .handle_engine_task_error(hash_for_task, needs_metadata, e)
+                        .await;
+                    if retry_metadata {
+                        runtime_for_task.schedule_delayed_reconcile_queue(
+                            "magnet_metadata_no_peers",
+                            MAGNET_METADATA_NO_PEERS_RETRY_DELAY,
+                        );
                     }
                 }
             }
+            runtime_for_task.engine_task_finished(hash_for_task).await;
             let _ = state_for_summary;
         });
         self.engine_handles.lock().await.insert(hash, handle);
@@ -888,6 +961,7 @@ impl DaemonRuntime {
     }
 
     async fn stop_engine(&self, hash: &InfoHash) {
+        self.engine_retry_after.lock().await.remove(hash);
         if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
             let _ = tx.send(EngineCommand::Stop).await;
         }
@@ -902,6 +976,7 @@ impl DaemonRuntime {
     }
 
     async fn force_stop_engine(&self, hash: &InfoHash) {
+        self.engine_retry_after.lock().await.remove(hash);
         if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
             let _ = tx.try_send(EngineCommand::Stop);
         }
@@ -1810,6 +1885,14 @@ fn read_last_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>
     Ok(lines)
 }
 
+fn is_retryable_magnet_metadata_discovery_error(error: &CoreError) -> bool {
+    let CoreError::Internal(message) = error else {
+        return false;
+    };
+    message.contains("magnet metadata fetch failed after discovery retries")
+        && message.contains("magnet metadata fetch: no peers discovered")
+}
+
 fn strip_ansi_controls(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
@@ -1981,6 +2064,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn resume(&self, hash: &InfoHash) -> Result<()> {
+        self.engine_retry_after.lock().await.remove(hash);
         {
             let mut reg = self.registry.lock().await;
             match reg.get_mut(hash) {
@@ -2001,6 +2085,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn start_now(&self, hash: &InfoHash) -> Result<()> {
+        self.engine_retry_after.lock().await.remove(hash);
         {
             let reg = self.registry.lock().await;
             if reg.get(hash).is_none() {
@@ -3311,6 +3396,125 @@ mod tests {
         let summary = runtime.get_torrent(&hash).await.unwrap();
         assert_eq!(summary.state, TorrentState::DownloadingMetadata);
         assert_eq!(summary.total_length, "placeholder".len() as u64);
+    }
+
+    #[tokio::test]
+    async fn retryable_magnet_metadata_no_peers_stays_in_metadata_state() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let placeholder_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "magnet placeholder",
+            b"placeholder",
+            8,
+            None,
+            false,
+        );
+        let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
+        let hash =
+            swarmotter_core::hash::InfoHash::from_hex("95c6c298c84fee2eee10c044d673537da158f0f8")
+                .unwrap();
+        let mut torrent = Torrent::new(placeholder_meta, 1);
+        torrent.state = TorrentState::DownloadingMetadata;
+        torrent.needs_metadata = true;
+        torrent.magnet_info_hash = Some(hash);
+        runtime.registry.lock().await.add(torrent).unwrap();
+        runtime.queue.lock().await.add(hash);
+
+        let retry = runtime
+            .handle_engine_task_error(
+                hash,
+                true,
+                CoreError::Internal(
+                    "magnet metadata fetch failed after discovery retries: internal error: magnet metadata fetch: no peers discovered"
+                        .into(),
+                ),
+            )
+            .await;
+
+        assert!(retry);
+        {
+            let reg = runtime.registry.lock().await;
+            let torrent = reg.get(&hash).unwrap();
+            assert_eq!(torrent.state, TorrentState::DownloadingMetadata);
+            assert_eq!(
+                torrent.error.as_deref(),
+                Some(MAGNET_METADATA_NO_PEERS_RETRY_MESSAGE)
+            );
+        }
+        assert!(runtime
+            .engine_retry_after
+            .lock()
+            .await
+            .get(&hash)
+            .is_some_and(|retry_at| *retry_at > Instant::now()));
+        assert!(
+            runtime.desired_download_hashes().await.is_empty(),
+            "retry backoff should keep no-peer magnets out of active queue slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_task_finished_clears_restart_blocking_runtime_bookkeeping() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let hash =
+            swarmotter_core::hash::InfoHash::from_hex("95c6c298c84fee2eee10c044d673537da158f0f8")
+                .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        runtime.engine_cmds.lock().await.insert(hash, tx);
+        runtime
+            .engine_handles
+            .lock()
+            .await
+            .insert(hash, tokio::spawn(async {}));
+        runtime
+            .engine_states
+            .lock()
+            .await
+            .insert(hash, Arc::new(Mutex::new(EngineState::default())));
+        runtime
+            .engine_limiters
+            .lock()
+            .await
+            .insert(hash, swarmotter_core::bandwidth::RateLimiter::new(0, 0));
+        runtime.rate_samples.lock().await.insert(
+            hash,
+            RateSample {
+                downloaded: 1,
+                uploaded: 1,
+                rate_down: 1,
+                rate_up: 1,
+                last_download_at: Some(Instant::now()),
+                last_upload_at: Some(Instant::now()),
+                at: Instant::now(),
+                peak_rate_down: 1,
+                peak_rate_up: 1,
+            },
+        );
+
+        runtime.engine_task_finished(hash).await;
+
+        assert!(!runtime.engine_cmds.lock().await.contains_key(&hash));
+        assert!(!runtime.engine_handles.lock().await.contains_key(&hash));
+        assert!(!runtime.engine_limiters.lock().await.contains_key(&hash));
+        assert!(
+            runtime.engine_states.lock().await.contains_key(&hash),
+            "diagnostic state should survive normal engine task exit"
+        );
+        assert!(
+            runtime.rate_samples.lock().await.contains_key(&hash),
+            "rate samples should survive normal engine task exit"
+        );
     }
 
     #[tokio::test]

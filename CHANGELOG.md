@@ -19,6 +19,14 @@ MVP release.
   control while preserving existing row actions and bulk selection behavior.
   ADR-0033 records the Tabulator dependency decision.
 
+### Fixed
+
+- **Retryable magnet metadata discovery:** magnets that discover no peers while
+  fetching BEP 9 metadata now remain in `downloading_metadata` with a retry
+  backoff instead of being moved to terminal `error`. Completed and failed
+  engine tasks also clear their runtime handles so explicit resume/start
+  actions and scheduled retries can start a fresh engine task.
+
 ## [1.0.0] - [2026-07-04]
 
 This is the active `v1.0.0` initial-release branch. It records completed
