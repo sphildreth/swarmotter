@@ -5,6 +5,12 @@
 <h1 align="center">SwarmOtter</h1>
 
 <p align="center">
+  <a href="https://github.com/sphildreth/swarmotter/actions/workflows/ci.yml">
+    <img src="https://github.com/sphildreth/swarmotter/actions/workflows/ci.yml/badge.svg" alt="CI">
+  </a>
+</p>
+
+<p align="center">
   <em>A fast little Rust BitTorrent daemon that keeps your swarm safely in its tunnel.</em>
 </p>
 
