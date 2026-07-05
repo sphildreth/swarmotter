@@ -196,6 +196,40 @@ docker compose --env-file .env -f compose.yml pull swarmotter
 docker compose --env-file .env -f compose.yml up -d swarmotter
 ```
 
+The repository also includes an update helper for Compose-based Docker servers:
+
+```bash
+cd deploy
+./update-swarmotter.sh
+```
+
+The helper is intended to run as a normal user with Docker access and sudo
+rights. Root-owned `0600` `.env` and `gluetun.env` files are supported; the
+helper uses sudo only where needed to read or update deployment secrets and
+state. With no image argument, it resolves the latest GitHub Release and uses
+the matching `ghcr.io/sphildreth/swarmotter:vX.Y.Z` image. If the running
+container already has that version label, the helper exits without backing up,
+pulling, or restarting. Otherwise, it backs up Compose environment files,
+SwarmOtter configuration, SwarmOtter state, and Gluetun state into
+`~/swarmotter-backups`, updates `SWARMOTTER_IMAGE`, recreates the Compose stack
+so Docker attaches networks before Gluetun installs VPN routes, validates the
+health endpoint, image labels, and contained egress from the SwarmOtter
+container, and keeps a local rollback image tag.
+
+Pass an explicit image or tag only when pinning a specific release or
+performing a rollback:
+
+```bash
+./update-swarmotter.sh ghcr.io/sphildreth/swarmotter:v1.0.0
+```
+
+Use `--force` to back up, pull, recreate, and validate even when the installed
+version already matches the latest release:
+
+```bash
+./update-swarmotter.sh --force
+```
+
 For a pinned rollback, set `SWARMOTTER_IMAGE` in `deploy/.env` to a `vX.Y.Z` or
 `sha-<shortsha>` tag and run the update commands again.
 

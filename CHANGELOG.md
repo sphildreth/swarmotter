@@ -48,6 +48,13 @@ status.
   and `aarch64` tarballs, `.deb`/`.rpm` packages, checksums, and semver-tagged
   GHCR images for `linux/amd64` and `linux/arm64`. ADR-0032 records the release
   artifact strategy.
+- **Docker server update helper:** `deploy/update-swarmotter.sh` resolves the
+  latest GitHub Release by default, skips when the running container already
+  has that version, supports `--force` for repair/reapply updates, and
+  otherwise backs up Compose environment files, SwarmOtter configuration and
+  state, and Gluetun state before pulling the target image, recreating the
+  Compose stack so Docker attaches networks before Gluetun installs VPN routes,
+  validating the running container, and keeping a local rollback image tag.
 - **FOSS torrent client comparison:** added `design/COMPARISON.md` as a living
   comparison matrix for SwarmOtter versus popular FOSS torrent clients,
   including feature parity, differentiators, source links, and roadmap gaps
