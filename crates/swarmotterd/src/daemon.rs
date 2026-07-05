@@ -134,6 +134,44 @@ struct QueueReconcileState {
     dirty: bool,
 }
 
+#[derive(Debug, Clone)]
+struct EngineStartSnapshot {
+    meta: meta::TorrentMeta,
+    download_dir: Option<String>,
+    download_limit: u64,
+    upload_limit: u64,
+    needs_metadata: bool,
+    magnet_info_hash: Option<InfoHash>,
+    magnet_name: Option<String>,
+    magnet_trackers: Vec<String>,
+}
+
+impl EngineStartSnapshot {
+    fn from_torrent(torrent: &Torrent) -> Self {
+        Self {
+            meta: torrent.meta.clone(),
+            download_dir: torrent.download_dir.clone(),
+            download_limit: torrent.download_limit,
+            upload_limit: torrent.upload_limit,
+            needs_metadata: torrent.needs_metadata,
+            magnet_info_hash: torrent.magnet_info_hash,
+            magnet_name: torrent.magnet_name.clone(),
+            magnet_trackers: torrent.magnet_trackers.clone(),
+        }
+    }
+
+    fn magnet_params(&self) -> Option<crate::engine::MagnetParams> {
+        self.needs_metadata.then(|| crate::engine::MagnetParams {
+            info_hash: self.magnet_info_hash.unwrap_or(self.meta.info_hash),
+            name: self
+                .magnet_name
+                .clone()
+                .unwrap_or_else(|| self.meta.name.clone()),
+            trackers: self.magnet_trackers.clone(),
+        })
+    }
+}
+
 impl LiveTorrentDiagnostics {
     fn from_engine_state(s: &EngineState, now: Instant) -> Self {
         let unchoked_peers = s
@@ -413,8 +451,13 @@ impl DaemonRuntime {
     /// Resolve the download directory for a torrent: per-torrent override,
     /// then global config, then a default temp dir.
     async fn resolve_download_dir(&self, t: &Torrent) -> String {
-        if let Some(d) = &t.download_dir {
-            return d.clone();
+        self.resolve_download_dir_override(t.download_dir.as_deref())
+            .await
+    }
+
+    async fn resolve_download_dir_override(&self, download_dir: Option<&str>) -> String {
+        if let Some(d) = download_dir {
+            return d.to_string();
         }
         let cfg = self.config.lock().await;
         cfg.storage
@@ -625,12 +668,12 @@ impl DaemonRuntime {
             return;
         }
 
-        let torrent = {
+        let snapshot = {
             let reg = self.registry.lock().await;
             let Some(t) = reg.get(&hash) else {
                 return;
             };
-            t.clone()
+            EngineStartSnapshot::from_torrent(t)
         };
 
         let (
@@ -647,20 +690,11 @@ impl DaemonRuntime {
             magnet,
             needs_metadata,
         ) = {
-            let complete_dir = self.resolve_download_dir(&torrent).await;
+            let complete_dir = self
+                .resolve_download_dir_override(snapshot.download_dir.as_deref())
+                .await;
             let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
-            let magnet = if torrent.needs_metadata {
-                Some(crate::engine::MagnetParams {
-                    info_hash: torrent.magnet_info_hash.unwrap_or(torrent.meta.info_hash),
-                    name: torrent
-                        .magnet_name
-                        .clone()
-                        .unwrap_or_else(|| torrent.meta.name.clone()),
-                    trackers: torrent.magnet_trackers.clone(),
-                })
-            } else {
-                None
-            };
+            let magnet = snapshot.magnet_params();
             let cfg = self.config.lock().await;
             let preallocate = cfg.storage.preallocate;
             let sparse = cfg.storage.sparse;
@@ -673,7 +707,7 @@ impl DaemonRuntime {
                 1,
             );
             (
-                torrent.meta.clone(),
+                snapshot.meta.clone(),
                 active_dir,
                 complete_dir,
                 cfg.torrent.listen_port,
@@ -684,7 +718,7 @@ impl DaemonRuntime {
                 pex_enabled,
                 pex_max_peers,
                 magnet,
-                torrent.needs_metadata,
+                snapshot.needs_metadata,
             )
         };
 
@@ -704,13 +738,10 @@ impl DaemonRuntime {
         // torrent's own download/upload limits (0 = unlimited), plus the shared
         // global limiter so the configured global cap is also enforced. The
         // daemon keeps a clone so per-torrent limit changes apply live.
-        let limiter = {
-            let reg = self.registry.lock().await;
-            let Some(t) = reg.get(&hash) else {
-                return;
-            };
-            swarmotter_core::bandwidth::RateLimiter::new(t.download_limit, t.upload_limit)
-        };
+        let limiter = swarmotter_core::bandwidth::RateLimiter::new(
+            snapshot.download_limit,
+            snapshot.upload_limit,
+        );
         self.engine_limiters
             .lock()
             .await
@@ -3720,6 +3751,64 @@ mod tests {
             assert!(state.scheduled);
             assert!(state.dirty);
         }
+    }
+
+    #[tokio::test]
+    async fn queue_reconcile_scheduler_clears_after_rapid_adds() {
+        let mut cfg = Config::default();
+        cfg.queue.auto_start = false;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+
+        let first_hash = runtime
+            .add_magnet(
+                "magnet:?xt=urn:btih:000000000000000000000000000000000000000a&dn=schedule-one",
+                None,
+            )
+            .await
+            .unwrap();
+        {
+            let state = runtime.queue_reconcile.lock().await;
+            assert!(state.scheduled);
+            assert!(!state.dirty);
+        }
+
+        for index in 1..3 {
+            let magnet = format!(
+                "magnet:?xt=urn:btih:{:040x}&dn=schedule-{index}",
+                index + 10
+            );
+            runtime.add_magnet(&magnet, None).await.unwrap();
+        }
+        {
+            let state = runtime.queue_reconcile.lock().await;
+            assert!(state.scheduled);
+            assert!(state.dirty);
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let complete = {
+                    let state = runtime.queue_reconcile.lock().await;
+                    !state.scheduled && !state.dirty
+                };
+                if complete {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(runtime.registry.lock().await.torrents.len(), 3);
+        assert_eq!(runtime.queue.lock().await.order.len(), 3);
+        assert_eq!(runtime.queue.lock().await.position(&first_hash), Some(1));
+        assert!(runtime.engine_handles.lock().await.is_empty());
     }
 
     #[tokio::test]

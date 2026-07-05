@@ -1,6 +1,8 @@
 # SwarmOtter User Guide
 
-<img src="assets/swarmotter-logo.png" alt="SwarmOtter logo" width="256" height="256" style="display:block;margin:1em auto;max-width:50%;height:auto;" />
+<p align="center">
+  <img src="assets/swarmotter-logo.png" alt="SwarmOtter logo" width="256" height="256">
+</p>
 
 SwarmOtter is a performance-first Rust BitTorrent daemon with a practical Web
 UI, a complete API, and fail-closed VPN/NIC traffic containment.

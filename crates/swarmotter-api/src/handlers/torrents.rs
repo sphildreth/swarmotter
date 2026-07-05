@@ -329,7 +329,7 @@ fn resolve_start_paused(
             ));
         }
     }
-    Ok(paused.unwrap_or_else(|| matches!(start_behavior, Some(StartBehavior::Paused))))
+    Ok(paused.unwrap_or(matches!(start_behavior, Some(StartBehavior::Paused))))
 }
 
 async fn require_hash(hash: &str) -> Result<InfoHash> {
