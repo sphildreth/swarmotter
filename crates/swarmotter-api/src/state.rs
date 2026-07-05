@@ -12,7 +12,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use swarmotter_core::config::Config;
-use swarmotter_core::error::Result;
+use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
 use swarmotter_core::models::diagnostics::{
     ConfigUpdateResult, DoctorReport, LogSnapshot, NetworkDiagnostics, ResetResult, WatchStatus,
@@ -61,6 +61,22 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn add_magnet(&self, magnet: &str, options: AddTorrentOptions) -> Result<InfoHash>;
     /// Remove a torrent, optionally deleting its data.
     async fn remove_torrent(&self, hash: &InfoHash, delete_data: bool) -> Result<()>;
+    /// Remove multiple torrents, optionally deleting their data.
+    async fn remove_torrents(
+        &self,
+        hashes: Vec<InfoHash>,
+        delete_data: bool,
+    ) -> Result<Vec<InfoHash>> {
+        let mut removed = Vec::new();
+        for hash in hashes {
+            match self.remove_torrent(&hash, delete_data).await {
+                Ok(()) => removed.push(hash),
+                Err(CoreError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(removed)
+    }
     /// Pause a torrent.
     async fn pause(&self, hash: &InfoHash) -> Result<()>;
     /// Resume a torrent.

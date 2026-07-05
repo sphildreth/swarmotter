@@ -7,11 +7,14 @@ use axum::{
     response::Response,
     Json,
 };
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use swarmotter_core::config::StartBehavior;
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
 
+use crate::encoding::decode_base64;
 use crate::error::{err_response, into_response, ok_empty_response};
 use crate::routes::{parse_hash, DeleteQuery};
 use crate::state::{AddTorrentOptions, SharedState};
@@ -25,6 +28,46 @@ pub struct AddMagnetBody {
     pub paused: Option<bool>,
     #[serde(default)]
     pub start_behavior: Option<StartBehavior>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddTorrentsBody {
+    #[serde(default)]
+    pub magnets: Vec<String>,
+    #[serde(default)]
+    pub torrent_files: Vec<AddTorrentFileBody>,
+    #[serde(default)]
+    pub download_dir: Option<String>,
+    #[serde(default)]
+    pub paused: Option<bool>,
+    #[serde(default)]
+    pub start_behavior: Option<StartBehavior>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddTorrentFileBody {
+    pub metainfo: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddTorrentsResult {
+    pub added: Vec<AddTorrentItemResult>,
+    pub failed: Vec<AddTorrentItemFailure>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddTorrentItemResult {
+    pub kind: &'static str,
+    pub index: usize,
+    pub info_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddTorrentItemFailure {
+    pub kind: &'static str,
+    pub index: usize,
+    pub code: String,
+    pub message: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -53,6 +96,19 @@ pub struct SetLimitsBody {
     /// Per-torrent upload limit in bytes/sec (0 = unlimited).
     #[serde(default)]
     pub upload_limit: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoveTorrentsBody {
+    pub info_hashes: Vec<String>,
+    #[serde(default)]
+    pub delete_data: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RemoveTorrentsResult {
+    pub removed: Vec<String>,
+    pub not_found: Vec<String>,
 }
 
 /// List all torrents.
@@ -150,6 +206,69 @@ pub async fn add_torrent_file(
     )
 }
 
+pub async fn add_torrents(
+    State(state): State<SharedState>,
+    Query(query): Query<AddTorrentQuery>,
+    Json(body): Json<AddTorrentsBody>,
+) -> Response {
+    if body.magnets.is_empty() && body.torrent_files.is_empty() {
+        return err_response(CoreError::InvalidArgument(
+            "bulk add requires magnets or torrent_files".into(),
+        ));
+    }
+    let options = match add_options(
+        body.download_dir.clone(),
+        body.paused,
+        body.start_behavior,
+        Some(&query),
+    ) {
+        Ok(options) => options,
+        Err(e) => return err_response(e),
+    };
+
+    let mut added = Vec::new();
+    let mut failed = Vec::new();
+    for (index, magnet) in body.magnets.into_iter().enumerate() {
+        match state.daemon.add_magnet(&magnet, options.clone()).await {
+            Ok(hash) => added.push(AddTorrentItemResult {
+                kind: "magnet",
+                index,
+                info_hash: hash.to_hex(),
+            }),
+            Err(e) => failed.push(add_failure("magnet", index, e)),
+        }
+    }
+    for (index, file) in body.torrent_files.into_iter().enumerate() {
+        let Some(bytes) = decode_base64(&file.metainfo) else {
+            failed.push(add_failure(
+                "torrent_file",
+                index,
+                CoreError::InvalidArgument("metainfo must be valid base64".into()),
+            ));
+            continue;
+        };
+        match state.daemon.add_torrent_file(bytes, options.clone()).await {
+            Ok(hash) => added.push(AddTorrentItemResult {
+                kind: "torrent_file",
+                index,
+                info_hash: hash.to_hex(),
+            }),
+            Err(e) => failed.push(add_failure("torrent_file", index, e)),
+        }
+    }
+
+    into_response(Ok(AddTorrentsResult { added, failed }))
+}
+
+fn add_failure(kind: &'static str, index: usize, error: CoreError) -> AddTorrentItemFailure {
+    AddTorrentItemFailure {
+        kind,
+        index,
+        code: error.code().as_str().to_string(),
+        message: error.to_string(),
+    }
+}
+
 fn add_options(
     download_dir: Option<String>,
     body_paused: Option<bool>,
@@ -239,6 +358,39 @@ pub async fn remove_torrent(
                 .remove_torrent(&h, q.delete_data.unwrap_or(false))
                 .await,
         ),
+        Err(e) => err_response(e),
+    }
+}
+
+pub async fn remove_torrents(
+    State(state): State<SharedState>,
+    Json(body): Json<RemoveTorrentsBody>,
+) -> Response {
+    let mut hashes = Vec::new();
+    for raw in body.info_hashes {
+        match require_hash(&raw).await {
+            Ok(hash) if !hashes.contains(&hash) => hashes.push(hash),
+            Ok(_) => {}
+            Err(e) => return err_response(e),
+        }
+    }
+    let requested: BTreeSet<InfoHash> = hashes.iter().copied().collect();
+    match state
+        .daemon
+        .remove_torrents(hashes, body.delete_data.unwrap_or(false))
+        .await
+    {
+        Ok(removed) => {
+            let removed_set: BTreeSet<InfoHash> = removed.iter().copied().collect();
+            let not_found = requested
+                .difference(&removed_set)
+                .map(InfoHash::to_hex)
+                .collect();
+            into_response(Ok(RemoveTorrentsResult {
+                removed: removed.into_iter().map(|hash| hash.to_hex()).collect(),
+                not_found,
+            }))
+        }
         Err(e) => err_response(e),
     }
 }

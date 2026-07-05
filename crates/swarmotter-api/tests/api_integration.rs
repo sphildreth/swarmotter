@@ -429,6 +429,132 @@ async fn rapid_api_magnet_adds_all_register() {
 }
 
 #[tokio::test]
+async fn bulk_add_accepts_many_magnets_paused() {
+    const ADD_COUNT: usize = 200;
+
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let magnets = (0..ADD_COUNT).map(bulk_magnet).collect::<Vec<_>>();
+    let body = serde_json::json!({
+        "magnets": magnets,
+        "paused": true
+    })
+    .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/bulk")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["data"]["added"].as_array().unwrap().len(), ADD_COUNT);
+    assert!(v["data"]["failed"].as_array().unwrap().is_empty());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let torrents = v["data"].as_array().unwrap();
+    assert_eq!(torrents.len(), ADD_COUNT);
+    assert!(torrents.iter().all(|torrent| torrent["state"] == "paused"));
+}
+
+#[tokio::test]
+async fn bulk_remove_handles_selected_torrent_count() {
+    const REMOVE_COUNT: usize = 98;
+
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let magnets = (0..REMOVE_COUNT).map(bulk_magnet).collect::<Vec<_>>();
+    let body = serde_json::json!({ "magnets": magnets }).to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/bulk")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let hashes = v["data"]["added"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["info_hash"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(hashes.len(), REMOVE_COUNT);
+    assert!(v["data"]["failed"].as_array().unwrap().is_empty());
+
+    let body = serde_json::json!({ "info_hashes": hashes }).to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/remove")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["data"]["removed"].as_array().unwrap().len(), REMOVE_COUNT);
+    assert!(v["data"]["not_found"].as_array().unwrap().is_empty());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["data"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn reset_endpoint_clears_torrents() {
     let state = fake_daemon::fake_state();
     let app = swarmotter_api::app_router(state);

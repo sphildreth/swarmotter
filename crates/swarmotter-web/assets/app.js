@@ -366,29 +366,38 @@ async function removeSelectedTorrents() {
   if (!confirmed) return;
   bulkRemoveInFlight = true;
   updateSelectionControls();
-  let removed = 0;
-  let failed = 0;
   try {
+    const result = await api("/torrents/remove", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        info_hashes: selected.map(([hash]) => hash),
+        delete_data: false,
+      }),
+    });
+    const removedSet = new Set(result?.removed || []);
+    const notFoundSet = new Set(result?.not_found || []);
     for (const [hash, name] of selected) {
-      try {
-        await api(`/torrents/${encodeURIComponent(hash)}`, { method: "DELETE" });
+      if (removedSet.has(hash) || notFoundSet.has(hash)) {
         expectedRemovedTorrents.set(hash, name);
         selectedTorrents.delete(hash);
-        removed++;
-      } catch (e) {
-        failed++;
-        showToast("Torrent remove failed", `${name}: ${e.message}`, "error");
-        log(`bulk remove error (${hash}): ${e.message}`);
       }
     }
     await refreshTorrents();
-    if (removed > 0 && failed > 0) {
-      showToast(`Removed ${removed} ${removed === 1 ? "torrent" : "torrents"}`, `${failed} failed`, "warning");
+    const removed = removedSet.size;
+    const alreadyGone = notFoundSet.size;
+    if (removed > 0 && alreadyGone > 0) {
+      showToast(`Removed ${removed} ${removed === 1 ? "torrent" : "torrents"}`, `${alreadyGone} already gone`, "warning");
     } else if (removed > 0) {
       showToast(`Removed ${removed} ${removed === 1 ? "torrent" : "torrents"}`, "Downloaded data kept", "info");
-    } else if (failed > 0) {
-      showToast("No selected torrents removed", `${failed} failed`, "error");
+    } else if (alreadyGone > 0) {
+      showToast("Selected torrents already removed", `${alreadyGone} no longer present`, "info");
+    } else {
+      showToast("No selected torrents removed", "", "warning");
     }
+  } catch (e) {
+    showError("Remove selected failed", e);
+    log(`bulk remove error: ${e.message}`);
   } finally {
     bulkRemoveInFlight = false;
     updateSelectionControls();
@@ -1321,7 +1330,11 @@ function appendLogLine(line) {
 async function refreshDoctor() {
   try {
     const report = await api("/doctor");
-    renderDoctor(report);
+    const version = await api("/version").catch((e) => {
+      log("version error: " + e.message);
+      return null;
+    });
+    renderDoctor(report, version);
     updateHealthBadge(report);
     return report;
   } catch (e) {
@@ -1338,13 +1351,21 @@ async function refreshDoctorBadge() {
   }
 }
 
-function renderDoctor(report) {
+function renderDoctor(report, version = null) {
   $("#doctor-summary").innerHTML = `
     <h3>Health summary</h3>
     ${renderKv([
       ["Overall", levelLabel(report.level)],
       ["Summary", report.summary || ""],
       ["Checks", String((report.checks || []).length)],
+    ])}`;
+  $("#doctor-application").innerHTML = `
+    <h3>Application</h3>
+    ${renderKv([
+      ["Name", version?.name || "SwarmOtter"],
+      ["Version", version?.version || "unknown"],
+      ["Commit", version?.commit || "unknown"],
+      ["Target", version?.target || "unknown"],
     ])}`;
   $("#doctor-checks").innerHTML = `
     <h3>Checks</h3>

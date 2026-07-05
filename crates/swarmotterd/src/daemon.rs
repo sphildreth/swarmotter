@@ -353,6 +353,63 @@ impl DaemonRuntime {
         Ok(hash)
     }
 
+    async fn remove_torrents_with_single_reconcile(
+        &self,
+        hashes: Vec<InfoHash>,
+        delete_data: bool,
+    ) -> Result<Vec<InfoHash>> {
+        let mut unique_hashes = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            if !unique_hashes.contains(&hash) {
+                unique_hashes.push(hash);
+            }
+        }
+
+        let removed = {
+            let mut reg = self.registry.lock().await;
+            unique_hashes
+                .into_iter()
+                .filter_map(|hash| reg.remove(&hash).map(|torrent| (hash, torrent)))
+                .collect::<Vec<_>>()
+        };
+        if removed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        {
+            let mut queue = self.queue.lock().await;
+            for (hash, _) in &removed {
+                queue.remove(hash);
+            }
+        }
+        {
+            let mut rate_samples = self.rate_samples.lock().await;
+            for (hash, _) in &removed {
+                rate_samples.remove(hash);
+            }
+        }
+        for (hash, _) in &removed {
+            self.force_stop_engine(hash).await;
+        }
+        if delete_data {
+            for (_, torrent) in &removed {
+                let complete_dir = self.resolve_download_dir(torrent).await;
+                let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
+                let mut dirs = vec![active_dir, complete_dir];
+                dirs.dedup();
+                for dir in dirs {
+                    let storage = swarmotter_core::storage::StorageIo::new(
+                        torrent.meta.clone(),
+                        std::path::PathBuf::from(&dir),
+                    );
+                    let _ = storage.remove_all().await;
+                }
+            }
+        }
+        self.reconcile_queue().await;
+        Ok(removed.into_iter().map(|(hash, _)| hash).collect())
+    }
+
     /// Resolve the download directory for a torrent: per-torrent override,
     /// then global config, then a default temp dir.
     async fn resolve_download_dir(&self, t: &Torrent) -> String {
@@ -1857,31 +1914,22 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn remove_torrent(&self, hash: &InfoHash, delete_data: bool) -> Result<()> {
-        let removed = {
-            let mut reg = self.registry.lock().await;
-            reg.remove(hash)
-                .ok_or_else(|| CoreError::NotFound("torrent".into()))?
-        };
-        self.queue.lock().await.remove(hash);
-        self.rate_samples.lock().await.remove(hash);
-        // Removal must not wait for an active peer session to reach its next
-        // command poll. Abort the live data-plane task before deleting files.
-        self.force_stop_engine(hash).await;
-        if delete_data {
-            let complete_dir = self.resolve_download_dir(&removed).await;
-            let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
-            let mut dirs = vec![active_dir, complete_dir];
-            dirs.dedup();
-            for dir in dirs {
-                let storage = swarmotter_core::storage::StorageIo::new(
-                    removed.meta.clone(),
-                    std::path::PathBuf::from(&dir),
-                );
-                let _ = storage.remove_all().await;
-            }
+        let removed = self
+            .remove_torrents_with_single_reconcile(vec![*hash], delete_data)
+            .await?;
+        if removed.is_empty() {
+            return Err(CoreError::NotFound("torrent".into()));
         }
-        self.reconcile_queue().await;
         Ok(())
+    }
+
+    async fn remove_torrents(
+        &self,
+        hashes: Vec<InfoHash>,
+        delete_data: bool,
+    ) -> Result<Vec<InfoHash>> {
+        self.remove_torrents_with_single_reconcile(hashes, delete_data)
+            .await
     }
 
     async fn pause(&self, hash: &InfoHash) -> Result<()> {
@@ -3706,6 +3754,34 @@ mod tests {
             assert!(state.scheduled);
             assert!(state.dirty);
         }
+    }
+
+    #[tokio::test]
+    async fn bulk_remove_clears_many_torrents_and_queue_entries() {
+        const REMOVE_COUNT: usize = 98;
+
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let mut hashes = Vec::with_capacity(REMOVE_COUNT);
+
+        for index in 0..REMOVE_COUNT {
+            let magnet = format!("magnet:?xt=urn:btih:{:040x}&dn=remove-{index}", index + 1);
+            let hash = runtime.add_magnet(&magnet, None).await.unwrap();
+            hashes.push(hash);
+        }
+        hashes.push(InfoHash::from_hex("ffffffffffffffffffffffffffffffffffffffff").unwrap());
+
+        let removed = runtime.remove_torrents(hashes, false).await.unwrap();
+
+        assert_eq!(removed.len(), REMOVE_COUNT);
+        assert!(runtime.registry.lock().await.torrents.is_empty());
+        assert!(runtime.queue.lock().await.order.is_empty());
+        assert!(runtime.engine_handles.lock().await.is_empty());
     }
 
     #[tokio::test]

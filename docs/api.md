@@ -69,9 +69,11 @@ The root `/health` path is also available without the `/api/v1` prefix.
 | POST | `/torrents` | Add magnet JSON or raw `.torrent` body. |
 | POST | `/torrents/magnet` | Add magnet JSON: `{ magnet, download_dir?, paused?, start_behavior? }`. |
 | POST | `/torrents/file` | Upload raw `.torrent` body. |
+| POST | `/torrents/bulk` | Add multiple magnets and/or base64 `.torrent` payloads. |
 | GET | `/torrents/:hash` | Torrent details. |
 | GET | `/torrents/:hash/stats` | Per-torrent counters and live engine diagnostics. |
 | DELETE | `/torrents/:hash?delete_data=bool` | Remove torrent, optionally deleting data. |
+| POST | `/torrents/remove` | Remove multiple torrents: `{ info_hashes, delete_data? }`. |
 | POST | `/torrents/:hash/pause` | Pause. |
 | POST | `/torrents/:hash/resume` | Resume. |
 | POST | `/torrents/:hash/start` | Start now, bypassing queue. |
@@ -94,6 +96,31 @@ Successful add responses mean the torrent record was registered and inserted
 into queue order. The daemon does not wait for queue reconciliation, metadata
 fetching, tracker announces, peer connections, or engine startup before
 returning. Rapid add bursts are coalesced by the daemon scheduler.
+
+Bulk add requests use:
+
+```json
+{
+  "magnets": ["magnet:?xt=urn:btih:..."],
+  "torrent_files": [{ "metainfo": "base64 .torrent bytes" }],
+  "download_dir": "/data/downloads",
+  "paused": true
+}
+```
+
+`download_dir`, `paused`, and `start_behavior` apply to every item in the
+batch. The response includes `added` items with `{ kind, index, info_hash }`
+and `failed` items with `{ kind, index, code, message }`, so one invalid or
+duplicate item does not prevent other valid items from being registered.
+
+Bulk remove requests use:
+
+```json
+{ "info_hashes": ["40hex..."], "delete_data": false }
+```
+
+The response includes `removed` and `not_found` info-hash arrays. The daemon
+removes all found records and reconciles queue state once for the batch.
 
 `/torrents/:hash/stats` includes counters, rates, limits, active peer workers,
 known peers, live peer scheduler diagnostics, tracker diagnostics, and DHT/PEX

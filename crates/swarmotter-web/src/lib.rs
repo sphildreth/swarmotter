@@ -262,7 +262,9 @@ mod tests {
             "function deselectAllTorrents(",
             "async function removeSelectedTorrents(",
             "Downloaded data will be kept.",
-            "api(`/torrents/${encodeURIComponent(hash)}`",
+            "api(\"/torrents/remove\"",
+            "info_hashes: selected.map(([hash]) => hash)",
+            "not_found",
             "selectedTorrents.delete(hash);",
             "$(\"#select-all-torrents-btn\").addEventListener(\"click\", selectAllVisibleTorrents);",
             "$(\"#deselect-all-torrents-btn\").addEventListener(\"click\", deselectAllTorrents);",
@@ -357,6 +359,7 @@ mod tests {
             "log-controls",
             "log-stream",
             "doctor-summary",
+            "doctor-application",
             "doctor-checks",
         ] {
             assert!(
@@ -376,6 +379,24 @@ mod tests {
             assert!(
                 INDEX_HTML.contains(needle),
                 "Web UI is missing markup marker {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_doctor_displays_application_version() {
+        for needle in [
+            "id=\"doctor-application\"",
+            "<h3>Application</h3>",
+            "api(\"/version\")",
+            "function renderDoctor(report, version = null)",
+            "[\"Version\", version?.version || \"unknown\"]",
+            "[\"Commit\", version?.commit || \"unknown\"]",
+            "[\"Target\", version?.target || \"unknown\"]",
+        ] {
+            assert!(
+                APP_JS.contains(needle) || INDEX_HTML.contains(needle),
+                "Web UI is missing Doctor version support {needle}"
             );
         }
     }

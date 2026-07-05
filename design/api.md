@@ -32,6 +32,9 @@ ADR-0009 and ADR-0010.
 - Add requests return after registration and queue insertion; expensive queue
   reconciliation and engine startup are asynchronous and coalesced for rapid
   add bursts; see ADR-0030.
+- Batch add and remove endpoints are part of the native `/api/v1` compatibility
+  contract for clients that submit or operate on many torrents at once; see
+  ADR-0031.
 - Optional compatibility endpoints, currently `/transmission/rpc`, are isolated
   from the native API and delegate to native daemon operations rather than a
   second torrent engine.
