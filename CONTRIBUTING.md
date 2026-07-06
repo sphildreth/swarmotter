@@ -11,9 +11,6 @@ rules.
 
 Key points:
 
-- **No MVP.** The first release is `v1.0.0`, complete only when all required
-  features in `design/requirements.md` are implemented, tested, documented,
-  and usable.
 - **No time estimates.** Do not include calendar, sprint, week, month, or
   duration estimates in issues, PRs, commits, or documentation. Track work by
   completed capabilities and acceptance criteria.
