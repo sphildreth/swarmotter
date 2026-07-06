@@ -8,6 +8,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  RELEASE_RUST_IMAGE: rust:1.96.1-bookworm
+  RELEASE_GLIBC_MAX: "2.36"
 
 permissions:
   contents: read
@@ -56,32 +58,53 @@ jobs:
           fi
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Add Rust target
-        run: rustup target add "${{ matrix.rust_target }}"
-
-      - name: Install aarch64 linker
-        if: matrix.rust_target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version: stable
 
-      - name: Build release binary
-        env:
-          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
-          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          SWARMOTTER_BUILD_COMMIT: ${{ github.sha }}
+      - name: Build release binary in Debian bookworm
         run: |
-          mkdir -p dist/binary dist/packages
-          cargo build --locked --release --target "${{ matrix.rust_target }}" --bin swarmotterd
-          install -m 0755 "target/${{ matrix.rust_target }}/release/swarmotterd" dist/binary/swarmotterd
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/src" \
+            -w /src \
+            -e RUST_TARGET="${{ matrix.rust_target }}" \
+            -e SWARMOTTER_BUILD_COMMIT="${{ github.sha }}" \
+            "${RELEASE_RUST_IMAGE}" \
+            bash -lc '
+              set -Eeuo pipefail
+              rustup target add "$RUST_TARGET"
+              if [[ "$RUST_TARGET" == "aarch64-unknown-linux-gnu" ]]; then
+                apt-get update
+                apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+                export AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
+                export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+              fi
+              mkdir -p dist/binary dist/packages
+              cargo build --locked --release --target "$RUST_TARGET" --bin swarmotterd
+              install -m 0755 "target/$RUST_TARGET/release/swarmotterd" dist/binary/swarmotterd
+            '
+          sudo chown -R "$(id -u):$(id -g)" dist target
+
+      - name: Verify release binary glibc compatibility
+        run: |
+          max_glibc="$(
+            strings dist/binary/swarmotterd \
+              | grep -Eo 'GLIBC_[0-9]+[.][0-9]+' \
+              | sed 's/^GLIBC_//' \
+              | sort -Vu \
+              | tail -n 1
+          )"
+          if [[ -z "$max_glibc" ]]; then
+            echo "::error::Could not determine required glibc version for release binary."
+            exit 1
+          fi
+          echo "Release binary requires glibc <= ${max_glibc}; allowed max is ${RELEASE_GLIBC_MAX}"
+          if dpkg --compare-versions "$max_glibc" gt "$RELEASE_GLIBC_MAX"; then
+            echo "::error::Release binary requires glibc ${max_glibc}, newer than allowed ${RELEASE_GLIBC_MAX}."
+            exit 1
+          fi
 
       - name: Package tarball
         run: |

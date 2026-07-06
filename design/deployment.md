@@ -63,9 +63,11 @@ The native packages install `/usr/bin/swarmotterd`,
 `swarmotter` service account and reload systemd metadata but do not start the
 daemon automatically.
 
-Release automation builds the Linux binaries with Rust target builds and uses
-those prebuilt binaries for release container images. This keeps version-tag
-image publication from recompiling the daemon under CPU emulation.
+Release automation builds the Linux binaries inside a Debian bookworm Rust
+container with Rust target builds and uses those prebuilt binaries for release
+container images. This keeps version-tag image publication from recompiling the
+daemon under CPU emulation while keeping the binary glibc floor compatible with
+the Debian bookworm runtime image.
 
 Windows and macOS native packages are not release surfaces. Operators on those
 hosts should use the Linux container image through their container runtime.
