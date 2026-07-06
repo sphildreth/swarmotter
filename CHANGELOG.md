@@ -5,10 +5,9 @@ This file records notable project changes. It follows the
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 All notable changes are recorded by capability and acceptance criteria, not by
-date or duration estimates. SwarmOtter's first release is `v1.0.0`; there is no
-MVP release.
+date or duration estimates.
 
-## [1.1.0] - [UNRELEASED]
+## [1.1.0] - [2026-07-06]
 
 ### Added
 
@@ -70,12 +69,6 @@ MVP release.
 
 ### Fixed
 
-- **Web UI Tabulator initialization:** the torrent table now waits for
-  Tabulator's `tableBuilt` event before replacing data or reading table
-  filters, avoiding first-load console warnings and initialization races.
-- **Web UI Tabulator theme switching:** the torrent table now applies stronger
-  theme-aware Tabulator overrides and redraws the grid when the light/dark
-  theme icon is toggled.
 - **Retryable magnet metadata discovery:** magnets that discover no peers while
   fetching BEP 9 metadata now remain in `downloading_metadata` with a retry
   backoff instead of being moved to terminal `error`. Completed and failed
