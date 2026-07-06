@@ -285,10 +285,10 @@ impl AutopilotAnalyzer {
         let eligible = input.eligible_peers.unwrap_or_default();
         let peer_worker_limit = input.peer_worker_limit.unwrap_or_default();
         let backed_off = input.backed_off_peers.unwrap_or_default();
-        let discovery_ok = match (input.dht_discovery_ok, input.pex_discovery_ok) {
-            (Some(true), _) | (_, Some(true)) => true,
-            _ => false,
-        };
+        let discovery_ok = matches!(
+            (input.dht_discovery_ok, input.pex_discovery_ok),
+            (Some(true), _) | (_, Some(true))
+        );
 
         AutopilotSnapshot {
             slow: !causes.is_empty(),
@@ -353,11 +353,13 @@ mod tests {
     use super::*;
     #[test]
     fn disabled_mode_is_noop() {
-        let mut input = AutopilotInput::default();
-        input.state = TorrentState::Downloading;
-        input.piece_count = 1;
-        input.known_peers = 12;
-        input.rate_down = 0;
+        let input = AutopilotInput {
+            state: TorrentState::Downloading,
+            piece_count: 1,
+            known_peers: 12,
+            rate_down: 0,
+            ..Default::default()
+        };
         let decision = AutopilotAnalyzer::new().analyze(&input, AutopilotMode::Disabled);
         assert!(!decision.apply);
         assert!(decision.action.is_none());
@@ -366,12 +368,14 @@ mod tests {
 
     #[test]
     fn observe_mode_only_reports_causes() {
-        let mut input = AutopilotInput::default();
-        input.state = TorrentState::Downloading;
-        input.piece_count = 1;
-        input.rate_down = 10;
-        input.rate_down_observed_peak = 1000;
-        input.known_peers = 0;
+        let input = AutopilotInput {
+            state: TorrentState::Downloading,
+            piece_count: 1,
+            rate_down: 10,
+            rate_down_observed_peak: 1000,
+            known_peers: 0,
+            ..Default::default()
+        };
         let decision = AutopilotAnalyzer::new().analyze(&input, AutopilotMode::Observe);
         assert!(!decision.apply);
         assert!(decision.action.is_none());
@@ -380,12 +384,14 @@ mod tests {
 
     #[test]
     fn act_mode_returns_action_for_known_cause() {
-        let mut input = AutopilotInput::default();
-        input.state = TorrentState::Downloading;
-        input.piece_count = 10;
-        input.known_peers = 4;
-        input.useful_peers = Some(0);
-        input.active_peer_workers = 2;
+        let input = AutopilotInput {
+            state: TorrentState::Downloading,
+            piece_count: 10,
+            known_peers: 4,
+            useful_peers: Some(0),
+            active_peer_workers: 2,
+            ..Default::default()
+        };
         let decision = AutopilotAnalyzer::new().analyze(&input, AutopilotMode::Act);
         assert!(decision.apply);
         assert!(matches!(
@@ -400,9 +406,11 @@ mod tests {
 
     #[test]
     fn no_progress_without_download_activity_is_noop() {
-        let mut input = AutopilotInput::default();
-        input.rate_down = 0;
-        input.state = TorrentState::Paused;
+        let input = AutopilotInput {
+            rate_down: 0,
+            state: TorrentState::Paused,
+            ..Default::default()
+        };
         let decision = AutopilotAnalyzer::new().analyze(&input, AutopilotMode::Act);
         assert!(!decision.apply);
         assert_eq!(
@@ -413,10 +421,12 @@ mod tests {
 
     #[test]
     fn no_peers_prefers_discovery_action() {
-        let mut input = AutopilotInput::default();
-        input.state = TorrentState::Downloading;
-        input.piece_count = 1;
-        input.known_peers = 0;
+        let input = AutopilotInput {
+            state: TorrentState::Downloading,
+            piece_count: 1,
+            known_peers: 0,
+            ..Default::default()
+        };
         let decision = AutopilotAnalyzer::new().analyze(&input, AutopilotMode::Act);
         assert_eq!(
             decision.action.as_ref().expect("action").kind,

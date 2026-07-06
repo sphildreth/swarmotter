@@ -170,18 +170,13 @@ pub struct TorrentConfig {
     pub selfish: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerEncryptionMode {
     Disabled,
+    #[default]
     Preferred,
     Required,
-}
-
-impl Default for PeerEncryptionMode {
-    fn default() -> Self {
-        Self::Preferred
-    }
 }
 
 impl PeerEncryptionMode {

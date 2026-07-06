@@ -175,26 +175,17 @@ impl Seeder {
                 Err(_) => continue, // timeout; loop to re-check
             };
             let peer_addr = stream.peer_addr().ok();
-            let meta = self.meta.clone();
-            let storage = self.storage.clone();
-            let complete_storage = self.complete_storage.clone();
-            let state = self.state.clone();
-            let peer_id = self.peer_id;
-            let encryption_mode = self.encryption_mode;
-            let limiter = self.limiter.clone();
+            let context = PeerServeContext {
+                meta: self.meta.clone(),
+                storage: self.storage.clone(),
+                complete_storage: self.complete_storage.clone(),
+                state: self.state.clone(),
+                peer_id: self.peer_id,
+                encryption_mode: self.encryption_mode,
+                limiter: self.limiter.clone(),
+            };
             tokio::spawn(async move {
-                if let Err(e) = serve_peer(
-                    stream,
-                    &meta,
-                    storage,
-                    complete_storage,
-                    &state,
-                    peer_id,
-                    encryption_mode,
-                    &limiter,
-                )
-                .await
-                {
+                if let Err(e) = serve_peer(stream, context).await {
                     tracing::debug!(peer = ?peer_addr, error = %e, "inbound peer session ended");
                 }
             });
@@ -203,16 +194,26 @@ impl Seeder {
     }
 }
 
-async fn serve_peer(
-    stream: tokio::net::TcpStream,
-    meta: &TorrentMeta,
+struct PeerServeContext {
+    meta: TorrentMeta,
     storage: Arc<StorageIo>,
     complete_storage: Option<Arc<StorageIo>>,
-    state: &Arc<Mutex<EngineState>>,
+    state: Arc<Mutex<EngineState>>,
     peer_id: [u8; 20],
     encryption_mode: PeerEncryptionMode,
-    limiter: &ShapedLimiter,
-) -> Result<()> {
+    limiter: ShapedLimiter,
+}
+
+async fn serve_peer(stream: tokio::net::TcpStream, context: PeerServeContext) -> Result<()> {
+    let PeerServeContext {
+        meta,
+        storage,
+        complete_storage,
+        state,
+        peer_id,
+        encryption_mode,
+        limiter,
+    } = context;
     let stream = negotiate_inbound_peer_stream(stream, meta.info_hash, encryption_mode).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = PeerReader::new(read_half);

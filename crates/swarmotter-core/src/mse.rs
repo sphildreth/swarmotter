@@ -529,10 +529,10 @@ impl Big768 {
     fn add_mod(self, rhs: Self) -> Self {
         let mut out = [0u64; 12];
         let mut carry = false;
-        for i in 0..12 {
+        for (i, item) in out.iter_mut().enumerate() {
             let (sum1, c1) = self.0[i].overflowing_add(rhs.0[i]);
             let (sum2, c2) = sum1.overflowing_add(carry as u64);
-            out[i] = sum2;
+            *item = sum2;
             carry = c1 || c2;
         }
         let mut result = Self(out);
@@ -545,10 +545,10 @@ impl Big768 {
     fn wrapping_sub(self, rhs: Self) -> Self {
         let mut out = [0u64; 12];
         let mut borrow = false;
-        for i in 0..12 {
+        for (i, item) in out.iter_mut().enumerate() {
             let (sub1, b1) = self.0[i].overflowing_sub(rhs.0[i]);
             let (sub2, b2) = sub1.overflowing_sub(borrow as u64);
-            out[i] = sub2;
+            *item = sub2;
             borrow = b1 || b2;
         }
         Self(out)

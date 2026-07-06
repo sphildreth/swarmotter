@@ -116,9 +116,10 @@ pub struct RemoveTorrentsResult {
     pub not_found: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TorrentListSort {
+    #[default]
     Name,
     State,
     Health,
@@ -141,23 +142,12 @@ pub enum TorrentListSort {
     Queue,
 }
 
-impl Default for TorrentListSort {
-    fn default() -> Self {
-        Self::Name
-    }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TorrentListDirection {
+    #[default]
     Asc,
     Desc,
-}
-
-impl Default for TorrentListDirection {
-    fn default() -> Self {
-        Self::Asc
-    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]

@@ -232,7 +232,7 @@ fn filesystem_type(path: &Path) -> Option<String> {
         return None;
     }
     let stat = unsafe { stat.assume_init() };
-    Some(filesystem_magic_name(stat.f_type as i64).to_string())
+    Some(filesystem_magic_name(stat.f_type as u64).to_string())
 }
 
 #[cfg(not(unix))]
@@ -262,8 +262,8 @@ fn bytes_from_blocks(blocks: u128, block_size: u128) -> u64 {
     blocks.saturating_mul(block_size).min(u64::MAX as u128) as u64
 }
 
-fn filesystem_magic_name(magic: i64) -> String {
-    match magic as u64 {
+fn filesystem_magic_name(magic: u64) -> String {
+    match magic {
         0x9123683e => "btrfs".into(),
         0xef53 => "ext".into(),
         0x58465342 => "xfs".into(),
@@ -292,8 +292,10 @@ mod tests {
 
     #[test]
     fn preflight_rejects_impossible_space_requirement() {
-        let mut cfg = StorageConfig::default();
-        cfg.minimum_free_space_bytes = u64::MAX;
+        let cfg = StorageConfig {
+            minimum_free_space_bytes: u64::MAX,
+            ..Default::default()
+        };
         let err = check_storage_preflight(&std::env::temp_dir(), &cfg, 1).unwrap_err();
         assert_eq!(err.code().as_str(), "storage_error");
     }

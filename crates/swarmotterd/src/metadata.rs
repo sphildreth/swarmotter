@@ -33,6 +33,16 @@ use swarmotter_core::utp::{self, PeerDuplex, PeerTransport};
 const MAX_METADATA_SIZE: usize = 16 * 1024 * 1024;
 const METADATA_CANDIDATE_CONCURRENCY: usize = 32;
 
+#[derive(Clone)]
+struct MetadataFetchContext {
+    binder: Arc<dyn NetworkBinder>,
+    info_hash: InfoHash,
+    peer_id: [u8; 20],
+    utp_enabled: bool,
+    utp_prefer_tcp: bool,
+    encryption_mode: PeerEncryptionMode,
+}
+
 /// Fetch the torrent metadata (`info` dict) from a peer via `ut_metadata`.
 /// Returns the assembled, info-hash-verified `info` bytes.
 ///
@@ -379,18 +389,17 @@ pub async fn fetch_metadata_from_candidates_with_transport(
     let mut tasks = tokio::task::JoinSet::new();
     let mut last_err: Option<String> = None;
     let mut next = 0usize;
+    let fetch_context = MetadataFetchContext {
+        binder,
+        info_hash,
+        peer_id,
+        utp_enabled,
+        utp_prefer_tcp,
+        encryption_mode,
+    };
 
     while next < candidates.len() && tasks.len() < METADATA_CANDIDATE_CONCURRENCY {
-        spawn_metadata_fetch(
-            &mut tasks,
-            binder.clone(),
-            info_hash,
-            peer_id,
-            candidates[next],
-            utp_enabled,
-            utp_prefer_tcp,
-            encryption_mode,
-        );
+        spawn_metadata_fetch(&mut tasks, fetch_context.clone(), candidates[next]);
         next += 1;
     }
 
@@ -405,16 +414,7 @@ pub async fn fetch_metadata_from_candidates_with_transport(
             }
         }
         while next < candidates.len() && tasks.len() < METADATA_CANDIDATE_CONCURRENCY {
-            spawn_metadata_fetch(
-                &mut tasks,
-                binder.clone(),
-                info_hash,
-                peer_id,
-                candidates[next],
-                utp_enabled,
-                utp_prefer_tcp,
-                encryption_mode,
-            );
+            spawn_metadata_fetch(&mut tasks, fetch_context.clone(), candidates[next]);
             next += 1;
         }
     }
@@ -426,23 +426,18 @@ pub async fn fetch_metadata_from_candidates_with_transport(
 
 fn spawn_metadata_fetch(
     tasks: &mut tokio::task::JoinSet<(PeerAddr, Result<Vec<u8>>)>,
-    binder: Arc<dyn NetworkBinder>,
-    info_hash: InfoHash,
-    peer_id: [u8; 20],
+    context: MetadataFetchContext,
     peer: PeerAddr,
-    utp_enabled: bool,
-    utp_prefer_tcp: bool,
-    encryption_mode: PeerEncryptionMode,
 ) {
     tasks.spawn(async move {
         let result = fetch_metadata_with_transport(
-            binder,
-            info_hash,
-            peer_id,
+            context.binder,
+            context.info_hash,
+            context.peer_id,
             peer,
-            utp_enabled,
-            utp_prefer_tcp,
-            encryption_mode,
+            context.utp_enabled,
+            context.utp_prefer_tcp,
+            context.encryption_mode,
         )
         .await;
         (peer, result)
