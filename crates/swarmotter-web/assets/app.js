@@ -6,18 +6,85 @@ const MAX_TOAST_DISPLAY_MS = 60000;
 const MAX_VISIBLE_TOASTS = 3;
 const MAX_LOG_LINES = 500;
 const TOAST_DISPLAY_STORAGE_KEY = "swarmotter.toastDisplayMs";
+const THEME_STORAGE_KEY = "swarmotter.theme";
+const TORRENT_QUERY_STORAGE_KEY = "swarmotter.torrentQueryView";
+const TORRENT_DEFAULT_PER_PAGE = 200;
+const TORRENT_MAX_PER_PAGE = 500;
+const THEME_DARK = "dark";
+const THEME_LIGHT = "light";
+const DEFAULT_THEME = THEME_DARK;
+const TORRENT_SORT_OPTIONS = new Set([
+  "name",
+  "state",
+  "health",
+  "health_score",
+  "progress",
+  "size",
+  "down_rate",
+  "up_rate",
+  "ratio",
+  "peers",
+  "added",
+  "completed",
+  "queue",
+]);
+const TORRENT_TABLE_TO_QUERY_SORT = {
+  name: "name",
+  state: "state",
+  health_label: "health",
+  total_length: "size",
+  progress_percent: "progress",
+  rate_down: "down_rate",
+  rate_up: "up_rate",
+  ratio: "ratio",
+  active_peers: "peers",
+};
+const TORRENT_QUERY_TO_TABLE_SORT = {
+  name: "name",
+  state: "state",
+  health: "health_label",
+  health_score: "health_label",
+  progress: "progress_percent",
+  size: "total_length",
+  down_rate: "rate_down",
+  up_rate: "rate_up",
+  ratio: "ratio",
+  peers: "active_peers",
+  added: "name",
+  completed: "name",
+  queue: "name",
+};
+
 let currentHash = null;
 let toastDisplayMs = loadToastDisplayMs();
+let currentTheme = loadThemePreference();
 let torrentsLoaded = false;
 let knownTorrents = new Map();
 let expectedRemovedTorrents = new Map();
 let selectedTorrents = new Map();
 let visibleTorrents = [];
+let torrentTable = null;
+let torrentTableBuilt = false;
+let torrentTableReady = Promise.resolve();
 let bulkRemoveInFlight = false;
 let magnetAddInFlight = false;
 let logEventSource = null;
 let lastEventStreamErrorAt = 0;
 let fullConfigSnapshot = null;
+let autopilotModeUpdateInFlight = false;
+let activeSettingsPanel = "api";
+let torrentQueryRefreshTimer = null;
+let isApplyingSortFromServer = false;
+let torrentQueryState = {
+  q: "",
+  state: "",
+  health: "",
+  performance: "",
+  sort: "name",
+  dir: "asc",
+  page: 1,
+  per_page: TORRENT_DEFAULT_PER_PAGE,
+};
 
 const EVENT_KINDS = [
   "torrent_added",
@@ -63,6 +130,51 @@ const TORRENT_ACTIONS = [
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+
+function loadThemePreference() {
+  try {
+    return normalizeTheme(window.localStorage.getItem(THEME_STORAGE_KEY));
+  } catch {
+    return DEFAULT_THEME;
+  }
+}
+
+function normalizeTheme(rawTheme) {
+  return rawTheme === THEME_LIGHT || rawTheme === THEME_DARK
+    ? rawTheme
+    : DEFAULT_THEME;
+}
+
+function applyTheme(theme, { persist = true } = {}) {
+  const next = normalizeTheme(theme);
+  currentTheme = next;
+  document.documentElement.dataset.theme = next;
+  refreshTorrentTableTheme(next);
+  const button = $("#theme-toggle");
+  if (button) {
+    button.dataset.theme = next;
+    const label = next === THEME_DARK ? "Switch to light theme" : "Switch to dark theme";
+    button.setAttribute("aria-label", label);
+    button.title = label;
+  }
+  if (!persist) return;
+  try {
+    window.localStorage.setItem(THEME_STORAGE_KEY, next);
+  } catch {}
+}
+
+function refreshTorrentTableTheme(theme) {
+  const tableElement = $("#torrent-table");
+  if (tableElement) tableElement.dataset.theme = theme;
+  if (!isTorrentTableReady() || typeof torrentTable.redraw !== "function") return;
+  const redraw = () => torrentTable.redraw(true);
+  if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(redraw);
+  else window.setTimeout(redraw, 0);
+}
+
+function toggleTheme() {
+  applyTheme(currentTheme === THEME_DARK ? THEME_LIGHT : THEME_DARK);
+}
 
 function loadToastDisplayMs() {
   try {
@@ -152,11 +264,21 @@ function fmtPercentFromFraction(n, digits = 1) {
   n = finiteNumber(n);
   return n === null ? "" : (n * 100).toFixed(digits) + "%";
 }
+function fmtPercent(value) {
+  value = finiteNumber(value);
+  return value === null ? "" : `${value}%`;
+}
 function fmtProgress(bytesCompleted, totalLength) {
   const completed = finiteNumber(bytesCompleted);
   const total = finiteNumber(totalLength);
   if (completed === null || total === null || total <= 0) return "";
   return (Math.min(completed, total) / total * 100).toFixed(1) + "%";
+}
+function fmtUnixSeconds(seconds) {
+  const value = finiteNumber(seconds);
+  if (value === null) return "";
+  const timestamp = new Date(value * 1000);
+  return Number.isNaN(timestamp.getTime()) ? "" : timestamp.toLocaleString();
 }
 function renderProgressCell(bytesCompleted, totalLength) {
   const completed = finiteNumber(bytesCompleted);
@@ -199,50 +321,609 @@ $$(".nav").forEach(btn => btn.addEventListener("click", () => {
 }));
 
 // --- Torrents ---
+function clampTorrentPerPage(value) {
+  const n = finiteNumber(value);
+  if (n === null) return TORRENT_DEFAULT_PER_PAGE;
+  return Math.min(Math.max(Math.floor(n), 0), TORRENT_MAX_PER_PAGE);
+}
+
+function clampTorrentPage(value) {
+  const n = finiteNumber(value);
+  return n === null || n <= 0 ? 1 : Math.floor(n);
+}
+
+function normalizeTorrentDir(rawDir) {
+  return String(rawDir || "").toLowerCase() === "desc" ? "desc" : "asc";
+}
+
+function normalizeTorrentSort(rawSort) {
+  const normalized = String(rawSort || "").toLowerCase();
+  return TORRENT_SORT_OPTIONS.has(normalized) ? normalized : "name";
+}
+
+function tableSortToQuerySort(field) {
+  return TORRENT_TABLE_TO_QUERY_SORT[field] || null;
+}
+
+function querySortToTableSort(sort) {
+  return TORRENT_QUERY_TO_TABLE_SORT[sort] || null;
+}
+
+function collectTorrentQueryControls() {
+  return {
+    q: ($("#search")?.value || "").trim(),
+    state: ($("#torrent-state-filter")?.value || "").trim().toLowerCase(),
+    health: ($("#torrent-health-filter")?.value || "").trim().toLowerCase(),
+    performance: ($("#torrent-performance-filter")?.value || "").trim().toLowerCase(),
+    per_page: clampTorrentPerPage($("#torrent-per-page")?.value),
+  };
+}
+
+function applyTorrentQueryControls(state) {
+  if ($("#search")) $("#search").value = state.q || "";
+  if ($("#torrent-state-filter")) $("#torrent-state-filter").value = state.state || "";
+  if ($("#torrent-health-filter")) $("#torrent-health-filter").value = state.health || "";
+  if ($("#torrent-performance-filter")) $("#torrent-performance-filter").value = state.performance || "";
+  if ($("#torrent-per-page")) $("#torrent-per-page").value = String(state.per_page || TORRENT_DEFAULT_PER_PAGE);
+}
+
+function collectTorrentQueryState() {
+  const controls = collectTorrentQueryControls();
+  return {
+    ...torrentQueryState,
+    ...controls,
+    sort: normalizeTorrentSort(torrentQueryState.sort),
+    dir: normalizeTorrentDir(torrentQueryState.dir),
+    page: clampTorrentPage(torrentQueryState.page),
+    per_page: controls.per_page,
+  };
+}
+
+function buildTorrentQueryParams(state) {
+  const query = new URLSearchParams();
+  if (state.q) query.set("q", state.q);
+  if (state.state) query.set("state", state.state);
+  if (state.health) query.set("health", state.health);
+  if (state.performance) query.set("performance", state.performance);
+  if (state.sort) query.set("sort", state.sort);
+  if (state.dir) query.set("dir", state.dir);
+  if (state.page) query.set("page", String(state.page));
+  if (state.per_page !== undefined && state.per_page !== null) query.set("per_page", String(state.per_page));
+  return query.toString();
+}
+
 async function refreshTorrents() {
+  if (torrentQueryRefreshTimer) {
+    window.clearTimeout(torrentQueryRefreshTimer);
+    torrentQueryRefreshTimer = null;
+  }
+  torrentQueryState = collectTorrentQueryState();
   try {
-    const list = await api("/torrents");
-    const stats = await api("/stats");
-    observeTorrentRemovals(list);
-    syncSelectedTorrents(list);
-    const tbody = $("#torrent-table tbody");
-    tbody.innerHTML = "";
-    const filter = $("#search").value.toLowerCase();
-    const filtered = list.filter(t => String(t.name || "").toLowerCase().includes(filter));
-    visibleTorrents = filtered.map(t => ({
-      hash: t.info_hash,
-      name: torrentDisplayName(t),
-    }));
-    filtered.forEach(t => {
-      const tr = document.createElement("tr");
-      tr.className = "torrent";
-      tr.classList.toggle("selected", selectedTorrents.has(t.info_hash));
-      tr.dataset.hash = t.info_hash;
-      tr.innerHTML = `
-        <td class="selection-column">${renderTorrentSelection(t)}</td>
-        <td>${escapeHtml(t.name)}</td>
-        <td>${fmtBytes(t.total_length)}</td>
-        <td>${renderProgressCell(t.bytes_completed, t.total_length)}</td>
-        <td>${escapeHtml(t.state)}</td>
-        <td>${renderHealth(t.health)}</td>
-        <td>${fmtRate(t.rate_down)}</td>
-        <td>${fmtRate(t.rate_up)}</td>
-        <td>${fmtRatio(t.ratio)}</td>
-        <td>${renderPeerCount(t)}</td>
-        <td>${renderTorrentActions()}</td>`;
-      tr.addEventListener("click", (e) => {
-        if (e.target.closest("button, input, label")) return;
-        openDetails(t.info_hash);
-      });
-      tbody.appendChild(tr);
-    });
+    const queryParams = buildTorrentQueryParams(torrentQueryState);
+    const [query, stats] = await Promise.all([
+      api(`/torrents/query${queryParams ? `?${queryParams}` : ""}`),
+      api("/stats"),
+    ]);
+    const torrents = query?.rows || [];
+    torrentQueryState.sort = normalizeTorrentSort(query?.sort);
+    torrentQueryState.dir = normalizeTorrentDir(query?.dir);
+    torrentQueryState.page = clampTorrentPage(query?.page);
+    torrentQueryState.per_page = clampTorrentPerPage(query?.per_page);
+    applyTorrentQueryControls(torrentQueryState);
+    if (query?.page_count > 0 && query?.page > query?.page_count) {
+      torrentQueryState.page = query.page_count;
+      refreshTorrents();
+      return;
+    }
+    observeTorrentRemovals(torrents);
+    syncSelectedTorrents(torrents);
+    const rows = torrents.map(normalizeTorrentRow);
+    ensureTorrentTable();
+    await setTorrentTableData(rows);
+    if (!isApplyingSortFromServer) syncTorrentTableSort(torrentQueryState.sort, torrentQueryState.dir);
+    if ($("#query-summary")) $("#query-summary").textContent = renderTorrentQuerySummary(query);
+    updateTorrentPaginationControls(query);
     $("#stats-summary").textContent = renderStatsSummary(stats);
-    bindSelectionInputs();
-    bindActionButtons();
-    updateSelectionControls();
+    if ($("#torrent-prev-page-btn")) {
+      const pageCount = query?.page_count || 0;
+      const page = query?.page || 1;
+      $("#torrent-prev-page-btn").disabled = page <= 1 || pageCount === 0;
+      $("#torrent-next-page-btn").disabled = page >= pageCount || pageCount === 0;
+    }
+    updateTorrentTableViewState();
+    updateClearFiltersButton();
   } catch (e) {
     log("torrent list error: " + e.message);
   }
+}
+
+function updateTorrentPaginationControls(query) {
+  if (!query) return;
+  const page = query.page || 1;
+  const pageCount = query.page_count || 0;
+  const summary = $("#torrent-page-summary");
+  if (summary) summary.textContent = pageCount === 0 ? "Page 0/0" : `Page ${page}/${pageCount}`;
+  const prev = $("#torrent-prev-page-btn");
+  const next = $("#torrent-next-page-btn");
+  if (prev) prev.disabled = page <= 1 || pageCount === 0;
+  if (next) next.disabled = page >= pageCount || pageCount === 0;
+}
+
+function renderTorrentQuerySummary(query) {
+  const filtered = finiteNumber(query?.filtered);
+  const total = finiteNumber(query?.total);
+  const perPage = clampTorrentPerPage(query?.per_page);
+  const page = clampTorrentPage(query?.page);
+  const pageCountRaw = finiteNumber(query?.page_count);
+  const pageCount = pageCountRaw === null ? 0 : Math.floor(Math.max(pageCountRaw, 0));
+  if (filtered === null || total === null) return "";
+  if (filtered === 0) return `${fmtCount(filtered)}/${fmtCount(total)} matching torrents · page 0/0`;
+  if (perPage === 0) return `${fmtCount(filtered)}/${fmtCount(total)} matching torrents · counts only`;
+  const start = Math.min((page - 1) * perPage + 1, filtered);
+  const end = Math.min(page * perPage, filtered);
+  return `${fmtCount(filtered)}/${fmtCount(total)} matching torrents · ${start}-${end} · page ${page}/${pageCount}`;
+}
+
+function syncTorrentTableSort(sort, dir) {
+  if (!isTorrentTableReady()) return;
+  const tableSort = querySortToTableSort(sort);
+  if (!tableSort) return;
+  const sorters = torrentTable.getSorters();
+  const current = sorters && sorters[0] ? sorters[0] : null;
+  const nextDir = normalizeTorrentDir(dir);
+  if (current && current.field === tableSort && current.dir === nextDir) return;
+  isApplyingSortFromServer = true;
+  torrentTable.setSort([{ column: tableSort, dir: nextDir }]);
+  window.setTimeout(() => {
+    isApplyingSortFromServer = false;
+  }, 0);
+}
+
+function handleTorrentTableSort(sorters) {
+  if (isApplyingSortFromServer) return;
+  const first = Array.isArray(sorters) && sorters.length > 0 ? sorters[0] : null;
+  if (!first) return;
+  const field = first.field || (first.column && first.column.getField && first.column.getField());
+  const sort = tableSortToQuerySort(field);
+  if (!sort) return;
+  const dir = normalizeTorrentDir(first.dir);
+  if (sort === torrentQueryState.sort && dir === torrentQueryState.dir) return;
+  torrentQueryState.sort = sort;
+  torrentQueryState.dir = dir;
+  torrentQueryState.page = 1;
+  refreshTorrents();
+}
+
+function scheduleTorrentRefresh() {
+  if (torrentQueryRefreshTimer) {
+    window.clearTimeout(torrentQueryRefreshTimer);
+  }
+  torrentQueryRefreshTimer = window.setTimeout(() => {
+    torrentQueryRefreshTimer = null;
+    refreshTorrents();
+  }, 250);
+}
+
+function setTorrentPage(page) {
+  const next = clampTorrentPage(page);
+  if (next === torrentQueryState.page) return;
+  torrentQueryState.page = next;
+  refreshTorrents();
+}
+
+function normalizeTorrentRow(t) {
+  const total = finiteNumber(t.total_length);
+  const completed = finiteNumber(t.bytes_completed);
+  const progress = completed === null || total === null || total <= 0
+    ? null
+    : Math.min(completed, total) / total * 100;
+  const rawHealthLabel = t?.health?.label || "unknown";
+  return {
+    ...t,
+    info_hash: String(t.info_hash || ""),
+    name: torrentDisplayName(t),
+    progress_percent: progress === null ? 0 : progress,
+    health_label: healthLabelName(rawHealthLabel),
+    health_score: finiteNumber(t?.health?.score) ?? 0,
+    active_peers: finiteNumber(t.active_peer_workers) ?? 0,
+    known_peer_count: finiteNumber(t.known_peers) ?? 0,
+  };
+}
+
+function ensureTorrentTable() {
+  if (torrentTable) return torrentTableReady;
+  if (typeof Tabulator === "undefined") {
+    throw new Error("Tabulator asset did not load");
+  }
+  let resolveReady;
+  torrentTableBuilt = false;
+  torrentTableReady = new Promise(resolve => { resolveReady = resolve; });
+  torrentTable = new Tabulator("#torrent-table", {
+    data: [],
+    index: "info_hash",
+    layout: "fitDataStretch",
+    height: "calc(100vh - 11rem)",
+    movableColumns: true,
+    placeholder: "No torrents match the current filters.",
+    columnHeaderVertAlign: "bottom",
+    headerFilterLiveFilterDelay: 250,
+    initialSort: [{ column: "name", dir: "asc" }],
+    columns: torrentTableColumns(),
+    rowFormatter(row) {
+      const data = row.getData();
+      const element = row.getElement();
+      element.classList.add("torrent");
+      element.classList.toggle("selected", selectedTorrents.has(data.info_hash));
+    },
+  });
+  torrentTable.on("tableBuilt", () => {
+    torrentTableBuilt = true;
+    resolveReady(torrentTable);
+    refreshTorrentTableTheme(currentTheme);
+    updateTorrentTableViewState();
+  });
+  torrentTable.on("rowClick", (event, row) => {
+    if (event.target.closest("button, input, label, select")) return;
+    openDetails(row.getData().info_hash);
+  });
+  torrentTable.on("dataFiltered", updateTorrentTableViewState);
+  torrentTable.on("dataSorted", (sorters) => {
+    handleTorrentTableSort(sorters);
+    updateTorrentTableViewState();
+  });
+  torrentTable.on("renderComplete", updateTorrentTableViewState);
+  return torrentTableReady;
+}
+
+function torrentTableColumns() {
+  return [
+    {
+      title: "",
+      field: "_selected",
+      width: 44,
+      minWidth: 44,
+      frozen: true,
+      headerSort: false,
+      resizable: false,
+      hozAlign: "center",
+      cssClass: "selection-column",
+      titleFormatter: () => `<span class="sr-only">Selected</span>`,
+      formatter: torrentSelectionFormatter,
+    },
+    {
+      title: "Name",
+      field: "name",
+      minWidth: 260,
+      sorter: "string",
+      headerFilter: "input",
+      headerFilterPlaceholder: "Filter name",
+      formatter: textCellFormatter,
+    },
+    {
+      title: "Size",
+      field: "total_length",
+      width: 105,
+      hozAlign: "right",
+      sorter: "number",
+      headerFilter: "input",
+      headerFilterPlaceholder: "> 0",
+      headerFilterFunc: numericHeaderFilter,
+      formatter: cell => fmtBytes(cell.getValue()),
+    },
+    {
+      title: "Progress",
+      field: "progress_percent",
+      width: 180,
+      sorter: "number",
+      headerFilter: "input",
+      headerFilterPlaceholder: "> 50",
+      headerFilterFunc: numericHeaderFilter,
+      formatter: cell => {
+        const data = cell.getRow().getData();
+        return renderProgressCell(data.bytes_completed, data.total_length);
+      },
+    },
+    {
+      title: "Status",
+      field: "state",
+      width: 145,
+      sorter: "string",
+      headerFilter: "list",
+      headerFilterParams: { valuesLookup: true, clearable: true },
+      headerFilterPlaceholder: "All",
+      formatter: textCellFormatter,
+    },
+    {
+      title: "Health",
+      field: "health_label",
+      width: 165,
+      sorter: healthSorter,
+      headerFilter: "list",
+      headerFilterParams: { valuesLookup: true, clearable: true },
+      headerFilterPlaceholder: "All",
+      formatter: cell => renderHealth(cell.getRow().getData().health),
+    },
+    {
+      title: "Down",
+      field: "rate_down",
+      width: 105,
+      hozAlign: "right",
+      sorter: "number",
+      headerFilter: "input",
+      headerFilterPlaceholder: "> 0",
+      headerFilterFunc: numericHeaderFilter,
+      formatter: cell => fmtRate(cell.getValue()),
+    },
+    {
+      title: "Up",
+      field: "rate_up",
+      width: 105,
+      hozAlign: "right",
+      sorter: "number",
+      headerFilter: "input",
+      headerFilterPlaceholder: "> 0",
+      headerFilterFunc: numericHeaderFilter,
+      formatter: cell => fmtRate(cell.getValue()),
+    },
+    {
+      title: "Ratio",
+      field: "ratio",
+      width: 95,
+      hozAlign: "right",
+      sorter: "number",
+      headerFilter: "input",
+      headerFilterPlaceholder: "> 1",
+      headerFilterFunc: numericHeaderFilter,
+      formatter: cell => fmtRatio(cell.getValue()),
+    },
+    {
+      title: "Peers",
+      field: "active_peers",
+      width: 105,
+      hozAlign: "right",
+      sorter: peerCountSorter,
+      headerFilter: "input",
+      headerFilterPlaceholder: "> 0",
+      headerFilterFunc: numericHeaderFilter,
+      formatter: cell => renderPeerCount(cell.getRow().getData()),
+    },
+    {
+      title: "Actions",
+      field: "_actions",
+      width: 150,
+      headerSort: false,
+      resizable: false,
+      formatter: () => renderTorrentActions(),
+      cellClick: handleTorrentActionCellClick,
+    },
+  ];
+}
+
+function isTorrentTableReady() {
+  return !!torrentTable && torrentTableBuilt;
+}
+
+async function setTorrentTableData(rows) {
+  if (!torrentTable) return Promise.resolve();
+  await torrentTableReady;
+  const result = torrentTable.replaceData(rows);
+  return result && typeof result.then === "function" ? result : Promise.resolve();
+}
+
+function textCellFormatter(cell) {
+  return escapeHtml(cell.getValue());
+}
+
+function healthSorter(_a, _b, aRow, bRow) {
+  return compareNumbers(aRow.getData().health_score, bRow.getData().health_score);
+}
+
+function peerCountSorter(_a, _b, aRow, bRow) {
+  const a = aRow.getData();
+  const b = bRow.getData();
+  return compareNumbers(a.active_peers, b.active_peers)
+    || compareNumbers(a.known_peer_count, b.known_peer_count);
+}
+
+function compareNumbers(a, b) {
+  return (finiteNumber(a) ?? 0) - (finiteNumber(b) ?? 0);
+}
+
+function numericHeaderFilter(headerValue, rowValue) {
+  const parsed = parseNumericFilter(headerValue);
+  if (!parsed) return true;
+  const value = finiteNumber(rowValue);
+  if (value === null) return false;
+  switch (parsed.operator) {
+    case ">": return value > parsed.value;
+    case ">=": return value >= parsed.value;
+    case "<": return value < parsed.value;
+    case "<=": return value <= parsed.value;
+    case "!=": return value !== parsed.value;
+    default: return value === parsed.value;
+  }
+}
+
+function parseNumericFilter(value) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  const match = text.match(/^(<=|>=|!=|==|=|<|>)?\s*(-?(?:\d+(?:\.\d+)?|\.\d+))$/);
+  if (!match) return null;
+  return {
+    operator: match[1] === "==" ? "=" : (match[1] || "="),
+    value: Number(match[2]),
+  };
+}
+
+function torrentSelectionFormatter(cell, _formatterParams, onRendered) {
+  onRendered(() => bindTorrentSelectionCheckbox(cell));
+  return renderTorrentSelection(cell.getRow().getData());
+}
+
+function bindTorrentSelectionCheckbox(cell) {
+  const checkbox = cell.getElement().querySelector(".torrent-select");
+  if (!checkbox) return;
+  checkbox.addEventListener("click", event => event.stopPropagation());
+  checkbox.addEventListener("change", () => {
+    const row = cell.getRow();
+    const data = row.getData();
+    if (checkbox.checked) selectedTorrents.set(data.info_hash, torrentDisplayName(data));
+    else selectedTorrents.delete(data.info_hash);
+    row.getElement().classList.toggle("selected", checkbox.checked);
+    updateSelectionControls();
+  });
+}
+
+function handleTorrentActionCellClick(event, cell) {
+  const button = event.target.closest("button");
+  if (!button) return;
+  event.stopPropagation();
+  const data = cell.getRow().getData();
+  handleTorrentAction(button.dataset.act, data.info_hash, torrentDisplayName(data));
+}
+
+function activeTorrentRows() {
+  if (!isTorrentTableReady()) return [];
+  try {
+    return torrentTable.getRows("active");
+  } catch {
+    return torrentTable.getRows();
+  }
+}
+
+function updateVisibleTorrentsFromTable() {
+  visibleTorrents = activeTorrentRows().map(row => {
+    const data = row.getData();
+    return {
+      hash: data.info_hash,
+      name: torrentDisplayName(data),
+    };
+  }).filter(t => t.hash);
+}
+
+function updateTorrentTableViewState() {
+  updateVisibleTorrentsFromTable();
+  updateRenderedSelection();
+  updateSelectionControls();
+  updateClearFiltersButton();
+}
+
+async function applyTorrentSearchFilter() {
+  torrentQueryState.page = 1;
+  scheduleTorrentRefresh();
+}
+
+async function clearTorrentFilters() {
+  $("#search").value = "";
+  if ($("#torrent-state-filter")) $("#torrent-state-filter").value = "";
+  if ($("#torrent-health-filter")) $("#torrent-health-filter").value = "";
+  if ($("#torrent-performance-filter")) $("#torrent-performance-filter").value = "";
+  if ($("#torrent-per-page")) $("#torrent-per-page").value = String(TORRENT_DEFAULT_PER_PAGE);
+  torrentQueryState.page = 1;
+  torrentQueryState.per_page = TORRENT_DEFAULT_PER_PAGE;
+  torrentQueryState.sort = "name";
+  torrentQueryState.dir = "asc";
+  if (torrentTable) {
+    await torrentTableReady;
+    torrentTable.clearFilter(true);
+  }
+  scheduleTorrentRefresh();
+  updateTorrentTableViewState();
+}
+
+function updateClearFiltersButton() {
+  const button = $("#clear-torrent-filters-btn");
+  if (!button) return;
+  const controls = collectTorrentQueryControls();
+  const hasSearch = !!controls.q || !!controls.state || !!controls.health || !!controls.performance;
+  const hasPerPageOverride = controls.per_page !== TORRENT_DEFAULT_PER_PAGE;
+  let hasHeaderFilters = false;
+  if (isTorrentTableReady()) {
+    try { hasHeaderFilters = torrentTable.getHeaderFilters().length > 0; } catch {}
+  }
+  button.disabled = !hasSearch && !hasPerPageOverride && !hasHeaderFilters;
+}
+
+function saveTorrentQueryView() {
+  const base = collectTorrentQueryState();
+  const payload = {
+    q: base.q,
+    state: base.state,
+    health: base.health,
+    performance: base.performance,
+    per_page: base.per_page,
+    sort: base.sort,
+    dir: base.dir,
+  };
+  try {
+    window.localStorage.setItem(TORRENT_QUERY_STORAGE_KEY, JSON.stringify(payload));
+    showToast("Torrent view saved", "Default query view stored.", "success");
+  } catch {
+    showError("Save view failed", new Error("Could not write to local storage"));
+  }
+}
+
+function readSavedTorrentQueryView() {
+  try {
+    const raw = window.localStorage.getItem(TORRENT_QUERY_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      q: String(parsed.q || "").trim(),
+      state: String(parsed.state || "").trim(),
+      health: String(parsed.health || "").trim(),
+      performance: String(parsed.performance || "").trim(),
+      per_page: clampTorrentPerPage(parsed.per_page),
+      sort: normalizeTorrentSort(parsed.sort),
+      dir: normalizeTorrentDir(parsed.dir),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function loadTorrentQueryView() {
+  const loaded = readSavedTorrentQueryView();
+  if (!loaded) {
+    showToast("No saved view", "Save a view first.", "warning");
+    return;
+  }
+  torrentQueryState = {
+    ...torrentQueryState,
+    ...loaded,
+    page: 1,
+  };
+  applyTorrentQueryControls(torrentQueryState);
+  refreshTorrents();
+}
+
+function clearTorrentQueryView() {
+  try {
+    window.localStorage.removeItem(TORRENT_QUERY_STORAGE_KEY);
+  } catch {}
+  torrentQueryState.sort = "name";
+  torrentQueryState.dir = "asc";
+  torrentQueryState.q = "";
+  torrentQueryState.state = "";
+  torrentQueryState.health = "";
+  torrentQueryState.performance = "";
+  torrentQueryState.per_page = TORRENT_DEFAULT_PER_PAGE;
+  torrentQueryState.page = 1;
+  applyTorrentQueryControls(torrentQueryState);
+  refreshTorrents();
+  showToast("Saved view cleared", "", "info");
+}
+
+function applySavedTorrentQueryView() {
+  const saved = readSavedTorrentQueryView();
+  if (!saved) return;
+  torrentQueryState = {
+    ...torrentQueryState,
+    ...saved,
+    page: 1,
+  };
+  applyTorrentQueryControls(torrentQueryState);
 }
 
 function observeTorrentRemovals(list) {
@@ -306,27 +987,13 @@ function renderTorrentSelection(t) {
   return `<input type="checkbox" class="torrent-select" data-hash="${escapeHtml(t.info_hash)}"${checked} aria-label="Select ${escapeHtml(name)}">`;
 }
 
-function bindSelectionInputs() {
-  $$("#torrent-table tbody .torrent-select").forEach(cb => {
-    cb.addEventListener("click", e => e.stopPropagation());
-    cb.addEventListener("change", () => {
-      const tr = cb.closest("tr");
-      const hash = cb.dataset.hash;
-      const name = tr?.querySelector("td:nth-child(2)")?.textContent || hash;
-      if (cb.checked) selectedTorrents.set(hash, name);
-      else selectedTorrents.delete(hash);
-      tr?.classList.toggle("selected", cb.checked);
-      updateSelectionControls();
-    });
-  });
-}
-
 function updateRenderedSelection() {
-  $$("#torrent-table tbody tr").forEach(tr => {
-    const hash = tr.dataset.hash;
-    const selected = selectedTorrents.has(hash);
-    tr.classList.toggle("selected", selected);
-    const cb = tr.querySelector(".torrent-select");
+  if (!isTorrentTableReady()) return;
+  torrentTable.getRows().forEach(row => {
+    const data = row.getData();
+    const selected = selectedTorrents.has(data.info_hash);
+    row.getElement().classList.toggle("selected", selected);
+    const cb = row.getElement().querySelector(".torrent-select");
     if (cb) cb.checked = selected;
   });
 }
@@ -404,29 +1071,22 @@ async function removeSelectedTorrents() {
   }
 }
 
-function bindActionButtons() {
-  $$("#torrent-table tbody button").forEach(btn => {
-    btn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      const tr = btn.closest("tr");
-      const hash = tr.dataset.hash;
-      const name = tr.querySelector("td:nth-child(2)")?.textContent || hash;
-      const act = btn.dataset.act;
-      try {
-        if (act === "pause") await api(`/torrents/${hash}/pause`, { method: "POST" });
-        else if (act === "resume") await api(`/torrents/${hash}/resume`, { method: "POST" });
-        else if (act === "recheck") await api(`/torrents/${hash}/recheck`, { method: "POST" });
-        else if (act === "remove") {
-          if (confirm("Remove torrent? Delete data too?")) await api(`/torrents/${hash}?delete_data=true`, { method: "DELETE" });
-          else await api(`/torrents/${hash}`, { method: "DELETE" });
-          expectedRemovedTorrents.set(hash, name);
-          selectedTorrents.delete(hash);
-          showToast("Torrent removed", name, "info");
-        }
-        refreshTorrents();
-      } catch (e) { showError("Torrent action failed", e); }
-    });
-  });
+async function handleTorrentAction(act, hash, name) {
+  try {
+    if (act === "pause") await api(`/torrents/${hash}/pause`, { method: "POST" });
+    else if (act === "resume") await api(`/torrents/${hash}/resume`, { method: "POST" });
+    else if (act === "recheck") await api(`/torrents/${hash}/recheck`, { method: "POST" });
+    else if (act === "remove") {
+      if (confirm("Remove torrent? Delete data too?")) await api(`/torrents/${hash}?delete_data=true`, { method: "DELETE" });
+      else await api(`/torrents/${hash}`, { method: "DELETE" });
+      expectedRemovedTorrents.set(hash, name);
+      selectedTorrents.delete(hash);
+      showToast("Torrent removed", name, "info");
+    }
+    refreshTorrents();
+  } catch (e) {
+    showError("Torrent action failed", e);
+  }
 }
 
 // --- Details ---
@@ -434,13 +1094,33 @@ async function openDetails(hash) {
   currentHash = hash;
   $$(".view").forEach(v => v.classList.add("hidden"));
   $("#view-details").classList.remove("hidden");
-  const t = await api(`/torrents/${hash}`);
-  $("#details-title").textContent = t.name;
-  renderDetailsHealth(t.health);
-  $("#details-summary").innerHTML = `<pre>${escapeHtml(JSON.stringify(t, null, 2))}</pre>`;
-  loadFiles(hash);
-  loadPeers(hash);
-  loadTrackers(hash);
+  try {
+    const [t, decision, autopilotStatus, networkDiag] = await Promise.all([
+      api(`/torrents/${hash}`),
+      api(`/torrents/${hash}/autopilot`).catch(() => null),
+      api("/autopilot/status").catch(() => null),
+      api("/network/diagnostics").catch(() => null),
+    ]);
+    $("#details-title").textContent = t.name;
+    renderDetailsHealth(t.health);
+    renderDetailsSummary(t);
+    renderAutopilotDiagnostics({
+      torrent: t,
+      decision,
+      globalAutopilot: autopilotStatus,
+      networkDiagnostics: networkDiag,
+    });
+    bindAutopilotModeSelector(hash, t.autopilot_mode_override);
+    loadFiles(hash);
+    loadPeers(hash);
+    loadTrackers(hash);
+  } catch (e) {
+    $("#details-title").textContent = "Torrent details";
+    renderDetailsHealth(null);
+    renderAutopilotDiagnostics({ torrent: null, decision: null, globalAutopilot: null, networkDiagnostics: null });
+    $("#details-summary").innerHTML = "";
+    showError("Open torrent details failed", e);
+  }
 }
 
 function healthLabelName(label) {
@@ -505,6 +1185,160 @@ function renderDetailsHealth(h) {
     ${reasonsHtml}
     ${subs}
   `;
+}
+
+function renderDetailsSummary(t) {
+  if (!t) {
+    $("#details-summary").innerHTML = "";
+    return;
+  }
+  $("#details-summary").innerHTML = `
+    <h3>Details</h3>
+    ${renderKv([
+      ["State", t.state],
+      ["Peers", `${fmtCount(t.active_peer_workers)} active / ${fmtCount(t.known_peers)} known`],
+      ["Rate down", fmtRate(t.rate_down)],
+      ["Rate up", fmtRate(t.rate_up)],
+      ["Download cap", fmtBytes(t.download_limit || 0)],
+      ["Upload cap", fmtBytes(t.upload_limit || 0)],
+    ])}
+  `;
+}
+
+function renderAutopilotDiagnostics({ torrent, decision, globalAutopilot, networkDiagnostics }) {
+  const panel = $("#details-autopilot");
+  if (!panel) return;
+  if (!torrent) {
+    panel.innerHTML = `<h3>Autopilot diagnostics</h3><p class="muted">No diagnostics available for this torrent.</p>`;
+    return;
+  }
+  const override = torrent.autopilot_mode_override === null ? null : (torrent.autopilot_mode_override || null);
+  const globalMode = globalAutopilot?.mode || "unknown";
+  const effectiveMode = override ?? globalMode;
+  const health = networkDiagnostics?.health || {};
+  const checks = (networkDiagnostics?.checks || []).filter((c) => c && c.level && c.level !== "ok");
+  const containment = (networkDiagnostics?.containment_matrix || []).filter((c) => c && c.level && c.level !== "ok");
+  const reasons = (decision?.reasons || []);
+  const reasonLines = reasons.length
+    ? reasons.map((item) => {
+      const cause = item.cause ? `<code>${escapeHtml(item.cause)}</code> ` : "";
+      return `<li>${cause}${escapeHtml(item.message || String(item))}</li>`;
+    }).join("")
+    : "<li>No slow-condition reasons reported.</li>";
+  const snapshot = decision?.snapshot || null;
+  const action = decision?.action || null;
+  const networkSummary = networkHealthSummary(health, checks, containment);
+  panel.innerHTML = `
+    <h3>Autopilot diagnostics</h3>
+    <div class="autopilot-control-row">
+      <label for="details-autopilot-mode">Per-torrent mode</label>
+      <select id="details-autopilot-mode" aria-label="Per-torrent autopilot mode">
+        <option value="inherit"${override === null ? " selected" : ""}>inherit</option>
+        <option value="disabled"${override === "disabled" ? " selected" : ""}>disabled</option>
+        <option value="observe"${override === "observe" ? " selected" : ""}>observe</option>
+        <option value="act"${override === "act" ? " selected" : ""}>act</option>
+      </select>
+    </div>
+    ${renderKv([
+      ["Global mode", renderAutopilotModeLabel(globalMode)],
+      ["Effective mode", renderAutopilotModeLabel(effectiveMode)],
+      ["Network", networkSummary],
+      ["Decision", decision?.apply ? "recommendation ready" : "no immediate action"],
+    ])}
+    <div class="autopilot-section-heading">Why is this slow?</div>
+    <ul class="compact-list">${reasonLines}</ul>
+    ${action ? `<p><strong>Recommended action:</strong> ${escapeHtml(renderAutopilotActionKind(action.kind))}<code> (${escapeHtml(action.kind || "action")})</code>. ${escapeHtml(action.rationale || "")}</p>` : ""}
+    ${snapshot ? `${renderAutopilotSnapshot(snapshot)}` : ""}
+    ${checks.length || containment.length ? `<div class="autopilot-section-heading">Network impact</div>${renderAutopilotChecks(checks, containment)}` : ""}
+  `;
+}
+
+function renderAutopilotChecks(checks, containment) {
+  const items = [...checks, ...containment];
+  if (!items.length) return "<p class='muted'>Network checks pass for autopilot conditions.</p>";
+  return `<ul class="compact-list">${items.map(check => `
+    <li>
+      <div>${renderStatus(check.level)} <strong>${escapeHtml(check.label || check.id)}</strong></div>
+      <div class="muted">${escapeHtml(check.detail || "")}</div>
+    </li>`).join("")}</ul>`;
+}
+
+function renderAutopilotSnapshot(snapshot) {
+  const rows = [
+    ["Known peers", snapshot.known_peers],
+    ["Useful peers", snapshot.useful_peers],
+    ["Active workers", snapshot.active_peer_workers],
+    ["Peer worker limit", snapshot.peer_worker_limit],
+    ["Tracker healthy", snapshot.tracker_ok ? "yes" : "no"],
+    ["Discovery", snapshot.discovery_ok ? "yes" : "no"],
+    ["Backed off peers", snapshot.backed_off_peers],
+    ["Observed peak down", fmtRate(snapshot.rate_down_observed_peak)],
+  ];
+  return `<div class="autopilot-section-heading">Why now</div>${renderKv(rows.map(([label, value]) => [label, value]))}`;
+}
+
+function renderAutopilotModeLabel(mode) {
+  if (mode === null || mode === undefined || mode === "") return "inherit";
+  if (mode === "act") return "act";
+  if (mode === "observe") return "observe";
+  if (mode === "disabled") return "disabled";
+  return String(mode);
+}
+
+function renderAutopilotActionKind(kind) {
+  if (kind === "increase_peer_workers") return "Increase peer workers";
+  if (kind === "expand_discovery") return "Expand discovery";
+  if (kind === "relax_peer_backoff") return "Relax peer backoff";
+  if (kind === "release_queue_slot") return "Release queue slot";
+  if (kind === "raise_download_ceiling") return "Raise download ceiling";
+  return String(kind || "recommendation");
+}
+
+function networkHealthSummary(health, checks, containment) {
+  const status = health.status || "unknown";
+  const allowed = health.traffic_allowed;
+  const traffic = allowed === false ? "blocked" : "allowed";
+  const issues = [...checks, ...containment].filter(
+    item => item && (item.level === "invalid" || item.level === "warning"),
+  );
+  const issueText = issues.length
+    ? ` (${issues.length} impacting containment)`
+    : "";
+  return `${status} / traffic ${traffic}${issueText}`;
+}
+
+function bindAutopilotModeSelector(hash) {
+  const select = $("#details-autopilot-mode");
+  if (!select) return;
+  const setMode = async () => {
+    const nextMode = select.value;
+    await setAutopilotModeOverride(hash, nextMode);
+  };
+  select.onchange = setMode;
+}
+
+async function setAutopilotModeOverride(hash, nextMode) {
+  if (!hash || autopilotModeUpdateInFlight) return;
+  autopilotModeUpdateInFlight = true;
+  const select = $("#details-autopilot-mode");
+  const previous = select ? select.value : "inherit";
+  if (select) select.disabled = true;
+  try {
+    const body = { mode: nextMode === "inherit" ? null : nextMode };
+    await api(`/torrents/${hash}/autopilot`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    showToast("Autopilot mode saved", "Override updated for this torrent.", "success");
+    if (currentHash === hash) await openDetails(hash);
+  } catch (e) {
+    if (select) select.value = previous;
+    showError("Failed to update autopilot mode", e);
+  } finally {
+    autopilotModeUpdateInFlight = false;
+    if (select) select.disabled = false;
+  }
 }
 
 function fmtScore(value) {
@@ -857,6 +1691,8 @@ function renderSettingsEditor(cfg) {
   const apiCfg = cfg.api || {};
   const compatibility = cfg.compatibility || {};
   const transmission = compatibility.transmission || {};
+  const qbittorrent = compatibility.qbittorrent || {};
+  const autopilot = cfg.autopilot || {};
   const storage = cfg.storage || {};
   const network = cfg.network || {};
   const torrent = cfg.torrent || {};
@@ -873,9 +1709,14 @@ function renderSettingsEditor(cfg) {
   setSettingsChecked("cfg-api-require-auth", apiCfg.require_auth);
 
   setSettingsChecked("cfg-compat-transmission-enabled", transmission.enabled);
+  setSettingsChecked("cfg-compat-qbittorrent-enabled", qbittorrent.enabled);
+
+  setSettingsValue("cfg-autopilot-mode", autopilot.mode || "observe");
 
   setSettingsValue("cfg-storage-download-dir", storage.download_dir);
   setSettingsValue("cfg-storage-incomplete-dir", storage.incomplete_dir);
+  setSettingsValue("cfg-storage-minimum-free-space-bytes", storage.minimum_free_space_bytes);
+  setSettingsValue("cfg-storage-minimum-free-space-percent", storage.minimum_free_space_percent);
   setSettingsChecked("cfg-storage-preallocate", storage.preallocate);
   setSettingsChecked("cfg-storage-sparse", storage.sparse);
 
@@ -889,6 +1730,7 @@ function renderSettingsEditor(cfg) {
   setSettingsChecked("cfg-network-validate-route", network.validate_route);
   setSettingsChecked("cfg-network-validate-dns", network.validate_dns);
 
+  setSettingsValue("cfg-torrent-encryption-mode", torrent.encryption_mode || "preferred");
   setSettingsValue("cfg-torrent-listen-port", torrent.listen_port);
   setSettingsChecked("cfg-torrent-allow-ipv6", torrent.allow_ipv6);
   setSettingsChecked("cfg-torrent-utp-enabled", torrent.utp_enabled);
@@ -924,6 +1766,30 @@ function renderSettingsEditor(cfg) {
 
   renderWatchFolderEditors(cfg.watch || []);
   setSettingsValue("toast-seconds", String(Math.round(toastDisplayMs / 1000)));
+  activateSettingsPanel(activeSettingsPanel, { focus: false });
+}
+
+function activateSettingsPanel(panelName, options = {}) {
+  const panels = $$("[data-settings-panel]");
+  if (!panels.length) return;
+  const target = panels.some(panel => panel.dataset.settingsPanel === panelName)
+    ? panelName
+    : "api";
+  activeSettingsPanel = target;
+  panels.forEach(panel => {
+    const active = panel.dataset.settingsPanel === target;
+    panel.classList.toggle("active", active);
+    panel.hidden = !active;
+  });
+  $$(".settings-nav-item").forEach(button => {
+    const active = button.dataset.settingsTarget === target;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-current", active ? "page" : "false");
+  });
+  if (options.focus) {
+    const panel = $(`[data-settings-panel="${target}"]`);
+    if (panel) panel.focus({ preventScroll: true });
+  }
 }
 
 function collectSettingsConfig() {
@@ -939,10 +1805,18 @@ function collectSettingsConfig() {
       transmission: {
         enabled: settingsField("cfg-compat-transmission-enabled").checked,
       },
+      qbittorrent: {
+        enabled: settingsField("cfg-compat-qbittorrent-enabled").checked,
+      },
+    },
+    autopilot: {
+      mode: settingsString("cfg-autopilot-mode"),
     },
     storage: {
       download_dir: settingsOptionalString("cfg-storage-download-dir"),
       incomplete_dir: settingsOptionalString("cfg-storage-incomplete-dir"),
+      minimum_free_space_bytes: settingsInteger("cfg-storage-minimum-free-space-bytes", 0),
+      minimum_free_space_percent: settingsInteger("cfg-storage-minimum-free-space-percent", 0),
       preallocate: settingsField("cfg-storage-preallocate").checked,
       sparse: settingsField("cfg-storage-sparse").checked,
     },
@@ -958,6 +1832,7 @@ function collectSettingsConfig() {
       validate_dns: settingsField("cfg-network-validate-dns").checked,
     },
     torrent: {
+      encryption_mode: settingsString("cfg-torrent-encryption-mode"),
       listen_port: settingsInteger("cfg-torrent-listen-port", 51413),
       allow_ipv6: settingsField("cfg-torrent-allow-ipv6").checked,
       utp_enabled: settingsField("cfg-torrent-utp-enabled").checked,
@@ -1065,7 +1940,13 @@ function watchOptionalString(row, field) {
 $("#settings-editor").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
-  if (!form.reportValidity()) return;
+  if (!form.checkValidity()) {
+    const invalid = form.querySelector(":invalid");
+    const panel = invalid?.closest("[data-settings-panel]")?.dataset.settingsPanel;
+    if (panel) activateSettingsPanel(panel, { focus: false });
+    form.reportValidity();
+    return;
+  }
   const status = $("#settings-save-status");
   try {
     const result = await api("/settings", {
@@ -1330,11 +2211,17 @@ function appendLogLine(line) {
 async function refreshDoctor() {
   try {
     const report = await api("/doctor");
-    const version = await api("/version").catch((e) => {
-      log("version error: " + e.message);
-      return null;
-    });
-    renderDoctor(report, version);
+    const [version, storageRoots] = await Promise.all([
+      api("/version").catch((e) => {
+        log("version error: " + e.message);
+        return null;
+      }),
+      api("/storage/roots").catch((e) => {
+        log("storage roots error: " + e.message);
+        return { error: e.message };
+      }),
+    ]);
+    renderDoctor(report, version, storageRoots);
     updateHealthBadge(report);
     return report;
   } catch (e) {
@@ -1351,7 +2238,86 @@ async function refreshDoctorBadge() {
   }
 }
 
-function renderDoctor(report, version = null) {
+function renderStorageRootWarnings(root) {
+  const warnings = Array.isArray(root?.warnings) ? root.warnings.filter(Boolean) : [];
+  if (!warnings.length) return "";
+  const items = warnings.map(w => `<li>${escapeHtml(String(w))}</li>`).join("");
+  return `<ul class="storage-root-warnings compact-list">${items}</ul>`;
+}
+
+function renderDoctorStorageRoots(storageRoots = {}) {
+  if (!storageRoots || storageRoots.error) {
+    return `
+      <h3>Storage diagnostics</h3>
+      <p class="muted">${escapeHtml(storageRoots?.error || "Storage diagnostics are unavailable.")}</p>
+    `;
+  }
+  const roots = Array.isArray(storageRoots.roots) ? storageRoots.roots : [];
+  const generatedAt = fmtUnixSeconds(storageRoots.generated_at);
+  const header = renderKv([
+    ["Minimum free bytes", fmtBytes(storageRoots.minimum_free_space_bytes)],
+    ["Minimum free percent", fmtPercent(storageRoots.minimum_free_space_percent)],
+    ["Generated", generatedAt],
+  ]);
+  if (!roots.length) {
+    return `
+      <h3>Storage diagnostics</h3>
+      ${header}
+      <p class="muted">No storage root diagnostics were returned.</p>
+    `;
+  }
+  const rows = roots.map((root) => {
+    const roles = Array.isArray(root?.roles) ? root.roles.join(", ") : "";
+    const free = `${fmtBytes(root.free_space_bytes)} / ${fmtBytes(root.available_space_bytes)}`;
+    const total = fmtBytes(root.total_space_bytes);
+    const required = fmtBytes(root.required_free_space_bytes);
+    const warnings = renderStorageRootWarnings(root);
+    const status = [
+      root.exists ? "exists" : "missing",
+      root.is_directory ? "dir" : "file",
+      root.writable ? "writable" : "read-only",
+    ].filter(Boolean).join(", ");
+    return `
+      <tr>
+        <td>${escapeHtml(root.path || "")}</td>
+        <td>${escapeHtml(roles || "")}</td>
+        <td>${escapeHtml(status)}</td>
+        <td>${escapeHtml(root.filesystem_type || "")}</td>
+        <td>${escapeHtml(total ? `${total}` : "")}</td>
+        <td>free ${escapeHtml(free)}</td>
+        <td>${escapeHtml(required || "")}</td>
+        <td>${renderStatus(root.reserve_satisfied ? "ok" : "warning")}</td>
+        <td>${fmtCount(root.torrent_count)}</td>
+        <td>${fmtCount(root.active_torrents)}</td>
+        <td>${fmtRate(root.active_write_rate)} / ${fmtRate(root.active_recheck_rate)}</td>
+        <td>${warnings || ""}</td>
+      </tr>`;
+  }).join("");
+  return `
+    <h3>Storage diagnostics</h3>
+    ${header}
+    <table class="storage-root-table">
+      <thead>
+        <tr>
+          <th>Path</th>
+          <th>Roles</th>
+          <th>State</th>
+          <th>Filesystem</th>
+          <th>Total</th>
+          <th>Free / Available</th>
+          <th>Required free</th>
+          <th>Reserve</th>
+          <th>Torrents</th>
+          <th>Active</th>
+          <th>Rates</th>
+          <th>Warnings</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderDoctor(report, version = null, storageRoots = null) {
   $("#doctor-summary").innerHTML = `
     <h3>Health summary</h3>
     ${renderKv([
@@ -1359,6 +2325,7 @@ function renderDoctor(report, version = null) {
       ["Summary", report.summary || ""],
       ["Checks", String((report.checks || []).length)],
     ])}`;
+  $("#doctor-storage").innerHTML = renderDoctorStorageRoots(storageRoots);
   $("#doctor-application").innerHTML = `
     <h3>Application</h3>
     ${renderKv([
@@ -1395,13 +2362,45 @@ function log(msg) {
   else console.log(msg);
 }
 
-$("#search").addEventListener("input", refreshTorrents);
+$("#search").addEventListener("input", applyTorrentSearchFilter);
+$("#clear-torrent-filters-btn").addEventListener("click", clearTorrentFilters);
+$("#torrent-state-filter").addEventListener("change", () => {
+  torrentQueryState.page = 1;
+  scheduleTorrentRefresh();
+});
+$("#torrent-health-filter").addEventListener("change", () => {
+  torrentQueryState.page = 1;
+  scheduleTorrentRefresh();
+});
+$("#torrent-performance-filter").addEventListener("change", () => {
+  torrentQueryState.page = 1;
+  scheduleTorrentRefresh();
+});
+$("#torrent-per-page").addEventListener("change", () => {
+  torrentQueryState.per_page = clampTorrentPerPage($("#torrent-per-page").value);
+  torrentQueryState.page = 1;
+  scheduleTorrentRefresh();
+});
+$("#torrent-prev-page-btn").addEventListener("click", () => setTorrentPage(torrentQueryState.page - 1));
+$("#torrent-next-page-btn").addEventListener("click", () => setTorrentPage(torrentQueryState.page + 1));
+$("#save-torrent-view-btn").addEventListener("click", saveTorrentQueryView);
+$("#load-torrent-view-btn").addEventListener("click", loadTorrentQueryView);
+$("#clear-torrent-view-btn").addEventListener("click", clearTorrentQueryView);
 $("#select-all-torrents-btn").addEventListener("click", selectAllVisibleTorrents);
 $("#deselect-all-torrents-btn").addEventListener("click", deselectAllTorrents);
 $("#remove-selected-torrents-btn").addEventListener("click", removeSelectedTorrents);
+$$(".settings-nav-item").forEach(button => {
+  button.addEventListener("click", () => {
+    activateSettingsPanel(button.dataset.settingsTarget, { focus: true });
+  });
+});
+const themeToggle = $("#theme-toggle");
+if (themeToggle) themeToggle.addEventListener("click", toggleTheme);
 
 // --- Init ---
 (async function init() {
+  applyTheme(currentTheme, { persist: false });
+  applySavedTorrentQueryView();
   await refreshTorrents();
   await refreshDoctorBadge();
   setInterval(refreshTorrents, 5000);

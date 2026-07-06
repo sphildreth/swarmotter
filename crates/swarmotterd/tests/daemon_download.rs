@@ -274,6 +274,7 @@ async fn daemon_remove_active_torrent_delete_data_returns_promptly() {
     cfg.network.mode = swarmotter_core::models::network::NetworkContainmentMode::Disabled;
     cfg.dht.enabled = false;
     cfg.bandwidth.max_peers_per_torrent = 1;
+    cfg.torrent.encryption_mode = swarmotter_core::config::PeerEncryptionMode::Disabled;
     let healthy = swarmotter_core::models::network::NetworkHealth::blocked(
         swarmotter_core::models::network::NetworkContainmentMode::Disabled,
         swarmotter_core::models::network::NetworkContainmentStatus::Disabled,

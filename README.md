@@ -8,6 +8,15 @@
   <a href="https://github.com/sphildreth/swarmotter/actions/workflows/ci.yml">
     <img src="https://github.com/sphildreth/swarmotter/actions/workflows/ci.yml/badge.svg" alt="CI">
   </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0">
+  </a>
+  <a href="Cargo.toml">
+    <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="Rust 1.75+">
+  </a>
+  <a href="design/vpn-network-containment.md">
+    <img src="https://img.shields.io/badge/network-fail--closed-success" alt="Fail-closed network containment">
+  </a>
 </p>
 
 <p align="center">
@@ -49,15 +58,28 @@ infringement.
 - Native REST API with WebSocket and Server-Sent Events.
 - Optional Transmission RPC compatibility endpoint at `/transmission/rpc` for
   Transmission-style tools and scripts.
+- Optional qBittorrent-compatible `/api/v2` endpoint for
+  Sonarr/Radarr/Flood-style automation.
 - Practical Web UI that uses the same API exposed to external automation.
+- UI operations-console updates for large libraries, with
+  a sortable/filterable Tabulator table, theme toggle, and efficient large-list
+  workflows.
 - Magnet links and `.torrent` file intake.
 - TCP and uTP peer wire protocol support.
+- TCP peer-wire protocol encryption (MSE/PE) with configurable mode:
+  `disabled`, `preferred` (default), or `required`.
 - DHT, PEX, HTTP/HTTPS trackers, UDP trackers, and webseeds.
 - BEP 9 magnet metadata fetching.
 - Fast resume and forced recheck.
 - Watch-folder import.
 - File selection, file prioritization, and path rename controls.
 - Queue, bandwidth, ratio, and seeding controls.
+- Adaptive swarm performance autopilot with per-torrent diagnostics and
+  override controls.
+- Disk-aware storage optimizer: storage-root diagnostics and add-time free-space
+  preflight via `[storage].minimum_free_space_bytes`,
+  `[storage].minimum_free_space_percent`, and `GET /api/v1/storage/roots`.
+- Settings two-panel layout for dense configuration in the Web UI.
 - Strict VPN/NIC traffic containment with fail-closed behavior.
 - Container and homelab-friendly deployment.
 - Lawful-use project posture.

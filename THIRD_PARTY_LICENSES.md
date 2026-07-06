@@ -65,6 +65,7 @@ foundational dependency stack rationale.
 | mdbook-mermaid | 0.17.0 | MPL-2.0 | Build-time mdBook preprocessor for Mermaid diagrams |
 | `assets/mermaid.min.js` | Bundled by mdbook-mermaid 0.17.0 | MIT | Browser runtime for rendered Mermaid diagrams in the published user guide |
 | `assets/mermaid-init.js` | Bundled by mdbook-mermaid 0.17.0 | MPL-2.0 | Theme-aware Mermaid initialization script for mdBook |
+| `crates/swarmotter-web/assets/vendor/tabulator` | 6.5.0 | MIT | Vendored browser grid used by the Web UI torrent list for sorting, column filtering, and table refresh behavior |
 
 ## Network containment note
 
@@ -72,7 +73,8 @@ None of the direct dependencies above create torrent data-plane network
 traffic on their own. All torrent-related sockets (peers, trackers, DHT, PEX,
 webseeds, magnet metadata) are created through SwarmOtter's central network
 containment layer. `axum`/`hyper`/`tower-http` are scoped to the control plane
-(API/Web UI) and do not participate in torrent data traffic.
+(API/Web UI) and do not participate in torrent data traffic. The vendored
+Tabulator browser asset only renders API data already returned to the Web UI.
 
 ## Notes
 

@@ -25,6 +25,70 @@ fn bulk_magnet(index: usize) -> String {
     format!("magnet:?xt=urn:btih:{:040x}&dn=bulk-{index}", index + 1)
 }
 
+fn named_magnet(index: usize, name: &str) -> String {
+    format!("magnet:?xt=urn:btih:{:040x}&dn={name}", index + 1)
+}
+
+async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    (status, value)
+}
+
+async fn post_json(
+    app: &Router,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    (status, value)
+}
+
+async fn add_named_test_magnet(
+    app: &Router,
+    index: usize,
+    name: &str,
+    paused: bool,
+    download_dir: &str,
+) -> String {
+    let (status, value) = post_json(
+        app,
+        "/api/v1/torrents/magnet",
+        serde_json::json!({
+            "magnet": named_magnet(index, name),
+            "paused": paused,
+            "download_dir": download_dir,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    value["data"].as_str().unwrap().to_string()
+}
+
 async fn transmission_session(app: Router, auth: Option<&str>) -> String {
     let mut builder = Request::builder()
         .method("POST")
@@ -73,6 +137,80 @@ async fn transmission_rpc(
         .unwrap();
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     (status, value)
+}
+
+async fn qb_get(
+    app: Router,
+    uri: &str,
+    auth: Option<&str>,
+    cookie: Option<&str>,
+) -> (StatusCode, String) {
+    let mut builder = Request::builder().uri(uri);
+    if let Some(auth) = auth {
+        builder = builder.header("authorization", auth);
+    }
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", cookie);
+    }
+    let resp = app
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+async fn qb_post_form(
+    app: Router,
+    uri: &str,
+    body: &str,
+    auth: Option<&str>,
+    cookie: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded");
+    if let Some(auth) = auth {
+        builder = builder.header("authorization", auth);
+    }
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", cookie);
+    }
+    let resp = app
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, headers, String::from_utf8(body.to_vec()).unwrap())
+}
+
+async fn qb_login(app: Router, password: &str) -> String {
+    let (status, headers, body) = qb_post_form(
+        app,
+        "/api/v2/auth/login",
+        &format!("username=admin&password={password}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+    headers
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("SID cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 fn test_base64(bytes: &[u8]) -> String {
@@ -254,6 +392,74 @@ async fn add_and_list_torrents() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn torrent_query_filters_sorts_paginates_counts_and_groups() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let alpha = add_named_test_magnet(&app, 100, "alpha-linux", false, "/data/linux").await;
+    let beta = add_named_test_magnet(&app, 101, "beta-archive", true, "/data/archive").await;
+    let gamma = add_named_test_magnet(&app, 102, "gamma-linux", false, "/data/linux").await;
+
+    for (hash, labels) in [
+        (
+            &alpha,
+            serde_json::json!({ "labels": ["linux", "release"] }),
+        ),
+        (&beta, serde_json::json!({ "labels": ["archive"] })),
+        (&gamma, serde_json::json!({ "labels": ["linux"] })),
+    ] {
+        let (status, _value) =
+            post_json(&app, &format!("/api/v1/torrents/{hash}/labels"), labels).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let (status, value) = get_json(
+        &app,
+        "/api/v1/torrents/query?label=linux&storage_root=/data/linux&sort=name&dir=desc&page=1&per_page=1&group_by=label",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let data = &value["data"];
+    assert_eq!(data["total"], 3);
+    assert_eq!(data["filtered"], 2);
+    assert_eq!(data["page"], 1);
+    assert_eq!(data["per_page"], 1);
+    assert_eq!(data["page_count"], 2);
+    assert_eq!(data["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(data["rows"][0]["name"], "gamma-linux");
+    assert_eq!(data["counts"]["labels"]["linux"], 2);
+    assert_eq!(data["counts"]["storage_roots"]["/data/linux"], 2);
+    assert_eq!(data["counts"]["states"]["downloading_metadata"], 2);
+    assert!(data["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|group| group["key"] == "linux" && group["count"] == 2));
+
+    let (status, value) = get_json(&app, "/api/v1/torrents/query?state=paused&sort=name").await;
+    assert_eq!(status, StatusCode::OK);
+    let data = &value["data"];
+    assert_eq!(data["filtered"], 1);
+    assert_eq!(data["rows"][0]["name"], "beta-archive");
+
+    let (status, value) = get_json(
+        &app,
+        "/api/v1/torrents/query?q=alpha&per_page=0&group_by=state",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let data = &value["data"];
+    assert_eq!(data["filtered"], 1);
+    assert_eq!(data["rows"].as_array().unwrap().len(), 0);
+    assert_eq!(data["counts"]["labels"]["linux"], 1);
+    assert!(data["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|group| group["key"] == "downloading_metadata" && group["count"] == 1));
 }
 
 #[tokio::test]
@@ -725,7 +931,8 @@ async fn settings_get_and_update() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     let patch = serde_json::json!({
-        "bandwidth": { "global_download": 1000, "global_upload": 500, "alt_download": 0, "alt_upload": 0, "alt_enabled": false, "max_peers": 0, "max_peers_per_torrent": 0 }
+        "bandwidth": { "global_download": 1000, "global_upload": 500, "alt_download": 0, "alt_upload": 0, "alt_enabled": false, "max_peers": 0, "max_peers_per_torrent": 0 },
+        "autopilot": { "mode": "act" }
     });
     let resp = app
         .clone()
@@ -740,6 +947,23 @@ async fn settings_get_and_update() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/autopilot/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["data"]["mode"], "act");
 }
 
 #[tokio::test]
@@ -976,6 +1200,164 @@ async fn transmission_rpc_is_disabled_by_default() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn qbittorrent_api_is_disabled_by_default() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let (status, body) = qb_get(app, "/api/v2/app/version", None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("disabled"));
+}
+
+#[tokio::test]
+async fn qbittorrent_api_reuses_api_token_and_sid_cookie_auth() {
+    let mut cfg = Config::default();
+    cfg.compatibility.qbittorrent.enabled = true;
+    cfg.api.require_auth = true;
+    cfg.api.auth_token = Some("test-token".into());
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let (status, _) = qb_get(app.clone(), "/api/v2/app/version", None, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = qb_get(
+        app.clone(),
+        "/api/v2/app/webapiVersion",
+        Some("Bearer test-token"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "2.11.4");
+
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/auth/login",
+        "username=admin&password=wrong",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Fails.");
+
+    let cookie = qb_login(app.clone(), "test-token").await;
+    let (status, body) = qb_get(app, "/api/v2/app/version", None, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.starts_with('v'));
+}
+
+#[tokio::test]
+async fn qbittorrent_api_adds_lists_controls_and_deletes_magnets() {
+    let mut cfg = Config::default();
+    cfg.compatibility.qbittorrent.enabled = true;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+    let magnet =
+        "magnet%3A%3Fxt%3Durn%3Abtih%3Add8255ecdc7ca55fb0bbf81323d87062ba1f7a4e%26dn%3Dtest";
+    let add_body = format!("urls={magnet}&paused=true&savepath=%2Ftmp%2Fqb&category=linux");
+
+    let (status, _, body) =
+        qb_post_form(app.clone(), "/api/v2/torrents/add", &add_body, None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+
+    let (status, body) = qb_get(
+        app.clone(),
+        "/api/v2/torrents/info?category=linux",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "test");
+    assert_eq!(rows[0]["category"], "linux");
+    assert_eq!(rows[0]["save_path"], "/tmp/qb");
+    assert_eq!(rows[0]["state"], "pausedDL");
+    let hash = rows[0]["hash"].as_str().unwrap();
+    assert_eq!(hash.len(), 40);
+
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/resume",
+        &format!("hashes={hash}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+    let (status, body) = qb_get(
+        app.clone(),
+        &format!("/api/v2/torrents/info?hashes={hash}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rows[0]["state"], "downloading");
+
+    let (status, _, _) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/setCategory",
+        &format!("hashes={hash}&category=distros"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = qb_get(
+        app.clone(),
+        "/api/v2/torrents/info?category=distros",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/delete",
+        &format!("hashes={hash}&deleteFiles=true"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+    let (status, body) = qb_get(app, "/api/v2/torrents/info", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(rows.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn qbittorrent_api_rejects_remote_torrent_urls() {
+    let mut cfg = Config::default();
+    cfg.compatibility.qbittorrent.enabled = true;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let (status, _, body) = qb_post_form(
+        app,
+        "/api/v2/torrents/add",
+        "urls=https%3A%2F%2Fexample.invalid%2Flinux.torrent",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("remote torrent URL intake is not supported"));
 }
 
 #[tokio::test]
@@ -1294,6 +1676,33 @@ async fn network_diagnostics_endpoint() {
 }
 
 #[tokio::test]
+async fn storage_roots_endpoint_reports_reserve_configuration() {
+    let root = std::env::temp_dir().join(format!(
+        "swarmotter-storage-api-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut cfg = Config::default();
+    cfg.storage.download_dir = Some(root.display().to_string());
+    cfg.storage.minimum_free_space_bytes = 4096;
+    cfg.storage.minimum_free_space_percent = 5;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let (status, value) = get_json(&app, "/api/v1/storage/roots").await;
+    assert_eq!(status, StatusCode::OK);
+    let data = &value["data"];
+    assert_eq!(data["minimum_free_space_bytes"], 4096);
+    assert_eq!(data["minimum_free_space_percent"], 5);
+    let roots = data["roots"].as_array().unwrap();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0]["path"], root.display().to_string());
+    assert!(roots[0]["available_space_bytes"].is_u64());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn watch_status_endpoint_reflects_config() {
     let mut cfg = Config::default();
     cfg.watch.push(WatchFolderConfig {
@@ -1488,4 +1897,146 @@ async fn torrent_summary_includes_health_field() {
     // Spot-check that HealthLabel::Unknown deserializes back to its snake-case
     // string form, as documented for the API.
     let _ = HealthLabel::Unknown;
+}
+
+#[tokio::test]
+async fn autopilot_status_route_returns_current_config_mode() {
+    let mut cfg = Config::default();
+    cfg.autopilot.mode = swarmotter_core::autopilot::AutopilotMode::Act;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/autopilot/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["success"], true);
+    assert_eq!(v["data"]["mode"], "act");
+}
+
+#[tokio::test]
+async fn torrent_autopilot_routes_support_get_and_mode_override() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let body = serde_json::json!({ "magnet": known_magnet() }).to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let hash = v["data"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/torrents/{hash}/autopilot"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["success"], true);
+    assert!(v["data"]["apply"].is_boolean());
+
+    let set = serde_json::json!({"mode":"disabled"}).to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/torrents/{hash}/autopilot"))
+                .header("content-type", "application/json")
+                .body(Body::from(set))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["success"], true);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/torrents/{hash}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["data"]["autopilot_mode_override"], "disabled");
+
+    let clear = serde_json::json!({ "mode": serde_json::Value::Null }).to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/torrents/{hash}/autopilot"))
+                .header("content-type", "application/json")
+                .body(Body::from(clear))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["success"], true);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/torrents/{hash}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["data"]["autopilot_mode_override"].is_null());
 }

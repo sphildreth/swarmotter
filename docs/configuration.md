@@ -16,9 +16,12 @@ with double underscores:
 SWARMOTTER_API__BIND_ADDRESS=0.0.0.0:9091
 SWARMOTTER_API__REQUIRE_AUTH=true
 SWARMOTTER_API__AUTH_TOKEN=replace-with-a-long-random-token
+SWARMOTTER_AUTOPILOT__MODE=observe
 SWARMOTTER_NETWORK__MODE=strict
 SWARMOTTER_NETWORK__REQUIRED_INTERFACE=br0
 SWARMOTTER_TORRENT__LISTEN_PORT=51413
+SWARMOTTER_TORRENT__ENCRYPTION_MODE=preferred
+SWARMOTTER_COMPATIBILITY__QBITTORRENT__ENABLED=true
 SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED=true
 ```
 
@@ -57,6 +60,8 @@ validate_dns = true
 listen_port = 51413
 allow_ipv6 = true
 utp_enabled = true
+utp_prefer_tcp = true
+encryption_mode = "preferred"
 ```
 
 If a `[network]` table contains `required_interface` but omits `mode`,
@@ -135,6 +140,7 @@ fail-closed behavior when strict containment is configured:
 - `torrent.utp_prefer_tcp = true`
 - `torrent.allow_ipv6 = true`
 - `network.allow_ipv6 = true`
+- `torrent.encryption_mode = "preferred"`
 - `dht.enabled = true`
 - `pex.enabled = true`
 - Bandwidth limits default to `0`, meaning unlimited.
@@ -143,6 +149,28 @@ fail-closed behavior when strict containment is configured:
 
 Use bandwidth and queue limits when the host needs resource caps. Leaving them
 unlimited or high is better for raw transfer throughput.
+
+## Adaptive autopilot controls
+
+The adaptive swarm performance autopilot is configurable and can be staged safely:
+
+- Global behavior is controlled by `[autopilot].mode`, defaulting to `observe`.
+- `mode` is one of `disabled`, `observe`, or `act`.
+- In `observe` mode, SwarmOtter reports slowdown causes without applying
+  tuning actions.
+- In `act` mode, SwarmOtter can apply bounded daemon/engine actions such as
+  discovery refresh, peer-worker adjustment, peer-backoff relaxation, and
+  queue-slot release.
+- Per-torrent control is an override through API/UI.
+- Recommendations are constrained by existing hard caps and never ignore
+  `bandwidth`, `queue`, or containment limits.
+
+Example:
+
+```toml
+[autopilot]
+mode = "observe"  # optional; defaults to observe
+```
 
 ## Option reference
 
@@ -154,6 +182,39 @@ unlimited or high is better for raw transfer throughput.
 | `require_auth` | `false` | Requires API/Web UI token auth when true. |
 | `auth_token` | unset | Required when `require_auth = true`. |
 | `max_request_body_bytes` | `16777216` | Maximum API request body size, including `.torrent` uploads. |
+
+### `[compatibility.qbittorrent]`
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Enable the optional qBittorrent-compatible compatibility endpoint at `/api/v2`. |
+
+When enabled, `/api/v2` is an optional compatibility adapter over native SwarmOtter
+operations and does not add any separate torrent data-plane pathways.
+
+Authentication follows `api.require_auth`:
+
+- If auth is required, `Authorization: Bearer <token>` and
+  `X-SwarmOtter-Auth: <token>` are accepted.
+- For qBittorrent-style cookie sessions, POST to `/api/v2/auth/login` with
+  credentials where `password` matches `api.auth_token`; the response sets a `SID`
+  cookie that can be reused for subsequent `/api/v2` requests.
+
+Represented compatibility endpoints used by automation include:
+
+- `GET /api/v2/app/version`
+- `GET /api/v2/app/webapiVersion`
+- `GET /api/v2/torrents/info`
+- `POST /api/v2/torrents/add`
+- `POST /api/v2/torrents/delete`
+- `POST /api/v2/torrents/pause`
+- `POST /api/v2/torrents/resume`
+- `POST /api/v2/torrents/start`
+- `POST /api/v2/torrents/stop`
+- `POST /api/v2/torrents/setCategory`
+
+The adapter is intentionally limited: no indexer/search/discovery endpoints are
+exposed through the compatibility surface.
 
 ### `[compatibility.transmission]`
 
@@ -187,6 +248,12 @@ Remote HTTP/HTTPS URLs for torrent metadata are rejected by this adapter.
 | `incomplete_dir` | unset | Active write directory for incomplete downloads. |
 | `preallocate` | `false` | Pre-size files before downloading. |
 | `sparse` | `true` | When `false`, active payload files are sized up front even if `preallocate = false`. |
+| `minimum_free_space_bytes` | `0` | If > 0, reject new adds when target-root usable space falls below this number of bytes. |
+| `minimum_free_space_percent` | `0` | If > 0, reject new adds when free space on the target root falls below this percent of total root size. |
+
+The minimum reserve fields apply to add/start-time preflight and are checked
+before payload data is written. Both fields are optional; when both are set,
+the preflight uses the stricter reserve.
 
 When `incomplete_dir` is set, SwarmOtter writes partial pieces and partial
 fast-resume metadata there while the torrent is downloading. After every piece
@@ -216,6 +283,12 @@ sized up front.
 Strict mode requires at least one enforceable path: interface, source address,
 or network namespace.
 
+### `[autopilot]`
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `observe` | Autopilot mode: `disabled` (no analysis), `observe` (reasons only), or `act` (reasons plus bounded automatic actions). |
+
 ### `[torrent]`
 
 | Option | Default | Meaning |
@@ -224,6 +297,7 @@ or network namespace.
 | `allow_ipv6` | `true` | Enables IPv6 peers when network containment also allows IPv6; when false, IPv6 peers are filtered before connecting. |
 | `utp_enabled` | `true` | Enables uTP peer transport through contained UDP sockets. |
 | `utp_prefer_tcp` | `true` | Tries TCP first, with uTP fallback. |
+| `encryption_mode` | `preferred` | TCP MSE/PE peer wire mode. `disabled` permits plaintext handshakes. `preferred` enables MSE/PE with plaintext fallback for TCP attempts while preserving the configured TCP/uTP preference. `required` refuses plaintext and requires encrypted TCP stream negotiation. Changing this setting is reported as restart-required for already-running torrent tasks. |
 | `selfish` | `false` | Removes a torrent after verified completion and does not seed it. |
 
 ### `[bandwidth]`

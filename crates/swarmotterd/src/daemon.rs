@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use swarmotter_api::state::{AddTorrentOptions, DaemonOps};
+use swarmotter_core::autopilot::{AutopilotAnalyzer, AutopilotConfig, AutopilotMode};
 use swarmotter_core::config::Config;
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
@@ -28,7 +29,13 @@ use swarmotter_core::meta;
 use swarmotter_core::models::health::{HealthCalculator, HealthInput};
 use swarmotter_core::models::network::{NetworkContainmentMode, NetworkHealth};
 use swarmotter_core::models::peer::{EnginePeerHealth, Peer};
-use swarmotter_core::models::stats::{GlobalStats, PeerSchedulerDiagnostics, TorrentDiagnostics};
+use swarmotter_core::models::stats::{
+    AutopilotActionKind, AutopilotDecision, AutopilotInput, GlobalStats, PeerSchedulerDiagnostics,
+    TorrentDiagnostics,
+};
+use swarmotter_core::models::storage::{
+    StorageDiagnostics, StorageRootDiagnostics, StorageRootRole,
+};
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{TrackerId, TrackerInfo, TrackerKind, TrackerStatus};
 use swarmotter_core::models::{
@@ -48,6 +55,12 @@ use crate::seeder::Seeder;
 
 const PEER_DIAGNOSTIC_RECENT_WINDOW: Duration = Duration::from_secs(30);
 const QUEUE_RECONCILE_DEBOUNCE: Duration = Duration::from_millis(25);
+const AUTOPILOT_INTERVAL: Duration = Duration::from_secs(10);
+const AUTOPILOT_ACTION_COOLDOWN: Duration = Duration::from_secs(60);
+const AUTOPILOT_QUEUE_RELEASE_RETRY_DELAY: Duration = Duration::from_secs(60);
+const MAGNET_METADATA_NO_PEERS_RETRY_DELAY: Duration = Duration::from_secs(60);
+const MAGNET_METADATA_NO_PEERS_RETRY_MESSAGE: &str =
+    "magnet metadata fetch: no peers discovered; will retry";
 
 #[derive(Clone)]
 pub struct DaemonRuntime {
@@ -77,6 +90,13 @@ pub struct DaemonRuntime {
     engine_limiters: Arc<Mutex<HashMap<InfoHash, swarmotter_core::bandwidth::RateLimiter>>>,
     /// Last byte-counter samples used to calculate API/UI transfer rates.
     rate_samples: Arc<Mutex<HashMap<InfoHash, RateSample>>>,
+    /// Per-torrent retry suppression for transient engine failures.
+    engine_retry_after: Arc<Mutex<HashMap<InfoHash, Instant>>>,
+    /// Latest computed autopilot decision per torrent, exposed through the API.
+    autopilot_decisions: Arc<Mutex<HashMap<InfoHash, AutopilotDecision>>>,
+    /// Last automatic action time per torrent, used to avoid repeated act-mode
+    /// commands on every background pass.
+    autopilot_last_action: Arc<Mutex<HashMap<InfoHash, Instant>>>,
     /// Runtime queue state backing queue positions and queue move operations.
     queue: Arc<Mutex<QueueState>>,
     /// Shared DHT runner so the configured DHT port is bound by one runner
@@ -132,6 +152,14 @@ struct LiveTorrentDiagnostics {
 struct QueueReconcileState {
     scheduled: bool,
     dirty: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StorageRootAccumulator {
+    roles: Vec<StorageRootRole>,
+    torrent_count: usize,
+    active_torrents: usize,
+    active_write_rate: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -235,6 +263,20 @@ fn default_download_dir_string() -> String {
         .to_string()
 }
 
+fn resolve_download_dir_from_config(download_dir: Option<&str>, cfg: &Config) -> String {
+    download_dir
+        .map(str::to_string)
+        .or_else(|| cfg.storage.download_dir.clone())
+        .unwrap_or_else(default_download_dir_string)
+}
+
+fn resolve_incomplete_dir_from_config(download_dir: &str, cfg: &Config) -> String {
+    cfg.storage
+        .incomplete_dir
+        .clone()
+        .unwrap_or_else(|| download_dir.to_string())
+}
+
 impl DaemonRuntime {
     #[allow(dead_code)]
     pub fn new(config: Config, startup_health: NetworkHealth) -> Self {
@@ -267,6 +309,9 @@ impl DaemonRuntime {
             global_limiter,
             engine_limiters: Arc::new(Mutex::new(HashMap::new())),
             rate_samples: Arc::new(Mutex::new(HashMap::new())),
+            engine_retry_after: Arc::new(Mutex::new(HashMap::new())),
+            autopilot_decisions: Arc::new(Mutex::new(HashMap::new())),
+            autopilot_last_action: Arc::new(Mutex::new(HashMap::new())),
             dht_runner: Arc::new(Mutex::new(None)),
             queue_reconcile: Arc::new(Mutex::new(QueueReconcileState::default())),
         }
@@ -308,6 +353,18 @@ impl DaemonRuntime {
         let mut t = Torrent::new(parsed, now());
         if let Some(d) = options.download_dir {
             t.download_dir = Some(d);
+        }
+        if let Err(e) = self
+            .preflight_storage_for_download(t.download_dir.as_deref(), t.meta.total_length)
+            .await
+        {
+            tracing::warn!(
+                info_hash = %hash,
+                error = %e,
+                error_code = %e.code(),
+                "torrent file add rejected by storage preflight"
+            );
+            return Err(e);
         }
         apply_network_state(&mut t, &self.network_health).await;
         let blocked = t.state == TorrentState::NetworkBlocked;
@@ -365,6 +422,18 @@ impl DaemonRuntime {
         t.magnet_trackers = m.trackers.clone();
         if let Some(d) = options.download_dir {
             t.download_dir = Some(d);
+        }
+        if let Err(e) = self
+            .preflight_storage_for_download(t.download_dir.as_deref(), 0)
+            .await
+        {
+            tracing::warn!(
+                info_hash = %hash,
+                error = %e,
+                error_code = %e.code(),
+                "magnet add rejected by storage reserve preflight"
+            );
+            return Err(e);
         }
         apply_network_state(&mut t, &self.network_health).await;
         let blocked = t.state == TorrentState::NetworkBlocked;
@@ -426,6 +495,14 @@ impl DaemonRuntime {
                 rate_samples.remove(hash);
             }
         }
+        {
+            let mut decisions = self.autopilot_decisions.lock().await;
+            let mut last_actions = self.autopilot_last_action.lock().await;
+            for (hash, _) in &removed {
+                decisions.remove(hash);
+                last_actions.remove(hash);
+            }
+        }
         for (hash, _) in &removed {
             self.force_stop_engine(hash).await;
         }
@@ -456,14 +533,8 @@ impl DaemonRuntime {
     }
 
     async fn resolve_download_dir_override(&self, download_dir: Option<&str>) -> String {
-        if let Some(d) = download_dir {
-            return d.to_string();
-        }
         let cfg = self.config.lock().await;
-        cfg.storage
-            .download_dir
-            .clone()
-            .unwrap_or_else(default_download_dir_string)
+        resolve_download_dir_from_config(download_dir, &cfg)
     }
 
     /// Resolve the active write directory for a torrent. Incomplete downloads
@@ -471,10 +542,25 @@ impl DaemonRuntime {
     /// write directly to the final download directory.
     async fn resolve_incomplete_dir(&self, download_dir: &str) -> String {
         let cfg = self.config.lock().await;
-        cfg.storage
-            .incomplete_dir
-            .clone()
-            .unwrap_or_else(|| download_dir.to_string())
+        resolve_incomplete_dir_from_config(download_dir, &cfg)
+    }
+
+    async fn preflight_storage_for_download(
+        &self,
+        download_dir: Option<&str>,
+        total_length: u64,
+    ) -> Result<()> {
+        let cfg = self.config.lock().await.clone();
+        if cfg.storage.minimum_free_space_bytes == 0 && cfg.storage.minimum_free_space_percent == 0
+        {
+            return Ok(());
+        }
+        let complete_dir = resolve_download_dir_from_config(download_dir, &cfg);
+        let active_dir = resolve_incomplete_dir_from_config(&complete_dir, &cfg);
+        for dir in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
+            swarmotter_core::storage::check_storage_preflight(&dir, &cfg.storage, total_length)?;
+        }
+        Ok(())
     }
 
     async fn configured_peer_worker_limit(&self, active_downloads: usize) -> usize {
@@ -497,18 +583,17 @@ impl DaemonRuntime {
     }
 
     async fn active_download_hashes(&self) -> Vec<InfoHash> {
+        let running: Vec<InfoHash> = self.engine_handles.lock().await.keys().copied().collect();
         let reg = self.registry.lock().await;
-        reg.torrents
-            .iter()
-            .filter_map(|(hash, t)| {
-                if matches!(
-                    t.state,
-                    TorrentState::Downloading | TorrentState::DownloadingMetadata
-                ) {
-                    Some(*hash)
-                } else {
-                    None
-                }
+        running
+            .into_iter()
+            .filter(|hash| {
+                reg.get(hash).is_some_and(|t| {
+                    matches!(
+                        t.state,
+                        TorrentState::Downloading | TorrentState::DownloadingMetadata
+                    )
+                })
             })
             .collect()
     }
@@ -518,6 +603,8 @@ impl DaemonRuntime {
         let mut queue = self.queue.lock().await;
         queue.limits = cfg.queue.clone();
         let reg = self.registry.lock().await;
+        let retry_after = self.engine_retry_after.lock().await.clone();
+        let now = Instant::now();
         queue.order.retain(|hash| reg.contains(hash));
         queue.bypass.retain(|hash| reg.contains(hash));
 
@@ -528,6 +615,12 @@ impl DaemonRuntime {
                 break;
             }
             if active.contains(hash) {
+                continue;
+            }
+            if retry_after
+                .get(hash)
+                .is_some_and(|retry_at| *retry_at > now)
+            {
                 continue;
             }
             let Some(t) = reg.get(hash) else {
@@ -596,6 +689,14 @@ impl DaemonRuntime {
         });
     }
 
+    fn schedule_delayed_reconcile_queue(&self, reason: &'static str, delay: Duration) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            runtime.schedule_reconcile_queue(reason).await;
+        });
+    }
+
     async fn run_scheduled_reconcile_queue(self, reason: &'static str) {
         tokio::time::sleep(QUEUE_RECONCILE_DEBOUNCE).await;
         loop {
@@ -618,6 +719,54 @@ impl DaemonRuntime {
             tracing::debug!(reason, "queue reconciliation complete");
             break;
         }
+    }
+
+    async fn engine_task_finished(&self, hash: InfoHash) {
+        self.engine_cmds.lock().await.remove(&hash);
+        self.engine_handles.lock().await.remove(&hash);
+        self.engine_limiters.lock().await.remove(&hash);
+    }
+
+    async fn handle_engine_task_error(
+        &self,
+        hash: InfoHash,
+        needs_metadata: bool,
+        error: CoreError,
+    ) -> bool {
+        let retry_metadata = needs_metadata && is_retryable_magnet_metadata_discovery_error(&error);
+        if retry_metadata {
+            tracing::debug!(
+                info_hash = %hash,
+                error = %error,
+                "magnet metadata discovery found no peers; retry scheduled"
+            );
+            let mut reg = self.registry.lock().await;
+            if let Some(t) = reg.get_mut(&hash) {
+                t.state = TorrentState::DownloadingMetadata;
+                t.error = Some(MAGNET_METADATA_NO_PEERS_RETRY_MESSAGE.into());
+            }
+            drop(reg);
+            self.engine_retry_after
+                .lock()
+                .await
+                .insert(hash, Instant::now() + MAGNET_METADATA_NO_PEERS_RETRY_DELAY);
+            return true;
+        }
+
+        let state = if error.is_network_blocked() {
+            TorrentState::NetworkBlocked
+        } else if matches!(&error, CoreError::Storage(_)) {
+            TorrentState::StorageError
+        } else {
+            TorrentState::Error
+        };
+        tracing::warn!(info_hash = %hash, error = %error, "engine task failed");
+        let mut reg = self.registry.lock().await;
+        if let Some(t) = reg.get_mut(&hash) {
+            t.state = state;
+            t.error = Some(error.to_string());
+        }
+        false
     }
 
     async fn shared_dht_runner(
@@ -667,6 +816,7 @@ impl DaemonRuntime {
         if self.engine_handles.lock().await.contains_key(&hash) {
             return;
         }
+        self.engine_retry_after.lock().await.remove(&hash);
 
         let snapshot = {
             let reg = self.registry.lock().await;
@@ -687,6 +837,8 @@ impl DaemonRuntime {
             allow_ipv6,
             pex_enabled,
             pex_max_peers,
+            minimum_free_space_bytes,
+            minimum_free_space_percent,
             magnet,
             needs_metadata,
         ) = {
@@ -701,6 +853,8 @@ impl DaemonRuntime {
             let allow_ipv6 = cfg.torrent.allow_ipv6 && cfg.network.allow_ipv6;
             let pex_enabled = cfg.pex.enabled;
             let pex_max_peers = cfg.pex.max_peers;
+            let minimum_free_space_bytes = cfg.storage.minimum_free_space_bytes;
+            let minimum_free_space_percent = cfg.storage.minimum_free_space_percent;
             let max_peer_workers = effective_peer_worker_limit(
                 cfg.bandwidth.max_peers,
                 cfg.bandwidth.max_peers_per_torrent,
@@ -717,6 +871,8 @@ impl DaemonRuntime {
                 allow_ipv6,
                 pex_enabled,
                 pex_max_peers,
+                minimum_free_space_bytes,
+                minimum_free_space_percent,
                 magnet,
                 snapshot.needs_metadata,
             )
@@ -724,6 +880,36 @@ impl DaemonRuntime {
 
         if !self.registry.lock().await.contains(&hash) {
             return;
+        }
+
+        let preflight_content_bytes = if needs_metadata { 0 } else { meta.total_length };
+        if preflight_content_bytes > 0
+            || minimum_free_space_bytes > 0
+            || minimum_free_space_percent > 0
+        {
+            let mut cfg = self.config.lock().await.storage.clone();
+            cfg.minimum_free_space_bytes = minimum_free_space_bytes;
+            cfg.minimum_free_space_percent = minimum_free_space_percent;
+            for dir in unique_pathbufs([PathBuf::from(&active_dir), PathBuf::from(&complete_dir)]) {
+                if let Err(e) = swarmotter_core::storage::check_storage_preflight(
+                    &dir,
+                    &cfg,
+                    preflight_content_bytes,
+                ) {
+                    tracing::warn!(
+                        info_hash = %hash,
+                        error = %e,
+                        error_code = %e.code(),
+                        "engine start blocked by storage preflight"
+                    );
+                    let mut reg = self.registry.lock().await;
+                    if let Some(t) = reg.get_mut(&hash) {
+                        t.state = TorrentState::StorageError;
+                        t.error = Some(e.to_string());
+                    }
+                    return;
+                }
+            }
         }
 
         let state = Arc::new(Mutex::new(EngineState::default()));
@@ -748,9 +934,13 @@ impl DaemonRuntime {
             .insert(hash, limiter.clone());
         // Peer transport selection (TCP/uTP) from config. All transports stay
         // on the contained binder; fail-closed blocks both.
-        let (utp_enabled, utp_prefer_tcp) = {
+        let (utp_enabled, utp_prefer_tcp, encryption_mode) = {
             let cfg = self.config.lock().await;
-            (cfg.torrent.utp_enabled, cfg.torrent.utp_prefer_tcp)
+            (
+                cfg.torrent.utp_enabled,
+                cfg.torrent.utp_prefer_tcp,
+                cfg.torrent.encryption_mode,
+            )
         };
 
         let state_for_summary = state.clone();
@@ -766,6 +956,7 @@ impl DaemonRuntime {
         let engine_limiters_arc = self.engine_limiters.clone();
         let seeder_shutdowns_arc = self.seeder_shutdowns.clone();
         let seeder_handles_arc = self.seeder_handles.clone();
+        let runtime_for_task = self.clone();
         // DHT runner for trackerless peer discovery. Gated by config and
         // containment; the engine disables DHT for private torrents.
         let dht_runner = self.shared_dht_runner(binder.clone(), peer_id).await;
@@ -784,8 +975,10 @@ impl DaemonRuntime {
         .with_complete_dir(complete_dir.clone().into())
         .with_global_limiter(Some(self.global_limiter.clone()))
         .with_transport(utp_enabled, utp_prefer_tcp)
+        .with_encryption_mode(encryption_mode)
         .with_preallocate(preallocate)
         .with_sparse(sparse)
+        .with_storage_reserve(minimum_free_space_bytes, minimum_free_space_percent)
         .with_peer_worker_limit(max_peer_workers)
         .with_allow_ipv6(allow_ipv6)
         .with_pex(pex_enabled, pex_max_peers);
@@ -840,14 +1033,18 @@ impl DaemonRuntime {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(info_hash = %hash_for_task, error = %e, "engine task failed");
-                    let mut reg = registry.lock().await;
-                    if let Some(t) = reg.get_mut(&hash_for_task) {
-                        t.state = TorrentState::Error;
-                        t.error = Some(e.to_string());
+                    let retry_metadata = runtime_for_task
+                        .handle_engine_task_error(hash_for_task, needs_metadata, e)
+                        .await;
+                    if retry_metadata {
+                        runtime_for_task.schedule_delayed_reconcile_queue(
+                            "magnet_metadata_no_peers",
+                            MAGNET_METADATA_NO_PEERS_RETRY_DELAY,
+                        );
                     }
                 }
             }
+            runtime_for_task.engine_task_finished(hash_for_task).await;
             let _ = state_for_summary;
         });
         self.engine_handles.lock().await.insert(hash, handle);
@@ -888,6 +1085,7 @@ impl DaemonRuntime {
     }
 
     async fn stop_engine(&self, hash: &InfoHash) {
+        self.engine_retry_after.lock().await.remove(hash);
         if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
             let _ = tx.send(EngineCommand::Stop).await;
         }
@@ -902,6 +1100,7 @@ impl DaemonRuntime {
     }
 
     async fn force_stop_engine(&self, hash: &InfoHash) {
+        self.engine_retry_after.lock().await.remove(hash);
         if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
             let _ = tx.try_send(EngineCommand::Stop);
         }
@@ -943,6 +1142,8 @@ impl DaemonRuntime {
         self.seeder_shutdowns.lock().await.clear();
         self.seeder_handles.lock().await.clear();
         self.rate_samples.lock().await.clear();
+        self.autopilot_decisions.lock().await.clear();
+        self.autopilot_last_action.lock().await.clear();
     }
 
     /// Spawn the inbound peer listener / seeder for a torrent. It shares the
@@ -985,6 +1186,7 @@ impl DaemonRuntime {
             )))
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let encryption_mode = self.config.lock().await.torrent.encryption_mode;
         let mut seeder = Seeder::with_limiter(
             meta,
             storage,
@@ -995,6 +1197,7 @@ impl DaemonRuntime {
             shutdown_rx,
             limiter,
         )
+        .with_encryption_mode(encryption_mode)
         .with_global_limiter(Some(self.global_limiter.clone()));
         if let Some(complete_storage) = complete_storage {
             seeder = seeder.with_complete_storage(complete_storage);
@@ -1366,6 +1569,217 @@ impl DaemonRuntime {
         self.reconcile_seeders().await;
     }
 
+    /// Periodically compute autopilot decisions from contained runtime
+    /// telemetry. In `act` mode this applies only bounded daemon/engine
+    /// commands that use existing contained data-plane paths.
+    pub async fn autopilot_loop(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(AUTOPILOT_INTERVAL).await;
+            self.refresh_autopilot_decisions(true).await;
+        }
+    }
+
+    async fn refresh_autopilot_decisions(&self, apply_actions: bool) {
+        self.reconcile_engine_progress().await;
+
+        let cfg = self.config.lock().await.clone();
+        let global_mode = cfg.autopilot.mode;
+        let network = self.network_health.lock().await.clone();
+        let states = self.engine_states.lock().await.clone();
+        let samples = self.rate_samples.lock().await.clone();
+        let active_downloads = self.active_download_hashes().await.len().max(1);
+        let torrents: Vec<Torrent> = self
+            .registry
+            .lock()
+            .await
+            .torrents
+            .values()
+            .cloned()
+            .collect();
+        let analyzer = AutopilotAnalyzer::new();
+        let mut decisions = HashMap::new();
+        let now = Instant::now();
+
+        for torrent in torrents {
+            let hash = torrent.info_hash();
+            let state = match states.get(&hash) {
+                Some(state) => Some(state.lock().await.clone()),
+                None => None,
+            };
+            let input = build_autopilot_input(
+                &torrent,
+                state.as_ref(),
+                samples.get(&hash).copied(),
+                now,
+                &network,
+            );
+            let mode = effective_autopilot_mode(global_mode, torrent.autopilot_mode_override);
+            let decision = analyzer.analyze(&input, mode);
+            if apply_actions && mode == AutopilotMode::Act {
+                self.apply_autopilot_decision(hash, &decision, &cfg, active_downloads)
+                    .await;
+            }
+            decisions.insert(hash, decision);
+        }
+
+        *self.autopilot_decisions.lock().await = decisions;
+    }
+
+    async fn apply_autopilot_decision(
+        &self,
+        hash: InfoHash,
+        decision: &AutopilotDecision,
+        cfg: &Config,
+        active_downloads: usize,
+    ) {
+        if !decision.apply {
+            return;
+        }
+        let Some(action) = decision.action.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        if self
+            .autopilot_last_action
+            .lock()
+            .await
+            .get(&hash)
+            .is_some_and(|at| now.saturating_duration_since(*at) < AUTOPILOT_ACTION_COOLDOWN)
+        {
+            return;
+        }
+
+        let applied = match action.kind {
+            AutopilotActionKind::IncreasePeerWorkers => {
+                self.apply_autopilot_peer_worker_limit(hash, decision, cfg, active_downloads)
+                    .await
+            }
+            AutopilotActionKind::ExpandDiscovery => {
+                self.send_engine_command(hash, EngineCommand::Reannounce)
+                    .await
+            }
+            AutopilotActionKind::RelaxPeerBackoff => {
+                self.send_engine_command(hash, EngineCommand::RelaxPeerBackoff)
+                    .await
+            }
+            AutopilotActionKind::ReleaseQueueSlot => self.apply_autopilot_queue_release(hash).await,
+            AutopilotActionKind::RaiseDownloadCeiling => {
+                self.apply_autopilot_download_ceiling(hash, action.suggested_download_limit)
+                    .await
+            }
+        };
+
+        if applied {
+            self.autopilot_last_action.lock().await.insert(hash, now);
+            tracing::info!(
+                info_hash = %hash,
+                action_kind = ?action.kind,
+                rationale = %action.rationale,
+                causes = ?decision.snapshot.causes,
+                "autopilot applied action"
+            );
+        }
+    }
+
+    async fn send_engine_command(&self, hash: InfoHash, command: EngineCommand) -> bool {
+        let tx = self.engine_cmds.lock().await.get(&hash).cloned();
+        let Some(tx) = tx else {
+            return false;
+        };
+        tx.send(command).await.is_ok()
+    }
+
+    async fn apply_autopilot_peer_worker_limit(
+        &self,
+        hash: InfoHash,
+        decision: &AutopilotDecision,
+        cfg: &Config,
+        active_downloads: usize,
+    ) -> bool {
+        let current = decision.snapshot.peer_worker_limit.max(1);
+        let hard_limit = effective_peer_worker_limit(
+            cfg.bandwidth.max_peers,
+            cfg.bandwidth.max_peers_per_torrent,
+            active_downloads,
+        );
+        let next = current.saturating_add(1).min(hard_limit).max(1);
+        if next <= current {
+            tracing::debug!(
+                info_hash = %hash,
+                current_peer_worker_limit = current,
+                hard_peer_worker_limit = hard_limit,
+                "autopilot peer worker increase skipped by configured hard cap"
+            );
+            return false;
+        }
+        self.send_engine_command(hash, EngineCommand::UpdatePeerWorkerLimit(next))
+            .await
+    }
+
+    async fn apply_autopilot_queue_release(&self, hash: InfoHash) -> bool {
+        if !self.engine_handles.lock().await.contains_key(&hash) {
+            return false;
+        }
+        self.stop_engine(&hash).await;
+        {
+            let mut reg = self.registry.lock().await;
+            let Some(t) = reg.get_mut(&hash) else {
+                return false;
+            };
+            if matches!(
+                t.state,
+                TorrentState::Downloading | TorrentState::DownloadingMetadata
+            ) {
+                t.state = TorrentState::Queued;
+                t.error = Some("autopilot released active queue slot after no progress".into());
+            }
+        }
+        {
+            let mut queue = self.queue.lock().await;
+            queue.add(hash);
+            queue.clear_bypass(&hash);
+            queue.move_to_bottom(&hash);
+        }
+        self.engine_retry_after
+            .lock()
+            .await
+            .insert(hash, Instant::now() + AUTOPILOT_QUEUE_RELEASE_RETRY_DELAY);
+        self.schedule_reconcile_queue("autopilot_queue_release")
+            .await;
+        true
+    }
+
+    async fn apply_autopilot_download_ceiling(
+        &self,
+        hash: InfoHash,
+        suggested_download_limit: Option<u64>,
+    ) -> bool {
+        let Some(download_limit) = suggested_download_limit else {
+            tracing::debug!(
+                info_hash = %hash,
+                "autopilot download ceiling change skipped without a bounded suggestion"
+            );
+            return false;
+        };
+        let mut reg = self.registry.lock().await;
+        let Some(t) = reg.get_mut(&hash) else {
+            return false;
+        };
+        if t.download_limit == 0 || download_limit <= t.download_limit {
+            return false;
+        }
+        t.download_limit = download_limit;
+        drop(reg);
+        if let Some(rl) = self.engine_limiters.lock().await.get(&hash).cloned() {
+            rl.set_capacity(
+                swarmotter_core::bandwidth::RateDirection::Download,
+                download_limit,
+            )
+            .await;
+        }
+        true
+    }
+
     /// Watch-folder scan loop: periodically scans configured folders and imports
     /// newly-stabilized `.torrent` files.
     pub async fn watch_loop(self: Arc<Self>) {
@@ -1640,6 +2054,9 @@ fn restart_required_fields(previous: &Config, next: &Config) -> Vec<String> {
     if previous.torrent.listen_port != next.torrent.listen_port {
         fields.push("torrent.listen_port".into());
     }
+    if previous.torrent.encryption_mode != next.torrent.encryption_mode {
+        fields.push("torrent.encryption_mode".into());
+    }
     if previous.dht.port != next.dht.port {
         fields.push("dht.port".into());
     }
@@ -1808,6 +2225,14 @@ fn read_last_lines(path: &Path, max_lines: usize) -> std::io::Result<Vec<String>
         }
     }
     Ok(lines)
+}
+
+fn is_retryable_magnet_metadata_discovery_error(error: &CoreError) -> bool {
+    let CoreError::Internal(message) = error else {
+        return false;
+    };
+    message.contains("magnet metadata fetch failed after discovery retries")
+        && message.contains("magnet metadata fetch: no peers discovered")
 }
 
 fn strip_ansi_controls(input: &str) -> String {
@@ -1981,6 +2406,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn resume(&self, hash: &InfoHash) -> Result<()> {
+        self.engine_retry_after.lock().await.remove(hash);
         {
             let mut reg = self.registry.lock().await;
             match reg.get_mut(hash) {
@@ -2001,6 +2427,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn start_now(&self, hash: &InfoHash) -> Result<()> {
+        self.engine_retry_after.lock().await.remove(hash);
         {
             let reg = self.registry.lock().await;
             if reg.get(hash).is_none() {
@@ -2385,6 +2812,9 @@ impl DaemonOps for DaemonRuntime {
             if let Some(s) = patch.seeding {
                 cfg.seeding = s;
             }
+            if let Some(autopilot) = patch.autopilot {
+                cfg.autopilot = autopilot;
+            }
         }
         self.apply_runtime_config_fields().await;
         Ok(())
@@ -2427,6 +2857,7 @@ impl DaemonOps for DaemonRuntime {
                 "torrent.selfish".into(),
                 "storage".into(),
                 "watch".into(),
+                "autopilot".into(),
             ],
             config: redact_config(next),
         })
@@ -2540,6 +2971,7 @@ impl DaemonOps for DaemonRuntime {
             torrent_allow_ipv6: cfg.torrent.allow_ipv6,
             utp_enabled: cfg.torrent.utp_enabled,
             utp_prefer_tcp: cfg.torrent.utp_prefer_tcp,
+            peer_encryption_mode: cfg.torrent.encryption_mode,
             interfaces,
             checks: vec![
                 NetworkPathCheck {
@@ -2580,7 +3012,7 @@ impl DaemonOps for DaemonRuntime {
                     label: "Peer transport selection".into(),
                     level: DiagnosticLevel::Ok,
                     detail: format!(
-                        "TCP is {}, uTP is {}, preference is {}",
+                        "TCP is {}, uTP is {}, preference is {}, peer encryption is {:?}",
                         "enabled",
                         if cfg.torrent.utp_enabled {
                             "enabled"
@@ -2591,11 +3023,87 @@ impl DaemonOps for DaemonRuntime {
                             "tcp-first"
                         } else {
                             "utp-first"
-                        }
+                        },
+                        cfg.torrent.encryption_mode.as_str()
                     ),
                 },
             ],
             containment_matrix: containment_matrix(&cfg, traffic_level),
+        }
+    }
+
+    async fn storage_roots(&self) -> StorageDiagnostics {
+        self.reconcile_engine_progress().await;
+        let cfg = self.config.lock().await.clone();
+        let mut roots: HashMap<String, StorageRootAccumulator> = HashMap::new();
+
+        let download_dir = resolve_download_dir_from_config(None, &cfg);
+        add_storage_root_role(
+            &mut roots,
+            download_dir.clone(),
+            if cfg.storage.download_dir.is_some() {
+                StorageRootRole::Download
+            } else {
+                StorageRootRole::DefaultDownload
+            },
+        );
+        let incomplete_dir = resolve_incomplete_dir_from_config(&download_dir, &cfg);
+        add_storage_root_role(
+            &mut roots,
+            incomplete_dir.clone(),
+            StorageRootRole::Incomplete,
+        );
+
+        for folder in &cfg.watch {
+            if let Some(path) = folder.download_dir.as_ref() {
+                add_storage_root_role(&mut roots, path.clone(), StorageRootRole::WatchDownload);
+            }
+        }
+
+        {
+            let reg = self.registry.lock().await;
+            for torrent in reg.torrents.values() {
+                let complete_dir =
+                    resolve_download_dir_from_config(torrent.download_dir.as_deref(), &cfg);
+                if torrent.download_dir.is_some() {
+                    add_storage_root_role(
+                        &mut roots,
+                        complete_dir.clone(),
+                        StorageRootRole::TorrentOverride,
+                    );
+                }
+                add_storage_root_usage(&mut roots, complete_dir.clone(), torrent);
+                let active_dir = resolve_incomplete_dir_from_config(&complete_dir, &cfg);
+                add_storage_root_role(&mut roots, active_dir.clone(), StorageRootRole::Incomplete);
+                if active_dir != complete_dir {
+                    add_storage_root_usage(&mut roots, active_dir, torrent);
+                }
+            }
+        }
+
+        let mut roots = roots
+            .into_iter()
+            .map(|(path, acc)| {
+                swarmotter_core::storage::inspect_storage_root(
+                    Path::new(&path),
+                    acc.roles,
+                    &cfg.storage,
+                    swarmotter_core::storage::StorageRootUsage {
+                        torrent_count: acc.torrent_count,
+                        active_torrents: acc.active_torrents,
+                        active_write_rate: acc.active_write_rate,
+                        active_recheck_rate: Some(0),
+                    },
+                )
+            })
+            .collect::<Vec<StorageRootDiagnostics>>();
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+
+        StorageDiagnostics {
+            roots,
+            minimum_free_space_bytes: cfg.storage.minimum_free_space_bytes,
+            minimum_free_space_percent: cfg.storage.minimum_free_space_percent,
+            generated_at: now(),
         }
     }
 
@@ -2760,6 +3268,45 @@ impl DaemonOps for DaemonRuntime {
         })
     }
 
+    async fn autopilot_status(&self) -> AutopilotConfig {
+        self.config.lock().await.autopilot.clone()
+    }
+
+    async fn torrent_autopilot_decision(&self, hash: &InfoHash) -> Option<AutopilotDecision> {
+        self.refresh_autopilot_decisions(false).await;
+        if let Some(decision) = self.autopilot_decisions.lock().await.get(hash).cloned() {
+            return Some(decision);
+        }
+        let torrent = self.registry.lock().await.get(hash).cloned()?;
+        let cfg = self.config.lock().await.clone();
+        let network = self.network_health.lock().await.clone();
+        let mode = effective_autopilot_mode(cfg.autopilot.mode, torrent.autopilot_mode_override);
+        let input = build_autopilot_input(
+            &torrent,
+            None,
+            self.rate_samples.lock().await.get(hash).copied(),
+            Instant::now(),
+            &network,
+        );
+        Some(AutopilotAnalyzer::new().analyze(&input, mode))
+    }
+
+    async fn set_torrent_autopilot_mode_override(
+        &self,
+        hash: &InfoHash,
+        mode: Option<AutopilotMode>,
+    ) -> Result<()> {
+        {
+            let mut reg = self.registry.lock().await;
+            let Some(t) = reg.get_mut(hash) else {
+                return Err(CoreError::NotFound("torrent".into()));
+            };
+            t.autopilot_mode_override = mode;
+        }
+        self.refresh_autopilot_decisions(false).await;
+        Ok(())
+    }
+
     async fn watch_scan(&self) -> Result<()> {
         self.scan_watch_folders().await
     }
@@ -2834,6 +3381,30 @@ where
     out
 }
 
+fn add_storage_root_role(
+    roots: &mut HashMap<String, StorageRootAccumulator>,
+    path: String,
+    role: StorageRootRole,
+) {
+    let entry = roots.entry(path).or_default();
+    if !entry.roles.contains(&role) {
+        entry.roles.push(role);
+    }
+}
+
+fn add_storage_root_usage(
+    roots: &mut HashMap<String, StorageRootAccumulator>,
+    path: String,
+    torrent: &Torrent,
+) {
+    let entry = roots.entry(path).or_default();
+    entry.torrent_count += 1;
+    if torrent.state.is_active() {
+        entry.active_torrents += 1;
+        entry.active_write_rate = entry.active_write_rate.saturating_add(torrent.rate_down);
+    }
+}
+
 fn push_display_path(paths: &mut Vec<String>, path: &Path) {
     let value = path.display().to_string();
     if !paths.contains(&value) {
@@ -2903,6 +3474,107 @@ async fn apply_network_state(t: &mut Torrent, health: &Arc<Mutex<NetworkHealth>>
         t.state = TorrentState::NetworkBlocked;
         t.error = Some(h.detail.clone());
     }
+}
+
+fn effective_autopilot_mode(
+    global_mode: AutopilotMode,
+    override_mode: Option<AutopilotMode>,
+) -> AutopilotMode {
+    if global_mode == AutopilotMode::Disabled {
+        AutopilotMode::Disabled
+    } else {
+        override_mode.unwrap_or(global_mode)
+    }
+}
+
+fn build_autopilot_input(
+    torrent: &Torrent,
+    state: Option<&EngineState>,
+    sample: Option<RateSample>,
+    now: Instant,
+    network: &NetworkHealth,
+) -> AutopilotInput {
+    let rate_down = sample.map(|s| s.rate_down).unwrap_or(torrent.rate_down);
+    let rate_up = sample.map(|s| s.rate_up).unwrap_or(torrent.rate_up);
+    let rate_down_observed_peak = sample
+        .map(|s| s.peak_rate_down)
+        .unwrap_or(torrent.rate_down)
+        .max(rate_down);
+    let network_traffic_allowed =
+        network.traffic_allowed || network.mode == NetworkContainmentMode::Disabled;
+
+    let no_progress_seconds = latest_progress_instant(sample, state)
+        .map(|seen| now.saturating_duration_since(seen).as_secs())
+        .or_else(|| sample.map(|s| now.saturating_duration_since(s.at).as_secs()));
+
+    let mut input = AutopilotInput {
+        state: torrent.state,
+        rate_down,
+        rate_up,
+        rate_down_observed_peak,
+        download_limit: torrent.download_limit,
+        piece_count: torrent.meta.piece_count(),
+        pieces_have: torrent.pieces_have(),
+        known_peers: torrent.known_peers,
+        useful_peers: None,
+        active_peer_workers: torrent.active_peer_workers,
+        tracker_ok: torrent.state.is_active(),
+        no_progress_seconds,
+        network_traffic_allowed: Some(network_traffic_allowed),
+        ..Default::default()
+    };
+
+    if let Some(state) = state {
+        let piece_count = state.piece_count.max(torrent.meta.piece_count());
+        input.piece_count = piece_count;
+        input.pieces_have = if state.piece_count > 0 {
+            state.pieces_have.count(state.piece_count)
+        } else {
+            torrent.pieces_have()
+        };
+        input.known_peers = state.peers.len();
+        input.useful_peers = Some(useful_peer_count(&state.peer_health, now));
+        input.active_peer_workers = state.active_peers;
+        input.discovered_peers = Some(state.peer_scheduler.discovered_peers.max(state.peers.len()));
+        input.eligible_peers = Some(state.peer_scheduler.eligible_peers);
+        input.peer_worker_limit = Some(state.peer_scheduler.peer_worker_limit);
+        input.backed_off_peers = Some(state.peer_scheduler.backed_off_peers);
+        input.tracker_ok = state.tracker_ok;
+        input.tracker_recent_ok_seconds_ago = instant_age_seconds(now, state.tracker_last_ok);
+        input.tracker_failures_recent = state.tracker_failures_recent;
+        input.dht_discovery_ok = Some(state.dht_discovery_ok);
+        input.dht_last_seen_seconds_ago = instant_age_seconds(now, state.dht_last_seen);
+        input.pex_discovery_ok = Some(state.pex_discovery_ok);
+        input.pex_last_seen_seconds_ago = instant_age_seconds(now, state.pex_last_seen);
+        input.peer_failures_recent = Some(
+            state
+                .peer_disconnects_recent
+                .saturating_add(state.hash_failures)
+                .saturating_add(state.timeout_failures),
+        );
+        input.serial_peer_active = state.peer_scheduler.serial_peer_active;
+    }
+
+    input
+}
+
+fn latest_progress_instant(
+    sample: Option<RateSample>,
+    state: Option<&EngineState>,
+) -> Option<Instant> {
+    let mut latest = sample.and_then(|sample| sample.last_download_at);
+    if let Some(state) = state {
+        for candidate in [
+            state.last_valid_block,
+            state.block_last_seen,
+            state.webseed_last_seen,
+        ] {
+            if candidate > latest {
+                latest = candidate;
+            }
+        }
+    }
+    latest
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3314,6 +3986,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retryable_magnet_metadata_no_peers_stays_in_metadata_state() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let placeholder_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "magnet placeholder",
+            b"placeholder",
+            8,
+            None,
+            false,
+        );
+        let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
+        let hash =
+            swarmotter_core::hash::InfoHash::from_hex("95c6c298c84fee2eee10c044d673537da158f0f8")
+                .unwrap();
+        let mut torrent = Torrent::new(placeholder_meta, 1);
+        torrent.state = TorrentState::DownloadingMetadata;
+        torrent.needs_metadata = true;
+        torrent.magnet_info_hash = Some(hash);
+        runtime.registry.lock().await.add(torrent).unwrap();
+        runtime.queue.lock().await.add(hash);
+
+        let retry = runtime
+            .handle_engine_task_error(
+                hash,
+                true,
+                CoreError::Internal(
+                    "magnet metadata fetch failed after discovery retries: internal error: magnet metadata fetch: no peers discovered"
+                        .into(),
+                ),
+            )
+            .await;
+
+        assert!(retry);
+        {
+            let reg = runtime.registry.lock().await;
+            let torrent = reg.get(&hash).unwrap();
+            assert_eq!(torrent.state, TorrentState::DownloadingMetadata);
+            assert_eq!(
+                torrent.error.as_deref(),
+                Some(MAGNET_METADATA_NO_PEERS_RETRY_MESSAGE)
+            );
+        }
+        assert!(runtime
+            .engine_retry_after
+            .lock()
+            .await
+            .get(&hash)
+            .is_some_and(|retry_at| *retry_at > Instant::now()));
+        assert!(
+            runtime.desired_download_hashes().await.is_empty(),
+            "retry backoff should keep no-peer magnets out of active queue slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_task_finished_clears_restart_blocking_runtime_bookkeeping() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let hash =
+            swarmotter_core::hash::InfoHash::from_hex("95c6c298c84fee2eee10c044d673537da158f0f8")
+                .unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        runtime.engine_cmds.lock().await.insert(hash, tx);
+        runtime
+            .engine_handles
+            .lock()
+            .await
+            .insert(hash, tokio::spawn(async {}));
+        runtime
+            .engine_states
+            .lock()
+            .await
+            .insert(hash, Arc::new(Mutex::new(EngineState::default())));
+        runtime
+            .engine_limiters
+            .lock()
+            .await
+            .insert(hash, swarmotter_core::bandwidth::RateLimiter::new(0, 0));
+        runtime.rate_samples.lock().await.insert(
+            hash,
+            RateSample {
+                downloaded: 1,
+                uploaded: 1,
+                rate_down: 1,
+                rate_up: 1,
+                last_download_at: Some(Instant::now()),
+                last_upload_at: Some(Instant::now()),
+                at: Instant::now(),
+                peak_rate_down: 1,
+                peak_rate_up: 1,
+            },
+        );
+
+        runtime.engine_task_finished(hash).await;
+
+        assert!(!runtime.engine_cmds.lock().await.contains_key(&hash));
+        assert!(!runtime.engine_handles.lock().await.contains_key(&hash));
+        assert!(!runtime.engine_limiters.lock().await.contains_key(&hash));
+        assert!(
+            runtime.engine_states.lock().await.contains_key(&hash),
+            "diagnostic state should survive normal engine task exit"
+        );
+        assert!(
+            runtime.rate_samples.lock().await.contains_key(&hash),
+            "rate samples should survive normal engine task exit"
+        );
+    }
+
+    #[tokio::test]
     async fn torrent_stats_includes_live_engine_diagnostics() {
         let cfg = Config::default();
         let health = NetworkHealth::blocked(
@@ -3441,6 +4232,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn autopilot_decision_uses_live_engine_telemetry() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "autopilot.bin",
+            b"0123456789abcdef",
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = meta.info_hash;
+        runtime
+            .registry
+            .lock()
+            .await
+            .add(Torrent::new(meta.clone(), 1))
+            .unwrap();
+        runtime.engine_states.lock().await.insert(
+            hash,
+            Arc::new(Mutex::new(EngineState {
+                piece_count: meta.piece_count(),
+                total_length: meta.total_length,
+                tracker_ok: false,
+                dht_discovery_ok: false,
+                pex_discovery_ok: false,
+                dht_last_seen: Some(Instant::now() - Duration::from_secs(180)),
+                pex_last_seen: Some(Instant::now() - Duration::from_secs(180)),
+                ..Default::default()
+            })),
+        );
+        runtime.rate_samples.lock().await.insert(
+            hash,
+            RateSample {
+                downloaded: 0,
+                uploaded: 0,
+                rate_down: 0,
+                rate_up: 0,
+                last_download_at: None,
+                last_upload_at: None,
+                at: Instant::now() - Duration::from_secs(45),
+                peak_rate_down: 0,
+                peak_rate_up: 0,
+            },
+        );
+
+        let decision = runtime.torrent_autopilot_decision(&hash).await.unwrap();
+
+        assert!(!decision.apply);
+        assert!(decision.snapshot.is_slow());
+        assert_eq!(decision.snapshot.network_traffic_allowed, Some(true));
+        assert!(decision
+            .snapshot
+            .causes
+            .contains(&swarmotter_core::models::stats::SlowCause::NoKnownPeers));
+    }
+
+    #[tokio::test]
+    async fn torrent_autopilot_override_is_persisted_and_used() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "autopilot-override.bin",
+            b"0123456789abcdef",
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = meta.info_hash;
+        runtime
+            .registry
+            .lock()
+            .await
+            .add(Torrent::new(meta, 1))
+            .unwrap();
+
+        runtime
+            .set_torrent_autopilot_mode_override(&hash, Some(AutopilotMode::Disabled))
+            .await
+            .unwrap();
+
+        let summary = runtime.get_torrent(&hash).await.unwrap();
+        assert_eq!(
+            summary.autopilot_mode_override,
+            Some(AutopilotMode::Disabled)
+        );
+        let decision = runtime.torrent_autopilot_decision(&hash).await.unwrap();
+        assert_eq!(decision.reasons[0].message, "autopilot disabled");
+    }
+
+    #[tokio::test]
+    async fn autopilot_act_mode_expands_discovery_through_engine_command() {
+        let mut cfg = Config::default();
+        cfg.autopilot.mode = AutopilotMode::Act;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "autopilot-act.bin",
+            b"0123456789abcdef",
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = meta.info_hash;
+        runtime
+            .registry
+            .lock()
+            .await
+            .add(Torrent::new(meta.clone(), 1))
+            .unwrap();
+        runtime.engine_states.lock().await.insert(
+            hash,
+            Arc::new(Mutex::new(EngineState {
+                piece_count: meta.piece_count(),
+                total_length: meta.total_length,
+                tracker_ok: false,
+                dht_discovery_ok: false,
+                pex_discovery_ok: false,
+                ..Default::default()
+            })),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        runtime.engine_cmds.lock().await.insert(hash, tx);
+
+        runtime.refresh_autopilot_decisions(true).await;
+
+        assert!(matches!(rx.try_recv().unwrap(), EngineCommand::Reannounce));
+        let decision = runtime
+            .autopilot_decisions
+            .lock()
+            .await
+            .get(&hash)
+            .cloned()
+            .unwrap();
+        assert!(decision.apply);
+        assert!(matches!(
+            decision.action.unwrap().kind,
+            AutopilotActionKind::ExpandDiscovery
+        ));
+    }
+
+    #[tokio::test]
     async fn list_trackers_uses_per_tracker_live_announce_results() {
         let cfg = Config::default();
         let health = NetworkHealth::blocked(
@@ -3518,6 +4467,33 @@ mod tests {
             Some("tracker announce timed out")
         );
         assert_eq!(secondary_row.last_message, None);
+    }
+
+    #[tokio::test]
+    async fn storage_preflight_rejects_torrent_file_add_before_registration() {
+        let root = unique_dir("storage-preflight");
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(root.display().to_string());
+        cfg.storage.minimum_free_space_bytes = u64::MAX;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "too-large.bin",
+            b"0123456789abcdef",
+            8,
+            None,
+            false,
+        );
+
+        let err = runtime.add_torrent_file(bytes, None).await.unwrap_err();
+
+        assert_eq!(err.code().as_str(), "storage_error");
+        assert!(runtime.registry.lock().await.torrents.is_empty());
+        assert!(runtime.queue.lock().await.order.is_empty());
     }
 
     #[tokio::test]
@@ -3614,6 +4590,18 @@ mod tests {
         assert_eq!(
             strip_ansi_controls(raw),
             "2026-07-03T19:43:03Z INFO message"
+        );
+    }
+
+    #[test]
+    fn encryption_mode_change_requires_restart() {
+        let previous = Config::default();
+        let mut next = previous.clone();
+        next.torrent.encryption_mode = swarmotter_core::config::PeerEncryptionMode::Required;
+
+        assert_eq!(
+            restart_required_fields(&previous, &next),
+            vec!["torrent.encryption_mode".to_string()]
         );
     }
 

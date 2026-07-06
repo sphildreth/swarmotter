@@ -8,10 +8,15 @@
 //! through the daemon using `tokio::fs`; the pure layout/verification logic
 //! lives here.
 
+pub mod diagnostics;
 pub mod io;
 pub mod layout;
 pub mod resume;
 
+pub use diagnostics::{
+    check_storage_preflight, inspect_storage_root, required_free_space_bytes, StoragePreflight,
+    StorageRootUsage,
+};
 pub use io::StorageIo;
 pub use layout::{FileLayout, FileSlice, StorageLayout};
 pub use resume::{FastResume, PieceBitfield};

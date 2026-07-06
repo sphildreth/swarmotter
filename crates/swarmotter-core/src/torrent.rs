@@ -3,6 +3,7 @@
 //! Torrent session glue: aggregates metadata, storage progress, state, and
 //! per-torrent settings into an in-memory `Torrent` record owned by the daemon.
 
+use crate::autopilot::AutopilotMode;
 use crate::hash::InfoHash;
 use crate::meta::TorrentMeta;
 use crate::models::torrent::{
@@ -54,6 +55,8 @@ pub struct Torrent {
     /// Magnet display name and trackers (for metadata fetch + announce).
     pub magnet_name: Option<String>,
     pub magnet_trackers: Vec<String>,
+    /// Optional per-torrent autopilot mode override.
+    pub autopilot_mode_override: Option<AutopilotMode>,
 }
 
 impl Torrent {
@@ -98,6 +101,7 @@ impl Torrent {
             magnet_info_hash: None,
             magnet_name: None,
             magnet_trackers: Vec::new(),
+            autopilot_mode_override: None,
         }
     }
 
@@ -148,6 +152,7 @@ impl Torrent {
             download_dir: self.download_dir.clone(),
             download_limit: self.download_limit,
             upload_limit: self.upload_limit,
+            autopilot_mode_override: self.autopilot_mode_override,
             rate_down: self.rate_down,
             rate_up: self.rate_up,
             active_peer_workers: self.active_peer_workers,
@@ -221,11 +226,14 @@ mod tests {
             build_single_file_torrent("f.bin", b"abcd".repeat(4).as_slice(), 8, None, false);
         let meta = crate::meta::parse_torrent(&bytes).unwrap();
         let t = Torrent::new(meta, 100);
+        assert!(t.autopilot_mode_override.is_none());
         assert_eq!(t.state, TorrentState::Queued);
         assert_eq!(t.meta.piece_count(), 2);
         assert_eq!(t.files.len(), 1);
         assert_eq!(t.priorities.len(), 1);
         assert!(t.wanted[0]);
         assert!(t.progress().abs() < f64::EPSILON);
+        let summary = t.to_summary();
+        assert!(summary.autopilot_mode_override.is_none());
     }
 }

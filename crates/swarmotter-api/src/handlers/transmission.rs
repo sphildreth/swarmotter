@@ -407,6 +407,7 @@ async fn session_set(state: &SharedState, cfg: &Config, request: &RpcRequest) ->
                 bandwidth: Some(bandwidth),
                 queue: Some(queue),
                 seeding: Some(seeding),
+                autopilot: None,
             })
             .await
             .map_err(RpcFailure::from_core)?;

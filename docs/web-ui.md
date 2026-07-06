@@ -38,10 +38,98 @@ summary response. The main UI area uses the available browser width so wide
 tables can show operational details without being capped to a narrow centered
 column. Per-row torrent actions are icon buttons with accessible labels.
 
+The torrent list is an interactive table. Click a column header to sort by
+that column, and click it again to reverse the direction. Header filters can
+filter individual columns: status and health use list filters, while numeric
+columns such as size, progress, rates, ratio, and peers accept comparisons
+such as `> 0`, `>= 50`, `< 10`, or `= 1`. The toolbar search remains a global
+filter across common torrent summary fields, and Clear Filters resets both the
+toolbar search and column filters.
+
 Torrent rows can be selected with checkboxes. The torrent toolbar can select
 all currently visible rows, clear the current selection, and remove all selected
 torrents. Bulk removal removes torrent records through `POST
 /api/v1/torrents/remove` and keeps downloaded data.
+
+## Large-library operations console
+
+For large libraries, the Operations Console is optimized for speed and low
+layout churn. The list is designed for high-count visibility with:
+
+- server-side search plus state, health, and performance-condition filters,
+- table sorting that round-trips through the server query endpoint,
+- a browser-local saved view for search/filter/page-size/sort state,
+- count-oriented list requests and pagination for incremental refresh,
+- clear confirmation paths for bulk destructive operations, and
+- detail views that avoid forcing a full table reload.
+
+The underlying `/api/v1/torrents/query` endpoint also supports label, storage
+root, peer/rate threshold, counts-only, and optional grouping parameters for
+external automation and future UI views.
+
+## Protocol encryption controls
+
+SwarmOtter can negotiate MSE/PE peer encryption. The Settings screen exposes
+`torrent.encryption_mode` with these choices:
+
+- `disabled` (plaintext handshakes only),
+- `preferred` (TCP attempts use MSE/PE first, with plaintext fallback),
+- `required` (refuse plaintext).
+
+The default is `preferred`. The UI keeps this control in the same Settings edit
+flow as other daemon config because it changes peer-wire compatibility behavior.
+Per-profile and per-torrent override controls are planned for a later phase.
+
+## Storage root diagnostics
+
+The Doctor view surfaces storage diagnostics from `GET /api/v1/storage/roots`
+so operators can:
+
+- review per-root free/available bytes before large add bursts,
+- identify which roots are close to configured reserve thresholds, and
+- diagnose storage pressure alongside active write/recheck activity in future views.
+
+Storage reserve fields in configuration are `[storage].minimum_free_space_bytes`
+and `[storage].minimum_free_space_percent`. When configured, add operations are
+rejected before writing data when the target root cannot satisfy the configured
+reserve.
+
+## Performance diagnostics and autopilot visibility
+
+The torrent detail view uses `/api/v1/torrents/:hash/stats` as its primary
+diagnostic source. Existing health sub-scores and `reasons` are the basis for the
+autopilot-oriented "why is this slow?" explanation and are updated from the same
+contained network observations as engine and network health reporting. In
+`act` mode, the daemon may apply bounded actions from those observations; the
+details page shows the current decision and rationale.
+
+In autopilot visibility mode, the UI reads:
+
+- `GET /api/v1/autopilot/status` for the global autopilot mode.
+- `GET /api/v1/network/health` and `GET /api/v1/network/diagnostics` for any
+  containment condition that may block or bias tuning decisions.
+- `GET /api/v1/torrents/:hash/stats` for peer-level health and scheduler signals.
+- `GET /api/v1/torrents/:hash/autopilot` and `POST /api/v1/torrents/:hash/autopilot`
+  for per-torrent decision views and mode override controls.
+
+The Settings tab includes an Autopilot card for the global
+`disabled` / `observe` / `act` mode. Torrent Details keeps the per-torrent
+override control.
+
+The Settings screen uses a two-panel layout: section navigation on the left and
+the selected settings group on the right. Save, reload, and reset controls sit
+in the Settings header. Saving still submits the full configuration snapshot.
+
+The details page renders a compact "why is this slow?" report with these fields:
+
+- active/global/autopilot mode state.
+- machine-readable reason identifiers and recommendations or applied-action
+  candidates.
+- snapshot signals and network-conditions impact for operational context.
+
+The UI should present autopilot recommendations as human-readable entries with
+underlying machine-readable identifiers (for operators and automation clients) and
+continue to honor the fail-closed containment model.
 
 ## Notifications
 
@@ -88,4 +176,6 @@ root directories, and clear daemon log files.
 ## Browser assets
 
 The daemon serves the Web UI favicon set and app manifest from the embedded
-graphics assets. The header uses the SwarmOtter icon next to the app name.
+graphics assets. The header uses the SwarmOtter icon next to the app name and
+includes a light/dark theme icon. The Web UI defaults to dark mode and stores
+the selected theme in browser `localStorage` under `swarmotter.theme`.

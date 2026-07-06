@@ -2,6 +2,7 @@
 
 //! Torrent state, summary, and file models.
 
+use crate::autopilot::AutopilotMode;
 use crate::hash::InfoHash;
 use serde::{Deserialize, Serialize};
 
@@ -11,9 +12,10 @@ use serde::{Deserialize, Serialize};
 /// `queued`, `checking`, `downloading_metadata`, `downloading`, `seeding`,
 /// `paused`, `completed`, `error`, `network_blocked`, `storage_error`,
 /// `tracker_error`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TorrentState {
+    #[default]
     Queued,
     Checking,
     DownloadingMetadata,
@@ -193,6 +195,8 @@ pub struct TorrentSummary {
     pub download_limit: u64,
     /// Per-torrent upload limit in bytes/sec (0 = unlimited).
     pub upload_limit: u64,
+    /// Optional per-torrent autopilot override.
+    pub autopilot_mode_override: Option<AutopilotMode>,
     pub rate_down: u64,
     pub rate_up: u64,
     /// Number of peer workers currently active for this torrent.

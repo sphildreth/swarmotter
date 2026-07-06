@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
+use swarmotter_core::autopilot::{AutopilotAnalyzer, AutopilotConfig, AutopilotMode};
 use swarmotter_core::config::Config;
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
@@ -16,7 +17,9 @@ use swarmotter_core::models::network::{
     NetworkContainmentMode, NetworkContainmentStatus, NetworkHealth,
 };
 use swarmotter_core::models::peer::Peer;
-use swarmotter_core::models::stats::{GlobalStats, TorrentDiagnostics};
+use swarmotter_core::models::stats::{
+    AutopilotDecision, AutopilotInput, GlobalStats, TorrentDiagnostics,
+};
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{
     TrackerId, TrackerInfo, TrackerKind, TrackerStatus, TrackerTier,
@@ -355,6 +358,9 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         if let Some(s) = patch.seeding {
             cfg.seeding = s;
         }
+        if let Some(autopilot) = patch.autopilot {
+            cfg.autopilot = autopilot;
+        }
         Ok(())
     }
     async fn replace_config(&self, config: Config) -> Result<ConfigUpdateResult> {
@@ -394,6 +400,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             torrent_allow_ipv6: cfg.torrent.allow_ipv6,
             utp_enabled: cfg.torrent.utp_enabled,
             utp_prefer_tcp: cfg.torrent.utp_prefer_tcp,
+            peer_encryption_mode: cfg.torrent.encryption_mode,
             interfaces: vec![NetworkInterfaceDiagnostic {
                 name: "lo".into(),
                 status: "up".into(),
@@ -523,6 +530,76 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             private: t.meta.is_private(),
         })
     }
+    async fn autopilot_status(&self) -> AutopilotConfig {
+        self.config.lock().await.autopilot.clone()
+    }
+    async fn torrent_autopilot_decision(&self, hash: &InfoHash) -> Option<AutopilotDecision> {
+        let torrent = self.registry.lock().await.get(hash).cloned()?;
+        let mode = {
+            let cfg = self.config.lock().await;
+            torrent
+                .autopilot_mode_override
+                .unwrap_or(cfg.autopilot.mode)
+        };
+        let input = AutopilotInput {
+            state: torrent.state,
+            rate_down: torrent.rate_down,
+            rate_up: torrent.rate_up,
+            rate_down_observed_peak: torrent.rate_down.max(8192),
+            download_limit: torrent.download_limit,
+            piece_count: torrent.meta.piece_count(),
+            pieces_have: torrent.pieces_have(),
+            known_peers: torrent.known_peers,
+            useful_peers: Some(torrent.known_peers.min(1)),
+            active_peer_workers: torrent.active_peer_workers,
+            discovered_peers: Some(torrent.known_peers.saturating_add(1)),
+            eligible_peers: Some(torrent.known_peers),
+            peer_worker_limit: Some(torrent.known_peers.saturating_add(2)),
+            backed_off_peers: Some(0),
+            tracker_ok: torrent.state.is_active(),
+            tracker_recent_ok_seconds_ago: if torrent.state.is_active() {
+                Some(0)
+            } else {
+                None
+            },
+            tracker_failures_recent: 0,
+            dht_discovery_ok: Some(torrent.state.is_active()),
+            dht_last_seen_seconds_ago: if torrent.state.is_active() {
+                Some(0)
+            } else {
+                None
+            },
+            pex_discovery_ok: Some(torrent.state.is_active()),
+            pex_last_seen_seconds_ago: if torrent.state.is_active() {
+                Some(0)
+            } else {
+                None
+            },
+            no_progress_seconds: if torrent.state.is_active() {
+                Some(0)
+            } else {
+                None
+            },
+            peer_failures_recent: Some(0),
+            serial_peer_active: false,
+            ..Default::default()
+        };
+        Some(AutopilotAnalyzer::new().analyze(&input, mode))
+    }
+    async fn set_torrent_autopilot_mode_override(
+        &self,
+        hash: &InfoHash,
+        mode: Option<AutopilotMode>,
+    ) -> Result<()> {
+        let mut reg = self.registry.lock().await;
+        match reg.get_mut(hash) {
+            Some(t) => {
+                t.autopilot_mode_override = mode;
+                Ok(())
+            }
+            None => Err(CoreError::NotFound("torrent".into())),
+        }
+    }
     async fn watch_scan(&self) -> Result<()> {
         Ok(())
     }
@@ -572,6 +649,7 @@ pub fn fake_state_with_config(config: Config) -> swarmotter_api::state::SharedSt
         build: BuildInfo::default(),
         broker: swarmotter_api::handlers::events::EventBroker::default(),
         transmission: swarmotter_api::state::TransmissionCompatState::default(),
+        qbittorrent: swarmotter_api::state::QbittorrentCompatState::default(),
     })
 }
 

@@ -21,6 +21,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 
+use swarmotter_core::config::PeerEncryptionMode;
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::extensions::{self, MetadataMsgType};
 use swarmotter_core::hash::InfoHash;
@@ -31,6 +32,16 @@ use swarmotter_core::utp::{self, PeerDuplex, PeerTransport};
 
 const MAX_METADATA_SIZE: usize = 16 * 1024 * 1024;
 const METADATA_CANDIDATE_CONCURRENCY: usize = 32;
+
+#[derive(Clone)]
+struct MetadataFetchContext {
+    binder: Arc<dyn NetworkBinder>,
+    info_hash: InfoHash,
+    peer_id: [u8; 20],
+    utp_enabled: bool,
+    utp_prefer_tcp: bool,
+    encryption_mode: PeerEncryptionMode,
+}
 
 /// Fetch the torrent metadata (`info` dict) from a peer via `ut_metadata`.
 /// Returns the assembled, info-hash-verified `info` bytes.
@@ -46,26 +57,26 @@ pub async fn fetch_metadata_with_transport(
     peer: PeerAddr,
     utp_enabled: bool,
     utp_prefer_tcp: bool,
+    encryption_mode: PeerEncryptionMode,
 ) -> Result<Vec<u8>> {
     if !binder.traffic_allowed() {
         return Err(CoreError::NetworkBlocked(
             "torrent data plane blocked; cannot fetch metadata".into(),
         ));
     }
-    let transports = if utp_enabled {
-        if utp_prefer_tcp {
-            vec![PeerTransport::Tcp, PeerTransport::Utp]
-        } else {
-            vec![PeerTransport::Utp, PeerTransport::Tcp]
-        }
-    } else {
-        vec![PeerTransport::Tcp]
-    };
+    let transports = peer_transport_order(utp_enabled, utp_prefer_tcp, encryption_mode);
 
     let mut last_error = None;
     for transport in transports {
-        match fetch_metadata_via_transport(binder.clone(), transport, info_hash, peer_id, peer)
-            .await
+        match fetch_metadata_via_transport(
+            binder.clone(),
+            transport,
+            info_hash,
+            peer_id,
+            peer,
+            encryption_mode,
+        )
+        .await
         {
             Ok(info) => return Ok(info),
             Err(e) => last_error = Some(e),
@@ -75,14 +86,84 @@ pub async fn fetch_metadata_with_transport(
         .unwrap_or_else(|| CoreError::Internal("no metadata transport configured".into())))
 }
 
+fn peer_transport_order(
+    utp_enabled: bool,
+    utp_prefer_tcp: bool,
+    encryption_mode: PeerEncryptionMode,
+) -> Vec<PeerTransport> {
+    if matches!(encryption_mode, PeerEncryptionMode::Required) {
+        return vec![PeerTransport::Tcp];
+    }
+    if !utp_enabled {
+        return vec![PeerTransport::Tcp];
+    }
+    if utp_prefer_tcp {
+        vec![PeerTransport::Tcp, PeerTransport::Utp]
+    } else {
+        vec![PeerTransport::Utp, PeerTransport::Tcp]
+    }
+}
+
 async fn fetch_metadata_via_transport(
     binder: Arc<dyn NetworkBinder>,
     transport: PeerTransport,
     info_hash: InfoHash,
     peer_id: [u8; 20],
     peer: PeerAddr,
+    encryption_mode: PeerEncryptionMode,
 ) -> Result<Vec<u8>> {
-    let (stream, _) = utp::connect_peer_stream(binder, transport, peer.socket_addr()).await?;
+    if transport == PeerTransport::Utp && matches!(encryption_mode, PeerEncryptionMode::Required) {
+        return Err(CoreError::Internal(
+            "uTP encrypted metadata peer wire is not implemented for required encryption mode"
+                .into(),
+        ));
+    }
+    let (stream, selected) =
+        utp::connect_peer_stream(binder.clone(), transport, peer.socket_addr()).await?;
+    let stream = match (selected, encryption_mode) {
+        (PeerTransport::Tcp, PeerEncryptionMode::Disabled) => stream,
+        (PeerTransport::Tcp, PeerEncryptionMode::Required) => {
+            let encrypted = timeout(
+                Duration::from_secs(10),
+                swarmotter_core::mse::connect(stream, info_hash),
+            )
+            .await??;
+            Box::new(encrypted) as Box<dyn PeerDuplex>
+        }
+        (PeerTransport::Tcp, PeerEncryptionMode::Preferred) => {
+            match timeout(
+                Duration::from_secs(10),
+                swarmotter_core::mse::connect(stream, info_hash),
+            )
+            .await
+            {
+                Ok(Ok(encrypted)) => Box::new(encrypted) as Box<dyn PeerDuplex>,
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        peer = %peer.socket_addr(),
+                        error = %e,
+                        "MSE/PE metadata negotiation failed; retrying TCP metadata peer as plaintext"
+                    );
+                    let (plain, _) =
+                        utp::connect_peer_stream(binder, PeerTransport::Tcp, peer.socket_addr())
+                            .await?;
+                    plain
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        peer = %peer.socket_addr(),
+                        error = %e,
+                        "MSE/PE metadata negotiation timed out; retrying TCP metadata peer as plaintext"
+                    );
+                    let (plain, _) =
+                        utp::connect_peer_stream(binder, PeerTransport::Tcp, peer.socket_addr())
+                            .await?;
+                    plain
+                }
+            }
+        }
+        (PeerTransport::Utp, _) => stream,
+    };
     fetch_metadata_over_stream(stream, info_hash, peer_id).await
 }
 
@@ -291,6 +372,7 @@ pub async fn fetch_metadata_from_candidates_with_transport(
     candidates: &[PeerAddr],
     utp_enabled: bool,
     utp_prefer_tcp: bool,
+    encryption_mode: PeerEncryptionMode,
 ) -> Result<Vec<u8>> {
     let mut seen = HashSet::new();
     let candidates: Vec<PeerAddr> = candidates
@@ -307,17 +389,17 @@ pub async fn fetch_metadata_from_candidates_with_transport(
     let mut tasks = tokio::task::JoinSet::new();
     let mut last_err: Option<String> = None;
     let mut next = 0usize;
+    let fetch_context = MetadataFetchContext {
+        binder,
+        info_hash,
+        peer_id,
+        utp_enabled,
+        utp_prefer_tcp,
+        encryption_mode,
+    };
 
     while next < candidates.len() && tasks.len() < METADATA_CANDIDATE_CONCURRENCY {
-        spawn_metadata_fetch(
-            &mut tasks,
-            binder.clone(),
-            info_hash,
-            peer_id,
-            candidates[next],
-            utp_enabled,
-            utp_prefer_tcp,
-        );
+        spawn_metadata_fetch(&mut tasks, fetch_context.clone(), candidates[next]);
         next += 1;
     }
 
@@ -332,15 +414,7 @@ pub async fn fetch_metadata_from_candidates_with_transport(
             }
         }
         while next < candidates.len() && tasks.len() < METADATA_CANDIDATE_CONCURRENCY {
-            spawn_metadata_fetch(
-                &mut tasks,
-                binder.clone(),
-                info_hash,
-                peer_id,
-                candidates[next],
-                utp_enabled,
-                utp_prefer_tcp,
-            );
+            spawn_metadata_fetch(&mut tasks, fetch_context.clone(), candidates[next]);
             next += 1;
         }
     }
@@ -352,21 +426,18 @@ pub async fn fetch_metadata_from_candidates_with_transport(
 
 fn spawn_metadata_fetch(
     tasks: &mut tokio::task::JoinSet<(PeerAddr, Result<Vec<u8>>)>,
-    binder: Arc<dyn NetworkBinder>,
-    info_hash: InfoHash,
-    peer_id: [u8; 20],
+    context: MetadataFetchContext,
     peer: PeerAddr,
-    utp_enabled: bool,
-    utp_prefer_tcp: bool,
 ) {
     tasks.spawn(async move {
         let result = fetch_metadata_with_transport(
-            binder,
-            info_hash,
-            peer_id,
+            context.binder,
+            context.info_hash,
+            context.peer_id,
             peer,
-            utp_enabled,
-            utp_prefer_tcp,
+            context.utp_enabled,
+            context.utp_prefer_tcp,
+            context.encryption_mode,
         )
         .await;
         (peer, result)
@@ -398,6 +469,22 @@ mod tests {
         let mut id = [0u8; 20];
         id[..8].copy_from_slice(prefix);
         id
+    }
+
+    #[test]
+    fn preferred_encryption_preserves_metadata_transport_preference() {
+        assert_eq!(
+            peer_transport_order(true, false, PeerEncryptionMode::Preferred),
+            vec![PeerTransport::Utp, PeerTransport::Tcp]
+        );
+        assert_eq!(
+            peer_transport_order(true, true, PeerEncryptionMode::Preferred),
+            vec![PeerTransport::Tcp, PeerTransport::Utp]
+        );
+        assert_eq!(
+            peer_transport_order(true, false, PeerEncryptionMode::Required),
+            vec![PeerTransport::Tcp]
+        );
     }
 
     /// A peer that serves the `info` dict over ut_metadata. It speaks the
@@ -661,6 +748,7 @@ mod tests {
             PeerAddr::from_socket_addr(addr),
             false,
             true,
+            PeerEncryptionMode::Disabled,
         )
         .await
         .expect("metadata fetch should succeed");
@@ -687,6 +775,7 @@ mod tests {
             PeerAddr::from_socket_addr("127.0.0.1:9".parse().unwrap()),
             false,
             true,
+            PeerEncryptionMode::Disabled,
         )
         .await
         .unwrap_err();
@@ -720,6 +809,7 @@ mod tests {
             PeerAddr::from_socket_addr(addr),
             false,
             true,
+            PeerEncryptionMode::Disabled,
         )
         .await
         .unwrap_err();
@@ -748,6 +838,7 @@ mod tests {
             PeerAddr::from_socket_addr(addr),
             false,
             true,
+            PeerEncryptionMode::Disabled,
         )
         .await
         .unwrap_err();

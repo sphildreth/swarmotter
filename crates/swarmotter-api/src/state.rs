@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use swarmotter_core::autopilot::{AutopilotConfig, AutopilotMode};
 use swarmotter_core::config::Config;
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
@@ -19,7 +20,8 @@ use swarmotter_core::models::diagnostics::{
 };
 use swarmotter_core::models::network::NetworkHealth;
 use swarmotter_core::models::peer::Peer;
-use swarmotter_core::models::stats::{GlobalStats, TorrentDiagnostics};
+use swarmotter_core::models::stats::{AutopilotDecision, GlobalStats, TorrentDiagnostics};
+use swarmotter_core::models::storage::StorageDiagnostics;
 use swarmotter_core::models::torrent::TorrentFile;
 use swarmotter_core::models::torrent::TorrentSummary;
 use swarmotter_core::models::tracker::TrackerInfo;
@@ -155,6 +157,31 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn network_health(&self) -> NetworkHealth;
     /// Rich network diagnostics for API dashboards.
     async fn network_diagnostics(&self) -> NetworkDiagnostics;
+    /// Storage root diagnostics for API dashboards.
+    async fn storage_roots(&self) -> StorageDiagnostics {
+        let cfg = self.get_config().await;
+        let root = cfg.storage.download_dir.clone().unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("swarmotter-downloads")
+                .display()
+                .to_string()
+        });
+        let root = swarmotter_core::storage::inspect_storage_root(
+            std::path::Path::new(&root),
+            vec![swarmotter_core::models::storage::StorageRootRole::Download],
+            &cfg.storage,
+            swarmotter_core::storage::StorageRootUsage::default(),
+        );
+        StorageDiagnostics {
+            roots: vec![root],
+            minimum_free_space_bytes: cfg.storage.minimum_free_space_bytes,
+            minimum_free_space_percent: cfg.storage.minimum_free_space_percent,
+            generated_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
     /// Doctor/system health checks.
     async fn doctor_report(&self) -> DoctorReport;
     /// Recent daemon log lines.
@@ -163,6 +190,22 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn global_stats(&self) -> GlobalStats;
     /// Per-torrent diagnostics and stats.
     async fn torrent_stats(&self, hash: &InfoHash) -> Option<TorrentDiagnostics>;
+    /// Global autopilot status exposed through the API.
+    async fn autopilot_status(&self) -> AutopilotConfig {
+        self.get_config().await.autopilot
+    }
+    /// Per-torrent autopilot decision and snapshot.
+    async fn torrent_autopilot_decision(&self, _hash: &InfoHash) -> Option<AutopilotDecision> {
+        None
+    }
+    /// Set or clear a per-torrent autopilot mode override.
+    async fn set_torrent_autopilot_mode_override(
+        &self,
+        _hash: &InfoHash,
+        _mode: Option<AutopilotMode>,
+    ) -> Result<()> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
 
     /// Trigger a watch-folder scan.
     async fn watch_scan(&self) -> Result<()>;
@@ -178,6 +221,7 @@ pub struct SettingsPatch {
     pub bandwidth: Option<swarmotter_core::bandwidth::BandwidthLimits>,
     pub queue: Option<swarmotter_core::queue::QueueLimits>,
     pub seeding: Option<swarmotter_core::ratio::SeedingPolicy>,
+    pub autopilot: Option<AutopilotConfig>,
 }
 
 /// Shared application state.
@@ -190,6 +234,7 @@ pub struct AppState {
     pub build: BuildInfo,
     pub broker: crate::handlers::events::EventBroker,
     pub transmission: TransmissionCompatState,
+    pub qbittorrent: QbittorrentCompatState,
 }
 
 /// Process-local state for the Transmission RPC compatibility adapter.
@@ -213,6 +258,30 @@ impl TransmissionCompatState {
 }
 
 impl Default for TransmissionCompatState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Process-local state for the qBittorrent Web API compatibility adapter.
+#[derive(Clone)]
+pub struct QbittorrentCompatState {
+    pub(crate) session_id: Arc<String>,
+}
+
+impl QbittorrentCompatState {
+    pub fn new() -> Self {
+        Self {
+            session_id: Arc::new(generate_session_id()),
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.session_id.as_str()
+    }
+}
+
+impl Default for QbittorrentCompatState {
     fn default() -> Self {
         Self::new()
     }

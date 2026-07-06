@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
         },
         broker,
         transmission: swarmotter_api::state::TransmissionCompatState::default(),
+        qbittorrent: swarmotter_api::state::QbittorrentCompatState::default(),
     });
 
     let bind: std::net::SocketAddr =
@@ -136,6 +137,15 @@ async fn main() -> Result<()> {
         let rt = runtime.clone();
         tokio::spawn(async move {
             rt.network_health_loop().await;
+        });
+    }
+
+    // Spawn the adaptive swarm autopilot. Observe mode only records decisions;
+    // act mode applies bounded engine/queue commands from contained telemetry.
+    {
+        let rt = runtime.clone();
+        tokio::spawn(async move {
+            rt.autopilot_loop().await;
         });
     }
 

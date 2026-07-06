@@ -1,15 +1,30 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SwarmOtter</title>
+  <script>
+    (function() {
+      const storageKey = "swarmotter.theme";
+      const fallbackTheme = "dark";
+      let theme = fallbackTheme;
+      try {
+        const saved = window.localStorage.getItem(storageKey);
+        if (saved === "light" || saved === "dark") theme = saved;
+      } catch {
+        theme = fallbackTheme;
+      }
+      document.documentElement.dataset.theme = theme;
+    })();
+  </script>
   <link rel="icon" href="/favicon.ico" sizes="any">
   <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
   <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48x48.png">
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
   <link rel="manifest" href="/site.webmanifest">
+  <link rel="stylesheet" href="/vendor/tabulator/tabulator_midnight.min.css">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -25,7 +40,23 @@
       <button data-view="watch" class="nav">Watch</button>
       <button data-view="logs" class="nav">Logs</button>
     </nav>
-    <button id="health-badge" class="badge nav" data-view="doctor" type="button">checking</button>
+    <div class="header-actions">
+      <button id="theme-toggle" class="icon-button theme-toggle" type="button" aria-label="Switch to light theme" title="Switch to light theme">
+        <span class="theme-icon theme-icon-sun" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+          </svg>
+        </span>
+        <span class="theme-icon theme-icon-moon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+          </svg>
+        </span>
+        <span class="sr-only">Theme</span>
+      </button>
+      <button id="health-badge" class="badge nav" data-view="doctor" type="button">checking</button>
+    </div>
   </header>
 
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
@@ -39,6 +70,7 @@
     <section id="view-torrents" class="view">
       <div class="toolbar">
         <input id="search" type="search" placeholder="Filter torrents...">
+        <button id="clear-torrent-filters-btn" type="button" class="secondary" disabled>Clear Filters</button>
         <div class="bulk-actions" aria-label="Torrent selection actions">
           <button id="select-all-torrents-btn" type="button" class="secondary">Select All</button>
           <button id="deselect-all-torrents-btn" type="button" class="secondary" disabled>Deselect All</button>
@@ -47,17 +79,69 @@
         </div>
         <span id="stats-summary" class="muted"></span>
       </div>
-      <table id="torrent-table">
-        <thead>
-          <tr>
-            <th class="selection-column"><span class="sr-only">Selected</span></th>
-            <th>Name</th><th>Size</th><th>Progress</th><th>Status</th>
-            <th>Health</th>
-            <th>Down</th><th>Up</th><th>Ratio</th><th>Peers</th><th>Actions</th>
-          </tr>
-        </thead>
-        <tbody></tbody>
-      </table>
+      <div class="toolbar torrent-query-controls">
+        <label class="torrent-query-field">
+          <span>State</span>
+          <select id="torrent-state-filter">
+            <option value="">All states</option>
+            <option value="checking">checking</option>
+            <option value="downloading">downloading</option>
+            <option value="downloading_metadata">downloading_metadata</option>
+            <option value="paused">paused</option>
+            <option value="seeding">seeding</option>
+            <option value="error">error</option>
+            <option value="completed">completed</option>
+            <option value="network_blocked">network_blocked</option>
+            <option value="storage_error">storage_error</option>
+            <option value="tracker_error">tracker_error</option>
+            <option value="queued">queued</option>
+          </select>
+        </label>
+        <label class="torrent-query-field">
+          <span>Health</span>
+          <select id="torrent-health-filter">
+            <option value="">All health</option>
+            <option value="network_blocked">network_blocked</option>
+            <option value="unknown">unknown</option>
+            <option value="excellent">excellent</option>
+            <option value="good">good</option>
+            <option value="fair">fair</option>
+            <option value="poor">poor</option>
+            <option value="critical">critical</option>
+            <option value="stalled">stalled</option>
+            <option value="complete">complete</option>
+            <option value="paused">paused</option>
+          </select>
+        </label>
+        <label class="torrent-query-field">
+          <span>Performance</span>
+          <select id="torrent-performance-filter">
+            <option value="">All</option>
+            <option value="active">active</option>
+            <option value="error">error</option>
+            <option value="complete">complete</option>
+            <option value="transferring">transferring</option>
+            <option value="has_peers">has_peers</option>
+            <option value="no_peers">no_peers</option>
+            <option value="stalled">stalled</option>
+            <option value="unhealthy">unhealthy</option>
+          </select>
+        </label>
+        <label class="torrent-query-field">
+          <span>Per page</span>
+          <input id="torrent-per-page" type="number" min="1" max="500" value="200">
+        </label>
+        <div class="torrent-pagination">
+          <button id="torrent-prev-page-btn" type="button" class="secondary" disabled>Prev</button>
+          <span id="torrent-page-summary" class="muted">Page 0/0</span>
+          <button id="torrent-next-page-btn" type="button" class="secondary" disabled>Next</button>
+        </div>
+        <button id="save-torrent-view-btn" type="button" class="secondary">Save View</button>
+        <button id="load-torrent-view-btn" type="button" class="secondary">Load View</button>
+        <button id="clear-torrent-view-btn" type="button" class="secondary">Clear View</button>
+        <span id="query-summary" class="muted"></span>
+      </div>
+      <div id="torrent-table" class="torrent-table" aria-label="Torrent list"></div>
     </section>
 
     <!-- Add view -->
@@ -81,7 +165,8 @@
       <button id="back-btn">Back</button>
       <h2 id="details-title"></h2>
       <div id="details-health" class="card"></div>
-      <div id="details-summary"></div>
+      <div id="details-summary" class="card"></div>
+      <div id="details-autopilot" class="card"></div>
       <div class="tabs">
         <button data-tab="files" class="tab active">Files</button>
         <button data-tab="peers" class="tab">Peers</button>
@@ -127,9 +212,36 @@
 
     <!-- Settings view -->
     <section id="view-settings" class="view hidden">
-      <h2>Settings</h2>
       <form id="settings-editor" class="settings-layout">
-        <div id="settings-api" class="card">
+        <div class="settings-header">
+          <h2>Settings</h2>
+          <div class="settings-actions" aria-label="Settings actions">
+            <button id="save-settings-btn" type="submit">Save Settings</button>
+            <button id="reload-settings-btn" type="button" class="secondary">Reload</button>
+            <button id="reset-downloads-btn" type="button" class="danger">Reset</button>
+          </div>
+        </div>
+
+        <div class="settings-shell">
+          <nav class="settings-nav" aria-label="Settings sections">
+            <button type="button" class="settings-nav-item active" data-settings-target="api">API</button>
+            <button type="button" class="settings-nav-item" data-settings-target="compatibility">Compatibility</button>
+            <button type="button" class="settings-nav-item" data-settings-target="autopilot">Autopilot</button>
+            <button type="button" class="settings-nav-item" data-settings-target="storage">Storage</button>
+            <button type="button" class="settings-nav-item" data-settings-target="network">Network</button>
+            <button type="button" class="settings-nav-item" data-settings-target="torrent">Torrent</button>
+            <button type="button" class="settings-nav-item" data-settings-target="bandwidth">Bandwidth</button>
+            <button type="button" class="settings-nav-item" data-settings-target="queue">Queue</button>
+            <button type="button" class="settings-nav-item" data-settings-target="seeding">Seeding</button>
+            <button type="button" class="settings-nav-item" data-settings-target="dht">DHT</button>
+            <button type="button" class="settings-nav-item" data-settings-target="pex">PEX</button>
+            <button type="button" class="settings-nav-item" data-settings-target="watch">Watch folders</button>
+            <button type="button" class="settings-nav-item" data-settings-target="logging">Logging</button>
+            <button type="button" class="settings-nav-item" data-settings-target="interface">Interface</button>
+          </nav>
+
+          <div class="settings-detail">
+        <div id="settings-api" class="card settings-panel active" data-settings-panel="api" tabindex="-1">
           <h3>API</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Bind address</span><input id="cfg-api-bind-address" type="text" required></label>
@@ -139,22 +251,39 @@
           </div>
         </div>
 
-        <div id="settings-compatibility" class="card">
+        <div id="settings-compatibility" class="card settings-panel" data-settings-panel="compatibility" tabindex="-1" hidden>
           <h3>Compatibility</h3>
           <label class="settings-check"><input id="cfg-compat-transmission-enabled" type="checkbox"><span>Transmission RPC API</span></label>
+          <label class="settings-check"><input id="cfg-compat-qbittorrent-enabled" type="checkbox"><span>qBittorrent WebUI API</span></label>
         </div>
 
-        <div id="settings-storage" class="card">
+        <div id="settings-autopilot" class="card settings-panel" data-settings-panel="autopilot" tabindex="-1" hidden>
+          <h3>Autopilot</h3>
+          <div class="settings-form-grid">
+            <label class="settings-field">
+              <span>Global mode</span>
+              <select id="cfg-autopilot-mode">
+                <option value="disabled">Disabled</option>
+                <option value="observe">Observe</option>
+                <option value="act">Act</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
+        <div id="settings-storage" class="card settings-panel" data-settings-panel="storage" tabindex="-1" hidden>
           <h3>Storage</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Download directory</span><input id="cfg-storage-download-dir" type="text"></label>
             <label class="settings-field"><span>Incomplete directory</span><input id="cfg-storage-incomplete-dir" type="text"></label>
+            <label class="settings-field"><span>Minimum free space bytes</span><input id="cfg-storage-minimum-free-space-bytes" type="number" min="0" step="1"></label>
+            <label class="settings-field"><span>Minimum free space percent</span><input id="cfg-storage-minimum-free-space-percent" type="number" min="0" max="100" step="1"></label>
             <label class="settings-check"><input id="cfg-storage-preallocate" type="checkbox"><span>Preallocate files</span></label>
             <label class="settings-check"><input id="cfg-storage-sparse" type="checkbox"><span>Sparse files</span></label>
           </div>
         </div>
 
-        <div id="settings-network" class="card settings-wide">
+        <div id="settings-network" class="card settings-panel" data-settings-panel="network" tabindex="-1" hidden>
           <h3>Network containment</h3>
           <div class="settings-form-grid">
             <label class="settings-field">
@@ -176,9 +305,17 @@
           </div>
         </div>
 
-        <div id="settings-torrent" class="card">
+        <div id="settings-torrent" class="card settings-panel" data-settings-panel="torrent" tabindex="-1" hidden>
           <h3>Torrent</h3>
           <div class="settings-form-grid">
+            <label class="settings-field">
+              <span>Encryption mode</span>
+              <select id="cfg-torrent-encryption-mode">
+                <option value="disabled">Disabled</option>
+                <option value="preferred">Preferred</option>
+                <option value="required">Required</option>
+              </select>
+            </label>
             <label class="settings-field"><span>Listen port</span><input id="cfg-torrent-listen-port" type="number" min="1" max="65535" step="1" required></label>
             <label class="settings-check"><input id="cfg-torrent-allow-ipv6" type="checkbox"><span>Allow IPv6 peers</span></label>
             <label class="settings-check"><input id="cfg-torrent-utp-enabled" type="checkbox"><span>Enable uTP</span></label>
@@ -187,7 +324,7 @@
           </div>
         </div>
 
-        <div id="settings-bandwidth" class="card">
+        <div id="settings-bandwidth" class="card settings-panel" data-settings-panel="bandwidth" tabindex="-1" hidden>
           <h3>Bandwidth</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Global download B/s</span><input id="cfg-bandwidth-global-download" type="number" min="0" step="1" required></label>
@@ -200,7 +337,7 @@
           </div>
         </div>
 
-        <div id="settings-queue" class="card">
+        <div id="settings-queue" class="card settings-panel" data-settings-panel="queue" tabindex="-1" hidden>
           <h3>Queue</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Max active downloads</span><input id="cfg-queue-max-active-downloads" type="number" min="0" step="1" required></label>
@@ -209,7 +346,7 @@
           </div>
         </div>
 
-        <div id="settings-seeding" class="card">
+        <div id="settings-seeding" class="card settings-panel" data-settings-panel="seeding" tabindex="-1" hidden>
           <h3>Seeding</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Global ratio limit</span><input id="cfg-seeding-global-ratio-limit" type="number" min="0" step="0.01"></label>
@@ -217,7 +354,7 @@
           </div>
         </div>
 
-        <div id="settings-dht" class="card">
+        <div id="settings-dht" class="card settings-panel" data-settings-panel="dht" tabindex="-1" hidden>
           <h3>DHT</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Port</span><input id="cfg-dht-port" type="number" min="1" max="65535" step="1" required></label>
@@ -226,7 +363,7 @@
           <label class="settings-field"><span>Bootstrap nodes</span><textarea id="cfg-dht-bootstrap-nodes" class="settings-list" rows="5" spellcheck="false"></textarea></label>
         </div>
 
-        <div id="settings-pex" class="card">
+        <div id="settings-pex" class="card settings-panel" data-settings-panel="pex" tabindex="-1" hidden>
           <h3>PEX</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Max peers</span><input id="cfg-pex-max-peers" type="number" min="0" step="1" required></label>
@@ -234,7 +371,7 @@
           </div>
         </div>
 
-        <div id="settings-watch" class="card settings-wide">
+        <div id="settings-watch" class="card settings-panel" data-settings-panel="watch" tabindex="-1" hidden>
           <div class="settings-card-heading">
             <h3>Watch folders</h3>
             <button id="add-watch-folder-btn" type="button">Add Folder</button>
@@ -242,7 +379,7 @@
           <div id="settings-watch-list" class="settings-watch-list"></div>
         </div>
 
-        <div id="settings-logging" class="card">
+        <div id="settings-logging" class="card settings-panel" data-settings-panel="logging" tabindex="-1" hidden>
           <h3>Logging</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Level</span><input id="cfg-logging-level" type="text" list="logging-level-options" required></label>
@@ -259,7 +396,7 @@
           </div>
         </div>
 
-        <div id="settings-interface" class="card">
+        <div id="settings-interface" class="card settings-panel" data-settings-panel="interface" tabindex="-1" hidden>
           <h3>Interface</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Toast display seconds</span><input id="toast-seconds" type="number" min="1" max="60" step="1"></label>
@@ -267,15 +404,11 @@
           </div>
         </div>
 
-        <div class="settings-actions settings-wide">
-          <button id="save-settings-btn" type="submit">Save Settings</button>
-          <button id="reload-settings-btn" type="button" class="secondary">Reload</button>
-          <button id="reset-downloads-btn" type="button" class="danger">Reset</button>
-        </div>
-
         <div id="settings-save-status" class="card settings-wide">
           <h3>Save status</h3>
           <p class="muted">No save operation yet.</p>
+        </div>
+          </div>
         </div>
       </form>
     </section>
@@ -319,6 +452,10 @@
           <h3>Health summary</h3>
           <p class="muted">System diagnostics summary appears here.</p>
         </div>
+        <div id="doctor-storage" class="card">
+          <h3>Storage diagnostics</h3>
+          <p class="muted">Storage-root diagnostics appear here.</p>
+        </div>
         <div id="doctor-application" class="card">
           <h3>Application</h3>
           <p class="muted">Version and build details appear here.</p>
@@ -331,6 +468,7 @@
     </section>
   </main>
 
+  <script src="/vendor/tabulator/tabulator.min.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

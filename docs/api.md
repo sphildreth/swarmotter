@@ -66,6 +66,7 @@ The root `/health` path is also available without the `/api/v1` prefix.
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/torrents` | List torrents. |
+| GET | `/torrents/query` | Query torrents with server-side filters, sorting, pagination, counts, and optional grouping. |
 | POST | `/torrents` | Add magnet JSON or raw `.torrent` body. |
 | POST | `/torrents/magnet` | Add magnet JSON: `{ magnet, download_dir?, paused?, start_behavior? }`. |
 | POST | `/torrents/file` | Upload raw `.torrent` body. |
@@ -89,7 +90,11 @@ order. For JSON magnet adds, set either `paused: true` or
 `start_behavior: "paused"`. For raw `.torrent` uploads, use
 `?paused=true` or `?start_behavior=paused` on `/torrents` or
 `/torrents/file`. `paused` and `start_behavior` must agree when both are
-provided. Strict fail-closed network blocking can still put the new torrent in
+provided. If add-time free-space preflight is configured, add requests can fail
+before write with a storage-capacity error when the target root does not meet the
+reserve configured under `[storage]`.
+
+Strict fail-closed network blocking can still put the new torrent in
 `network_blocked` instead of `paused`.
 
 Successful add responses mean the torrent record was registered and inserted
@@ -121,6 +126,48 @@ Bulk remove requests use:
 
 The response includes `removed` and `not_found` info-hash arrays. The daemon
 removes all found records and reconciles queue state once for the batch.
+
+Large-library clients should use `GET /torrents/query` instead of repeatedly
+fetching the full list. Supported query parameters are:
+
+| Parameter | Description |
+| --- | --- |
+| `q` | Case-insensitive search across name, info hash, state, health, label, and storage root. |
+| `state` | Comma-separated torrent states such as `downloading`, `paused`, or `error`. |
+| `health` | Comma-separated health labels such as `good`, `stalled`, or `network_blocked`. |
+| `label` | Comma-separated labels; unlabeled torrents use `unlabeled`. |
+| `storage_root` | Comma-separated download roots; torrents without an explicit root use `default`. |
+| `performance` | Comma-separated buckets: `active`, `error`, `complete`, `transferring`, `has_peers`, `no_peers`, `stalled`, `unhealthy`. |
+| `min_peers`, `max_peers` | Filter by the greater of active peer workers and known peers. |
+| `min_down_rate`, `min_up_rate` | Filter by current byte/sec rates. |
+| `sort` | One of `name`, `state`, `health`, `health_score`, `progress`, `size`, `down_rate`, `up_rate`, `ratio`, `peers`, `added`, `completed`, or `queue`. |
+| `dir` | `asc` or `desc`. |
+| `page` | 1-based page number. |
+| `per_page` | Page size, capped by the daemon; `0` returns counts and groups without rows. |
+| `group_by` | Optional grouping: `state`, `health`, `label`, `storage_root`, or `performance`. |
+
+The response data object is:
+
+```json
+{
+  "rows": [],
+  "total": 1000,
+  "filtered": 42,
+  "page": 1,
+  "per_page": 100,
+  "page_count": 1,
+  "sort": "name",
+  "dir": "asc",
+  "counts": {
+    "states": { "downloading": 10 },
+    "health": { "good": 8 },
+    "labels": { "linux": 6 },
+    "storage_roots": { "/data/linux": 6 },
+    "performance": { "active": 10 }
+  },
+  "groups": [{ "key": "downloading", "label": "Downloading", "count": 10 }]
+}
+```
 
 `/torrents/:hash/stats` includes counters, rates, limits, active peer workers,
 known peers, live peer scheduler diagnostics, tracker diagnostics, and DHT/PEX
@@ -158,6 +205,10 @@ reported one.
 | --- | --- | --- |
 | GET | `/torrents/:hash/peers` | List peers. |
 
+Peer rows include the discovered peer address, direction, current rates, flags,
+and ban state. Negotiated per-peer encryption state is not exposed in this
+phase.
+
 ## Queue
 
 | Method | Path | Description |
@@ -177,6 +228,18 @@ reported one.
 
 `PATCH /settings` updates live-safe bandwidth, queue, and seeding fields.
 
+`PUT /settings` includes `torrent.encryption_mode` and
+`[torrent].encryption_mode` values:
+
+- `disabled`
+- `preferred` (default)
+- `required`
+
+Changing this field is reported in `restart_required_fields` for already-running
+torrent tasks.
+
+Per-profile and per-torrent overrides are not yet documented in this phase.
+
 `PUT /settings` validates the full config before persistence, preserves the
 existing `api.auth_token` when omitted, applies live-safe fields immediately,
 and reports fields that require restart.
@@ -188,7 +251,46 @@ and reports fields that require restart.
 | GET | `/network/health` | Network containment health. |
 | GET | `/network/diagnostics` | Detailed network/path diagnostics. |
 
-See [Network Containment](network-containment.md) for health state meanings.
+`/network/diagnostics` includes transport settings such as `utp_enabled`,
+`utp_prefer_tcp`, and `peer_encryption_mode`. See
+[Network Containment](network-containment.md) for health state meanings.
+
+## Storage
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/storage/roots` | Return diagnostics for configured storage roots, including free space and availability. |
+
+The storage diagnostics response currently includes per-root identity and space
+data needed by operators and automation. Typical fields include:
+
+```json
+{
+  "roots": [
+    {
+      "path": "/mnt/media/downloads",
+      "roles": ["download"],
+      "exists": true,
+      "is_directory": true,
+      "writable": true,
+      "filesystem_type": "ext",
+      "total_space_bytes": 1024,
+      "free_space_bytes": 128,
+      "available_space_bytes": 120,
+      "required_free_space_bytes": 64,
+      "reserve_satisfied": true,
+      "torrent_count": 4,
+      "active_torrents": 2,
+      "active_write_rate": 1048576,
+      "active_recheck_rate": 0,
+      "warnings": []
+    }
+  ],
+  "minimum_free_space_bytes": 0,
+  "minimum_free_space_percent": 0,
+  "generated_at": 1783227600
+}
+```
 
 ## Watch folders
 
@@ -340,3 +442,35 @@ delete-data option.
 
 `torrent-add` accepts magnet links via `filename` and base64 torrent metadata
 via `metainfo`. Remote HTTP/HTTPS torrent metadata URLs are rejected.
+
+## qBittorrent-compatible API compatibility
+
+When enabled, `/api/v2` is a compatibility adapter over native daemon
+operations. It is not a separate data-plane implementation and does not expose
+indexing, search, or discovery endpoints.
+
+Enable it with:
+
+```toml
+[compatibility.qbittorrent]
+enabled = true
+```
+
+Authentication follows `api.require_auth`:
+
+- Bearer token flow via `Authorization` / `X-SwarmOtter-Auth`.
+- qBittorrent-style `SID` flow via `POST /api/v2/auth/login` and a returned `SID`
+  cookie.
+
+Representative automation endpoints:
+
+- `GET /api/v2/app/version`
+- `GET /api/v2/app/webapiVersion`
+- `GET /api/v2/torrents/info`
+- `POST /api/v2/torrents/add`
+- `POST /api/v2/torrents/delete`
+- `POST /api/v2/torrents/pause`
+- `POST /api/v2/torrents/resume`
+- `POST /api/v2/torrents/start`
+- `POST /api/v2/torrents/stop`
+- `POST /api/v2/torrents/setCategory`

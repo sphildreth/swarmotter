@@ -11,20 +11,33 @@ require_auth = true
 auth_token = "replace-with-a-long-random-token"
 max_request_body_bytes = 16777216
 
+[compatibility.transmission]
+enabled = false
+
+[compatibility.qbittorrent]
+enabled = false
+
 [storage]
 download_dir = "/data/downloads"
 incomplete_dir = "/data/incomplete"
+minimum_free_space_bytes = 0
+minimum_free_space_percent = 0
 preallocate = false
 sparse = true
 
 [network]
 mode = "disabled"
 
+[autopilot]
+# Optional: disabled (off), observe (reasons only), or act (recommendations).
+mode = "observe"
+
 [torrent]
 listen_port = 51413
 allow_ipv6 = true
 utp_enabled = true
 utp_prefer_tcp = true
+encryption_mode = "preferred"
 selfish = false
 
 [bandwidth]

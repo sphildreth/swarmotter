@@ -40,6 +40,8 @@ mode = "disabled"
 listen_port = 51413
 allow_ipv6 = true
 utp_enabled = true
+utp_prefer_tcp = true
+encryption_mode = "preferred"
 ```
 
 With this layout, active downloads write partial data under `incomplete`.
@@ -134,3 +136,51 @@ helper calls. Mutating calls map to native SwarmOtter operations; for example,
 payload data.
 
 Remote HTTP/HTTPS torrent URL fetching is not supported through this endpoint.
+
+## Optional qBittorrent-compatible endpoint
+
+SwarmOtter can also expose an optional qBittorrent-compatible endpoint at
+`/api/v2` when enabled:
+
+```toml
+[compatibility.qbittorrent]
+enabled = true
+```
+
+Use the same API auth token to protect the endpoint as you do for native API:
+
+```toml
+[api]
+require_auth = true
+auth_token = "replace-with-a-long-random-token"
+```
+
+Authentication is supported through:
+
+- Bearer token via `Authorization: Bearer <token>` (and
+  `X-SwarmOtter-Auth`).
+- qBittorrent-style SID cookie flow:
+
+```bash
+curl -i -X POST \
+  http://127.0.0.1:9091/api/v2/auth/login \
+  --data "username=swarmotter&password=replace-with-a-long-random-token"
+```
+
+Use the returned `SID` cookie for subsequent `/api/v2` requests.
+
+For automation, the shim currently documents and supports:
+
+- `GET /api/v2/app/version`
+- `GET /api/v2/app/webapiVersion`
+- `GET /api/v2/torrents/info`
+- `POST /api/v2/torrents/add`
+- `POST /api/v2/torrents/delete`
+- `POST /api/v2/torrents/pause`
+- `POST /api/v2/torrents/resume`
+- `POST /api/v2/torrents/start`
+- `POST /api/v2/torrents/stop`
+- `POST /api/v2/torrents/setCategory`
+
+The shim is opt-in by design, keeps the native API as the source of truth, and
+does not expose indexer/search/discovery compatibility endpoints.

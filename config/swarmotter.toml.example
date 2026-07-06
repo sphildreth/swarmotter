@@ -13,10 +13,19 @@ require_auth = false
 # Maximum API request body size in bytes.
 max_request_body_bytes = 16777216
 
+# --- Compatibility APIs ---
+[compatibility.transmission]
+enabled = false
+
+[compatibility.qbittorrent]
+enabled = false
+
 # --- Storage ---
 [storage]
 download_dir = "/data/downloads"
 incomplete_dir = "/data/incomplete"
+minimum_free_space_bytes = 0
+minimum_free_space_percent = 0
 preallocate = false
 sparse = true
 
@@ -36,6 +45,11 @@ validate_route = true
 # before torrent hostname resolution is allowed.
 validate_dns = true
 
+# --- Autopilot ---
+[autopilot]
+# Optional: disabled (off), observe (reasons only), or act (recommendations).
+mode = "observe"
+
 # --- Torrent peer listener (data plane) ---
 [torrent]
 listen_port = 51413
@@ -47,6 +61,9 @@ utp_enabled = true
 # When uTP is enabled, prefer TCP (try TCP first, fall back to uTP). Set to
 # false to prefer uTP.
 utp_prefer_tcp = true
+# TCP peer-wire encryption policy: disabled, preferred, or required. Preferred
+# attempts MSE/PE first while preserving plaintext fallback for compatibility.
+encryption_mode = "preferred"
 # Selfish mode removes a torrent from SwarmOtter immediately after the download
 # completes. Downloaded files are kept, but SwarmOtter will not seed the torrent
 # after completion. Useful when SwarmOtter should fetch content and then stop

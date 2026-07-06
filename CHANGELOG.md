@@ -5,8 +5,75 @@ This file records notable project changes. It follows the
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 All notable changes are recorded by capability and acceptance criteria, not by
-date or duration estimates. SwarmOtter's first release is `v1.0.0`; there is no
-MVP release.
+date or duration estimates.
+
+## [1.1.0] - [2026-07-06]
+
+### Added
+
+- **qBittorrent-compatible `/api/v2` shim:** added an optional
+  `[compatibility.qbittorrent]` toggle for opt-in qBittorrent-style API
+  compatibility. The adapter uses the native API as source of truth, supports
+  Bearer token plus `/api/v2/auth/login` SID-cookie auth flow, and documents a
+  focused automation subset including version and torrent lifecycle endpoints
+  (`/api/v2/app/version`, `/api/v2/app/webapiVersion`,
+  `/api/v2/torrents/info`, `/api/v2/torrents/add`, `/api/v2/torrents/delete`,
+  `/api/v2/torrents/pause`, `/api/v2/torrents/resume`,
+  `/api/v2/torrents/start`, `/api/v2/torrents/stop`,
+  `/api/v2/torrents/setCategory`) with no indexer/search or torrent-discovery
+  surface. ADR-0038 records this compatibility decision.
+- **Web UI sortable and filterable torrent table:** the torrent list now uses
+  a vendored Tabulator grid with clickable column sorting, reversible sort
+  direction, status/health header filters, numeric comparison filters for
+  columns such as progress, rates, ratio, size, and peers, and a Clear Filters
+  control while preserving existing row actions and bulk selection behavior.
+  ADR-0033 records the Tabulator dependency decision.
+- **Web UI light and dark theme toggle:** the header now includes a theme icon
+  that toggles between the default dark theme and a light theme, persists the
+  browser preference locally, and applies theme-aware Tabulator table colors.
+  ADR-0034 records the browser preference decision.
+- **Adaptive swarm performance autopilot:** added `[autopilot].mode`
+  (`disabled`/`observe`/`act`, default `observe`), per-torrent mode overrides,
+  API endpoints for global status and per-torrent "why is this slow?"
+  decisions, Settings tab global mode editing, Web UI diagnostics/per-torrent
+  override controls, and daemon-side act-mode actions for bounded discovery
+  refresh, peer-worker tuning, peer-backoff relaxation, and queue-slot release
+  using existing contained telemetry.
+  ADR-0035 records the control and containment decision.
+- **Disk-aware storage diagnostics and preflight:** added
+  `GET /api/v1/storage/roots` for per-root storage diagnostics, configurable
+  free-space reserve enforcement under `[storage]`
+  (`minimum_free_space_bytes`, `minimum_free_space_percent`), add/start-time
+  storage preflight before payload writes, Settings fields for the reserve
+  values, and a Doctor storage diagnostics card. ADR-0037 records this phased
+  contract.
+- **Web UI Settings two-panel layout:** Settings now uses a left section
+  navigation menu with one editable detail panel visible at a time, while
+  preserving the existing full-configuration save path and keeping the
+  Save/Reload/Reset controls in a single header action row.
+- **TCP Protocol Encryption / MSE-PE support:** added
+  `torrent.encryption_mode` with `disabled`, `preferred` (default), and
+  `required` modes. The implementation applies to TCP peer-wire negotiation
+  through the same contained peer sockets used by existing transport paths and
+  does not create separate encryption sockets or a containment bypass. uTP
+  encryption and per-profile/per-torrent overrides remain planned.
+  ADR-0039 records this phase decision.
+- **Large-library Web UI operations console:** added
+  `GET /api/v1/torrents/query` for server-side torrent-list search, filters,
+  sorting, pagination, bucket counts, counts-only queries, and optional
+  grouping while preserving the legacy full-array `GET /api/v1/torrents`
+  response. The Web UI now uses the query endpoint for the torrent list, adds
+  state/health/performance filters, page-size and previous/next controls,
+  query result metadata, and a browser-local saved view for the large-library
+  filter and sort state. ADR-0036 records the query API decision.
+
+### Fixed
+
+- **Retryable magnet metadata discovery:** magnets that discover no peers while
+  fetching BEP 9 metadata now remain in `downloading_metadata` with a retry
+  backoff instead of being moved to terminal `error`. Completed and failed
+  engine tasks also clear their runtime handles so explicit resume/start
+  actions and scheduled retries can start a fresh engine task.
 
 ## [1.0.0] - [2026-07-04]
 

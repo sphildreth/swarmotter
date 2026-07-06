@@ -7,6 +7,7 @@
 //! sockets directly; all torrent traffic goes through the containment layer
 //! (see `swarmotter-core::net` and `design/vpn-network-containment.md`).
 
+pub mod autopilot;
 pub mod bandwidth;
 pub mod bencode;
 pub mod config;
@@ -18,6 +19,7 @@ pub mod hash;
 pub mod magnet;
 pub mod meta;
 pub mod models;
+pub mod mse;
 pub mod net;
 pub mod peer;
 pub mod queue;
@@ -29,6 +31,7 @@ pub mod udp_tracker;
 pub mod utp;
 pub mod watch;
 
+pub use autopilot::{AutopilotAnalyzer, AutopilotConfig, AutopilotMode};
 pub use error::{CoreError, Result};
 pub use hash::InfoHash;
 pub use magnet::Magnet;

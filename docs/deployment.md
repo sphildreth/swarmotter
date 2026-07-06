@@ -260,6 +260,8 @@ validate_dns = true
 listen_port = 51413
 allow_ipv6 = true
 utp_enabled = true
+utp_prefer_tcp = true
+encryption_mode = "preferred"
 ```
 
 The service user needs write access to both storage directories. Incomplete

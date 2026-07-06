@@ -7,6 +7,7 @@
 //! fields separated by double underscores, e.g. `SWARMOTTER_API__BIND_ADDRESS`.
 //! Invalid required configuration produces clear startup errors.
 
+use crate::autopilot::AutopilotConfig;
 use crate::bandwidth::BandwidthLimits;
 use crate::error::{CoreError, Result};
 use crate::net::NetworkConfig;
@@ -34,6 +35,8 @@ pub struct Config {
     #[serde(default)]
     pub seeding: SeedingPolicy,
     #[serde(default)]
+    pub autopilot: AutopilotConfig,
+    #[serde(default)]
     pub dht: DhtConfig,
     #[serde(default)]
     pub pex: PexConfig,
@@ -47,11 +50,20 @@ pub struct Config {
 pub struct CompatibilityConfig {
     #[serde(default)]
     pub transmission: TransmissionCompatibilityConfig,
+    #[serde(default)]
+    pub qbittorrent: QbittorrentCompatibilityConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TransmissionCompatibilityConfig {
     /// Enable the Transmission RPC compatibility adapter at `/transmission/rpc`.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QbittorrentCompatibilityConfig {
+    /// Enable the qBittorrent-compatible Web API adapter at `/api/v2`.
     #[serde(default)]
     pub enabled: bool,
 }
@@ -95,6 +107,14 @@ pub struct StorageConfig {
     pub download_dir: Option<String>,
     #[serde(default)]
     pub incomplete_dir: Option<String>,
+    /// Minimum free bytes to keep available on storage roots after planned
+    /// torrent writes. `0` disables byte-reserve enforcement.
+    #[serde(default)]
+    pub minimum_free_space_bytes: u64,
+    /// Minimum percent of the storage root to keep available after planned
+    /// torrent writes. `0` disables percent-reserve enforcement.
+    #[serde(default)]
+    pub minimum_free_space_percent: u8,
     /// Whether to preallocate files on disk.
     #[serde(default)]
     pub preallocate: bool,
@@ -112,6 +132,8 @@ impl Default for StorageConfig {
         Self {
             download_dir: None,
             incomplete_dir: None,
+            minimum_free_space_bytes: 0,
+            minimum_free_space_percent: 0,
             preallocate: false,
             sparse: true,
         }
@@ -135,12 +157,36 @@ pub struct TorrentConfig {
     /// the other transport remains available.
     #[serde(default = "default_true")]
     pub utp_prefer_tcp: bool,
+    /// Peer wire encryption policy for TCP peers. `preferred` attempts MSE/PE
+    /// first and falls back to plaintext; `required` refuses plaintext peer
+    /// wire sessions and disables uTP fallback until encrypted uTP is added.
+    #[serde(default)]
+    pub encryption_mode: PeerEncryptionMode,
     /// Selfish mode: when true, SwarmOtter removes a torrent from the daemon
     /// immediately after its download completes (all pieces verified). The
     /// downloaded files are kept, but SwarmOtter will not seed the torrent
     /// after completion. Default is false (normal completion/seeding).
     #[serde(default)]
     pub selfish: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerEncryptionMode {
+    Disabled,
+    #[default]
+    Preferred,
+    Required,
+}
+
+impl PeerEncryptionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Preferred => "preferred",
+            Self::Required => "required",
+        }
+    }
 }
 
 fn default_utp_enabled() -> bool {
@@ -158,6 +204,7 @@ impl Default for TorrentConfig {
             allow_ipv6: true,
             utp_enabled: default_utp_enabled(),
             utp_prefer_tcp: true,
+            encryption_mode: PeerEncryptionMode::default(),
             selfish: false,
         }
     }
@@ -368,6 +415,11 @@ impl Config {
         if self.dht.port == 0 {
             return Err(CoreError::InvalidConfig("dht.port must be > 0".into()));
         }
+        if self.storage.minimum_free_space_percent > 100 {
+            return Err(CoreError::InvalidConfig(
+                "storage.minimum_free_space_percent must be between 0 and 100".into(),
+            ));
+        }
         for w in &self.watch {
             if w.path.is_empty() {
                 return Err(CoreError::InvalidConfig(
@@ -418,10 +470,49 @@ mod tests {
         assert!(cfg.network.allow_ipv6);
         assert!(cfg.torrent.allow_ipv6);
         assert!(cfg.torrent.utp_enabled);
+        assert_eq!(cfg.torrent.encryption_mode, PeerEncryptionMode::Preferred);
         assert_eq!(cfg.logging.level, "info");
         assert!(cfg.logging.file);
         assert!(!cfg.torrent.selfish);
         assert!(!cfg.compatibility.transmission.enabled);
+        assert!(matches!(
+            cfg.autopilot.mode,
+            crate::autopilot::AutopilotMode::Observe
+        ));
+    }
+
+    #[test]
+    fn autopilot_config_defaults_to_observe() {
+        let toml = r#"
+[torrent]
+listen_port = 51413
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert!(matches!(
+            cfg.autopilot.mode,
+            crate::autopilot::AutopilotMode::Observe
+        ));
+    }
+
+    #[test]
+    fn autopilot_config_parses_and_env_override() {
+        let toml = r#"
+[autopilot]
+mode = "act"
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert!(matches!(
+            cfg.autopilot.mode,
+            crate::autopilot::AutopilotMode::Act
+        ));
+
+        let cfg = Config::default();
+        let env = vec![("SWARMOTTER_AUTOPILOT__MODE".into(), "disabled".into())];
+        let cfg = cfg.apply_env_overrides(&env).unwrap();
+        assert!(matches!(
+            cfg.autopilot.mode,
+            crate::autopilot::AutopilotMode::Disabled
+        ));
     }
 
     #[test]
@@ -483,6 +574,8 @@ bind_address = "0.0.0.0:9091"
 [storage]
 download_dir = "/data/downloads"
 incomplete_dir = "/data/incomplete"
+minimum_free_space_bytes = 1048576
+minimum_free_space_percent = 5
 
 [network]
 mode = "strict"
@@ -500,6 +593,38 @@ listen_port = 51413
         assert_eq!(cfg.api.bind_address, "0.0.0.0:9091");
         assert_eq!(cfg.network.required_interface.as_deref(), Some("tun0"));
         assert!(cfg.storage.download_dir.as_deref() == Some("/data/downloads"));
+        assert_eq!(cfg.storage.minimum_free_space_bytes, 1_048_576);
+        assert_eq!(cfg.storage.minimum_free_space_percent, 5);
+    }
+
+    #[test]
+    fn storage_free_space_percent_validates_range() {
+        let err = Config::from_toml_str(
+            r#"
+[storage]
+minimum_free_space_percent = 101
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("minimum_free_space_percent"));
+    }
+
+    #[test]
+    fn storage_reserve_env_overrides_apply() {
+        let cfg = Config::default()
+            .apply_env_overrides(&[
+                (
+                    "SWARMOTTER_STORAGE__MINIMUM_FREE_SPACE_BYTES".into(),
+                    "4096".into(),
+                ),
+                (
+                    "SWARMOTTER_STORAGE__MINIMUM_FREE_SPACE_PERCENT".into(),
+                    "7".into(),
+                ),
+            ])
+            .unwrap();
+        assert_eq!(cfg.storage.minimum_free_space_bytes, 4096);
+        assert_eq!(cfg.storage.minimum_free_space_percent, 7);
     }
 
     #[test]
@@ -519,21 +644,32 @@ listen_port = 51413
     }
 
     #[test]
-    fn transmission_compatibility_parses_and_env_overrides() {
+    fn compatibility_parses_and_env_overrides() {
         let toml = r#"
 [compatibility.transmission]
+enabled = true
+
+[compatibility.qbittorrent]
 enabled = true
 "#;
         let cfg = Config::from_toml_str(toml).unwrap();
         assert!(cfg.compatibility.transmission.enabled);
+        assert!(cfg.compatibility.qbittorrent.enabled);
 
         let cfg = Config::default();
-        let env = vec![(
-            "SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED".into(),
-            "true".into(),
-        )];
+        let env = vec![
+            (
+                "SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED".into(),
+                "true".into(),
+            ),
+            (
+                "SWARMOTTER_COMPATIBILITY__QBITTORRENT__ENABLED".into(),
+                "true".into(),
+            ),
+        ];
         let cfg = cfg.apply_env_overrides(&env).unwrap();
         assert!(cfg.compatibility.transmission.enabled);
+        assert!(cfg.compatibility.qbittorrent.enabled);
     }
 
     #[test]
@@ -571,6 +707,24 @@ selfish = true
         let env = vec![("SWARMOTTER_TORRENT__SELFISH".into(), "true".into())];
         let cfg = cfg.apply_env_overrides(&env).unwrap();
         assert!(cfg.torrent.selfish);
+    }
+
+    #[test]
+    fn torrent_encryption_mode_parses_and_env_override() {
+        let toml = r#"
+[torrent]
+encryption_mode = "required"
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.torrent.encryption_mode, PeerEncryptionMode::Required);
+
+        let cfg = Config::default();
+        let env = vec![(
+            "SWARMOTTER_TORRENT__ENCRYPTION_MODE".into(),
+            "disabled".into(),
+        )];
+        let cfg = cfg.apply_env_overrides(&env).unwrap();
+        assert_eq!(cfg.torrent.encryption_mode, PeerEncryptionMode::Disabled);
     }
 
     #[test]
