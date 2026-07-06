@@ -7,6 +7,17 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [1.1.2] - [2026-07-06]
+
+### Fixed
+
+- **Release image glibc compatibility:** Linux release artifacts are now built
+  inside a Debian bookworm Rust container and checked against the Debian
+  bookworm glibc floor before publishing. The release container image continues
+  to stage those same prebuilt binaries, but the staged `swarmotterd` binary no
+  longer depends on newer GitHub runner glibc versions that are unavailable in
+  the runtime image.
+
 ## [1.1.1] - [2026-07-06]
 
 ### Fixed

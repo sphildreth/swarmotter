@@ -26,13 +26,17 @@ Stable `vX.Y.Z` tags publish these release artifacts:
 - `SHA256SUMS` for GitHub Release assets.
 - A multi-architecture GHCR image for `linux/amd64` and `linux/arm64`.
 
-The release workflow builds native binaries with Rust release targets on the
-GitHub runner. `x86_64-unknown-linux-gnu` builds natively, while
-`aarch64-unknown-linux-gnu` uses the aarch64 GNU linker and Linux target
-sysroot. The release container image downloads the release tarballs and stages
-those same prebuilt binaries through the `runtime-prebuilt` Dockerfile target,
-so release image publication does not compile Rust inside emulated Docker
-builds.
+The release workflow builds native binaries with Rust release targets inside a
+Debian bookworm Rust container. `x86_64-unknown-linux-gnu` builds natively in
+that container, while `aarch64-unknown-linux-gnu` uses the bookworm aarch64 GNU
+linker and Linux target sysroot. This pins the glibc floor to the same Debian
+family used by the runtime image and prevents binaries built on a newer GitHub
+runner userspace from requiring glibc versions that the image cannot provide.
+The workflow rejects release binaries whose required glibc version exceeds the
+runtime image floor. The release container image downloads the release tarballs
+and stages those same prebuilt binaries through the `runtime-prebuilt`
+Dockerfile target, so release image publication does not compile Rust inside
+emulated Docker builds.
 
 The packages install the daemon, default configuration, systemd unit, service
 account, and standard state/download directories, but they do not start the
