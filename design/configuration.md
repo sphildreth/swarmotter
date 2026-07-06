@@ -34,6 +34,8 @@ updates use two API paths:
 Configuration table names, field names, environment override names, defaults,
 and validation behavior are release-facing. Breaking changes should follow
 `VERSIONING_GUIDE.md`.
+- Autopilot control is compatible through `[autopilot].mode`, with exactly
+  three values: `disabled`, `observe`, and `act`. Default is `observe`.
 
 Compatibility adapter settings belong under `[compatibility.*]` so optional
 adapter surfaces remain isolated from native daemon configuration.

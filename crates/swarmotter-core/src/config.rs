@@ -7,6 +7,7 @@
 //! fields separated by double underscores, e.g. `SWARMOTTER_API__BIND_ADDRESS`.
 //! Invalid required configuration produces clear startup errors.
 
+use crate::autopilot::AutopilotConfig;
 use crate::bandwidth::BandwidthLimits;
 use crate::error::{CoreError, Result};
 use crate::net::NetworkConfig;
@@ -33,6 +34,8 @@ pub struct Config {
     pub queue: QueueLimits,
     #[serde(default)]
     pub seeding: SeedingPolicy,
+    #[serde(default)]
+    pub autopilot: AutopilotConfig,
     #[serde(default)]
     pub dht: DhtConfig,
     #[serde(default)]
@@ -422,6 +425,44 @@ mod tests {
         assert!(cfg.logging.file);
         assert!(!cfg.torrent.selfish);
         assert!(!cfg.compatibility.transmission.enabled);
+        assert!(matches!(
+            cfg.autopilot.mode,
+            crate::autopilot::AutopilotMode::Observe
+        ));
+    }
+
+    #[test]
+    fn autopilot_config_defaults_to_observe() {
+        let toml = r#"
+[torrent]
+listen_port = 51413
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert!(matches!(
+            cfg.autopilot.mode,
+            crate::autopilot::AutopilotMode::Observe
+        ));
+    }
+
+    #[test]
+    fn autopilot_config_parses_and_env_override() {
+        let toml = r#"
+[autopilot]
+mode = "act"
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert!(matches!(
+            cfg.autopilot.mode,
+            crate::autopilot::AutopilotMode::Act
+        ));
+
+        let cfg = Config::default();
+        let env = vec![("SWARMOTTER_AUTOPILOT__MODE".into(), "disabled".into())];
+        let cfg = cfg.apply_env_overrides(&env).unwrap();
+        assert!(matches!(
+            cfg.autopilot.mode,
+            crate::autopilot::AutopilotMode::Disabled
+        ));
     }
 
     #[test]

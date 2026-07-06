@@ -668,6 +668,33 @@ pre#log-stream {
   padding-bottom: 0.45rem;
 }
 .compact-list li:last-child { border-bottom: 0; padding-bottom: 0; }
+#details-autopilot .autopilot-control-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.2rem 0 0.5rem;
+}
+#details-autopilot .autopilot-control-row label {
+  color: var(--muted);
+}
+#details-autopilot .autopilot-control-row select {
+  width: 11rem;
+  min-width: 11rem;
+}
+#details-autopilot .autopilot-section-heading {
+  margin: 0.7rem 0 0.25rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+#details-autopilot code {
+  font-size: 0.82rem;
+}
+#details-autopilot .kv {
+  grid-template-columns: minmax(11rem, 13rem) 1fr;
+}
+#details-autopilot p {
+  margin: 0.45rem 0 0;
+}
 h3,
 h4 {
   margin: 0 0 0.7rem;

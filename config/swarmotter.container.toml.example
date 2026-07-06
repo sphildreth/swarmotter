@@ -20,6 +20,10 @@ sparse = true
 [network]
 mode = "disabled"
 
+[autopilot]
+# Optional: disabled (off), observe (reasons only), or act (recommendations).
+mode = "observe"
+
 [torrent]
 listen_port = 51413
 allow_ipv6 = true

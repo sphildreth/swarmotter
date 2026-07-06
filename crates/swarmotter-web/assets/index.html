@@ -103,7 +103,8 @@
       <button id="back-btn">Back</button>
       <h2 id="details-title"></h2>
       <div id="details-health" class="card"></div>
-      <div id="details-summary"></div>
+      <div id="details-summary" class="card"></div>
+      <div id="details-autopilot" class="card"></div>
       <div class="tabs">
         <button data-tab="files" class="tab active">Files</button>
         <button data-tab="peers" class="tab">Peers</button>
@@ -164,6 +165,20 @@
         <div id="settings-compatibility" class="card">
           <h3>Compatibility</h3>
           <label class="settings-check"><input id="cfg-compat-transmission-enabled" type="checkbox"><span>Transmission RPC API</span></label>
+        </div>
+
+        <div id="settings-autopilot" class="card">
+          <h3>Autopilot</h3>
+          <div class="settings-form-grid">
+            <label class="settings-field">
+              <span>Global mode</span>
+              <select id="cfg-autopilot-mode">
+                <option value="disabled">Disabled</option>
+                <option value="observe">Observe</option>
+                <option value="act">Act</option>
+              </select>
+            </label>
+          </div>
         </div>
 
         <div id="settings-storage" class="card">

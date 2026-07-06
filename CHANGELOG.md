@@ -22,6 +22,14 @@ MVP release.
   that toggles between the default dark theme and a light theme, persists the
   browser preference locally, and applies theme-aware Tabulator table colors.
   ADR-0034 records the browser preference decision.
+- **Adaptive swarm performance autopilot:** added `[autopilot].mode`
+  (`disabled`/`observe`/`act`, default `observe`), per-torrent mode overrides,
+  API endpoints for global status and per-torrent "why is this slow?"
+  decisions, Settings tab global mode editing, Web UI diagnostics/per-torrent
+  override controls, and daemon-side act-mode actions for bounded discovery
+  refresh, peer-worker tuning, peer-backoff relaxation, and queue-slot release
+  using existing contained telemetry.
+  ADR-0035 records the control and containment decision.
 
 ### Fixed
 

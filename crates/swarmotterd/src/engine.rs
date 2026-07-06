@@ -156,6 +156,7 @@ pub enum EngineCommand {
     Resume,
     Reannounce,
     Recheck,
+    RelaxPeerBackoff,
     UpdatePeerWorkerLimit(usize),
     Stop,
 }
@@ -444,6 +445,11 @@ impl TorrentEngine {
                     dedupe_peers(&mut discovered);
                     self.state.lock().await.peers = discovered.clone();
                     last_announce = Instant::now();
+                }
+                CommandOutcome::RelaxPeerBackoff => {
+                    peer_backoff.clear();
+                    candidate_cursor = 0;
+                    self.state.lock().await.peer_scheduler.backed_off_peers = 0;
                 }
                 CommandOutcome::Continue | CommandOutcome::Pause => {}
             }
@@ -1635,7 +1641,10 @@ impl TorrentEngine {
                 CommandOutcome::Stop => {
                     return Err(CoreError::Internal("magnet metadata fetch stopped".into()));
                 }
-                CommandOutcome::Reannounce | CommandOutcome::Continue | CommandOutcome::Pause => {}
+                CommandOutcome::Reannounce
+                | CommandOutcome::RelaxPeerBackoff
+                | CommandOutcome::Continue
+                | CommandOutcome::Pause => {}
             }
 
             let outcome = self
@@ -1805,6 +1814,7 @@ impl TorrentEngine {
             Ok(EngineCommand::Resume) => CommandOutcome::Continue,
             Ok(EngineCommand::Reannounce) => CommandOutcome::Reannounce,
             Ok(EngineCommand::Recheck) => CommandOutcome::Continue,
+            Ok(EngineCommand::RelaxPeerBackoff) => CommandOutcome::RelaxPeerBackoff,
             Ok(EngineCommand::UpdatePeerWorkerLimit(limit)) => {
                 self.set_peer_worker_limit(limit);
                 CommandOutcome::Continue
@@ -1823,6 +1833,7 @@ enum CommandOutcome {
     Continue,
     Pause,
     Reannounce,
+    RelaxPeerBackoff,
     Stop,
 }
 

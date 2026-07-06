@@ -51,6 +51,38 @@ all currently visible rows, clear the current selection, and remove all selected
 torrents. Bulk removal removes torrent records through `POST
 /api/v1/torrents/remove` and keeps downloaded data.
 
+## Performance diagnostics and autopilot visibility
+
+The torrent detail view uses `/api/v1/torrents/:hash/stats` as its primary
+diagnostic source. Existing health sub-scores and `reasons` are the basis for the
+autopilot-oriented "why is this slow?" explanation and are updated from the same
+contained network observations as engine and network health reporting. In
+`act` mode, the daemon may apply bounded actions from those observations; the
+details page shows the current decision and rationale.
+
+In autopilot visibility mode, the UI reads:
+
+- `GET /api/v1/autopilot/status` for the global autopilot mode.
+- `GET /api/v1/network/health` and `GET /api/v1/network/diagnostics` for any
+  containment condition that may block or bias tuning decisions.
+- `GET /api/v1/torrents/:hash/autopilot` and `POST /api/v1/torrents/:hash/autopilot`
+  for per-torrent decision views and mode override controls.
+
+The Settings tab includes an Autopilot card for the global
+`disabled` / `observe` / `act` mode. Torrent Details keeps the per-torrent
+override control.
+
+The details page renders a compact "why is this slow?" report with these fields:
+
+- active/global/autopilot mode state.
+- machine-readable reason identifiers and recommendations or applied-action
+  candidates.
+- snapshot signals and network-conditions impact for operational context.
+
+The UI should present autopilot recommendations as human-readable entries with
+underlying machine-readable identifiers (for operators and automation clients) and
+continue to honor the fail-closed containment model.
+
 ## Notifications
 
 Transient operation feedback is shown as toast notifications instead of inline

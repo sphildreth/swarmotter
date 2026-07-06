@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use swarmotter_core::autopilot::{AutopilotConfig, AutopilotMode};
 use swarmotter_core::config::Config;
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
@@ -19,7 +20,7 @@ use swarmotter_core::models::diagnostics::{
 };
 use swarmotter_core::models::network::NetworkHealth;
 use swarmotter_core::models::peer::Peer;
-use swarmotter_core::models::stats::{GlobalStats, TorrentDiagnostics};
+use swarmotter_core::models::stats::{AutopilotDecision, GlobalStats, TorrentDiagnostics};
 use swarmotter_core::models::torrent::TorrentFile;
 use swarmotter_core::models::torrent::TorrentSummary;
 use swarmotter_core::models::tracker::TrackerInfo;
@@ -163,6 +164,22 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn global_stats(&self) -> GlobalStats;
     /// Per-torrent diagnostics and stats.
     async fn torrent_stats(&self, hash: &InfoHash) -> Option<TorrentDiagnostics>;
+    /// Global autopilot status exposed through the API.
+    async fn autopilot_status(&self) -> AutopilotConfig {
+        self.get_config().await.autopilot
+    }
+    /// Per-torrent autopilot decision and snapshot.
+    async fn torrent_autopilot_decision(&self, _hash: &InfoHash) -> Option<AutopilotDecision> {
+        None
+    }
+    /// Set or clear a per-torrent autopilot mode override.
+    async fn set_torrent_autopilot_mode_override(
+        &self,
+        _hash: &InfoHash,
+        _mode: Option<AutopilotMode>,
+    ) -> Result<()> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
 
     /// Trigger a watch-folder scan.
     async fn watch_scan(&self) -> Result<()>;
@@ -178,6 +195,7 @@ pub struct SettingsPatch {
     pub bandwidth: Option<swarmotter_core::bandwidth::BandwidthLimits>,
     pub queue: Option<swarmotter_core::queue::QueueLimits>,
     pub seeding: Option<swarmotter_core::ratio::SeedingPolicy>,
+    pub autopilot: Option<AutopilotConfig>,
 }
 
 /// Shared application state.

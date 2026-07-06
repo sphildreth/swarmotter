@@ -42,6 +42,8 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
         .route("/version", get(handlers::health::version))
         // Stats
         .route("/stats", get(handlers::stats::global_stats))
+        // Autopilot
+        .route("/autopilot/status", get(handlers::autopilot::status))
         // Torrent management
         .route("/torrents", get(handlers::torrents::list_torrents))
         .route(
@@ -60,6 +62,11 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             get(handlers::torrents::get_torrent).delete(handlers::torrents::remove_torrent),
         )
         .route("/torrents/:hash/stats", get(handlers::stats::torrent_stats))
+        .route(
+            "/torrents/:hash/autopilot",
+            get(handlers::autopilot::get_torrent_autopilot)
+                .post(handlers::autopilot::set_torrent_autopilot),
+        )
         .route("/torrents/:hash/pause", post(handlers::torrents::pause))
         .route("/torrents/:hash/resume", post(handlers::torrents::resume))
         .route("/torrents/:hash/start", post(handlers::torrents::start_now))

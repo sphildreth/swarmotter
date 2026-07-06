@@ -18,6 +18,9 @@ pub use diagnostics::{
 pub use health::{HealthCalculator, HealthInput};
 pub use network::{NetworkContainmentMode, NetworkContainmentStatus, NetworkHealth};
 pub use peer::{EnginePeerHealth, Peer, PeerDirection, PeerFlags};
-pub use stats::{GlobalStats, TorrentDiagnostics, TorrentStats};
+pub use stats::{
+    AutopilotAction, AutopilotActionKind, AutopilotDecision, AutopilotInput, AutopilotReason,
+    AutopilotSnapshot, GlobalStats, SlowCause, TorrentDiagnostics, TorrentStats,
+};
 pub use torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 pub use tracker::{TrackerId, TrackerInfo, TrackerKind, TrackerStatus, TrackerTier};

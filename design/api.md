@@ -41,6 +41,24 @@ ADR-0009 and ADR-0010.
 - Authentication policy is shared: when API auth is enabled, compatibility
   adapters must map their auth mechanism back to `api.auth_token`.
 
+## Autopilot API contract
+
+- `GET /api/v1/autopilot/status` returns current global autopilot state, including
+  `mode`.
+- `GET /api/v1/torrents/:hash/autopilot` returns the current per-torrent diagnostic
+  decision, reasons, and snapshot.
+- `POST /api/v1/torrents/:hash/autopilot` sets or clears per-torrent override mode
+  with `{ "mode": "disabled" | "observe" | "act" | null }`.
+- `GET /api/v1/settings` returns `autopilot.mode` in the configuration snapshot with
+  a redacted `api.auth_token`.
+- `PATCH /api/v1/settings` can update `autopilot.mode` as a safe runtime
+  setting.
+- `PUT /api/v1/settings` replaces full configuration and accepts `[autopilot].mode`
+  after validation.
+
+`PATCH /api/v1/settings` remains constrained to runtime-safe settings and does
+not accept restart-required fields.
+
 ## Implementation ownership
 
 - Route assembly lives in `crates/swarmotter-api/src/routes.rs`.

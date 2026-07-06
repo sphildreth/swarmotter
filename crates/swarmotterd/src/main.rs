@@ -139,6 +139,15 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Spawn the adaptive swarm autopilot. Observe mode only records decisions;
+    // act mode applies bounded engine/queue commands from contained telemetry.
+    {
+        let rt = runtime.clone();
+        tokio::spawn(async move {
+            rt.autopilot_loop().await;
+        });
+    }
+
     // Graceful shutdown on Ctrl-C.
     serve
         .with_graceful_shutdown(shutdown_signal())

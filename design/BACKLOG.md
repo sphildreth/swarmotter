@@ -120,9 +120,13 @@ SwarmOtter feature shape:
 Acceptance direction:
 
 - The daemon must log and expose every automatic decision.
-- The user must be able to disable the feature globally and per torrent.
+- The user must be able to disable or enable feature modes globally through
+  `[autopilot].mode` (`disabled` / `observe` / `act`, default `observe`) and
+  per torrent through the API.
 - All network measurements must use the existing contained data plane; no
   separate uncontained probing is allowed.
+- Current documentation and acceptance for this phase are recorded in
+  `ADR-0035-adaptive-swarm-performance-autopilot.md`.
 
 ### Disk-Aware Storage Optimizer
 

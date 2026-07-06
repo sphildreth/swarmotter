@@ -26,6 +26,7 @@ let magnetAddInFlight = false;
 let logEventSource = null;
 let lastEventStreamErrorAt = 0;
 let fullConfigSnapshot = null;
+let autopilotModeUpdateInFlight = false;
 
 const EVENT_KINDS = [
   "torrent_added",
@@ -769,13 +770,33 @@ async function openDetails(hash) {
   currentHash = hash;
   $$(".view").forEach(v => v.classList.add("hidden"));
   $("#view-details").classList.remove("hidden");
-  const t = await api(`/torrents/${hash}`);
-  $("#details-title").textContent = t.name;
-  renderDetailsHealth(t.health);
-  $("#details-summary").innerHTML = `<pre>${escapeHtml(JSON.stringify(t, null, 2))}</pre>`;
-  loadFiles(hash);
-  loadPeers(hash);
-  loadTrackers(hash);
+  try {
+    const [t, decision, autopilotStatus, networkDiag] = await Promise.all([
+      api(`/torrents/${hash}`),
+      api(`/torrents/${hash}/autopilot`).catch(() => null),
+      api("/autopilot/status").catch(() => null),
+      api("/network/diagnostics").catch(() => null),
+    ]);
+    $("#details-title").textContent = t.name;
+    renderDetailsHealth(t.health);
+    renderDetailsSummary(t);
+    renderAutopilotDiagnostics({
+      torrent: t,
+      decision,
+      globalAutopilot: autopilotStatus,
+      networkDiagnostics: networkDiag,
+    });
+    bindAutopilotModeSelector(hash, t.autopilot_mode_override);
+    loadFiles(hash);
+    loadPeers(hash);
+    loadTrackers(hash);
+  } catch (e) {
+    $("#details-title").textContent = "Torrent details";
+    renderDetailsHealth(null);
+    renderAutopilotDiagnostics({ torrent: null, decision: null, globalAutopilot: null, networkDiagnostics: null });
+    $("#details-summary").innerHTML = "";
+    showError("Open torrent details failed", e);
+  }
 }
 
 function healthLabelName(label) {
@@ -840,6 +861,160 @@ function renderDetailsHealth(h) {
     ${reasonsHtml}
     ${subs}
   `;
+}
+
+function renderDetailsSummary(t) {
+  if (!t) {
+    $("#details-summary").innerHTML = "";
+    return;
+  }
+  $("#details-summary").innerHTML = `
+    <h3>Details</h3>
+    ${renderKv([
+      ["State", t.state],
+      ["Peers", `${fmtCount(t.active_peer_workers)} active / ${fmtCount(t.known_peers)} known`],
+      ["Rate down", fmtRate(t.rate_down)],
+      ["Rate up", fmtRate(t.rate_up)],
+      ["Download cap", fmtBytes(t.download_limit || 0)],
+      ["Upload cap", fmtBytes(t.upload_limit || 0)],
+    ])}
+  `;
+}
+
+function renderAutopilotDiagnostics({ torrent, decision, globalAutopilot, networkDiagnostics }) {
+  const panel = $("#details-autopilot");
+  if (!panel) return;
+  if (!torrent) {
+    panel.innerHTML = `<h3>Autopilot diagnostics</h3><p class="muted">No diagnostics available for this torrent.</p>`;
+    return;
+  }
+  const override = torrent.autopilot_mode_override === null ? null : (torrent.autopilot_mode_override || null);
+  const globalMode = globalAutopilot?.mode || "unknown";
+  const effectiveMode = override ?? globalMode;
+  const health = networkDiagnostics?.health || {};
+  const checks = (networkDiagnostics?.checks || []).filter((c) => c && c.level && c.level !== "ok");
+  const containment = (networkDiagnostics?.containment_matrix || []).filter((c) => c && c.level && c.level !== "ok");
+  const reasons = (decision?.reasons || []);
+  const reasonLines = reasons.length
+    ? reasons.map((item) => {
+      const cause = item.cause ? `<code>${escapeHtml(item.cause)}</code> ` : "";
+      return `<li>${cause}${escapeHtml(item.message || String(item))}</li>`;
+    }).join("")
+    : "<li>No slow-condition reasons reported.</li>";
+  const snapshot = decision?.snapshot || null;
+  const action = decision?.action || null;
+  const networkSummary = networkHealthSummary(health, checks, containment);
+  panel.innerHTML = `
+    <h3>Autopilot diagnostics</h3>
+    <div class="autopilot-control-row">
+      <label for="details-autopilot-mode">Per-torrent mode</label>
+      <select id="details-autopilot-mode" aria-label="Per-torrent autopilot mode">
+        <option value="inherit"${override === null ? " selected" : ""}>inherit</option>
+        <option value="disabled"${override === "disabled" ? " selected" : ""}>disabled</option>
+        <option value="observe"${override === "observe" ? " selected" : ""}>observe</option>
+        <option value="act"${override === "act" ? " selected" : ""}>act</option>
+      </select>
+    </div>
+    ${renderKv([
+      ["Global mode", renderAutopilotModeLabel(globalMode)],
+      ["Effective mode", renderAutopilotModeLabel(effectiveMode)],
+      ["Network", networkSummary],
+      ["Decision", decision?.apply ? "recommendation ready" : "no immediate action"],
+    ])}
+    <div class="autopilot-section-heading">Why is this slow?</div>
+    <ul class="compact-list">${reasonLines}</ul>
+    ${action ? `<p><strong>Recommended action:</strong> ${escapeHtml(renderAutopilotActionKind(action.kind))}<code> (${escapeHtml(action.kind || "action")})</code>. ${escapeHtml(action.rationale || "")}</p>` : ""}
+    ${snapshot ? `${renderAutopilotSnapshot(snapshot)}` : ""}
+    ${checks.length || containment.length ? `<div class="autopilot-section-heading">Network impact</div>${renderAutopilotChecks(checks, containment)}` : ""}
+  `;
+}
+
+function renderAutopilotChecks(checks, containment) {
+  const items = [...checks, ...containment];
+  if (!items.length) return "<p class='muted'>Network checks pass for autopilot conditions.</p>";
+  return `<ul class="compact-list">${items.map(check => `
+    <li>
+      <div>${renderStatus(check.level)} <strong>${escapeHtml(check.label || check.id)}</strong></div>
+      <div class="muted">${escapeHtml(check.detail || "")}</div>
+    </li>`).join("")}</ul>`;
+}
+
+function renderAutopilotSnapshot(snapshot) {
+  const rows = [
+    ["Known peers", snapshot.known_peers],
+    ["Useful peers", snapshot.useful_peers],
+    ["Active workers", snapshot.active_peer_workers],
+    ["Peer worker limit", snapshot.peer_worker_limit],
+    ["Tracker healthy", snapshot.tracker_ok ? "yes" : "no"],
+    ["Discovery", snapshot.discovery_ok ? "yes" : "no"],
+    ["Backed off peers", snapshot.backed_off_peers],
+    ["Observed peak down", fmtRate(snapshot.rate_down_observed_peak)],
+  ];
+  return `<div class="autopilot-section-heading">Why now</div>${renderKv(rows.map(([label, value]) => [label, value]))}`;
+}
+
+function renderAutopilotModeLabel(mode) {
+  if (mode === null || mode === undefined || mode === "") return "inherit";
+  if (mode === "act") return "act";
+  if (mode === "observe") return "observe";
+  if (mode === "disabled") return "disabled";
+  return String(mode);
+}
+
+function renderAutopilotActionKind(kind) {
+  if (kind === "increase_peer_workers") return "Increase peer workers";
+  if (kind === "expand_discovery") return "Expand discovery";
+  if (kind === "relax_peer_backoff") return "Relax peer backoff";
+  if (kind === "release_queue_slot") return "Release queue slot";
+  if (kind === "raise_download_ceiling") return "Raise download ceiling";
+  return String(kind || "recommendation");
+}
+
+function networkHealthSummary(health, checks, containment) {
+  const status = health.status || "unknown";
+  const allowed = health.traffic_allowed;
+  const traffic = allowed === false ? "blocked" : "allowed";
+  const issues = [...checks, ...containment].filter(
+    item => item && (item.level === "invalid" || item.level === "warning"),
+  );
+  const issueText = issues.length
+    ? ` (${issues.length} impacting containment)`
+    : "";
+  return `${status} / traffic ${traffic}${issueText}`;
+}
+
+function bindAutopilotModeSelector(hash) {
+  const select = $("#details-autopilot-mode");
+  if (!select) return;
+  const setMode = async () => {
+    const nextMode = select.value;
+    await setAutopilotModeOverride(hash, nextMode);
+  };
+  select.onchange = setMode;
+}
+
+async function setAutopilotModeOverride(hash, nextMode) {
+  if (!hash || autopilotModeUpdateInFlight) return;
+  autopilotModeUpdateInFlight = true;
+  const select = $("#details-autopilot-mode");
+  const previous = select ? select.value : "inherit";
+  if (select) select.disabled = true;
+  try {
+    const body = { mode: nextMode === "inherit" ? null : nextMode };
+    await api(`/torrents/${hash}/autopilot`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    showToast("Autopilot mode saved", "Override updated for this torrent.", "success");
+    if (currentHash === hash) await openDetails(hash);
+  } catch (e) {
+    if (select) select.value = previous;
+    showError("Failed to update autopilot mode", e);
+  } finally {
+    autopilotModeUpdateInFlight = false;
+    if (select) select.disabled = false;
+  }
 }
 
 function fmtScore(value) {
@@ -1192,6 +1367,7 @@ function renderSettingsEditor(cfg) {
   const apiCfg = cfg.api || {};
   const compatibility = cfg.compatibility || {};
   const transmission = compatibility.transmission || {};
+  const autopilot = cfg.autopilot || {};
   const storage = cfg.storage || {};
   const network = cfg.network || {};
   const torrent = cfg.torrent || {};
@@ -1208,6 +1384,8 @@ function renderSettingsEditor(cfg) {
   setSettingsChecked("cfg-api-require-auth", apiCfg.require_auth);
 
   setSettingsChecked("cfg-compat-transmission-enabled", transmission.enabled);
+
+  setSettingsValue("cfg-autopilot-mode", autopilot.mode || "observe");
 
   setSettingsValue("cfg-storage-download-dir", storage.download_dir);
   setSettingsValue("cfg-storage-incomplete-dir", storage.incomplete_dir);
@@ -1274,6 +1452,9 @@ function collectSettingsConfig() {
       transmission: {
         enabled: settingsField("cfg-compat-transmission-enabled").checked,
       },
+    },
+    autopilot: {
+      mode: settingsString("cfg-autopilot-mode"),
     },
     storage: {
       download_dir: settingsOptionalString("cfg-storage-download-dir"),

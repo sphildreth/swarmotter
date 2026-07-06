@@ -16,6 +16,7 @@ with double underscores:
 SWARMOTTER_API__BIND_ADDRESS=0.0.0.0:9091
 SWARMOTTER_API__REQUIRE_AUTH=true
 SWARMOTTER_API__AUTH_TOKEN=replace-with-a-long-random-token
+SWARMOTTER_AUTOPILOT__MODE=observe
 SWARMOTTER_NETWORK__MODE=strict
 SWARMOTTER_NETWORK__REQUIRED_INTERFACE=br0
 SWARMOTTER_TORRENT__LISTEN_PORT=51413
@@ -144,6 +145,28 @@ fail-closed behavior when strict containment is configured:
 Use bandwidth and queue limits when the host needs resource caps. Leaving them
 unlimited or high is better for raw transfer throughput.
 
+## Adaptive autopilot controls
+
+The adaptive swarm performance autopilot is configurable and can be staged safely:
+
+- Global behavior is controlled by `[autopilot].mode`, defaulting to `observe`.
+- `mode` is one of `disabled`, `observe`, or `act`.
+- In `observe` mode, SwarmOtter reports slowdown causes without applying
+  tuning actions.
+- In `act` mode, SwarmOtter can apply bounded daemon/engine actions such as
+  discovery refresh, peer-worker adjustment, peer-backoff relaxation, and
+  queue-slot release.
+- Per-torrent control is an override through API/UI.
+- Recommendations are constrained by existing hard caps and never ignore
+  `bandwidth`, `queue`, or containment limits.
+
+Example:
+
+```toml
+[autopilot]
+mode = "observe"  # optional; defaults to observe
+```
+
 ## Option reference
 
 ### `[api]`
@@ -215,6 +238,12 @@ sized up front.
 
 Strict mode requires at least one enforceable path: interface, source address,
 or network namespace.
+
+### `[autopilot]`
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `mode` | `observe` | Autopilot mode: `disabled` (no analysis), `observe` (reasons only), or `act` (reasons plus bounded automatic actions). |
 
 ### `[torrent]`
 
