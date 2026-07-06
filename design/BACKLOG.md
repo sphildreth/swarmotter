@@ -28,23 +28,28 @@ project.
 
 | Priority | Feature | User Value | Source Signals |
 | --- | --- | --- | --- |
+| P0 | UPnP / NAT-PMP Port Forwarding | Automatic port mapping for reachability behind NAT; every major client ships this as table stakes | qBittorrent UPnP/NAT-PMP, Transmission port forwarding, Deluge UPnP/NAT-PMP |
+| P0 | SOCKS5 Proxy Support | Route torrent traffic through a SOCKS5 proxy; shipped by every major client for seedbox and restricted-network deployments | Transmission [#1250](https://github.com/transmission/transmission/issues/1250), qBittorrent SOCKS5, Deluge proxy support |
+| P0 | IP Filtering / Blocklists / Peer Banning | Filter unwanted peers via CIDR/range lists, blocklist import, and manual peer bans; table-stakes security feature | qBittorrent IP filtering, Deluge IP filtering, eMule/PeerGuardian blocklist formats, qBittorrent [#10258](https://github.com/qbittorrent/qBittorrent/issues/10258) |
+| P0 | Listen Port Reachability Test | Active test of whether the configured peer listen port is reachable; basic diagnostic every client provides | qBittorrent port test, Transmission port test, Deluge port check, µTorrent port status indicator |
+| P0 | Protocol Encryption / MSE-PE | Interoperate with peers that refuse plaintext handshakes and reduce plaintext peer-wire exposure | Transmission, qBittorrent, Deluge, BiglyBT all ship MSE/PE; private trackers commonly require it |
 | P0 | Disk-aware storage optimizer | Better performance and fewer storage surprises on Btrfs, NAS, HDD, and constrained disks | qBittorrent [#23683](https://github.com/qbittorrent/qBittorrent/issues/23683), [#22949](https://github.com/qbittorrent/qBittorrent/issues/22949), [#23572](https://github.com/qbittorrent/qBittorrent/issues/23572), Transmission [#5064](https://github.com/transmission/transmission/issues/5064), [#5594](https://github.com/transmission/transmission/issues/5594), [#1060](https://github.com/transmission/transmission/issues/1060) |
 | P0 | Policy profiles and inherited torrent settings | Apply consistent path, ratio, queue, bandwidth, tracker, and file rules by label/category/profile | qBittorrent [#9939](https://github.com/qbittorrent/qBittorrent/issues/9939), [#24500](https://github.com/qbittorrent/qBittorrent/issues/24500), [#23722](https://github.com/qbittorrent/qBittorrent/issues/23722), [#24131](https://github.com/qbittorrent/qBittorrent/issues/24131), Transmission [#6710](https://github.com/transmission/transmission/issues/6710), [#1461](https://github.com/transmission/transmission/issues/1461), [#6425](https://github.com/transmission/transmission/issues/6425) |
 | P0 | Ecosystem Compatibility API | Operate alongside Sonarr/Radarr/Flood via qBittorrent-compatible and Transmission-compatible API shims | Deluge API parity requests, Flood UI, Sonarr/Radarr integration, self-hosting ecosystem (2026) |
 | P0 | Per-Profile / Per-Torrent Network-Path Binding | Assign a contained network path (namespace/VPN endpoint/interface) per profile, label, or torrent; fail-closed per path | rTorrent/Flood multi-user isolation, Deluge multi-profile routing, self-hosting VPN routing patterns |
 | P0 | Multi-User / Multi-Tenant Support | Role-based access control, per-user torrent isolation, per-user quotas, and shared-server deployments | qBittorrent [#3327](https://github.com/qbittorrent/qBittorrent/issues/3327), Flood multi-user, rTorrent+ruTorrent multi-user, Deluge thin-client auth |
-| P0 | Protocol Encryption / MSE-PE | Interoperate with peers that refuse plaintext handshakes and reduce plaintext peer-wire exposure | Transmission, qBittorrent, Deluge, BiglyBT all ship MSE/PE; private trackers commonly require it |
 | P1 | Metadata-first magnet preview and intake rules | Let users inspect/select files before starting data transfer and enforce file exclusion rules | Transmission [#1611](https://github.com/transmission/transmission/issues/1611), [#2366](https://github.com/transmission/transmission/issues/2366), [#7330](https://github.com/transmission/transmission/issues/7330), [#7399](https://github.com/transmission/transmission/issues/7399), [#2399](https://github.com/transmission/transmission/issues/2399), [#5582](https://github.com/transmission/transmission/issues/5582), [#8793](https://github.com/transmission/transmission/issues/8793), qBittorrent [#23674](https://github.com/qbittorrent/qBittorrent/issues/23674) |
+| P1 | Torrent Metadata Display (Comments, Created By, Creation Date) | Display `.torrent` metadata fields in API and UI for content verification and provenance | qBittorrent torrent properties, Transmission torrent inspector, Deluge torrent details, BiglyBT torrent info |
+| P1 | Magnet Link Generation from Added Torrents | Generate and export magnet URIs from torrents already in the library for sharing and backup workflows | qBittorrent copy magnet link, Transmission magnet export, Deluge magnet copy, BiglyBT magnet generation |
+| P1 | Torrent File Export | Export/download the `.torrent` file for any torrent in the library for backup, migration, and sharing | qBittorrent export .torrent, Transmission .torrent download, Deluge export, aria2 .torrent save |
 | P1 | File cleanup, trash, and retention safety | Avoid accidental data loss while making unwanted/obsolete partial data easy to remove | qBittorrent [#23575](https://github.com/qbittorrent/qBittorrent/issues/23575), [#23353](https://github.com/qbittorrent/qBittorrent/issues/23353), [#24102](https://github.com/qbittorrent/qBittorrent/issues/24102), [#24601](https://github.com/qbittorrent/qBittorrent/issues/24601), Transmission [#1722](https://github.com/transmission/transmission/issues/1722), [#6513](https://github.com/transmission/transmission/issues/6513) |
 | P1 | Tracker and peer operations workbench | Diagnose weak swarms, prioritize trackers, expose known peers, webseeds, and retry state | Transmission [#996](https://github.com/transmission/transmission/issues/996), [#6425](https://github.com/transmission/transmission/issues/6425), [#8326](https://github.com/transmission/transmission/issues/8326), [#8413](https://github.com/transmission/transmission/issues/8413), [#5234](https://github.com/transmission/transmission/issues/5234), qBittorrent [#24013](https://github.com/qbittorrent/qBittorrent/issues/24013), [#24014](https://github.com/qbittorrent/qBittorrent/issues/24014) |
 | P1 | Secure remote-operations hardening | Make headless/server use safer and easier behind reverse proxies and automation | qBittorrent [#7172](https://github.com/qbittorrent/qBittorrent/issues/7172), [#24308](https://github.com/qbittorrent/qBittorrent/issues/24308), Transmission [#5899](https://github.com/transmission/transmission/issues/5899), [#5989](https://github.com/transmission/transmission/issues/5989), qBittorrent [#19951](https://github.com/qbittorrent/qBittorrent/issues/19951) |
 | P1 | Safe automation hooks | Provide explicit, observable, allowlisted event actions without unsafe hidden scripts | Transmission [#8056](https://github.com/transmission/transmission/issues/8056), [#6984](https://github.com/transmission/transmission/issues/6984), qBittorrent [#23550](https://github.com/qbittorrent/qBittorrent/issues/23550), [#23603](https://github.com/qbittorrent/qBittorrent/issues/23603) |
 | P1 | Content organization controls | Keep download directories orderly through folder rules, preset paths, and path normalization | Transmission [#5614](https://github.com/transmission/transmission/issues/5614), [#8225](https://github.com/transmission/transmission/issues/8225), [#6044](https://github.com/transmission/transmission/issues/6044), [#6045](https://github.com/transmission/transmission/issues/6045), qBittorrent [#24239](https://github.com/qbittorrent/qBittorrent/issues/24239) |
+| P1 | Anonymous Mode | Hide client identification (User-Agent, peer ID prefix) from trackers and peers for privacy-preserving operation | qBittorrent anonymous mode, Deluge anonymous mode, Transmission peer-id spoofing discussions |
 | P1 | Torrent Creation (BEP 52 v2/hybrid) | Create `.torrent` files from local lawful content with piece hashing, tracker tiers, and webseed support | BiglyBT torrent creation, aria2 torrent creation, Transmission [#5794](https://github.com/transmission/transmission/issues/5794), Deluge create plugin |
 | P1 | Superseeding / Initial Seeding (BEP 16) | Efficient first distribution of new lawful releases via initial-seeding mode | BEP 16, qBittorrent [#20098](https://github.com/qbittorrent/qBittorrent/issues/20098), BiglyBT initial seeding |
-| P1 | IP Filtering / Blocklists / Peer Banning | Filter unwanted peers via CIDR/range lists, blocklist import, manual peer bans, and client-ID-based blocking | qBittorrent IP filtering, Deluge IP filtering, eMule/PeerGuardian blocklist formats, qBittorrent [#10258](https://github.com/qbittorrent/qBittorrent/issues/10258) |
-| P1 | UPnP / NAT-PMP Port Forwarding | Automatic port mapping for reachability behind NAT without manual router configuration | qBittorrent UPnP/NAT-PMP, Transmission port forwarding, Deluge UPnP/NAT-PMP |
-| P1 | SOCKS5 Proxy Support | Route torrent traffic through a SOCKS5 proxy for seedbox and restricted-network deployments | Transmission [#1250](https://github.com/transmission/transmission/issues/1250), qBittorrent SOCKS5, Deluge proxy support |
 | P1 | Seed Prioritization (Low-Seed First) | Prefer seeding torrents with few available seeds to improve swarm health and distribution efficiency | qBittorrent [#9063](https://github.com/qbittorrent/qBittorrent/issues/9063), Transmission seed-priority discussions |
 | P1 | OpenAPI Specification & Interactive API Docs | Auto-generated OpenAPI/JSON Schema with Swagger UI for native and compatibility API surfaces | Flood Swagger UI, Deluge API docs, self-hosting automation integration |
 | P1 | User-Configured Lawful RSS Feeds | Ingest content from user-supplied lawful RSS feeds as part of lawful distribution workflows | Deluge RSS plugin, rTorrent RSS, self-hosting RSS workflows; see lawful-use policy |
@@ -61,6 +66,7 @@ project.
 | P1 | Seedbox Pre-Seed Warm-Up | Pre-read and pre-hash a new lawful release before announcing so the first peer is served instantly | BiglyBT pre-seed concepts, superseeding efficiency |
 | P1 | Idempotent Re-Add / Content-Addressed Import | Recognize re-added torrents whose data already exists and skip re-download and re-verify automatically | qBittorrent re-add friction, large-library operator workflows |
 | P1 | Durable State Store (SQLite) | Single durable store enabling cheap queue, health, audit, and history queries beyond per-torrent resume files | Self-hosting operators, Long-Horizon Observability (P2), Operator Audit Log (P1) |
+| P2 | Disk Cache / I/O Buffer Configuration | Configurable read/write cache size and I/O buffer settings for performance tuning on different storage media | qBittorrent disk cache settings, Deluge cache configuration, Transmission prefetch/cache options, µTorrent cache settings |
 | P2 | Sequential Download / Streaming / File Preview | Sequential/priority-first fetch; in-place preview and verify; metadata-first preview | qBittorrent sequential download, aria2, WebTorrent streaming, Deluge |
 | P2 | Protocol modernization roadmap | Stay ahead of compatibility and swarm reachability changes; BEP 52 v2/hybrid handling | qBittorrent [#23421](https://github.com/qbittorrent/qBittorrent/issues/23421), [#24600](https://github.com/qbittorrent/qBittorrent/issues/24600), Transmission [#3387](https://github.com/transmission/transmission/issues/3387), [#3705](https://github.com/transmission/transmission/issues/3705), [#993](https://github.com/transmission/transmission/issues/993) |
 | P2 | Long-horizon observability | Preserve useful history beyond current live status and make operational events auditable | Transmission [#5591](https://github.com/transmission/transmission/issues/5591), qBittorrent [#22832](https://github.com/qbittorrent/qBittorrent/issues/22832), [#18525](https://github.com/qbittorrent/qBittorrent/issues/18525), [#24330](https://github.com/qbittorrent/qBittorrent/issues/24330) |
@@ -80,6 +86,191 @@ project.
 | P3 | Documentation Discoverability | Search index for `docs/` and a built-in help pane in the Web UI tied to daemon version | mdBook search, DocSearch, Sonarr/Radarr in-app help |
 
 ## P0 Features
+
+### UPnP / NAT-PMP Port Forwarding
+
+Problem: users behind NAT routers cannot accept inbound peer connections without
+manual port forwarding configuration. This cripples seeding and swarm contribution
+for non-VPN users. Every major client ships this as table-stakes functionality.
+
+Requested elsewhere:
+
+- qBittorrent, Transmission, and Deluge all ship UPnP and NAT-PMP support.
+- libtorrent-rasterbar (qBittorrent's backend) has mature UPnP/NAT-PMP
+  implementation.
+- This is expected baseline functionality, not a differentiator.
+
+SwarmOtter feature shape:
+
+- Add UPnP (Universal Plug and Play) and NAT-PMP (NAT Port Mapping Protocol)
+  support for automatic port mapping on supported routers.
+- Map the configured peer listen port; refresh mappings on lease expiry.
+- Surface mapping status in the API and network health UI.
+- Respect network containment: port mappings must only be requested on the
+  contained network interface, not the default route.
+
+Acceptance direction:
+
+- Port mapping must be opt-in and clearly surfaced.
+- Mapping must respect network containment; no mappings on uncontained interfaces.
+- UPnP/NAT-PMP traffic must go through the contained network path.
+
+### SOCKS5 Proxy Support
+
+Problem: seedbox and restricted-network users rely on SOCKS5 proxies as a
+simpler alternative to full VPN/namespace containment. Many users want both
+SOCKS5 and VPN containment for different use cases.
+
+Requested elsewhere:
+
+- Transmission [#1250](https://github.com/transmission/transmission/issues/1250)
+  is a top-voted feature request.
+- qBittorrent and Deluge ship built-in SOCKS5 proxy support.
+- Common in seedbox deployments where VPN is not available or practical.
+
+SwarmOtter feature shape:
+
+- Add optional SOCKS5 proxy configuration for torrent traffic.
+- Route peer TCP connections, tracker announces, and webseed requests through
+  the proxy.
+- Support authentication (username/password) and unauthenticated modes.
+- Proxy configuration is per-profile (existing P0) for multi-path deployments.
+- SOCKS5 proxy is distinct from network containment; both can coexist with
+  clear precedence rules.
+
+Acceptance direction:
+
+- Proxy configuration must be explicit and auditable.
+- When both SOCKS5 and network containment are configured, containment takes
+  precedence; proxy traffic must still go through the contained path.
+- DNS resolution for proxy hostname must respect containment.
+
+### IP Filtering / Blocklists / Peer Banning
+
+Problem: operators need tools to filter abusive, hostile, or misbehaving peers
+across all peer sources without ad hoc manual intervention.
+
+Requested elsewhere:
+
+- qBittorrent and Deluge ship built-in IP filtering and blocklist import.
+- eMule/PeerGuardian `.dat` blocklist formats are widely used in the community.
+- Manual peer banning is a common request across clients.
+
+SwarmOtter feature shape:
+
+- Support CIDR and range-based peer filters.
+- Import eMule/PeerGuardian `.dat` blocklist formats.
+- Add manual per-peer ban controls.
+- Add client-ID-based peer blocking (e.g., Xunlei/Thunder, known bad actors)
+  as a complement to IP-based filtering.
+- Integrate with the tracker and peer operations workbench (existing P1).
+- Filtering is framed as abuse mitigation and operational safety, not evasion.
+
+Acceptance direction:
+
+- Framing is consistent with lawful-use policy: filtering is abuse mitigation.
+- Applies to all peer sources through the contained network path.
+- Filters are auditable in logs and API.
+
+### Listen Port Reachability Test
+
+Problem: users behind NAT or firewalls need to know whether their configured
+peer listen port is reachable from the internet. An unreachable port means
+the client cannot accept inbound connections, severely limiting seeding
+capability and swarm contribution. Every mainstream client provides a port
+test feature or at minimum a port status indicator. SwarmOtter configures a
+listen port but provides no feedback on whether it is actually reachable.
+
+Requested elsewhere:
+
+- qBittorrent provides a port status indicator in the connection status bar
+  and an active port test via the Web API.
+- Transmission provides a port test via the RPC `port-test` method that
+  checks reachability from an external service.
+- Deluge shows port status in the connection manager and supports port
+  testing.
+- µTorrent displays a green/red status light indicating port reachability.
+- BiglyBT includes NAT traversal status and port testing.
+
+SwarmOtter feature shape:
+
+- Add an active port reachability test: the daemon initiates an outbound
+  connection to a configurable external echo service (or uses a STUN-like
+  check) to verify whether the configured listen port accepts inbound
+  connections.
+- Add a `POST /api/v1/network/port-test` endpoint that triggers the test
+  and returns the result (open, closed, error, timeout).
+- Surface the last-known port status in the network health API (`GET
+  /api/v1/network/health`) alongside the existing containment state.
+- Add a port status indicator in the Web UI (green for open, red for
+  closed, grey for unknown/untested).
+- Support configurable test endpoint: operators can point the test at their
+  own infrastructure rather than a third-party service.
+- Integrate with UPnP/NAT-PMP (existing P0): after a successful port
+  mapping, automatically trigger a port test to verify the mapping works.
+
+Acceptance direction:
+
+- The port test is opt-in and does not phone home to any hardcoded
+  third-party service by default.
+- The test respects network containment: the outbound check connection
+  goes through the same contained network path as torrent traffic.
+- A failed test does not block torrent operations; it is informational.
+- The test result is cached with a configurable TTL to avoid excessive
+  external requests.
+- When UPnP/NAT-PMP (existing P0) is implemented, the port test
+  integrates with the mapping lifecycle.
+
+### Protocol Encryption / MSE-PE
+
+Problem: every mainstream torrent client (Transmission, qBittorrent, Deluge,
+BiglyBT) implements Message Stream Encryption / Protocol Encryption
+(MSE/PE). Many peers refuse plaintext handshakes, and private trackers
+commonly *require* encrypted connections. SwarmOtter's network containment
+model constrains routing, not wire-level obfuscation: without MSE/PE, a contained peer
+connection is still a plaintext handshake on the wire. Without MSE/PE
+SwarmOtter cannot fully interoperate with a large fraction of swarms, and
+the comparison matrix should reflect that honestly rather than imply
+parity. This is arguably a core interoperability gap rather than a
+differentiator.
+
+Requested elsewhere:
+
+- Transmission, qBittorrent, Deluge, and BiglyBT all ship MSE/PE and have
+  for years; it is treated as table stakes.
+- Private tracker ecosystems commonly require encryption; peers that do
+  not offer it are rejected at the handshake.
+- Plaintext peer-wire handshakes reduce interoperability with encrypted-only
+  peers and expose more protocol metadata than necessary for contained operation.
+
+SwarmOtter feature shape:
+
+- Implemented in v1.1.0 for TCP peer connections:
+  - MSE/PE obfuscated handshake and encrypted-stream negotiation with no
+    separate socket creation.
+  - Configurable `torrent.encryption_mode` (`disabled`, `preferred`, `required`),
+    default `preferred`.
+- Remaining work:
+  - Encrypted transport for uTP.
+  - Per-profile (existing P0) and per-torrent overrides for encryption mode.
+
+Acceptance direction:
+
+- Framing is interoperability and wire-level integrity, consistent with
+  the lawful-use posture already applied to VPN/NIC containment. This is
+  not piracy-evasion framing; SwarmOtter does not advertise or document
+  this as a way to evade copyright enforcement.
+- Encryption never weakens network containment; the implemented path is TCP over
+  the existing contained peer transport. uTP encrypted transport remains
+  backlog work.
+- `required` mode must not silently fall back to plaintext; it must refuse or
+  close the connection.
+- Local swarm fixtures exercise encrypted, preferred (default), and
+  required handshakes before the default mode changes.
+- `design/COMPARISON.md` reflects TCP-only MSE/PE status and leaves partial-scope
+  work visible so roadmap comparisons stay truthful.
+- Implementing this requires an ADR (new wire-protocol surface and a
+  default-mode decision with interop trade-offs).
 
 ### Disk-Aware Storage Optimizer
 
@@ -281,57 +472,6 @@ Acceptance direction:
 - Per-user storage roots and per-user network paths together constitute the
   seedbox-grade isolation model that shared-server deployments require.
 - Implementing this requires an ADR (new auth model + user isolation semantics).
-
-### Protocol Encryption / MSE-PE
-
-Problem: every mainstream torrent client (Transmission, qBittorrent, Deluge,
-BiglyBT) implements Message Stream Encryption / Protocol Encryption
-(MSE/PE). Many peers refuse plaintext handshakes, and private trackers
-commonly *require* encrypted connections. SwarmOtter's network containment
-model constrains routing, not wire-level obfuscation: without MSE/PE, a contained peer
-connection is still a plaintext handshake on the wire. Without MSE/PE
-SwarmOtter cannot fully interoperate with a large fraction of swarms, and
-the comparison matrix should reflect that honestly rather than imply
-parity. This is arguably a core interoperability gap rather than a
-differentiator.
-
-Requested elsewhere:
-
-- Transmission, qBittorrent, Deluge, and BiglyBT all ship MSE/PE and have
-  for years; it is treated as table stakes.
-- Private tracker ecosystems commonly require encryption; peers that do
-  not offer it are rejected at the handshake.
-- Plaintext peer-wire handshakes reduce interoperability with encrypted-only
-  peers and expose more protocol metadata than necessary for contained operation.
-
-SwarmOtter feature shape:
-
-- Implemented in v1.1.0 for TCP peer connections:
-  - MSE/PE obfuscated handshake and encrypted-stream negotiation with no
-    separate socket creation.
-  - Configurable `torrent.encryption_mode` (`disabled`, `preferred`, `required`),
-    default `preferred`.
-- Remaining work:
-  - Encrypted transport for uTP.
-  - Per-profile (existing P0) and per-torrent overrides for encryption mode.
-
-Acceptance direction:
-
-- Framing is interoperability and wire-level integrity, consistent with
-  the lawful-use posture already applied to VPN/NIC containment. This is
-  not piracy-evasion framing; SwarmOtter does not advertise or document
-  this as a way to evade copyright enforcement.
-- Encryption never weakens network containment; the implemented path is TCP over
-  the existing contained peer transport. uTP encrypted transport remains
-  backlog work.
-- `required` mode must not silently fall back to plaintext; it must refuse or
-  close the connection.
-- Local swarm fixtures exercise encrypted, preferred (default), and
-  required handshakes before the default mode changes.
-- `design/COMPARISON.md` reflects TCP-only MSE/PE status and leaves partial-scope
-  work visible so roadmap comparisons stay truthful.
-- Implementing this requires an ADR (new wire-protocol surface and a
-  default-mode decision with interop trade-offs).
 
 ## P1 Features
 
@@ -554,91 +694,6 @@ Acceptance direction:
 - Piece-rarity distribution follows BEP 16 semantics.
 - Upload is contained through the configured network path.
 
-### IP Filtering / Blocklists / Peer Banning
-
-Problem: operators need tools to filter abusive, hostile, or misbehaving peers
-across all peer sources without ad hoc manual intervention.
-
-Requested elsewhere:
-
-- qBittorrent and Deluge ship built-in IP filtering and blocklist import.
-- eMule/PeerGuardian `.dat` blocklist formats are widely used in the community.
-- Manual peer banning is a common request across clients.
-
-SwarmOtter feature shape:
-
-- Support CIDR and range-based peer filters.
-- Import eMule/PeerGuardian `.dat` blocklist formats.
-- Add manual per-peer ban controls.
-- Add client-ID-based peer blocking (e.g., Xunlei/Thunder, known bad actors)
-  as a complement to IP-based filtering.
-- Integrate with the tracker and peer operations workbench (existing P1).
-- Filtering is framed as abuse mitigation and operational safety, not evasion.
-
-Acceptance direction:
-
-- Framing is consistent with lawful-use policy: filtering is abuse mitigation.
-- Applies to all peer sources through the contained network path.
-- Filters are auditable in logs and API.
-
-### UPnP / NAT-PMP Port Forwarding
-
-Problem: users behind NAT routers cannot accept inbound peer connections without
-manual port forwarding configuration. This cripples seeding and swarm contribution
-for non-VPN users. Every major client ships this as table-stakes functionality.
-
-Requested elsewhere:
-
-- qBittorrent, Transmission, and Deluge all ship UPnP and NAT-PMP support.
-- libtorrent-rasterbar (qBittorrent's backend) has mature UPnP/NAT-PMP
-  implementation.
-- This is expected baseline functionality, not a differentiator.
-
-SwarmOtter feature shape:
-
-- Add UPnP (Universal Plug and Play) and NAT-PMP (NAT Port Mapping Protocol)
-  support for automatic port mapping on supported routers.
-- Map the configured peer listen port; refresh mappings on lease expiry.
-- Surface mapping status in the API and network health UI.
-- Respect network containment: port mappings must only be requested on the
-  contained network interface, not the default route.
-
-Acceptance direction:
-
-- Port mapping must be opt-in and clearly surfaced.
-- Mapping must respect network containment; no mappings on uncontained interfaces.
-- UPnP/NAT-PMP traffic must go through the contained network path.
-
-### SOCKS5 Proxy Support
-
-Problem: seedbox and restricted-network users rely on SOCKS5 proxies as a
-simpler alternative to full VPN/namespace containment. Many users want both
-SOCKS5 and VPN containment for different use cases.
-
-Requested elsewhere:
-
-- Transmission [#1250](https://github.com/transmission/transmission/issues/1250)
-  is a top-voted feature request.
-- qBittorrent and Deluge ship built-in SOCKS5 proxy support.
-- Common in seedbox deployments where VPN is not available or practical.
-
-SwarmOtter feature shape:
-
-- Add optional SOCKS5 proxy configuration for torrent traffic.
-- Route peer TCP connections, tracker announces, and webseed requests through
-  the proxy.
-- Support authentication (username/password) and unauthenticated modes.
-- Proxy configuration is per-profile (existing P0) for multi-path deployments.
-- SOCKS5 proxy is distinct from network containment; both can coexist with
-  clear precedence rules.
-
-Acceptance direction:
-
-- Proxy configuration must be explicit and auditable.
-- When both SOCKS5 and network containment are configured, containment takes
-  precedence; proxy traffic must still go through the contained path.
-- DNS resolution for proxy hostname must respect containment.
-
 ### Seed Prioritization (Low-Seed First)
 
 Problem: torrents with few seeds are at risk of dying. Clients should prioritize
@@ -777,7 +832,7 @@ SwarmOtter feature shape:
 - Add a per-tracker trust state: trusted, neutral, untrusted, or blocked,
   with an explicit operator-controlled source (manual, imported, learned).
 - Support tracker allowlists and denylists integrated with the existing IP
-  filtering workbench (P1) and policy profiles (P0).
+   filtering workbench (P0) and policy profiles (P0).
 - Surface, for every torrent, the trust state of every active tracker and
   the effective upload/download policy the daemon is applying because of it.
 - Support a content provenance mode: import `.torrent` files and magnets
@@ -998,7 +1053,7 @@ Acceptance direction:
   party lookup.
 - Operators can disable the rollup or restrict it to specific torrents
   if they prefer.
-- This complements the IP filtering / blocklists workbench (P1) for
+- This complements the IP filtering / blocklists workbench (P0) for
   abuse mitigation.
 
 ### Filesystem Snapshot Integration
@@ -1042,7 +1097,7 @@ Acceptance direction:
 
 ### HTTP / HTTPS Proxy Support
 
-Problem: the backlog already covers SOCKS5 (P1), but corporate and
+Problem: the backlog already covers SOCKS5 (P0), but corporate and
 egress-filtered environments frequently expose only HTTP/CONNECT proxies.
 Users in those environments cannot route SwarmOtter traffic without an
 HTTP proxy option. qBittorrent and aria2 both support HTTP proxies
@@ -1075,7 +1130,7 @@ Acceptance direction:
   contained path.
 - DNS resolution for the proxy hostname respects containment.
 - Implementing this may share the connection-egress abstraction with the
-  existing SOCKS5 work (P1).
+  existing SOCKS5 work (P0).
 
 ### Scriptable CLI (`swarmotterctl`)
 
@@ -1231,7 +1286,234 @@ Acceptance direction:
 - Implementing this requires an ADR (new persistent format, migration
   path, and a query model decision).
 
+### Torrent Metadata Display (Comments, Created By, Creation Date)
+
+Problem: `.torrent` files contain metadata fields beyond the piece table and
+file list: `comment`, `created by`, `creation date`, and `encoding`. Every
+mainstream torrent client displays these fields in a properties or info panel.
+SwarmOtter parses `.torrent` files but does not surface this metadata to the
+user. For lawful distributors verifying provenance of downloaded content, and
+for operators inspecting torrent origin, this is baseline expected
+functionality.
+
+Requested elsewhere:
+
+- qBittorrent displays torrent properties including comment, created by, and
+  creation date in the "General" tab of the torrent details panel.
+- Transmission shows torrent metadata in the inspector including comment,
+  creator, and date created.
+- Deluge displays torrent info including comment and creator in the Details
+  tab.
+- BiglyBT shows comprehensive torrent metadata including all info dictionary
+  fields.
+- aria2 exposes torrent metadata via RPC including `comment` and `creationDate`.
+
+SwarmOtter feature shape:
+
+- Parse and persist `comment`, `created by`, `creation date`, and `encoding`
+  fields from `.torrent` files at add time.
+- For magnet links, populate these fields once metadata is fetched via BEP 9.
+- Expose metadata fields in the torrent detail API response (`GET
+  /api/v1/torrents/:hash`).
+- Display metadata in a "Properties" or "Info" section of the Web UI torrent
+  detail view.
+- Support editing the `comment` field via API and UI for operator annotation
+  of lawful content.
+
+Acceptance direction:
+
+- Metadata fields are preserved across save/load cycles and are included in
+  fast-resume state.
+- The comment field edit is auditable in the operator audit log (existing P1).
+- No metadata field is used to alter download/upload behavior.
+- Magnet-fetched metadata is stored once and not re-fetched on restart.
+
+### Magnet Link Generation from Added Torrents
+
+Problem: users frequently need to generate a magnet URI from a torrent already
+in their library — for sharing with collaborators, for backup of the magnet
+link itself, or for re-adding the same content on another system. Every
+mainstream client provides a "copy magnet link" action. SwarmOtter accepts
+magnet links as input but does not generate them as output.
+
+Requested elsewhere:
+
+- qBittorrent provides "Copy magnet link" in the right-click context menu
+  for any torrent.
+- Transmission allows exporting magnet URIs from the torrent inspector.
+- Deluge provides magnet link copy in the torrent details.
+- BiglyBT generates magnet URIs with configurable tracker inclusion.
+- aria2 can output magnet URIs via the `getUris` RPC method.
+
+SwarmOtter feature shape:
+
+- Generate a BEP 9-compliant magnet URI from any torrent in the library,
+  including the info hash (`xt=urn:btih:`), display name (`dn=`), tracker
+  URLs (`tr=`), and webseed URLs (`ws=`).
+- Support configurable tracker inclusion: all trackers, primary tier only,
+  or no trackers.
+- Add a `GET /api/v1/torrents/:hash/magnet` endpoint that returns the
+  generated URI.
+- Add a "Copy Magnet Link" action in the Web UI torrent detail and context
+  menu.
+- Support BEP 53 `so=` (select-only) parameter for partial-torrent magnet
+  generation when combined with metadata-first preview (existing P1).
+
+Acceptance direction:
+
+- Generated magnet URIs are valid and can be re-imported into SwarmOtter
+  or any BEP 9-compliant client.
+- Tracker inclusion options are clearly documented.
+- No private tracker URLs are included in generated magnets for private
+  torrents unless the operator explicitly opts in.
+- The generation is deterministic: the same torrent always produces the
+  same magnet URI given the same tracker inclusion setting.
+
+### Torrent File Export
+
+Problem: operators need to export the `.torrent` file for torrents in their
+library — for backup, for migration to another client, for sharing the
+torrent file itself (not just the magnet), or for archival of the original
+metadata. Every mainstream client allows downloading or exporting the
+`.torrent` file. SwarmOtter accepts `.torrent` files as input but does not
+provide them as output.
+
+Requested elsewhere:
+
+- qBittorrent provides "Export .torrent" in the right-click context menu
+  and stores `.torrent` files in its BT_backup directory.
+- Transmission serves `.torrent` files via the RPC `torrent-get` method
+  with `torrentFile` field or via the web interface download.
+- Deluge provides `.torrent` export in the torrent details.
+- aria2 saves `.torrent` files to disk when `--bt-save-metadata` is set
+  and can serve them via the `getFiles` RPC method.
+- BiglyBT stores and exports `.torrent` files with full metadata.
+
+SwarmOtter feature shape:
+
+- Persist the original `.torrent` file bytes (or reconstruct from metadata
+  for magnet-fetched torrents) at add time.
+- Add a `GET /api/v1/torrents/:hash/torrent` endpoint that returns the
+  `.torrent` file as a binary download with `Content-Disposition:
+  attachment`.
+- For magnet-fetched torrents where no original `.torrent` exists,
+  reconstruct a valid `.torrent` file from the fetched metadata (info
+  dictionary, trackers, webseeds).
+- Add a "Download .torrent" action in the Web UI torrent detail view.
+- Support batch export of multiple `.torrent` files as a zip archive via
+  `POST /api/v1/torrents/export`.
+
+Acceptance direction:
+
+- Exported `.torrent` files are valid and can be imported into SwarmOtter
+  or any BEP 3-compliant client.
+- Reconstructed `.torrent` files from magnet metadata are clearly marked
+  as reconstructed and include only the metadata that was fetched.
+- The `.torrent` storage is included in fast-resume state and survives
+  daemon restart.
+- Batch export respects the same auth and permission model as individual
+  export.
+
+### Anonymous Mode
+
+Problem: some operators want to minimize the identifiable fingerprint their
+torrent client presents to trackers and peers. Every mainstream client
+offers some form of anonymous mode that hides or randomizes the client
+identification (User-Agent header for trackers, peer ID prefix for peer
+connections). SwarmOtter uses a fixed peer ID prefix and User-Agent string.
+For lawful-use operators who simply want to reduce their operational
+footprint, this is expected privacy-preserving functionality.
+
+Requested elsewhere:
+
+- qBittorrent ships an "Anonymous Mode" toggle that randomizes the peer ID
+  and removes the User-Agent from tracker requests.
+- Deluge provides anonymous mode configuration that hides client identity.
+- Transmission discussions include peer-id spoofing and User-Agent
+  customization requests.
+- BiglyBT allows configurable peer ID and client identification.
+- µTorrent provides peer ID and User-Agent customization.
+
+SwarmOtter feature shape:
+
+- Add an `anonymous_mode` configuration toggle (default `false`).
+- When enabled: randomize the peer ID prefix (while maintaining the
+  Azureus-style `-XX####-` format for protocol compatibility), remove or
+  genericize the User-Agent header in tracker HTTP requests, and remove
+  the client identification from the BEP 10 extension handshake.
+- When disabled (default): use the standard SwarmOtter peer ID prefix and
+  User-Agent for normal protocol operation.
+- Per-profile (existing P0) anonymous mode setting for multi-path
+  deployments where some traffic classes should be anonymous and others
+  should not.
+- Surface the anonymous mode state in the API and UI so operators can
+  verify the setting is active.
+
+Acceptance direction:
+
+- Anonymous mode is framed as privacy-preserving operation, not as evasion
+  of copyright enforcement or lawful-use policy.
+- Anonymous mode never weakens network containment; it only changes
+  wire-level identification strings.
+- The randomized peer ID is generated once per daemon session and reused
+  for all connections within that session (consistent with protocol
+  expectations).
+- Anonymous mode is clearly documented with its scope and limitations: it
+  does not hide IP addresses (that is the role of VPN/NIC containment)
+  and does not encrypt traffic (that is the role of MSE/PE, existing P0).
+- Implementing this requires an ADR (changes wire-protocol identification
+  and tracker request headers).
+
 ## P2 Features
+
+### Disk Cache / I/O Buffer Configuration
+
+Problem: torrent clients perform intensive random and sequential disk I/O for
+piece writes, piece reads (for seeding), and verification. Mainstream clients
+provide configurable disk cache and I/O buffer settings to tune performance
+for different storage media (SSD, HDD, NAS, RAM disk). SwarmOtter relies on
+OS-level page cache and `tokio::fs` defaults with no user-visible cache
+configuration. For operators running large queues on HDDs or NAS mounts,
+cache tuning is expected baseline functionality.
+
+Requested elsewhere:
+
+- qBittorrent provides extensive disk cache settings: cache size, cache
+  expiry, write cache toggle, OS cache toggle, and coalesce reads/writes.
+  These are among the most-tuned settings in the qBittorrent community.
+- Deluge provides cache size and cache expiry configuration.
+- Transmission provides prefetch and cache-related options.
+- µTorrent provides disk cache size, write cache, and read cache settings
+  as primary performance tuning knobs.
+- BiglyBT provides configurable disk cache with separate read and write
+  cache sizes and cache strategy selection.
+
+SwarmOtter feature shape:
+
+- Add configurable disk cache settings: write cache size (MB), read cache
+  size (MB), cache expiry (seconds), and OS page cache preference.
+- Add I/O buffer settings: piece write buffer size, piece read buffer
+  size, and verification buffer size.
+- Add write coalescing: batch multiple small piece writes into larger
+  sequential writes to reduce HDD seek overhead.
+- Add read-ahead configuration for sequential download (existing P2) and
+  seeding workloads.
+- Integrate with the disk-aware storage optimizer (existing P0): cache
+  settings can be per-storage-root so HDD roots get larger caches and
+  SSD roots get smaller caches.
+- Surface cache hit/miss statistics in the API and UI for performance
+  diagnosis.
+
+Acceptance direction:
+
+- Cache settings are opt-in with sensible defaults; the daemon works well
+  without any cache configuration.
+- Cache settings never compromise data integrity: all writes are flushed
+  and verified before a piece is marked complete.
+- Cache statistics are informational only and do not affect download/upload
+  behavior.
+- Cache configuration is documented with clear guidance for common storage
+  media (SSD, HDD, NAS, Btrfs).
 
 ### Protocol Modernization Roadmap
 
@@ -1533,7 +1815,7 @@ Acceptance direction:
 - Operators can disable the rollup or restrict it to specific torrents.
 - IP addresses are not exported by the rollup; only aggregated
   country/ASN counts.
-- This complements the IP filtering / blocklists workbench (existing P1)
+- This complements the IP filtering / blocklists workbench (existing P0)
   for abuse mitigation.
 
 ### Responsive / Mobile-Friendly Web UI
