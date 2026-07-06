@@ -459,6 +459,38 @@ main {
   flex-wrap: wrap;
   margin-bottom: 0.8rem;
 }
+.torrent-query-controls {
+  align-items: flex-start;
+  gap: 0.5rem 0.8rem;
+}
+.torrent-query-field {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0;
+}
+.torrent-query-field > span {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.torrent-query-field select,
+.torrent-query-field input {
+  min-width: 10rem;
+}
+.torrent-pagination {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-top: 0.2rem;
+}
+#torrent-page-summary {
+  min-width: 5rem;
+  text-align: center;
+}
+#query-summary {
+  margin-left: auto;
+  white-space: nowrap;
+}
 .toolbar input[type="search"] {
   min-width: min(18rem, 100%);
 }
@@ -790,6 +822,23 @@ h4 {
   }
   nav {
     flex-wrap: wrap;
+  }
+}
+@media (max-width: 840px) {
+  .torrent-query-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .torrent-query-field {
+    min-width: 0;
+  }
+  .torrent-query-field select,
+  .torrent-query-field input,
+  .torrent-pagination {
+    width: 100%;
+  }
+  #query-summary {
+    margin-left: 0;
   }
 }
 label { display: block; margin: 0.4rem 0; }

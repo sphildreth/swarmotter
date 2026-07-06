@@ -7,9 +7,54 @@ const MAX_VISIBLE_TOASTS = 3;
 const MAX_LOG_LINES = 500;
 const TOAST_DISPLAY_STORAGE_KEY = "swarmotter.toastDisplayMs";
 const THEME_STORAGE_KEY = "swarmotter.theme";
+const TORRENT_QUERY_STORAGE_KEY = "swarmotter.torrentQueryView";
+const TORRENT_DEFAULT_PER_PAGE = 200;
+const TORRENT_MAX_PER_PAGE = 500;
 const THEME_DARK = "dark";
 const THEME_LIGHT = "light";
 const DEFAULT_THEME = THEME_DARK;
+const TORRENT_SORT_OPTIONS = new Set([
+  "name",
+  "state",
+  "health",
+  "health_score",
+  "progress",
+  "size",
+  "down_rate",
+  "up_rate",
+  "ratio",
+  "peers",
+  "added",
+  "completed",
+  "queue",
+]);
+const TORRENT_TABLE_TO_QUERY_SORT = {
+  name: "name",
+  state: "state",
+  health_label: "health",
+  total_length: "size",
+  progress_percent: "progress",
+  rate_down: "down_rate",
+  rate_up: "up_rate",
+  ratio: "ratio",
+  active_peers: "peers",
+};
+const TORRENT_QUERY_TO_TABLE_SORT = {
+  name: "name",
+  state: "state",
+  health: "health_label",
+  health_score: "health_label",
+  progress: "progress_percent",
+  size: "total_length",
+  down_rate: "rate_down",
+  up_rate: "rate_up",
+  ratio: "ratio",
+  peers: "active_peers",
+  added: "name",
+  completed: "name",
+  queue: "name",
+};
+
 let currentHash = null;
 let toastDisplayMs = loadToastDisplayMs();
 let currentTheme = loadThemePreference();
@@ -28,6 +73,18 @@ let lastEventStreamErrorAt = 0;
 let fullConfigSnapshot = null;
 let autopilotModeUpdateInFlight = false;
 let activeSettingsPanel = "api";
+let torrentQueryRefreshTimer = null;
+let isApplyingSortFromServer = false;
+let torrentQueryState = {
+  q: "",
+  state: "",
+  health: "",
+  performance: "",
+  sort: "name",
+  dir: "asc",
+  page: 1,
+  per_page: TORRENT_DEFAULT_PER_PAGE,
+};
 
 const EVENT_KINDS = [
   "torrent_added",
@@ -254,20 +311,194 @@ $$(".nav").forEach(btn => btn.addEventListener("click", () => {
 }));
 
 // --- Torrents ---
+function clampTorrentPerPage(value) {
+  const n = finiteNumber(value);
+  if (n === null) return TORRENT_DEFAULT_PER_PAGE;
+  return Math.min(Math.max(Math.floor(n), 0), TORRENT_MAX_PER_PAGE);
+}
+
+function clampTorrentPage(value) {
+  const n = finiteNumber(value);
+  return n === null || n <= 0 ? 1 : Math.floor(n);
+}
+
+function normalizeTorrentDir(rawDir) {
+  return String(rawDir || "").toLowerCase() === "desc" ? "desc" : "asc";
+}
+
+function normalizeTorrentSort(rawSort) {
+  const normalized = String(rawSort || "").toLowerCase();
+  return TORRENT_SORT_OPTIONS.has(normalized) ? normalized : "name";
+}
+
+function tableSortToQuerySort(field) {
+  return TORRENT_TABLE_TO_QUERY_SORT[field] || null;
+}
+
+function querySortToTableSort(sort) {
+  return TORRENT_QUERY_TO_TABLE_SORT[sort] || null;
+}
+
+function collectTorrentQueryControls() {
+  return {
+    q: ($("#search")?.value || "").trim(),
+    state: ($("#torrent-state-filter")?.value || "").trim().toLowerCase(),
+    health: ($("#torrent-health-filter")?.value || "").trim().toLowerCase(),
+    performance: ($("#torrent-performance-filter")?.value || "").trim().toLowerCase(),
+    per_page: clampTorrentPerPage($("#torrent-per-page")?.value),
+  };
+}
+
+function applyTorrentQueryControls(state) {
+  if ($("#search")) $("#search").value = state.q || "";
+  if ($("#torrent-state-filter")) $("#torrent-state-filter").value = state.state || "";
+  if ($("#torrent-health-filter")) $("#torrent-health-filter").value = state.health || "";
+  if ($("#torrent-performance-filter")) $("#torrent-performance-filter").value = state.performance || "";
+  if ($("#torrent-per-page")) $("#torrent-per-page").value = String(state.per_page || TORRENT_DEFAULT_PER_PAGE);
+}
+
+function collectTorrentQueryState() {
+  const controls = collectTorrentQueryControls();
+  return {
+    ...torrentQueryState,
+    ...controls,
+    sort: normalizeTorrentSort(torrentQueryState.sort),
+    dir: normalizeTorrentDir(torrentQueryState.dir),
+    page: clampTorrentPage(torrentQueryState.page),
+    per_page: controls.per_page,
+  };
+}
+
+function buildTorrentQueryParams(state) {
+  const query = new URLSearchParams();
+  if (state.q) query.set("q", state.q);
+  if (state.state) query.set("state", state.state);
+  if (state.health) query.set("health", state.health);
+  if (state.performance) query.set("performance", state.performance);
+  if (state.sort) query.set("sort", state.sort);
+  if (state.dir) query.set("dir", state.dir);
+  if (state.page) query.set("page", String(state.page));
+  if (state.per_page !== undefined && state.per_page !== null) query.set("per_page", String(state.per_page));
+  return query.toString();
+}
+
 async function refreshTorrents() {
+  if (torrentQueryRefreshTimer) {
+    window.clearTimeout(torrentQueryRefreshTimer);
+    torrentQueryRefreshTimer = null;
+  }
+  torrentQueryState = collectTorrentQueryState();
   try {
-    const [list, stats] = await Promise.all([api("/torrents"), api("/stats")]);
-    const torrents = list || [];
+    const queryParams = buildTorrentQueryParams(torrentQueryState);
+    const [query, stats] = await Promise.all([
+      api(`/torrents/query${queryParams ? `?${queryParams}` : ""}`),
+      api("/stats"),
+    ]);
+    const torrents = query?.rows || [];
+    torrentQueryState.sort = normalizeTorrentSort(query?.sort);
+    torrentQueryState.dir = normalizeTorrentDir(query?.dir);
+    torrentQueryState.page = clampTorrentPage(query?.page);
+    torrentQueryState.per_page = clampTorrentPerPage(query?.per_page);
+    applyTorrentQueryControls(torrentQueryState);
+    if (query?.page_count > 0 && query?.page > query?.page_count) {
+      torrentQueryState.page = query.page_count;
+      refreshTorrents();
+      return;
+    }
     observeTorrentRemovals(torrents);
     syncSelectedTorrents(torrents);
     const rows = torrents.map(normalizeTorrentRow);
     ensureTorrentTable();
     await setTorrentTableData(rows);
+    if (!isApplyingSortFromServer) syncTorrentTableSort(torrentQueryState.sort, torrentQueryState.dir);
+    if ($("#query-summary")) $("#query-summary").textContent = renderTorrentQuerySummary(query);
+    updateTorrentPaginationControls(query);
     $("#stats-summary").textContent = renderStatsSummary(stats);
+    if ($("#torrent-prev-page-btn")) {
+      const pageCount = query?.page_count || 0;
+      const page = query?.page || 1;
+      $("#torrent-prev-page-btn").disabled = page <= 1 || pageCount === 0;
+      $("#torrent-next-page-btn").disabled = page >= pageCount || pageCount === 0;
+    }
     updateTorrentTableViewState();
+    updateClearFiltersButton();
   } catch (e) {
     log("torrent list error: " + e.message);
   }
+}
+
+function updateTorrentPaginationControls(query) {
+  if (!query) return;
+  const page = query.page || 1;
+  const pageCount = query.page_count || 0;
+  const summary = $("#torrent-page-summary");
+  if (summary) summary.textContent = pageCount === 0 ? "Page 0/0" : `Page ${page}/${pageCount}`;
+  const prev = $("#torrent-prev-page-btn");
+  const next = $("#torrent-next-page-btn");
+  if (prev) prev.disabled = page <= 1 || pageCount === 0;
+  if (next) next.disabled = page >= pageCount || pageCount === 0;
+}
+
+function renderTorrentQuerySummary(query) {
+  const filtered = finiteNumber(query?.filtered);
+  const total = finiteNumber(query?.total);
+  const perPage = clampTorrentPerPage(query?.per_page);
+  const page = clampTorrentPage(query?.page);
+  const pageCountRaw = finiteNumber(query?.page_count);
+  const pageCount = pageCountRaw === null ? 0 : Math.floor(Math.max(pageCountRaw, 0));
+  if (filtered === null || total === null) return "";
+  if (filtered === 0) return `${fmtCount(filtered)}/${fmtCount(total)} matching torrents · page 0/0`;
+  if (perPage === 0) return `${fmtCount(filtered)}/${fmtCount(total)} matching torrents · counts only`;
+  const start = Math.min((page - 1) * perPage + 1, filtered);
+  const end = Math.min(page * perPage, filtered);
+  return `${fmtCount(filtered)}/${fmtCount(total)} matching torrents · ${start}-${end} · page ${page}/${pageCount}`;
+}
+
+function syncTorrentTableSort(sort, dir) {
+  if (!isTorrentTableReady()) return;
+  const tableSort = querySortToTableSort(sort);
+  if (!tableSort) return;
+  const sorters = torrentTable.getSorters();
+  const current = sorters && sorters[0] ? sorters[0] : null;
+  const nextDir = normalizeTorrentDir(dir);
+  if (current && current.field === tableSort && current.dir === nextDir) return;
+  isApplyingSortFromServer = true;
+  torrentTable.setSort([{ column: tableSort, dir: nextDir }]);
+  window.setTimeout(() => {
+    isApplyingSortFromServer = false;
+  }, 0);
+}
+
+function handleTorrentTableSort(sorters) {
+  if (isApplyingSortFromServer) return;
+  const first = Array.isArray(sorters) && sorters.length > 0 ? sorters[0] : null;
+  if (!first) return;
+  const field = first.field || (first.column && first.column.getField && first.column.getField());
+  const sort = tableSortToQuerySort(field);
+  if (!sort) return;
+  const dir = normalizeTorrentDir(first.dir);
+  if (sort === torrentQueryState.sort && dir === torrentQueryState.dir) return;
+  torrentQueryState.sort = sort;
+  torrentQueryState.dir = dir;
+  torrentQueryState.page = 1;
+  refreshTorrents();
+}
+
+function scheduleTorrentRefresh() {
+  if (torrentQueryRefreshTimer) {
+    window.clearTimeout(torrentQueryRefreshTimer);
+  }
+  torrentQueryRefreshTimer = window.setTimeout(() => {
+    torrentQueryRefreshTimer = null;
+    refreshTorrents();
+  }, 250);
+}
+
+function setTorrentPage(page) {
+  const next = clampTorrentPage(page);
+  if (next === torrentQueryState.page) return;
+  torrentQueryState.page = next;
+  refreshTorrents();
 }
 
 function normalizeTorrentRow(t) {
@@ -326,7 +557,10 @@ function ensureTorrentTable() {
     openDetails(row.getData().info_hash);
   });
   torrentTable.on("dataFiltered", updateTorrentTableViewState);
-  torrentTable.on("dataSorted", updateTorrentTableViewState);
+  torrentTable.on("dataSorted", (sorters) => {
+    handleTorrentTableSort(sorters);
+    updateTorrentTableViewState();
+  });
   torrentTable.on("renderComplete", updateTorrentTableViewState);
   return torrentTableReady;
 }
@@ -564,43 +798,122 @@ function updateTorrentTableViewState() {
   updateClearFiltersButton();
 }
 
-function torrentGlobalFilter(data) {
-  const query = $("#search").value.trim().toLowerCase();
-  if (!query) return true;
-  return [
-    data.name,
-    data.info_hash,
-    data.state,
-    data.health_label,
-  ].some(value => String(value || "").toLowerCase().includes(query));
-}
-
 async function applyTorrentSearchFilter() {
-  if (!torrentTable) return;
-  await torrentTableReady;
-  if ($("#search").value.trim()) torrentTable.setFilter(torrentGlobalFilter);
-  else torrentTable.clearFilter();
-  updateTorrentTableViewState();
+  torrentQueryState.page = 1;
+  scheduleTorrentRefresh();
 }
 
 async function clearTorrentFilters() {
   $("#search").value = "";
+  if ($("#torrent-state-filter")) $("#torrent-state-filter").value = "";
+  if ($("#torrent-health-filter")) $("#torrent-health-filter").value = "";
+  if ($("#torrent-performance-filter")) $("#torrent-performance-filter").value = "";
+  if ($("#torrent-per-page")) $("#torrent-per-page").value = String(TORRENT_DEFAULT_PER_PAGE);
+  torrentQueryState.page = 1;
+  torrentQueryState.per_page = TORRENT_DEFAULT_PER_PAGE;
+  torrentQueryState.sort = "name";
+  torrentQueryState.dir = "asc";
   if (torrentTable) {
     await torrentTableReady;
     torrentTable.clearFilter(true);
   }
+  scheduleTorrentRefresh();
   updateTorrentTableViewState();
 }
 
 function updateClearFiltersButton() {
   const button = $("#clear-torrent-filters-btn");
   if (!button) return;
-  const hasSearch = !!$("#search").value.trim();
+  const controls = collectTorrentQueryControls();
+  const hasSearch = !!controls.q || !!controls.state || !!controls.health || !!controls.performance;
+  const hasPerPageOverride = controls.per_page !== TORRENT_DEFAULT_PER_PAGE;
   let hasHeaderFilters = false;
   if (isTorrentTableReady()) {
     try { hasHeaderFilters = torrentTable.getHeaderFilters().length > 0; } catch {}
   }
-  button.disabled = !hasSearch && !hasHeaderFilters;
+  button.disabled = !hasSearch && !hasPerPageOverride && !hasHeaderFilters;
+}
+
+function saveTorrentQueryView() {
+  const base = collectTorrentQueryState();
+  const payload = {
+    q: base.q,
+    state: base.state,
+    health: base.health,
+    performance: base.performance,
+    per_page: base.per_page,
+    sort: base.sort,
+    dir: base.dir,
+  };
+  try {
+    window.localStorage.setItem(TORRENT_QUERY_STORAGE_KEY, JSON.stringify(payload));
+    showToast("Torrent view saved", "Default query view stored.", "success");
+  } catch {
+    showError("Save view failed", new Error("Could not write to local storage"));
+  }
+}
+
+function readSavedTorrentQueryView() {
+  try {
+    const raw = window.localStorage.getItem(TORRENT_QUERY_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      q: String(parsed.q || "").trim(),
+      state: String(parsed.state || "").trim(),
+      health: String(parsed.health || "").trim(),
+      performance: String(parsed.performance || "").trim(),
+      per_page: clampTorrentPerPage(parsed.per_page),
+      sort: normalizeTorrentSort(parsed.sort),
+      dir: normalizeTorrentDir(parsed.dir),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function loadTorrentQueryView() {
+  const loaded = readSavedTorrentQueryView();
+  if (!loaded) {
+    showToast("No saved view", "Save a view first.", "warning");
+    return;
+  }
+  torrentQueryState = {
+    ...torrentQueryState,
+    ...loaded,
+    page: 1,
+  };
+  applyTorrentQueryControls(torrentQueryState);
+  refreshTorrents();
+}
+
+function clearTorrentQueryView() {
+  try {
+    window.localStorage.removeItem(TORRENT_QUERY_STORAGE_KEY);
+  } catch {}
+  torrentQueryState.sort = "name";
+  torrentQueryState.dir = "asc";
+  torrentQueryState.q = "";
+  torrentQueryState.state = "";
+  torrentQueryState.health = "";
+  torrentQueryState.performance = "";
+  torrentQueryState.per_page = TORRENT_DEFAULT_PER_PAGE;
+  torrentQueryState.page = 1;
+  applyTorrentQueryControls(torrentQueryState);
+  refreshTorrents();
+  showToast("Saved view cleared", "", "info");
+}
+
+function applySavedTorrentQueryView() {
+  const saved = readSavedTorrentQueryView();
+  if (!saved) return;
+  torrentQueryState = {
+    ...torrentQueryState,
+    ...saved,
+    page: 1,
+  };
+  applyTorrentQueryControls(torrentQueryState);
 }
 
 function observeTorrentRemovals(list) {
@@ -1944,6 +2257,28 @@ function log(msg) {
 
 $("#search").addEventListener("input", applyTorrentSearchFilter);
 $("#clear-torrent-filters-btn").addEventListener("click", clearTorrentFilters);
+$("#torrent-state-filter").addEventListener("change", () => {
+  torrentQueryState.page = 1;
+  scheduleTorrentRefresh();
+});
+$("#torrent-health-filter").addEventListener("change", () => {
+  torrentQueryState.page = 1;
+  scheduleTorrentRefresh();
+});
+$("#torrent-performance-filter").addEventListener("change", () => {
+  torrentQueryState.page = 1;
+  scheduleTorrentRefresh();
+});
+$("#torrent-per-page").addEventListener("change", () => {
+  torrentQueryState.per_page = clampTorrentPerPage($("#torrent-per-page").value);
+  torrentQueryState.page = 1;
+  scheduleTorrentRefresh();
+});
+$("#torrent-prev-page-btn").addEventListener("click", () => setTorrentPage(torrentQueryState.page - 1));
+$("#torrent-next-page-btn").addEventListener("click", () => setTorrentPage(torrentQueryState.page + 1));
+$("#save-torrent-view-btn").addEventListener("click", saveTorrentQueryView);
+$("#load-torrent-view-btn").addEventListener("click", loadTorrentQueryView);
+$("#clear-torrent-view-btn").addEventListener("click", clearTorrentQueryView);
 $("#select-all-torrents-btn").addEventListener("click", selectAllVisibleTorrents);
 $("#deselect-all-torrents-btn").addEventListener("click", deselectAllTorrents);
 $("#remove-selected-torrents-btn").addEventListener("click", removeSelectedTorrents);
@@ -1958,6 +2293,7 @@ if (themeToggle) themeToggle.addEventListener("click", toggleTheme);
 // --- Init ---
 (async function init() {
   applyTheme(currentTheme, { persist: false });
+  applySavedTorrentQueryView();
   await refreshTorrents();
   await refreshDoctorBadge();
   setInterval(refreshTorrents, 5000);

@@ -51,6 +51,22 @@ all currently visible rows, clear the current selection, and remove all selected
 torrents. Bulk removal removes torrent records through `POST
 /api/v1/torrents/remove` and keeps downloaded data.
 
+## Large-library operations console
+
+For large libraries, the Operations Console is optimized for speed and low
+layout churn. The list is designed for high-count visibility with:
+
+- server-side search plus state, health, and performance-condition filters,
+- table sorting that round-trips through the server query endpoint,
+- a browser-local saved view for search/filter/page-size/sort state,
+- count-oriented list requests and pagination for incremental refresh,
+- clear confirmation paths for bulk destructive operations, and
+- detail views that avoid forcing a full table reload.
+
+The underlying `/api/v1/torrents/query` endpoint also supports label, storage
+root, peer/rate threshold, counts-only, and optional grouping parameters for
+external automation and future UI views.
+
 ## Performance diagnostics and autopilot visibility
 
 The torrent detail view uses `/api/v1/torrents/:hash/stats` as its primary

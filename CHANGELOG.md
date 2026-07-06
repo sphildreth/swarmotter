@@ -8,7 +8,7 @@ All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates. SwarmOtter's first release is `v1.0.0`; there is no
 MVP release.
 
-## [UNRELEASED]
+## [1.1.0] - [UNRELEASED]
 
 ### Added
 
@@ -34,6 +34,14 @@ MVP release.
   navigation menu with one editable detail panel visible at a time, while
   preserving the existing full-configuration save path and keeping the
   Save/Reload/Reset controls in a single header action row.
+- **Large-library Web UI operations console:** added
+  `GET /api/v1/torrents/query` for server-side torrent-list search, filters,
+  sorting, pagination, bucket counts, counts-only queries, and optional
+  grouping while preserving the legacy full-array `GET /api/v1/torrents`
+  response. The Web UI now uses the query endpoint for the torrent list, adds
+  state/health/performance filters, page-size and previous/next controls,
+  query result metadata, and a browser-local saved view for the large-library
+  filter and sort state. ADR-0036 records the query API decision.
 
 ### Fixed
 

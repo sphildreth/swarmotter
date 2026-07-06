@@ -66,6 +66,7 @@ The root `/health` path is also available without the `/api/v1` prefix.
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/torrents` | List torrents. |
+| GET | `/torrents/query` | Query torrents with server-side filters, sorting, pagination, counts, and optional grouping. |
 | POST | `/torrents` | Add magnet JSON or raw `.torrent` body. |
 | POST | `/torrents/magnet` | Add magnet JSON: `{ magnet, download_dir?, paused?, start_behavior? }`. |
 | POST | `/torrents/file` | Upload raw `.torrent` body. |
@@ -121,6 +122,48 @@ Bulk remove requests use:
 
 The response includes `removed` and `not_found` info-hash arrays. The daemon
 removes all found records and reconciles queue state once for the batch.
+
+Large-library clients should use `GET /torrents/query` instead of repeatedly
+fetching the full list. Supported query parameters are:
+
+| Parameter | Description |
+| --- | --- |
+| `q` | Case-insensitive search across name, info hash, state, health, label, and storage root. |
+| `state` | Comma-separated torrent states such as `downloading`, `paused`, or `error`. |
+| `health` | Comma-separated health labels such as `good`, `stalled`, or `network_blocked`. |
+| `label` | Comma-separated labels; unlabeled torrents use `unlabeled`. |
+| `storage_root` | Comma-separated download roots; torrents without an explicit root use `default`. |
+| `performance` | Comma-separated buckets: `active`, `error`, `complete`, `transferring`, `has_peers`, `no_peers`, `stalled`, `unhealthy`. |
+| `min_peers`, `max_peers` | Filter by the greater of active peer workers and known peers. |
+| `min_down_rate`, `min_up_rate` | Filter by current byte/sec rates. |
+| `sort` | One of `name`, `state`, `health`, `health_score`, `progress`, `size`, `down_rate`, `up_rate`, `ratio`, `peers`, `added`, `completed`, or `queue`. |
+| `dir` | `asc` or `desc`. |
+| `page` | 1-based page number. |
+| `per_page` | Page size, capped by the daemon; `0` returns counts and groups without rows. |
+| `group_by` | Optional grouping: `state`, `health`, `label`, `storage_root`, or `performance`. |
+
+The response data object is:
+
+```json
+{
+  "rows": [],
+  "total": 1000,
+  "filtered": 42,
+  "page": 1,
+  "per_page": 100,
+  "page_count": 1,
+  "sort": "name",
+  "dir": "asc",
+  "counts": {
+    "states": { "downloading": 10 },
+    "health": { "good": 8 },
+    "labels": { "linux": 6 },
+    "storage_roots": { "/data/linux": 6 },
+    "performance": { "active": 10 }
+  },
+  "groups": [{ "key": "downloading", "label": "Downloading", "count": 10 }]
+}
+```
 
 `/torrents/:hash/stats` includes counters, rates, limits, active peer workers,
 known peers, live peer scheduler diagnostics, tracker diagnostics, and DHT/PEX

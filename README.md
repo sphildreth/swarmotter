@@ -50,6 +50,9 @@ infringement.
 - Optional Transmission RPC compatibility endpoint at `/transmission/rpc` for
   Transmission-style tools and scripts.
 - Practical Web UI that uses the same API exposed to external automation.
+- UI operations-console updates for large libraries, with
+  a sortable/filterable Tabulator table, theme toggle, and efficient large-list
+  workflows.
 - Magnet links and `.torrent` file intake.
 - TCP and uTP peer wire protocol support.
 - DHT, PEX, HTTP/HTTPS trackers, UDP trackers, and webseeds.
@@ -58,6 +61,9 @@ infringement.
 - Watch-folder import.
 - File selection, file prioritization, and path rename controls.
 - Queue, bandwidth, ratio, and seeding controls.
+- Adaptive swarm performance autopilot with per-torrent diagnostics and
+  override controls.
+- Settings two-panel layout for dense configuration in the Web UI.
 - Strict VPN/NIC traffic containment with fail-closed behavior.
 - Container and homelab-friendly deployment.
 - Lawful-use project posture.

@@ -385,6 +385,55 @@ mod tests {
     }
 
     #[test]
+    fn web_ui_supports_large_library_query_controls() {
+        for id in [
+            "torrent-state-filter",
+            "torrent-health-filter",
+            "torrent-performance-filter",
+            "torrent-per-page",
+            "torrent-prev-page-btn",
+            "torrent-next-page-btn",
+            "save-torrent-view-btn",
+            "load-torrent-view-btn",
+            "clear-torrent-view-btn",
+            "query-summary",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{}\"", id)),
+                "Large-library torrent controls are missing field id {id}"
+            );
+        }
+        for needle in [
+            "const TORRENT_QUERY_STORAGE_KEY = \"swarmotter.torrentQueryView\";",
+            "api(`/torrents/query${queryParams ? `?${queryParams}` : \"\"}`)",
+            "function buildTorrentQueryParams(",
+            "function saveTorrentQueryView(",
+            "function loadTorrentQueryView(",
+            "function clearTorrentQueryView(",
+            "torrentTable.on(\"dataSorted\"",
+            "function handleTorrentTableSort(",
+            "function renderTorrentQuerySummary(",
+            "$(\"#save-torrent-view-btn\").addEventListener(\"click\", saveTorrentQueryView);",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "Web UI is missing large-library query support {needle}"
+            );
+        }
+        for needle in [
+            ".torrent-query-controls",
+            ".torrent-query-field",
+            ".torrent-pagination",
+            "#query-summary",
+        ] {
+            assert!(
+                STYLE_CSS.contains(needle),
+                "style.css is missing large-library query styling {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn web_ui_supports_light_dark_theme_toggle() {
         for needle in [
             "<html lang=\"en\" data-theme=\"dark\">",

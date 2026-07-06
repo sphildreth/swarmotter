@@ -25,6 +25,70 @@ fn bulk_magnet(index: usize) -> String {
     format!("magnet:?xt=urn:btih:{:040x}&dn=bulk-{index}", index + 1)
 }
 
+fn named_magnet(index: usize, name: &str) -> String {
+    format!("magnet:?xt=urn:btih:{:040x}&dn={name}", index + 1)
+}
+
+async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    (status, value)
+}
+
+async fn post_json(
+    app: &Router,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    (status, value)
+}
+
+async fn add_named_test_magnet(
+    app: &Router,
+    index: usize,
+    name: &str,
+    paused: bool,
+    download_dir: &str,
+) -> String {
+    let (status, value) = post_json(
+        app,
+        "/api/v1/torrents/magnet",
+        serde_json::json!({
+            "magnet": named_magnet(index, name),
+            "paused": paused,
+            "download_dir": download_dir,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    value["data"].as_str().unwrap().to_string()
+}
+
 async fn transmission_session(app: Router, auth: Option<&str>) -> String {
     let mut builder = Request::builder()
         .method("POST")
@@ -254,6 +318,74 @@ async fn add_and_list_torrents() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn torrent_query_filters_sorts_paginates_counts_and_groups() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let alpha = add_named_test_magnet(&app, 100, "alpha-linux", false, "/data/linux").await;
+    let beta = add_named_test_magnet(&app, 101, "beta-archive", true, "/data/archive").await;
+    let gamma = add_named_test_magnet(&app, 102, "gamma-linux", false, "/data/linux").await;
+
+    for (hash, labels) in [
+        (
+            &alpha,
+            serde_json::json!({ "labels": ["linux", "release"] }),
+        ),
+        (&beta, serde_json::json!({ "labels": ["archive"] })),
+        (&gamma, serde_json::json!({ "labels": ["linux"] })),
+    ] {
+        let (status, _value) =
+            post_json(&app, &format!("/api/v1/torrents/{hash}/labels"), labels).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    let (status, value) = get_json(
+        &app,
+        "/api/v1/torrents/query?label=linux&storage_root=/data/linux&sort=name&dir=desc&page=1&per_page=1&group_by=label",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let data = &value["data"];
+    assert_eq!(data["total"], 3);
+    assert_eq!(data["filtered"], 2);
+    assert_eq!(data["page"], 1);
+    assert_eq!(data["per_page"], 1);
+    assert_eq!(data["page_count"], 2);
+    assert_eq!(data["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(data["rows"][0]["name"], "gamma-linux");
+    assert_eq!(data["counts"]["labels"]["linux"], 2);
+    assert_eq!(data["counts"]["storage_roots"]["/data/linux"], 2);
+    assert_eq!(data["counts"]["states"]["downloading_metadata"], 2);
+    assert!(data["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|group| group["key"] == "linux" && group["count"] == 2));
+
+    let (status, value) = get_json(&app, "/api/v1/torrents/query?state=paused&sort=name").await;
+    assert_eq!(status, StatusCode::OK);
+    let data = &value["data"];
+    assert_eq!(data["filtered"], 1);
+    assert_eq!(data["rows"][0]["name"], "beta-archive");
+
+    let (status, value) = get_json(
+        &app,
+        "/api/v1/torrents/query?q=alpha&per_page=0&group_by=state",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let data = &value["data"];
+    assert_eq!(data["filtered"], 1);
+    assert_eq!(data["rows"].as_array().unwrap().len(), 0);
+    assert_eq!(data["counts"]["labels"]["linux"], 1);
+    assert!(data["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|group| group["key"] == "downloading_metadata" && group["count"] == 1));
 }
 
 #[tokio::test]

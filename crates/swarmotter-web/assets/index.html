@@ -79,6 +79,68 @@
         </div>
         <span id="stats-summary" class="muted"></span>
       </div>
+      <div class="toolbar torrent-query-controls">
+        <label class="torrent-query-field">
+          <span>State</span>
+          <select id="torrent-state-filter">
+            <option value="">All states</option>
+            <option value="checking">checking</option>
+            <option value="downloading">downloading</option>
+            <option value="downloading_metadata">downloading_metadata</option>
+            <option value="paused">paused</option>
+            <option value="seeding">seeding</option>
+            <option value="error">error</option>
+            <option value="completed">completed</option>
+            <option value="network_blocked">network_blocked</option>
+            <option value="storage_error">storage_error</option>
+            <option value="tracker_error">tracker_error</option>
+            <option value="queued">queued</option>
+          </select>
+        </label>
+        <label class="torrent-query-field">
+          <span>Health</span>
+          <select id="torrent-health-filter">
+            <option value="">All health</option>
+            <option value="network_blocked">network_blocked</option>
+            <option value="unknown">unknown</option>
+            <option value="excellent">excellent</option>
+            <option value="good">good</option>
+            <option value="fair">fair</option>
+            <option value="poor">poor</option>
+            <option value="critical">critical</option>
+            <option value="stalled">stalled</option>
+            <option value="complete">complete</option>
+            <option value="paused">paused</option>
+          </select>
+        </label>
+        <label class="torrent-query-field">
+          <span>Performance</span>
+          <select id="torrent-performance-filter">
+            <option value="">All</option>
+            <option value="active">active</option>
+            <option value="error">error</option>
+            <option value="complete">complete</option>
+            <option value="transferring">transferring</option>
+            <option value="has_peers">has_peers</option>
+            <option value="no_peers">no_peers</option>
+            <option value="stalled">stalled</option>
+            <option value="unhealthy">unhealthy</option>
+          </select>
+        </label>
+        <label class="torrent-query-field">
+          <span>Per page</span>
+          <input id="torrent-per-page" type="number" min="1" max="500" value="200">
+        </label>
+        <div class="torrent-pagination">
+          <button id="torrent-prev-page-btn" type="button" class="secondary" disabled>Prev</button>
+          <span id="torrent-page-summary" class="muted">Page 0/0</span>
+          <button id="torrent-next-page-btn" type="button" class="secondary" disabled>Next</button>
+        </div>
+        <button id="save-torrent-view-btn" type="button" class="secondary">Save View</button>
+        <button id="load-torrent-view-btn" type="button" class="secondary">Load View</button>
+        <button id="clear-torrent-view-btn" type="button" class="secondary">Clear View</button>
+        <span id="query-summary" class="muted"></span>
+      </div>
       <div id="torrent-table" class="torrent-table" aria-label="Torrent list"></div>
     </section>
 

@@ -50,6 +50,7 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             "/torrents",
             post(handlers::torrents::add_torrent_file_or_magnet),
         )
+        .route("/torrents/query", get(handlers::torrents::query_torrents))
         .route("/torrents/magnet", post(handlers::torrents::add_magnet))
         .route("/torrents/file", post(handlers::torrents::add_torrent_file))
         .route("/torrents/bulk", post(handlers::torrents::add_torrents))
