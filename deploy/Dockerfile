@@ -22,7 +22,7 @@ FROM debian:bookworm-slim AS runtime-base
 
 ARG SWARMOTTER_BUILD_COMMIT=unknown
 ARG SWARMOTTER_IMAGE_CREATED=unknown
-ARG SWARMOTTER_VERSION=1.1.2
+ARG SWARMOTTER_VERSION=1.1.3
 
 LABEL org.opencontainers.image.title="SwarmOtter" \
       org.opencontainers.image.description="SwarmOtter BitTorrent daemon and web UI" \
