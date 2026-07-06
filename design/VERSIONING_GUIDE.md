@@ -53,9 +53,9 @@ not use an MVP release model; see ADR-0003.
 The root `Cargo.toml` `[workspace.package].version` value is the canonical
 SwarmOtter release version.
 
-SwarmOtter does not currently have a root `VERSION` file or a version bump
-script. When the release version changes, update the release-facing files
-below and let Cargo refresh local workspace package versions in `Cargo.lock`.
+Use `scripts/bump_version.sh vX.Y.Z` for routine release bumps. The script
+updates the release-facing files below and lets Cargo refresh local workspace
+package versions in `Cargo.lock`.
 
 ### Core Rust workspace
 
@@ -123,20 +123,18 @@ Examples:
 
 1. Decide the next version according to SemVer using the highest-impact rule
    above.
-2. Update `Cargo.toml` `[workspace.package].version`.
-3. Refresh lockfile metadata:
+2. Run the version-bump script:
 
    ```bash
-   cargo metadata --format-version 1 >/dev/null
+   scripts/bump_version.sh vX.Y.Z
    ```
 
-4. Check whether `deploy/Dockerfile` `SWARMOTTER_VERSION` default should change
-   for local image metadata.
-5. Update `CHANGELOG.md`.
-6. Re-scan the repository for stale release-version strings.
-7. Validate that package metadata, tests, Docker build metadata, and docs still
+3. Check whether any release-specific documentation outside the standard
+   release-version points should change.
+4. Re-scan the repository for stale release-version strings.
+5. Validate that package metadata, tests, Docker build metadata, and docs still
    line up.
-8. Create the release tag when the project is ready to publish.
+6. Create the release tag when the project is ready to publish.
 
 ## 5. Validation checklist
 
