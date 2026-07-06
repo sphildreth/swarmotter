@@ -50,11 +50,20 @@ pub struct Config {
 pub struct CompatibilityConfig {
     #[serde(default)]
     pub transmission: TransmissionCompatibilityConfig,
+    #[serde(default)]
+    pub qbittorrent: QbittorrentCompatibilityConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TransmissionCompatibilityConfig {
     /// Enable the Transmission RPC compatibility adapter at `/transmission/rpc`.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct QbittorrentCompatibilityConfig {
+    /// Enable the qBittorrent-compatible Web API adapter at `/api/v2`.
     #[serde(default)]
     pub enabled: bool,
 }
@@ -609,21 +618,32 @@ minimum_free_space_percent = 101
     }
 
     #[test]
-    fn transmission_compatibility_parses_and_env_overrides() {
+    fn compatibility_parses_and_env_overrides() {
         let toml = r#"
 [compatibility.transmission]
+enabled = true
+
+[compatibility.qbittorrent]
 enabled = true
 "#;
         let cfg = Config::from_toml_str(toml).unwrap();
         assert!(cfg.compatibility.transmission.enabled);
+        assert!(cfg.compatibility.qbittorrent.enabled);
 
         let cfg = Config::default();
-        let env = vec![(
-            "SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED".into(),
-            "true".into(),
-        )];
+        let env = vec![
+            (
+                "SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED".into(),
+                "true".into(),
+            ),
+            (
+                "SWARMOTTER_COMPATIBILITY__QBITTORRENT__ENABLED".into(),
+                "true".into(),
+            ),
+        ];
         let cfg = cfg.apply_env_overrides(&env).unwrap();
         assert!(cfg.compatibility.transmission.enabled);
+        assert!(cfg.compatibility.qbittorrent.enabled);
     }
 
     #[test]

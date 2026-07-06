@@ -8,9 +8,6 @@
   <a href="https://github.com/sphildreth/swarmotter/actions/workflows/ci.yml">
     <img src="https://github.com/sphildreth/swarmotter/actions/workflows/ci.yml/badge.svg" alt="CI">
   </a>
-  <a href="https://github.com/sphildreth/swarmotter/releases">
-    <img src="https://img.shields.io/github/v/release/sphildreth/swarmotter?sort=semver" alt="Latest release">
-  </a>
   <a href="LICENSE">
     <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0">
   </a>
@@ -61,6 +58,8 @@ infringement.
 - Native REST API with WebSocket and Server-Sent Events.
 - Optional Transmission RPC compatibility endpoint at `/transmission/rpc` for
   Transmission-style tools and scripts.
+- Optional qBittorrent-compatible `/api/v2` endpoint for
+  Sonarr/Radarr/Flood-style automation.
 - Practical Web UI that uses the same API exposed to external automation.
 - UI operations-console updates for large libraries, with
   a sortable/filterable Tabulator table, theme toggle, and efficient large-list

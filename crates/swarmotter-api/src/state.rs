@@ -234,6 +234,7 @@ pub struct AppState {
     pub build: BuildInfo,
     pub broker: crate::handlers::events::EventBroker,
     pub transmission: TransmissionCompatState,
+    pub qbittorrent: QbittorrentCompatState,
 }
 
 /// Process-local state for the Transmission RPC compatibility adapter.
@@ -257,6 +258,30 @@ impl TransmissionCompatState {
 }
 
 impl Default for TransmissionCompatState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Process-local state for the qBittorrent Web API compatibility adapter.
+#[derive(Clone)]
+pub struct QbittorrentCompatState {
+    pub(crate) session_id: Arc<String>,
+}
+
+impl QbittorrentCompatState {
+    pub fn new() -> Self {
+        Self {
+            session_id: Arc::new(generate_session_id()),
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        self.session_id.as_str()
+    }
+}
+
+impl Default for QbittorrentCompatState {
     fn default() -> Self {
         Self::new()
     }

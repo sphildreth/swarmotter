@@ -20,6 +20,7 @@ SWARMOTTER_AUTOPILOT__MODE=observe
 SWARMOTTER_NETWORK__MODE=strict
 SWARMOTTER_NETWORK__REQUIRED_INTERFACE=br0
 SWARMOTTER_TORRENT__LISTEN_PORT=51413
+SWARMOTTER_COMPATIBILITY__QBITTORRENT__ENABLED=true
 SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED=true
 ```
 
@@ -177,6 +178,39 @@ mode = "observe"  # optional; defaults to observe
 | `require_auth` | `false` | Requires API/Web UI token auth when true. |
 | `auth_token` | unset | Required when `require_auth = true`. |
 | `max_request_body_bytes` | `16777216` | Maximum API request body size, including `.torrent` uploads. |
+
+### `[compatibility.qbittorrent]`
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Enable the optional qBittorrent-compatible compatibility endpoint at `/api/v2`. |
+
+When enabled, `/api/v2` is an optional compatibility adapter over native SwarmOtter
+operations and does not add any separate torrent data-plane pathways.
+
+Authentication follows `api.require_auth`:
+
+- If auth is required, `Authorization: Bearer <token>` and
+  `X-SwarmOtter-Auth: <token>` are accepted.
+- For qBittorrent-style cookie sessions, POST to `/api/v2/auth/login` with
+  credentials where `password` matches `api.auth_token`; the response sets a `SID`
+  cookie that can be reused for subsequent `/api/v2` requests.
+
+Represented compatibility endpoints used by automation include:
+
+- `GET /api/v2/app/version`
+- `GET /api/v2/app/webapiVersion`
+- `GET /api/v2/torrents/info`
+- `POST /api/v2/torrents/add`
+- `POST /api/v2/torrents/delete`
+- `POST /api/v2/torrents/pause`
+- `POST /api/v2/torrents/resume`
+- `POST /api/v2/torrents/start`
+- `POST /api/v2/torrents/stop`
+- `POST /api/v2/torrents/setCategory`
+
+The adapter is intentionally limited: no indexer/search/discovery endpoints are
+exposed through the compatibility surface.
 
 ### `[compatibility.transmission]`
 

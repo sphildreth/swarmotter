@@ -12,6 +12,17 @@ MVP release.
 
 ### Added
 
+- **qBittorrent-compatible `/api/v2` shim:** added an optional
+  `[compatibility.qbittorrent]` toggle for opt-in qBittorrent-style API
+  compatibility. The adapter uses the native API as source of truth, supports
+  Bearer token plus `/api/v2/auth/login` SID-cookie auth flow, and documents a
+  focused automation subset including version and torrent lifecycle endpoints
+  (`/api/v2/app/version`, `/api/v2/app/webapiVersion`,
+  `/api/v2/torrents/info`, `/api/v2/torrents/add`, `/api/v2/torrents/delete`,
+  `/api/v2/torrents/pause`, `/api/v2/torrents/resume`,
+  `/api/v2/torrents/start`, `/api/v2/torrents/stop`,
+  `/api/v2/torrents/setCategory`) with no indexer/search or torrent-discovery
+  surface. ADR-0038 records this compatibility decision.
 - **Web UI sortable and filterable torrent table:** the torrent list now uses
   a vendored Tabulator grid with clickable column sorting, reversible sort
   direction, status/health header filters, numeric comparison filters for

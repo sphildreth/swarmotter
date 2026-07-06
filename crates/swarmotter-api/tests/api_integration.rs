@@ -139,6 +139,80 @@ async fn transmission_rpc(
     (status, value)
 }
 
+async fn qb_get(
+    app: Router,
+    uri: &str,
+    auth: Option<&str>,
+    cookie: Option<&str>,
+) -> (StatusCode, String) {
+    let mut builder = Request::builder().uri(uri);
+    if let Some(auth) = auth {
+        builder = builder.header("authorization", auth);
+    }
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", cookie);
+    }
+    let resp = app
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+async fn qb_post_form(
+    app: Router,
+    uri: &str,
+    body: &str,
+    auth: Option<&str>,
+    cookie: Option<&str>,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/x-www-form-urlencoded");
+    if let Some(auth) = auth {
+        builder = builder.header("authorization", auth);
+    }
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", cookie);
+    }
+    let resp = app
+        .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, headers, String::from_utf8(body.to_vec()).unwrap())
+}
+
+async fn qb_login(app: Router, password: &str) -> String {
+    let (status, headers, body) = qb_post_form(
+        app,
+        "/api/v2/auth/login",
+        &format!("username=admin&password={password}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+    headers
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .expect("SID cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
+}
+
 fn test_base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
@@ -1126,6 +1200,164 @@ async fn transmission_rpc_is_disabled_by_default() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn qbittorrent_api_is_disabled_by_default() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let (status, body) = qb_get(app, "/api/v2/app/version", None, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("disabled"));
+}
+
+#[tokio::test]
+async fn qbittorrent_api_reuses_api_token_and_sid_cookie_auth() {
+    let mut cfg = Config::default();
+    cfg.compatibility.qbittorrent.enabled = true;
+    cfg.api.require_auth = true;
+    cfg.api.auth_token = Some("test-token".into());
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let (status, _) = qb_get(app.clone(), "/api/v2/app/version", None, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, body) = qb_get(
+        app.clone(),
+        "/api/v2/app/webapiVersion",
+        Some("Bearer test-token"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "2.11.4");
+
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/auth/login",
+        "username=admin&password=wrong",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Fails.");
+
+    let cookie = qb_login(app.clone(), "test-token").await;
+    let (status, body) = qb_get(app, "/api/v2/app/version", None, Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.starts_with('v'));
+}
+
+#[tokio::test]
+async fn qbittorrent_api_adds_lists_controls_and_deletes_magnets() {
+    let mut cfg = Config::default();
+    cfg.compatibility.qbittorrent.enabled = true;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+    let magnet =
+        "magnet%3A%3Fxt%3Durn%3Abtih%3Add8255ecdc7ca55fb0bbf81323d87062ba1f7a4e%26dn%3Dtest";
+    let add_body = format!("urls={magnet}&paused=true&savepath=%2Ftmp%2Fqb&category=linux");
+
+    let (status, _, body) =
+        qb_post_form(app.clone(), "/api/v2/torrents/add", &add_body, None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+
+    let (status, body) = qb_get(
+        app.clone(),
+        "/api/v2/torrents/info?category=linux",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "test");
+    assert_eq!(rows[0]["category"], "linux");
+    assert_eq!(rows[0]["save_path"], "/tmp/qb");
+    assert_eq!(rows[0]["state"], "pausedDL");
+    let hash = rows[0]["hash"].as_str().unwrap();
+    assert_eq!(hash.len(), 40);
+
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/resume",
+        &format!("hashes={hash}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+    let (status, body) = qb_get(
+        app.clone(),
+        &format!("/api/v2/torrents/info?hashes={hash}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rows[0]["state"], "downloading");
+
+    let (status, _, _) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/setCategory",
+        &format!("hashes={hash}&category=distros"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = qb_get(
+        app.clone(),
+        "/api/v2/torrents/info?category=distros",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/delete",
+        &format!("hashes={hash}&deleteFiles=true"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+    let (status, body) = qb_get(app, "/api/v2/torrents/info", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(rows.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn qbittorrent_api_rejects_remote_torrent_urls() {
+    let mut cfg = Config::default();
+    cfg.compatibility.qbittorrent.enabled = true;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let (status, _, body) = qb_post_form(
+        app,
+        "/api/v2/torrents/add",
+        "urls=https%3A%2F%2Fexample.invalid%2Flinux.torrent",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("remote torrent URL intake is not supported"));
 }
 
 #[tokio::test]

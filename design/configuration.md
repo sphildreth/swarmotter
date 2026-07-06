@@ -40,6 +40,10 @@ and validation behavior are release-facing. Breaking changes should follow
 Compatibility adapter settings belong under `[compatibility.*]` so optional
 adapter surfaces remain isolated from native daemon configuration.
 
+Compatibility adapters, including `[compatibility.qbittorrent]`, are contract
+surfaces that do not change torrent transport behavior. They must route through
+the native API and keep containment and socket policy unchanged.
+
 ## Maintenance
 
 When configuration behavior changes:

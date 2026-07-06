@@ -1691,6 +1691,7 @@ function renderSettingsEditor(cfg) {
   const apiCfg = cfg.api || {};
   const compatibility = cfg.compatibility || {};
   const transmission = compatibility.transmission || {};
+  const qbittorrent = compatibility.qbittorrent || {};
   const autopilot = cfg.autopilot || {};
   const storage = cfg.storage || {};
   const network = cfg.network || {};
@@ -1708,6 +1709,7 @@ function renderSettingsEditor(cfg) {
   setSettingsChecked("cfg-api-require-auth", apiCfg.require_auth);
 
   setSettingsChecked("cfg-compat-transmission-enabled", transmission.enabled);
+  setSettingsChecked("cfg-compat-qbittorrent-enabled", qbittorrent.enabled);
 
   setSettingsValue("cfg-autopilot-mode", autopilot.mode || "observe");
 
@@ -1801,6 +1803,9 @@ function collectSettingsConfig() {
     compatibility: {
       transmission: {
         enabled: settingsField("cfg-compat-transmission-enabled").checked,
+      },
+      qbittorrent: {
+        enabled: settingsField("cfg-compat-qbittorrent-enabled").checked,
       },
     },
     autopilot: {

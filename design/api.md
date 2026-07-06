@@ -42,11 +42,14 @@ ADR-0009 and ADR-0010.
 - Storage add-time preflight is part of `/api/v1` compatibility: when
   configured reserves are not met on the target storage root, add requests reject
   before data write.
-- Optional compatibility endpoints, currently `/transmission/rpc`, are isolated
-  from the native API and delegate to native daemon operations rather than a
-  second torrent engine.
+- Optional compatibility endpoints, currently `/transmission/rpc` and `/api/v2`,
+  are isolated from the native API and delegate to native daemon operations
+  rather than a separate engine.
 - Authentication policy is shared: when API auth is enabled, compatibility
-  adapters must map their auth mechanism back to `api.auth_token`.
+  adapters must map their auth mechanism back to `api.auth_token`, including
+  `/api/v2` Bearer and SID-cookie flows.
+- Optional qBittorrent compatibility is intentionally limited to core
+  automation endpoints and does not include indexer/search/discovery APIs.
 
 ## Storage API contract
 

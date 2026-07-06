@@ -11,6 +11,12 @@ require_auth = true
 auth_token = "replace-with-a-long-random-token"
 max_request_body_bytes = 16777216
 
+[compatibility.transmission]
+enabled = false
+
+[compatibility.qbittorrent]
+enabled = false
+
 [storage]
 download_dir = "/data/downloads"
 incomplete_dir = "/data/incomplete"

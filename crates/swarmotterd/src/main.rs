@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
         },
         broker,
         transmission: swarmotter_api::state::TransmissionCompatState::default(),
+        qbittorrent: swarmotter_api::state::QbittorrentCompatState::default(),
     });
 
     let bind: std::net::SocketAddr =

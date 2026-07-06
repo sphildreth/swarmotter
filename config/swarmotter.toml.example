@@ -13,6 +13,13 @@ require_auth = false
 # Maximum API request body size in bytes.
 max_request_body_bytes = 16777216
 
+# --- Compatibility APIs ---
+[compatibility.transmission]
+enabled = false
+
+[compatibility.qbittorrent]
+enabled = false
+
 # --- Storage ---
 [storage]
 download_dir = "/data/downloads"

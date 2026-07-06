@@ -424,3 +424,35 @@ delete-data option.
 
 `torrent-add` accepts magnet links via `filename` and base64 torrent metadata
 via `metainfo`. Remote HTTP/HTTPS torrent metadata URLs are rejected.
+
+## qBittorrent-compatible API compatibility
+
+When enabled, `/api/v2` is a compatibility adapter over native daemon
+operations. It is not a separate data-plane implementation and does not expose
+indexing, search, or discovery endpoints.
+
+Enable it with:
+
+```toml
+[compatibility.qbittorrent]
+enabled = true
+```
+
+Authentication follows `api.require_auth`:
+
+- Bearer token flow via `Authorization` / `X-SwarmOtter-Auth`.
+- qBittorrent-style `SID` flow via `POST /api/v2/auth/login` and a returned `SID`
+  cookie.
+
+Representative automation endpoints:
+
+- `GET /api/v2/app/version`
+- `GET /api/v2/app/webapiVersion`
+- `GET /api/v2/torrents/info`
+- `POST /api/v2/torrents/add`
+- `POST /api/v2/torrents/delete`
+- `POST /api/v2/torrents/pause`
+- `POST /api/v2/torrents/resume`
+- `POST /api/v2/torrents/start`
+- `POST /api/v2/torrents/stop`
+- `POST /api/v2/torrents/setCategory`

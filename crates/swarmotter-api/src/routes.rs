@@ -30,6 +30,45 @@ pub fn app_router_with_body_limit(state: SharedState, max_request_body_bytes: us
     Router::new()
         .route("/health", get(handlers::health::root_health))
         .route("/transmission/rpc", post(handlers::transmission::rpc))
+        .route("/api/v2/auth/login", post(handlers::qbittorrent::login))
+        .route("/api/v2/auth/logout", post(handlers::qbittorrent::logout))
+        .route("/api/v2/app/version", get(handlers::qbittorrent::version))
+        .route(
+            "/api/v2/app/webapiVersion",
+            get(handlers::qbittorrent::webapi_version),
+        )
+        .route(
+            "/api/v2/torrents/info",
+            get(handlers::qbittorrent::torrents_info),
+        )
+        .route(
+            "/api/v2/torrents/add",
+            post(handlers::qbittorrent::torrents_add),
+        )
+        .route(
+            "/api/v2/torrents/delete",
+            post(handlers::qbittorrent::torrents_delete),
+        )
+        .route(
+            "/api/v2/torrents/pause",
+            post(handlers::qbittorrent::torrents_pause),
+        )
+        .route(
+            "/api/v2/torrents/resume",
+            post(handlers::qbittorrent::torrents_resume),
+        )
+        .route(
+            "/api/v2/torrents/stop",
+            post(handlers::qbittorrent::torrents_pause),
+        )
+        .route(
+            "/api/v2/torrents/start",
+            post(handlers::qbittorrent::torrents_resume),
+        )
+        .route(
+            "/api/v2/torrents/setCategory",
+            post(handlers::qbittorrent::torrents_set_category),
+        )
         .layer(DefaultBodyLimit::max(max_request_body_bytes))
         .nest("/api/v1", v1)
         .with_state(state)

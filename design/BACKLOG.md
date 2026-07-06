@@ -179,21 +179,21 @@ Requested elsewhere:
 - The `amutorrent`/`got3nks` project demonstrates a pattern of supporting both
   Bearer API-key and session-cookie auth as compatibility shims.
 
-SwarmOtter feature shape:
+SwarmOtter compatibility shape currently implemented in v1.1.0:
 
-- Add opt-in qBittorrent `/api/v2` and Transmission RPC compatibility shims
+- Added opt-in qBittorrent `/api/v2` and Transmission RPC compatibility shims
   layered over the native API.
-- Support multiple auth modes: Bearer API key (Sonarr/Radarr preferred, as of
-  2026), session cookie (`/api/v2/auth/login`), and HTTP Basic Auth as fallback.
-- Map category/label semantics, completion/import semantics, and torrent-state
-  transitions to match client expectations. qBittorrent's category model maps
-  to SwarmOtter policy profiles and labels with explicit per-compatibility-
-  endpoint parity; Sonarr/Radarr workflows that key off qBittorrent categories
-  work without manual translation.
-- Map Sonarr/Radarr "import" semantics: the import path returns the
-  expected torrent state transition, label, and download root so *arr
-  pipelines complete the import step without custom scripting.
-- Native API remains the source of truth; compatibility endpoints delegate to it.
+- Supported auth for this phase is Bearer token auth plus `/api/v2/auth/login`
+  SID-cookie auth.
+- Exposed endpoints target automation and lifecycle interoperability, including
+  core version and `torrents` operations.
+
+Remaining roadmap work not included in this v1.1.0 shim slice:
+
+- Broader category/profile semantics beyond the implemented single
+  category-to-label mapping.
+- Completion/import semantics mapping to match broader ecosystem expectations.
+- Deep parity on transfer states beyond the focused automation endpoints.
 - No indexer, search, or content-discovery surface is exposed through
   compatibility endpoints.
 
@@ -204,7 +204,8 @@ Acceptance direction:
 - Auth mode support documented; parity matrix published.
 - Integration tests run against representative *arr/Flood flows.
 - No bundled infringing trackers, indexers, or discovery integrations.
-- Implementing this requires an ADR (new compatibility surface + auth model).
+- Further compatibility parity phases require ADR updates when they change the
+  compatibility surface or auth model.
 
 ### Per-Profile / Per-Torrent Network-Path Binding
 
