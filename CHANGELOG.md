@@ -7,6 +7,17 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [1.1.1] - [2026-07-06]
+
+### Fixed
+
+- **Gluetun Compose control-plane reachability:** the Gluetun environment
+  example now sets `FIREWALL_INPUT_PORTS=9091`, so the documented
+  host-published API/Web UI health endpoint remains reachable while torrent
+  data-plane traffic stays in the Gluetun VPN namespace. The update helper now
+  checks container-internal health after a host health failure and reports the
+  Gluetun firewall fix when the daemon is healthy inside the shared namespace.
+
 ## [1.1.0] - [2026-07-06]
 
 ### Added

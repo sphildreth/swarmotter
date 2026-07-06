@@ -63,6 +63,7 @@ Environment overrides:
   SWARMOTTER_BACKUP_DIR
   SWARMOTTER_ROLLBACK_ON_FAILURE=0
   SWARMOTTER_SKIP_EGRESS_CHECK=1
+  SWARMOTTER_CONTAINER_HEALTH_URL
 EOF
 }
 
@@ -456,10 +457,12 @@ recreate_stack() {
 validate_health() {
     local port
     local url
+    local container_url
     local attempt
 
     port="$(read_env_value SWARMOTTER_WEB_PORT 9091)"
     url="${SWARMOTTER_HEALTH_URL:-http://127.0.0.1:$port/health}"
+    container_url="${SWARMOTTER_CONTAINER_HEALTH_URL:-http://127.0.0.1:9091/health}"
 
     log "Waiting for health endpoint: $url"
     for attempt in {1..30}; do
@@ -471,6 +474,11 @@ validate_health() {
             sleep 2
         fi
     done
+
+    log "Host health check failed; checking health inside the SwarmOtter network namespace: $container_url"
+    if compose exec -T "$SERVICE_NAME" curl --max-time 5 -fsS "$container_url" >/dev/null; then
+        die "health passes inside the SwarmOtter container but not through the host-published port. For Gluetun deployments, set FIREWALL_INPUT_PORTS=9091 in the Gluetun environment file."
+    fi
 
     die "health endpoint did not pass: $url"
 }

@@ -172,6 +172,11 @@ WireGuard providers, this usually includes `WIREGUARD_PRIVATE_KEY`,
 `WIREGUARD_ENDPOINT_PORT`. The split keeps the SwarmOtter API token out of the
 Gluetun container environment.
 
+Keep `FIREWALL_INPUT_PORTS=9091` in `gluetun.env` unless the internal
+SwarmOtter API port changes. This lets the API/Web UI control plane through
+Gluetun's default-interface firewall while torrent data-plane traffic remains
+inside the Gluetun VPN namespace.
+
 Validate and start the stack:
 
 ```bash

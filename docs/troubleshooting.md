@@ -171,6 +171,29 @@ X-SwarmOtter-Auth: <token>
 
 The Web UI uses the same API routes as external clients.
 
+## Update helper health check reports connection resets
+
+If `deploy/update-swarmotter.sh` reports repeated `curl: (56) Recv failure:
+Connection reset by peer` while checking `http://127.0.0.1:9091/health`, first
+verify whether the daemon is healthy inside the shared Gluetun network
+namespace:
+
+```bash
+docker compose --env-file .env -f compose.yml exec swarmotter \
+  curl -fsS http://127.0.0.1:9091/health
+```
+
+If that succeeds but host `curl http://127.0.0.1:9091/health` fails, Gluetun is
+blocking the published control-plane port. Set this in `gluetun.env`:
+
+```dotenv
+FIREWALL_INPUT_PORTS=9091
+```
+
+This opens the SwarmOtter API/Web UI port on Gluetun's default interface. It
+does not expose torrent peer, tracker, DHT, webseed, or torrent DNS traffic
+outside the Gluetun VPN namespace.
+
 ## Torrents are added but stay at `0 B/s`
 
 If torrents appear in the Web UI but stay at `0 B/s`, check tracker status:
