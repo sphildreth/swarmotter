@@ -270,6 +270,32 @@ mod tests {
     }
 
     #[test]
+    fn web_ui_torrent_encryption_setting_is_wired() {
+        assert!(
+            INDEX_HTML.contains("id=\"cfg-torrent-encryption-mode\""),
+            "Web UI is missing torrent encryption mode field"
+        );
+        for (mode, label) in [
+            ("disabled", "Disabled"),
+            ("preferred", "Preferred"),
+            ("required", "Required"),
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("<option value=\"{mode}\">{label}</option>")),
+                "Web UI is missing torrent encryption option {mode}"
+            );
+        }
+        assert!(
+            APP_JS.contains("setSettingsValue(\"cfg-torrent-encryption-mode\", torrent.encryption_mode || \"preferred\")"),
+            "Web UI is missing torrent encryption load wiring"
+        );
+        assert!(
+            APP_JS.contains("encryption_mode: settingsString(\"cfg-torrent-encryption-mode\")"),
+            "Web UI is missing torrent encryption save wiring"
+        );
+    }
+
+    #[test]
     fn web_ui_supports_bulk_torrent_selection() {
         for id in [
             "select-all-torrents-btn",

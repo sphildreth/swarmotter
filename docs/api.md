@@ -205,6 +205,10 @@ reported one.
 | --- | --- | --- |
 | GET | `/torrents/:hash/peers` | List peers. |
 
+Peer rows include the discovered peer address, direction, current rates, flags,
+and ban state. Negotiated per-peer encryption state is not exposed in this
+phase.
+
 ## Queue
 
 | Method | Path | Description |
@@ -224,6 +228,18 @@ reported one.
 
 `PATCH /settings` updates live-safe bandwidth, queue, and seeding fields.
 
+`PUT /settings` includes `torrent.encryption_mode` and
+`[torrent].encryption_mode` values:
+
+- `disabled`
+- `preferred` (default)
+- `required`
+
+Changing this field is reported in `restart_required_fields` for already-running
+torrent tasks.
+
+Per-profile and per-torrent overrides are not yet documented in this phase.
+
 `PUT /settings` validates the full config before persistence, preserves the
 existing `api.auth_token` when omitted, applies live-safe fields immediately,
 and reports fields that require restart.
@@ -235,7 +251,9 @@ and reports fields that require restart.
 | GET | `/network/health` | Network containment health. |
 | GET | `/network/diagnostics` | Detailed network/path diagnostics. |
 
-See [Network Containment](network-containment.md) for health state meanings.
+`/network/diagnostics` includes transport settings such as `utp_enabled`,
+`utp_prefer_tcp`, and `peer_encryption_mode`. See
+[Network Containment](network-containment.md) for health state meanings.
 
 ## Storage
 

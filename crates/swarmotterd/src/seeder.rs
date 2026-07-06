@@ -23,11 +23,13 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use swarmotter_core::bandwidth::{RateDirection, RateLimiter, ShapedLimiter};
+use swarmotter_core::config::PeerEncryptionMode;
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::meta::TorrentMeta;
 use swarmotter_core::net::NetworkBinder;
 use swarmotter_core::peer::{self, Bitfield, Handshake, Message, PeerReader};
 use swarmotter_core::storage::StorageIo;
+use swarmotter_core::utp::PeerDuplex;
 
 use crate::engine::EngineState;
 
@@ -45,6 +47,7 @@ pub struct Seeder {
     binder: Arc<dyn NetworkBinder>,
     port: u16,
     peer_id: [u8; 20],
+    encryption_mode: PeerEncryptionMode,
     shutdown: tokio::sync::watch::Receiver<bool>,
     limiter: ShapedLimiter,
     /// Optional one-shot sender receiving the bound listen address, for tests
@@ -94,10 +97,17 @@ impl Seeder {
             binder,
             port,
             peer_id,
+            encryption_mode: PeerEncryptionMode::default(),
             shutdown,
             limiter: ShapedLimiter::from_rate_limiter(limiter),
             bound_addr: None,
         }
+    }
+
+    /// Configure inbound TCP peer-wire encryption policy.
+    pub fn with_encryption_mode(mut self, encryption_mode: PeerEncryptionMode) -> Self {
+        self.encryption_mode = encryption_mode;
+        self
     }
 
     /// Attach a shared global rate limiter (the daemon's process-wide upload
@@ -170,6 +180,7 @@ impl Seeder {
             let complete_storage = self.complete_storage.clone();
             let state = self.state.clone();
             let peer_id = self.peer_id;
+            let encryption_mode = self.encryption_mode;
             let limiter = self.limiter.clone();
             tokio::spawn(async move {
                 if let Err(e) = serve_peer(
@@ -179,6 +190,7 @@ impl Seeder {
                     complete_storage,
                     &state,
                     peer_id,
+                    encryption_mode,
                     &limiter,
                 )
                 .await
@@ -198,8 +210,10 @@ async fn serve_peer(
     complete_storage: Option<Arc<StorageIo>>,
     state: &Arc<Mutex<EngineState>>,
     peer_id: [u8; 20],
+    encryption_mode: PeerEncryptionMode,
     limiter: &ShapedLimiter,
 ) -> Result<()> {
+    let stream = negotiate_inbound_peer_stream(stream, meta.info_hash, encryption_mode).await?;
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = PeerReader::new(read_half);
 
@@ -352,6 +366,57 @@ async fn serve_peer(
     Ok(())
 }
 
+async fn negotiate_inbound_peer_stream(
+    stream: tokio::net::TcpStream,
+    info_hash: swarmotter_core::hash::InfoHash,
+    encryption_mode: PeerEncryptionMode,
+) -> Result<Box<dyn PeerDuplex>> {
+    let plaintext = looks_like_plaintext_peer_handshake(&stream).await?;
+    match encryption_mode {
+        PeerEncryptionMode::Disabled => Ok(Box::new(stream)),
+        PeerEncryptionMode::Preferred if plaintext => Ok(Box::new(stream)),
+        PeerEncryptionMode::Preferred => {
+            let encrypted = timeout(
+                Duration::from_secs(10),
+                swarmotter_core::mse::accept(stream, info_hash),
+            )
+            .await??;
+            Ok(Box::new(encrypted))
+        }
+        PeerEncryptionMode::Required if plaintext => Err(CoreError::Internal(
+            "plaintext inbound peer rejected by required encryption mode".into(),
+        )),
+        PeerEncryptionMode::Required => {
+            let encrypted = timeout(
+                Duration::from_secs(10),
+                swarmotter_core::mse::accept(stream, info_hash),
+            )
+            .await??;
+            Ok(Box::new(encrypted))
+        }
+    }
+}
+
+async fn looks_like_plaintext_peer_handshake(stream: &tokio::net::TcpStream) -> Result<bool> {
+    Ok(timeout(Duration::from_secs(5), async {
+        let mut prefix = [0u8; 1 + peer::PSTR.len()];
+        loop {
+            let n = stream.peek(&mut prefix).await?;
+            if n == 0 || prefix[0] != peer::PSTR.len() as u8 {
+                return Ok::<bool, std::io::Error>(false);
+            }
+            if n > 1 && prefix[1..n] != peer::PSTR[..n - 1] {
+                return Ok::<bool, std::io::Error>(false);
+            }
+            if n == prefix.len() {
+                return Ok::<bool, std::io::Error>(true);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,6 +560,75 @@ mod tests {
         let uploaded = state.lock().await.uploaded;
         assert_eq!(uploaded, req_len as u64);
 
+        let _ = shutdown_tx.send(true);
+        let _ = seeder_task.await;
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seeder_required_mode_accepts_encrypted_peer() {
+        let content = b"swarmotter encrypted seeding test payload";
+        let piece_length: u64 = content.len() as u64;
+        let bytes =
+            build_single_file_torrent("seed-encrypted.bin", content, piece_length, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("seeder-encrypted");
+        let storage = Arc::new(StorageIo::new(meta.clone(), dir.clone()));
+        storage.preallocate().await.unwrap();
+        storage.write_block(0, 0, content).await.unwrap();
+
+        let mut have = PieceBitfield::new(meta.piece_count());
+        for i in 0..meta.piece_count() {
+            have.set(i);
+        }
+        let mut state = EngineState {
+            piece_count: meta.piece_count(),
+            pieces_have: have,
+            ..EngineState::default()
+        };
+        state.total_length = meta.total_length;
+        let state = Arc::new(Mutex::new(state));
+        let binder = Arc::new(LoopbackBinder);
+
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let seeder = Seeder::new(
+            meta.clone(),
+            storage,
+            state,
+            binder,
+            0,
+            peer_id(b"-SW0002-"),
+            shutdown_rx,
+        )
+        .with_encryption_mode(PeerEncryptionMode::Required)
+        .with_bound_addr(bound_tx);
+        let seeder_task = tokio::spawn(async move { seeder.run().await });
+        let seeder_addr = bound_rx.await.expect("seeder bound its listener");
+
+        let tcp = tokio::net::TcpStream::connect(seeder_addr).await.unwrap();
+        let encrypted = swarmotter_core::mse::connect(tcp, meta.info_hash)
+            .await
+            .unwrap();
+        let (rd, mut wr) = tokio::io::split(encrypted);
+        let hs = Handshake {
+            info_hash: meta.info_hash,
+            peer_id: peer_id(b"-LC0002-"),
+            reserved: swarmotter_core::extensions::EXTENSION_RESERVED,
+        };
+        peer::write_handshake(&mut wr, &hs).await.unwrap();
+        let mut reader = PeerReader::new(rd);
+        let their_hs = reader.read_handshake().await.unwrap();
+        assert_eq!(their_hs.info_hash, meta.info_hash);
+        let msg = reader.read_message().await.unwrap().unwrap();
+        let bf = match msg {
+            Message::Bitfield { bits } => Bitfield::from_bytes(bits, meta.piece_count()),
+            _ => panic!("expected bitfield"),
+        };
+        assert_eq!(bf.count(), meta.piece_count());
+
+        drop(reader);
+        drop(wr);
         let _ = shutdown_tx.send(true);
         let _ = seeder_task.await;
         std::fs::remove_dir_all(&dir).ok();

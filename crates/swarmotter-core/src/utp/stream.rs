@@ -231,8 +231,7 @@ pub async fn connect_peer_stream(
 /// is `Send`, used as the engine's transport-agnostic peer stream.
 pub trait PeerDuplex: AsyncRead + AsyncWrite + Send + Unpin {}
 
-impl PeerDuplex for tokio::net::TcpStream {}
-impl PeerDuplex for UtpStream {}
+impl<T> PeerDuplex for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
 // Re-export the tokio IO traits for downstream convenience.
 pub use tokio::io::{AsyncRead as _, AsyncWrite as _};

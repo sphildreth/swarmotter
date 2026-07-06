@@ -49,11 +49,12 @@ struct SeedPeer {
 impl SeedPeer {
     /// Serve one connecting leecher to completion, then return.
     async fn serve_one(self, stream: tokio::net::TcpStream) -> swarmotter_core::Result<()> {
+        let stream = accept_plain_or_mse(stream, self.info_hash).await?;
         let (mut rd, mut wr) = tokio::io::split(stream);
         // Read leecher handshake.
         let mut hs_buf = [0u8; 68];
         rd.read_exact(&mut hs_buf).await?;
-        let their_hs = Handshake::decode(&hs_buf).unwrap();
+        let their_hs = Handshake::decode(&hs_buf)?;
         if their_hs.info_hash != self.info_hash {
             return Err(swarmotter_core::error::CoreError::Internal(
                 "info hash mismatch".into(),
@@ -147,11 +148,12 @@ struct InstrumentedSeedPeer {
 
 impl InstrumentedSeedPeer {
     async fn serve_one(self, stream: tokio::net::TcpStream) -> swarmotter_core::Result<()> {
+        let stream = accept_plain_or_mse(stream, self.info_hash).await?;
         let (mut rd, mut wr) = tokio::io::split(stream);
 
         let mut hs_buf = [0u8; 68];
         rd.read_exact(&mut hs_buf).await?;
-        let their_hs = Handshake::decode(&hs_buf).unwrap();
+        let their_hs = Handshake::decode(&hs_buf)?;
         if their_hs.info_hash != self.info_hash {
             return Err(swarmotter_core::error::CoreError::Internal(
                 "info hash mismatch".into(),
@@ -231,6 +233,43 @@ impl InstrumentedSeedPeer {
             }
         }
     }
+}
+
+async fn accept_plain_or_mse(
+    stream: tokio::net::TcpStream,
+    info_hash: swarmotter_core::hash::InfoHash,
+) -> swarmotter_core::Result<Box<dyn swarmotter_core::utp::PeerDuplex>> {
+    if looks_like_plaintext_peer_handshake(&stream).await? {
+        return Ok(Box::new(stream));
+    }
+    let encrypted = tokio::time::timeout(
+        Duration::from_secs(10),
+        swarmotter_core::mse::accept(stream, info_hash),
+    )
+    .await??;
+    Ok(Box::new(encrypted))
+}
+
+async fn looks_like_plaintext_peer_handshake(
+    stream: &tokio::net::TcpStream,
+) -> swarmotter_core::Result<bool> {
+    Ok(tokio::time::timeout(Duration::from_secs(5), async {
+        let mut prefix = [0u8; 1 + peer::PSTR.len()];
+        loop {
+            let n = stream.peek(&mut prefix).await?;
+            if n == 0 || prefix[0] != peer::PSTR.len() as u8 {
+                return Ok::<bool, std::io::Error>(false);
+            }
+            if n > 1 && prefix[1..n] != peer::PSTR[..n - 1] {
+                return Ok::<bool, std::io::Error>(false);
+            }
+            if n == prefix.len() {
+                return Ok::<bool, std::io::Error>(true);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??)
 }
 
 async fn read_len_prefix<R: AsyncReadExt + Unpin>(rd: &mut R) -> std::io::Result<Option<[u8; 4]>> {
@@ -320,6 +359,7 @@ async fn serve_no_extension_metadata_peer(
     stream: tokio::net::TcpStream,
     info_hash: swarmotter_core::hash::InfoHash,
 ) -> swarmotter_core::Result<()> {
+    let stream = accept_plain_or_mse(stream, info_hash).await?;
     let (mut rd, mut wr) = tokio::io::split(stream);
     let mut hs_buf = [0u8; 68];
     rd.read_exact(&mut hs_buf).await?;
@@ -1476,6 +1516,7 @@ async fn local_swarm_magnet_fetches_metadata_then_downloads() {
         info_bytes: Vec<u8>,
     ) -> swarmotter_core::Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let stream = accept_plain_or_mse(stream, meta.info_hash).await?;
         let (mut rd, mut wr) = tokio::io::split(stream);
         let mut hs_buf = [0u8; 68];
         rd.read_exact(&mut hs_buf).await?;
@@ -1702,10 +1743,11 @@ async fn local_swarm_discovers_peer_via_pex() {
         extra_peer: PeerAddr,
     ) -> swarmotter_core::Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let stream = accept_plain_or_mse(stream, info_hash).await?;
         let (mut rd, mut wr) = tokio::io::split(stream);
         let mut hs_buf = [0u8; 68];
         rd.read_exact(&mut hs_buf).await?;
-        let their_hs = Handshake::decode(&hs_buf).unwrap();
+        let their_hs = Handshake::decode(&hs_buf)?;
         if their_hs.info_hash != info_hash {
             return Err(swarmotter_core::error::CoreError::Internal(
                 "info hash mismatch".into(),

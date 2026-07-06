@@ -4,7 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, WatchFolderConfig};
+use crate::config::{Config, PeerEncryptionMode, WatchFolderConfig};
 use crate::models::network::NetworkHealth;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +69,7 @@ pub struct NetworkDiagnostics {
     pub torrent_allow_ipv6: bool,
     pub utp_enabled: bool,
     pub utp_prefer_tcp: bool,
+    pub peer_encryption_mode: PeerEncryptionMode,
     pub interfaces: Vec<NetworkInterfaceDiagnostic>,
     pub checks: Vec<NetworkPathCheck>,
     pub containment_matrix: Vec<NetworkPathCheck>,

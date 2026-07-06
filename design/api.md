@@ -56,6 +56,15 @@ ADR-0009 and ADR-0010.
 - `GET /api/v1/storage/roots` exposes storage-root diagnostics used for
   operator visibility and add-time preflight checks.
 
+- `[torrent].encryption_mode` is part of transport compatibility.
+  `/api/v1/settings` GET includes it in configuration snapshots.
+  `/api/v1/settings` PUT accepts `disabled` | `preferred` | `required`.
+  `preferred` is the default when not set.
+  Changing this field is reported in `restart_required_fields` for existing
+  torrent tasks.
+  Encryption mode is documented for interoperability and must remain under the
+  same contained peer transport path.
+
 ## Storage configuration contract
 
 - `[storage].minimum_free_space_bytes` and `[storage].minimum_free_space_percent`

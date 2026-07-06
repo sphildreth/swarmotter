@@ -36,15 +36,13 @@ authoritative scope.
 
 ## Footnotes
 
-- **Peer encryption (SwarmOtter Roadmap P0):** SwarmOtter does not yet
-  implement BEP 8 Message Stream Encryption / Protocol Encryption. This
-  is a core interoperability gap rather than a policy decision: every
-  other client in this matrix ships MSE/PE, many swarms refuse plaintext
-  handshakes, and private trackers commonly require encryption. It is
-  tracked at P0 in `design/BACKLOG.md` with framing as interoperability
-  and wire-level integrity, consistent with the lawful-use posture applied
-  to VPN/NIC containment. The matrix row is marked `Roadmap P0` so the
-  comparison stays truthful; it is not an unstated parity assumption.
+- **Peer encryption (SwarmOtter):** SwarmOtter implemented MSE/PE-style
+  Message Stream Encryption / Protocol Encryption for TCP peer connections in v1.1.0 with
+  configurable `torrent.encryption_mode` (`disabled` | `preferred` | `required`),
+  default `preferred`, and no separate socket paths.
+  Encryption runs on the contained peer transport and never bypasses network
+  containment. Remaining work is not yet complete for uTP and per-profile/per-torrent
+  overrides.
 
 - **Local peer discovery (SwarmOtter ❌):** SwarmOtter deliberately does
   not implement local-network peer discovery. Local discovery is a
@@ -106,7 +104,7 @@ authoritative scope.
 | Webseeds | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Partial |
 | uTP | ✅ | ✅ | ✅ | ✅ | Plugin/core plugin | ❌ | ❌ |
 | IPv6 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Partial |
-| Peer encryption (MSE/PE, BEP 8) | Roadmap P0 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Peer encryption (MSE/PE) | Partial | Partial | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Private torrent handling | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | File selection/priorities | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Queueing/priorities | ✅ | ✅ | ✅ | ✅ | ✅ | Partial | ✅ |
@@ -169,7 +167,7 @@ usable, remove it from `design/BACKLOG.md` and update this comparison.
 | P0 | Ecosystem Compatibility API | Adds qBittorrent-compatible API support beside the existing Transmission RPC compatibility layer. |
 | P0 | Per-Profile / Per-Torrent Network-Path Binding | Extends containment from one daemon-wide path to contained network paths by profile or torrent. |
 | P0 | Multi-User / Multi-Tenant Support | Adds role-based access, isolation, quotas, and shared-server workflows. |
-| P0 | Protocol Encryption / MSE-PE (BEP 8) | Closes a core interop gap: every mainstream client ships MSE/PE and many swarms refuse plaintext. Adds a truthful comparison row that previously understated the gap. |
+| P0 | Protocol Encryption / MSE-PE | TCP MSE/PE is now implemented with configurable `required/preferred/disabled`; remaining work is uTP encryption and per-profile/per-torrent override policy. |
 | P1 | HTTP / HTTPS Proxy Support | Adds egress through corporate/filtered HTTP proxies alongside the existing SOCKS5 (P1) entry. |
 | P1 | Scriptable CLI (`swarmotterctl`) | Adds a scriptable, JSON-output CLI mirroring the API for SSH and automation workflows without a browser. |
 | P1 | Seedbox Pre-Seed Warm-Up | Adds first-peer serving optimization for new lawful releases; complements superseeding (P1). |

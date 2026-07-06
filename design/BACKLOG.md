@@ -33,7 +33,7 @@ project.
 | P0 | Ecosystem Compatibility API | Operate alongside Sonarr/Radarr/Flood via qBittorrent-compatible and Transmission-compatible API shims | Deluge API parity requests, Flood UI, Sonarr/Radarr integration, self-hosting ecosystem (2026) |
 | P0 | Per-Profile / Per-Torrent Network-Path Binding | Assign a contained network path (namespace/VPN endpoint/interface) per profile, label, or torrent; fail-closed per path | rTorrent/Flood multi-user isolation, Deluge multi-profile routing, self-hosting VPN routing patterns |
 | P0 | Multi-User / Multi-Tenant Support | Role-based access control, per-user torrent isolation, per-user quotas, and shared-server deployments | qBittorrent [#3327](https://github.com/qbittorrent/qBittorrent/issues/3327), Flood multi-user, rTorrent+ruTorrent multi-user, Deluge thin-client auth |
-| P0 | Protocol Encryption / MSE-PE (BEP 8) | Interoperate with peers that refuse plaintext handshakes and protect the peer wire protocol from ISP throttling/identification | Transmission, qBittorrent, Deluge, BiglyBT all ship MSE/PE; private trackers commonly require it |
+| P0 | Protocol Encryption / MSE-PE | Interoperate with peers that refuse plaintext handshakes and reduce plaintext peer-wire exposure | Transmission, qBittorrent, Deluge, BiglyBT all ship MSE/PE; private trackers commonly require it |
 | P1 | Metadata-first magnet preview and intake rules | Let users inspect/select files before starting data transfer and enforce file exclusion rules | Transmission [#1611](https://github.com/transmission/transmission/issues/1611), [#2366](https://github.com/transmission/transmission/issues/2366), [#7330](https://github.com/transmission/transmission/issues/7330), [#7399](https://github.com/transmission/transmission/issues/7399), [#2399](https://github.com/transmission/transmission/issues/2399), [#5582](https://github.com/transmission/transmission/issues/5582), [#8793](https://github.com/transmission/transmission/issues/8793), qBittorrent [#23674](https://github.com/qbittorrent/qBittorrent/issues/23674) |
 | P1 | File cleanup, trash, and retention safety | Avoid accidental data loss while making unwanted/obsolete partial data easy to remove | qBittorrent [#23575](https://github.com/qbittorrent/qBittorrent/issues/23575), [#23353](https://github.com/qbittorrent/qBittorrent/issues/23353), [#24102](https://github.com/qbittorrent/qBittorrent/issues/24102), [#24601](https://github.com/qbittorrent/qBittorrent/issues/24601), Transmission [#1722](https://github.com/transmission/transmission/issues/1722), [#6513](https://github.com/transmission/transmission/issues/6513) |
 | P1 | Tracker and peer operations workbench | Diagnose weak swarms, prioritize trackers, expose known peers, webseeds, and retry state | Transmission [#996](https://github.com/transmission/transmission/issues/996), [#6425](https://github.com/transmission/transmission/issues/6425), [#8326](https://github.com/transmission/transmission/issues/8326), [#8413](https://github.com/transmission/transmission/issues/8413), [#5234](https://github.com/transmission/transmission/issues/5234), qBittorrent [#24013](https://github.com/qbittorrent/qBittorrent/issues/24013), [#24014](https://github.com/qbittorrent/qBittorrent/issues/24014) |
@@ -282,14 +282,13 @@ Acceptance direction:
   seedbox-grade isolation model that shared-server deployments require.
 - Implementing this requires an ADR (new auth model + user isolation semantics).
 
-### Protocol Encryption / MSE-PE (BEP 8)
+### Protocol Encryption / MSE-PE
 
 Problem: every mainstream torrent client (Transmission, qBittorrent, Deluge,
 BiglyBT) implements Message Stream Encryption / Protocol Encryption
-(BEP 8). Many peers refuse plaintext handshakes, and private trackers
-commonly *require* encrypted connections. ISPs routinely throttle or
-shape plain-text BitTorrent handshakes. SwarmOtter's network containment
-model constrains routing, not wire-level obfuscation: a contained peer
+(MSE/PE). Many peers refuse plaintext handshakes, and private trackers
+commonly *require* encrypted connections. SwarmOtter's network containment
+model constrains routing, not wire-level obfuscation: without MSE/PE, a contained peer
 connection is still a plaintext handshake on the wire. Without MSE/PE
 SwarmOtter cannot fully interoperate with a large fraction of swarms, and
 the comparison matrix should reflect that honestly rather than imply
@@ -302,22 +301,19 @@ Requested elsewhere:
   for years; it is treated as table stakes.
 - Private tracker ecosystems commonly require encryption; peers that do
   not offer it are rejected at the handshake.
-- ISPs commonly throttle or deprioritize traffic identified by the
-  plaintext BitTorrent handshake, affecting legitimate Linux ISO and
-  open-source release distribution.
+- Plaintext peer-wire handshakes reduce interoperability with encrypted-only
+  peers and expose more protocol metadata than necessary for contained operation.
 
 SwarmOtter feature shape:
 
-- Implement BEP 8 obfuscated handshake plus the encrypted-stream
-  negotiation (plaintext fallback, RC4/AES encrypted modes per BEP 8).
-- Make the encryption mode configurable: disabled, opportunistic
-  (plaintext handshake fallback allowed), and forced (refuse plaintext).
-- Per-profile (existing P0) and per-torrent overrides for encryption
-  mode.
-- Encryption negotiation goes through the existing contained peer
-  connection path; no separate socket creation.
-- Surface the negotiated encryption state per peer in the API, UI, and
-  the client-identity rollup (existing P1).
+- Implemented in v1.1.0 for TCP peer connections:
+  - MSE/PE obfuscated handshake and encrypted-stream negotiation with no
+    separate socket creation.
+  - Configurable `torrent.encryption_mode` (`disabled`, `preferred`, `required`),
+    default `preferred`.
+- Remaining work:
+  - Encrypted transport for uTP.
+  - Per-profile (existing P0) and per-torrent overrides for encryption mode.
 
 Acceptance direction:
 
@@ -325,15 +321,15 @@ Acceptance direction:
   the lawful-use posture already applied to VPN/NIC containment. This is
   not piracy-evasion framing; SwarmOtter does not advertise or document
   this as a way to evade copyright enforcement.
-- Encryption never weakens network containment; the encrypted stream runs
-  over the existing contained TCP/uTP transport.
-- Forced-encryption mode must not silently fall back to plaintext; it
-  must refuse or close the connection.
-- Local swarm fixtures exercise encrypted, opportunistic, and
-  forced-encryption handshakes before the default mode is set.
-- When implemented, `design/COMPARISON.md` must add a "Peer encryption
-  (MSE/PE)" row that previously showed an unstated gap; the matrix stays
-  truthful.
+- Encryption never weakens network containment; the implemented path is TCP over
+  the existing contained peer transport. uTP encrypted transport remains
+  backlog work.
+- `required` mode must not silently fall back to plaintext; it must refuse or
+  close the connection.
+- Local swarm fixtures exercise encrypted, preferred (default), and
+  required handshakes before the default mode changes.
+- `design/COMPARISON.md` reflects TCP-only MSE/PE status and leaves partial-scope
+  work visible so roadmap comparisons stay truthful.
 - Implementing this requires an ADR (new wire-protocol surface and a
   default-mode decision with interop trade-offs).
 

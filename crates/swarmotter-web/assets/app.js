@@ -1730,6 +1730,7 @@ function renderSettingsEditor(cfg) {
   setSettingsChecked("cfg-network-validate-route", network.validate_route);
   setSettingsChecked("cfg-network-validate-dns", network.validate_dns);
 
+  setSettingsValue("cfg-torrent-encryption-mode", torrent.encryption_mode || "preferred");
   setSettingsValue("cfg-torrent-listen-port", torrent.listen_port);
   setSettingsChecked("cfg-torrent-allow-ipv6", torrent.allow_ipv6);
   setSettingsChecked("cfg-torrent-utp-enabled", torrent.utp_enabled);
@@ -1831,6 +1832,7 @@ function collectSettingsConfig() {
       validate_dns: settingsField("cfg-network-validate-dns").checked,
     },
     torrent: {
+      encryption_mode: settingsString("cfg-torrent-encryption-mode"),
       listen_port: settingsInteger("cfg-torrent-listen-port", 51413),
       allow_ipv6: settingsField("cfg-torrent-allow-ipv6").checked,
       utp_enabled: settingsField("cfg-torrent-utp-enabled").checked,

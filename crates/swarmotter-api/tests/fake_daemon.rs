@@ -400,6 +400,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             torrent_allow_ipv6: cfg.torrent.allow_ipv6,
             utp_enabled: cfg.torrent.utp_enabled,
             utp_prefer_tcp: cfg.torrent.utp_prefer_tcp,
+            peer_encryption_mode: cfg.torrent.encryption_mode,
             interfaces: vec![NetworkInterfaceDiagnostic {
                 name: "lo".into(),
                 status: "up".into(),

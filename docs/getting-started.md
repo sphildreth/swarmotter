@@ -40,6 +40,8 @@ mode = "disabled"
 listen_port = 51413
 allow_ipv6 = true
 utp_enabled = true
+utp_prefer_tcp = true
+encryption_mode = "preferred"
 ```
 
 With this layout, active downloads write partial data under `incomplete`.

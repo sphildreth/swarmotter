@@ -934,9 +934,13 @@ impl DaemonRuntime {
             .insert(hash, limiter.clone());
         // Peer transport selection (TCP/uTP) from config. All transports stay
         // on the contained binder; fail-closed blocks both.
-        let (utp_enabled, utp_prefer_tcp) = {
+        let (utp_enabled, utp_prefer_tcp, encryption_mode) = {
             let cfg = self.config.lock().await;
-            (cfg.torrent.utp_enabled, cfg.torrent.utp_prefer_tcp)
+            (
+                cfg.torrent.utp_enabled,
+                cfg.torrent.utp_prefer_tcp,
+                cfg.torrent.encryption_mode,
+            )
         };
 
         let state_for_summary = state.clone();
@@ -971,6 +975,7 @@ impl DaemonRuntime {
         .with_complete_dir(complete_dir.clone().into())
         .with_global_limiter(Some(self.global_limiter.clone()))
         .with_transport(utp_enabled, utp_prefer_tcp)
+        .with_encryption_mode(encryption_mode)
         .with_preallocate(preallocate)
         .with_sparse(sparse)
         .with_storage_reserve(minimum_free_space_bytes, minimum_free_space_percent)
@@ -1181,6 +1186,7 @@ impl DaemonRuntime {
             )))
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let encryption_mode = self.config.lock().await.torrent.encryption_mode;
         let mut seeder = Seeder::with_limiter(
             meta,
             storage,
@@ -1191,6 +1197,7 @@ impl DaemonRuntime {
             shutdown_rx,
             limiter,
         )
+        .with_encryption_mode(encryption_mode)
         .with_global_limiter(Some(self.global_limiter.clone()));
         if let Some(complete_storage) = complete_storage {
             seeder = seeder.with_complete_storage(complete_storage);
@@ -2046,6 +2053,9 @@ fn restart_required_fields(previous: &Config, next: &Config) -> Vec<String> {
     }
     if previous.torrent.listen_port != next.torrent.listen_port {
         fields.push("torrent.listen_port".into());
+    }
+    if previous.torrent.encryption_mode != next.torrent.encryption_mode {
+        fields.push("torrent.encryption_mode".into());
     }
     if previous.dht.port != next.dht.port {
         fields.push("dht.port".into());
@@ -2961,6 +2971,7 @@ impl DaemonOps for DaemonRuntime {
             torrent_allow_ipv6: cfg.torrent.allow_ipv6,
             utp_enabled: cfg.torrent.utp_enabled,
             utp_prefer_tcp: cfg.torrent.utp_prefer_tcp,
+            peer_encryption_mode: cfg.torrent.encryption_mode,
             interfaces,
             checks: vec![
                 NetworkPathCheck {
@@ -3001,7 +3012,7 @@ impl DaemonOps for DaemonRuntime {
                     label: "Peer transport selection".into(),
                     level: DiagnosticLevel::Ok,
                     detail: format!(
-                        "TCP is {}, uTP is {}, preference is {}",
+                        "TCP is {}, uTP is {}, preference is {}, peer encryption is {:?}",
                         "enabled",
                         if cfg.torrent.utp_enabled {
                             "enabled"
@@ -3012,7 +3023,8 @@ impl DaemonOps for DaemonRuntime {
                             "tcp-first"
                         } else {
                             "utp-first"
-                        }
+                        },
+                        cfg.torrent.encryption_mode.as_str()
                     ),
                 },
             ],
@@ -4578,6 +4590,18 @@ mod tests {
         assert_eq!(
             strip_ansi_controls(raw),
             "2026-07-03T19:43:03Z INFO message"
+        );
+    }
+
+    #[test]
+    fn encryption_mode_change_requires_restart() {
+        let previous = Config::default();
+        let mut next = previous.clone();
+        next.torrent.encryption_mode = swarmotter_core::config::PeerEncryptionMode::Required;
+
+        assert_eq!(
+            restart_required_fields(&previous, &next),
+            vec!["torrent.encryption_mode".to_string()]
         );
     }
 

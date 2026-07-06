@@ -67,6 +67,19 @@ The underlying `/api/v1/torrents/query` endpoint also supports label, storage
 root, peer/rate threshold, counts-only, and optional grouping parameters for
 external automation and future UI views.
 
+## Protocol encryption controls
+
+SwarmOtter can negotiate MSE/PE peer encryption. The Settings screen exposes
+`torrent.encryption_mode` with these choices:
+
+- `disabled` (plaintext handshakes only),
+- `preferred` (TCP attempts use MSE/PE first, with plaintext fallback),
+- `required` (refuse plaintext).
+
+The default is `preferred`. The UI keeps this control in the same Settings edit
+flow as other daemon config because it changes peer-wire compatibility behavior.
+Per-profile and per-torrent override controls are planned for a later phase.
+
 ## Storage root diagnostics
 
 The Doctor view surfaces storage diagnostics from `GET /api/v1/storage/roots`
@@ -95,6 +108,7 @@ In autopilot visibility mode, the UI reads:
 - `GET /api/v1/autopilot/status` for the global autopilot mode.
 - `GET /api/v1/network/health` and `GET /api/v1/network/diagnostics` for any
   containment condition that may block or bias tuning decisions.
+- `GET /api/v1/torrents/:hash/stats` for peer-level health and scheduler signals.
 - `GET /api/v1/torrents/:hash/autopilot` and `POST /api/v1/torrents/:hash/autopilot`
   for per-torrent decision views and mode override controls.
 

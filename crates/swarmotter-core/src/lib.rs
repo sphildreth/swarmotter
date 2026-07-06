@@ -19,6 +19,7 @@ pub mod hash;
 pub mod magnet;
 pub mod meta;
 pub mod models;
+pub mod mse;
 pub mod net;
 pub mod peer;
 pub mod queue;

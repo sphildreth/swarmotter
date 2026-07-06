@@ -157,12 +157,41 @@ pub struct TorrentConfig {
     /// the other transport remains available.
     #[serde(default = "default_true")]
     pub utp_prefer_tcp: bool,
+    /// Peer wire encryption policy for TCP peers. `preferred` attempts MSE/PE
+    /// first and falls back to plaintext; `required` refuses plaintext peer
+    /// wire sessions and disables uTP fallback until encrypted uTP is added.
+    #[serde(default)]
+    pub encryption_mode: PeerEncryptionMode,
     /// Selfish mode: when true, SwarmOtter removes a torrent from the daemon
     /// immediately after its download completes (all pieces verified). The
     /// downloaded files are kept, but SwarmOtter will not seed the torrent
     /// after completion. Default is false (normal completion/seeding).
     #[serde(default)]
     pub selfish: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerEncryptionMode {
+    Disabled,
+    Preferred,
+    Required,
+}
+
+impl Default for PeerEncryptionMode {
+    fn default() -> Self {
+        Self::Preferred
+    }
+}
+
+impl PeerEncryptionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Preferred => "preferred",
+            Self::Required => "required",
+        }
+    }
 }
 
 fn default_utp_enabled() -> bool {
@@ -180,6 +209,7 @@ impl Default for TorrentConfig {
             allow_ipv6: true,
             utp_enabled: default_utp_enabled(),
             utp_prefer_tcp: true,
+            encryption_mode: PeerEncryptionMode::default(),
             selfish: false,
         }
     }
@@ -445,6 +475,7 @@ mod tests {
         assert!(cfg.network.allow_ipv6);
         assert!(cfg.torrent.allow_ipv6);
         assert!(cfg.torrent.utp_enabled);
+        assert_eq!(cfg.torrent.encryption_mode, PeerEncryptionMode::Preferred);
         assert_eq!(cfg.logging.level, "info");
         assert!(cfg.logging.file);
         assert!(!cfg.torrent.selfish);
@@ -681,6 +712,24 @@ selfish = true
         let env = vec![("SWARMOTTER_TORRENT__SELFISH".into(), "true".into())];
         let cfg = cfg.apply_env_overrides(&env).unwrap();
         assert!(cfg.torrent.selfish);
+    }
+
+    #[test]
+    fn torrent_encryption_mode_parses_and_env_override() {
+        let toml = r#"
+[torrent]
+encryption_mode = "required"
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(cfg.torrent.encryption_mode, PeerEncryptionMode::Required);
+
+        let cfg = Config::default();
+        let env = vec![(
+            "SWARMOTTER_TORRENT__ENCRYPTION_MODE".into(),
+            "disabled".into(),
+        )];
+        let cfg = cfg.apply_env_overrides(&env).unwrap();
+        assert_eq!(cfg.torrent.encryption_mode, PeerEncryptionMode::Disabled);
     }
 
     #[test]

@@ -52,6 +52,13 @@ MVP release.
   navigation menu with one editable detail panel visible at a time, while
   preserving the existing full-configuration save path and keeping the
   Save/Reload/Reset controls in a single header action row.
+- **TCP Protocol Encryption / MSE-PE support:** added
+  `torrent.encryption_mode` with `disabled`, `preferred` (default), and
+  `required` modes. The implementation applies to TCP peer-wire negotiation
+  through the same contained peer sockets used by existing transport paths and
+  does not create separate encryption sockets or a containment bypass. uTP
+  encryption and per-profile/per-torrent overrides remain planned.
+  ADR-0039 records this phase decision.
 - **Large-library Web UI operations console:** added
   `GET /api/v1/torrents/query` for server-side torrent-list search, filters,
   sorting, pagination, bucket counts, counts-only queries, and optional

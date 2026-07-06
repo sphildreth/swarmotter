@@ -20,6 +20,7 @@ SWARMOTTER_AUTOPILOT__MODE=observe
 SWARMOTTER_NETWORK__MODE=strict
 SWARMOTTER_NETWORK__REQUIRED_INTERFACE=br0
 SWARMOTTER_TORRENT__LISTEN_PORT=51413
+SWARMOTTER_TORRENT__ENCRYPTION_MODE=preferred
 SWARMOTTER_COMPATIBILITY__QBITTORRENT__ENABLED=true
 SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED=true
 ```
@@ -59,6 +60,8 @@ validate_dns = true
 listen_port = 51413
 allow_ipv6 = true
 utp_enabled = true
+utp_prefer_tcp = true
+encryption_mode = "preferred"
 ```
 
 If a `[network]` table contains `required_interface` but omits `mode`,
@@ -137,6 +140,7 @@ fail-closed behavior when strict containment is configured:
 - `torrent.utp_prefer_tcp = true`
 - `torrent.allow_ipv6 = true`
 - `network.allow_ipv6 = true`
+- `torrent.encryption_mode = "preferred"`
 - `dht.enabled = true`
 - `pex.enabled = true`
 - Bandwidth limits default to `0`, meaning unlimited.
@@ -293,6 +297,7 @@ or network namespace.
 | `allow_ipv6` | `true` | Enables IPv6 peers when network containment also allows IPv6; when false, IPv6 peers are filtered before connecting. |
 | `utp_enabled` | `true` | Enables uTP peer transport through contained UDP sockets. |
 | `utp_prefer_tcp` | `true` | Tries TCP first, with uTP fallback. |
+| `encryption_mode` | `preferred` | TCP MSE/PE peer wire mode. `disabled` permits plaintext handshakes. `preferred` enables MSE/PE with plaintext fallback for TCP attempts while preserving the configured TCP/uTP preference. `required` refuses plaintext and requires encrypted TCP stream negotiation. Changing this setting is reported as restart-required for already-running torrent tasks. |
 | `selfish` | `false` | Removes a torrent after verified completion and does not seed it. |
 
 ### `[bandwidth]`

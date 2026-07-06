@@ -308,6 +308,14 @@
         <div id="settings-torrent" class="card settings-panel" data-settings-panel="torrent" tabindex="-1" hidden>
           <h3>Torrent</h3>
           <div class="settings-form-grid">
+            <label class="settings-field">
+              <span>Encryption mode</span>
+              <select id="cfg-torrent-encryption-mode">
+                <option value="disabled">Disabled</option>
+                <option value="preferred">Preferred</option>
+                <option value="required">Required</option>
+              </select>
+            </label>
             <label class="settings-field"><span>Listen port</span><input id="cfg-torrent-listen-port" type="number" min="1" max="65535" step="1" required></label>
             <label class="settings-check"><input id="cfg-torrent-allow-ipv6" type="checkbox"><span>Allow IPv6 peers</span></label>
             <label class="settings-check"><input id="cfg-torrent-utp-enabled" type="checkbox"><span>Enable uTP</span></label>

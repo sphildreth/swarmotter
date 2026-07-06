@@ -66,6 +66,8 @@ infringement.
   workflows.
 - Magnet links and `.torrent` file intake.
 - TCP and uTP peer wire protocol support.
+- TCP peer-wire protocol encryption (MSE/PE) with configurable mode:
+  `disabled`, `preferred` (default), or `required`.
 - DHT, PEX, HTTP/HTTPS trackers, UDP trackers, and webseeds.
 - BEP 9 magnet metadata fetching.
 - Fast resume and forced recheck.

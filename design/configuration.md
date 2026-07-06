@@ -28,6 +28,7 @@ updates use two API paths:
   request omits it.
 - Runtime updates must report fields that require restart.
 - Environment overrides must pass through the same validation as file config.
+- Transport option changes are release-facing compatibility decisions.
 
 ## Compatibility boundaries
 
@@ -43,6 +44,20 @@ adapter surfaces remain isolated from native daemon configuration.
 Compatibility adapters, including `[compatibility.qbittorrent]`, are contract
 surfaces that do not change torrent transport behavior. They must route through
 the native API and keep containment and socket policy unchanged.
+
+`[torrent].encryption_mode` is the protocol-transport compatibility option for
+peer-wire negotiation:
+
+- `disabled`: permit plaintext handshakes.
+- `preferred` (default): TCP peer attempts use MSE/PE first, with plaintext
+  fallback when allowed; TCP/uTP ordering still follows `torrent.utp_prefer_tcp`.
+- `required`: refuse plaintext and require encrypted stream negotiation.
+
+Changing this mode is restart-required for already-running torrent tasks because
+engines and seeders capture the peer-wire policy at task startup.
+
+This phase is TCP-only; no uTP encryption and no per-profile/per-torrent override
+surface is included yet.
 
 ## Maintenance
 

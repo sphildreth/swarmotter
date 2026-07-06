@@ -29,6 +29,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use swarmotter_core::bandwidth::{RateDirection, RateLimiter, ShapedLimiter};
+use swarmotter_core::config::PeerEncryptionMode;
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
 use swarmotter_core::meta::TorrentMeta;
@@ -191,6 +192,7 @@ pub struct TorrentEngine {
     /// preferred over uTP. All transports go through the contained binder.
     utp_enabled: bool,
     utp_prefer_tcp: bool,
+    encryption_mode: PeerEncryptionMode,
     preallocate: bool,
     sparse: bool,
     minimum_free_space_bytes: u64,
@@ -258,6 +260,7 @@ impl TorrentEngine {
             dht: None,
             utp_enabled: true,
             utp_prefer_tcp: true,
+            encryption_mode: PeerEncryptionMode::default(),
             preallocate: true,
             sparse: true,
             minimum_free_space_bytes: 0,
@@ -293,6 +296,12 @@ impl TorrentEngine {
     pub fn with_transport(mut self, utp_enabled: bool, utp_prefer_tcp: bool) -> Self {
         self.utp_enabled = utp_enabled;
         self.utp_prefer_tcp = utp_prefer_tcp;
+        self
+    }
+
+    /// Configure TCP peer-wire encryption policy.
+    pub fn with_encryption_mode(mut self, encryption_mode: PeerEncryptionMode) -> Self {
+        self.encryption_mode = encryption_mode;
         self
     }
 
@@ -784,6 +793,7 @@ impl TorrentEngine {
             self.peer_id,
             self.utp_enabled,
             self.utp_prefer_tcp,
+            self.encryption_mode,
         )
         .await?;
         tracing::debug!(peer = %peer_addr.socket_addr(), transport = transport.as_str(), "peer connected");
@@ -1092,6 +1102,7 @@ impl TorrentEngine {
             let limiter = self.limiter.clone();
             let utp_enabled = self.utp_enabled;
             let utp_prefer_tcp = self.utp_prefer_tcp;
+            let encryption_mode = self.encryption_mode;
             handles.push(tokio::spawn(async move {
                 endgame_peer_session(
                     binder,
@@ -1107,6 +1118,7 @@ impl TorrentEngine {
                     limiter,
                     utp_enabled,
                     utp_prefer_tcp,
+                    encryption_mode,
                 )
                 .await
             }));
@@ -1200,6 +1212,7 @@ impl TorrentEngine {
                 self.limiter.clone(),
                 self.utp_enabled,
                 self.utp_prefer_tcp,
+                self.encryption_mode,
                 self.pex_enabled && !self.meta.is_private(),
                 self.allow_ipv6,
                 self.pex_max_peers,
@@ -1301,6 +1314,7 @@ impl TorrentEngine {
                     self.limiter.clone(),
                     self.utp_enabled,
                     self.utp_prefer_tcp,
+                    self.encryption_mode,
                     self.pex_enabled && !self.meta.is_private(),
                     self.allow_ipv6,
                     self.pex_max_peers,
@@ -1733,6 +1747,7 @@ impl TorrentEngine {
                     &candidates,
                     self.utp_enabled,
                     self.utp_prefer_tcp,
+                    self.encryption_mode,
                 )
                 .await
                 {
@@ -2626,21 +2641,21 @@ async fn connect_peer_wire_with_transport(
     peer_id: [u8; 20],
     utp_enabled: bool,
     utp_prefer_tcp: bool,
+    encryption_mode: PeerEncryptionMode,
 ) -> Result<(PeerReader<PeerReadHalf>, PeerWriteHalf, PeerTransport)> {
-    let transports = if utp_enabled {
-        if utp_prefer_tcp {
-            vec![PeerTransport::Tcp, PeerTransport::Utp]
-        } else {
-            vec![PeerTransport::Utp, PeerTransport::Tcp]
-        }
-    } else {
-        vec![PeerTransport::Tcp]
-    };
+    let transports = peer_transport_order(utp_enabled, utp_prefer_tcp, encryption_mode);
 
     let mut last_error = None;
     for (idx, transport) in transports.iter().copied().enumerate() {
-        match attempt_peer_wire_transport(binder.clone(), transport, peer_addr, info_hash, peer_id)
-            .await
+        match attempt_peer_wire_transport(
+            binder.clone(),
+            transport,
+            peer_addr,
+            info_hash,
+            peer_id,
+            encryption_mode,
+        )
+        .await
         {
             Ok(session) => return Ok(session),
             Err(e) => {
@@ -2660,15 +2675,90 @@ async fn connect_peer_wire_with_transport(
     Err(last_error.unwrap_or_else(|| CoreError::Internal("no peer transport configured".into())))
 }
 
+fn peer_transport_order(
+    utp_enabled: bool,
+    utp_prefer_tcp: bool,
+    encryption_mode: PeerEncryptionMode,
+) -> Vec<PeerTransport> {
+    if matches!(encryption_mode, PeerEncryptionMode::Required) {
+        return vec![PeerTransport::Tcp];
+    }
+    if !utp_enabled {
+        return vec![PeerTransport::Tcp];
+    }
+    if utp_prefer_tcp {
+        vec![PeerTransport::Tcp, PeerTransport::Utp]
+    } else {
+        vec![PeerTransport::Utp, PeerTransport::Tcp]
+    }
+}
+
 async fn attempt_peer_wire_transport(
     binder: Arc<dyn NetworkBinder>,
     transport: PeerTransport,
     peer_addr: PeerAddr,
     info_hash: InfoHash,
     peer_id: [u8; 20],
+    encryption_mode: PeerEncryptionMode,
 ) -> Result<(PeerReader<PeerReadHalf>, PeerWriteHalf, PeerTransport)> {
+    if transport == PeerTransport::Utp && matches!(encryption_mode, PeerEncryptionMode::Required) {
+        return Err(CoreError::Internal(
+            "uTP encrypted peer wire is not implemented for required encryption mode".into(),
+        ));
+    }
+
     let (stream, selected) =
-        utp::connect_peer_stream(binder, transport, peer_addr.socket_addr()).await?;
+        utp::connect_peer_stream(binder.clone(), transport, peer_addr.socket_addr()).await?;
+    let stream = match (selected, encryption_mode) {
+        (PeerTransport::Tcp, PeerEncryptionMode::Disabled) => stream,
+        (PeerTransport::Tcp, PeerEncryptionMode::Required) => {
+            let encrypted = timeout(
+                Duration::from_secs(10),
+                swarmotter_core::mse::connect(stream, info_hash),
+            )
+            .await??;
+            Box::new(encrypted) as Box<dyn utp::PeerDuplex>
+        }
+        (PeerTransport::Tcp, PeerEncryptionMode::Preferred) => {
+            match timeout(
+                Duration::from_secs(10),
+                swarmotter_core::mse::connect(stream, info_hash),
+            )
+            .await
+            {
+                Ok(Ok(encrypted)) => Box::new(encrypted) as Box<dyn utp::PeerDuplex>,
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        peer = %peer_addr.socket_addr(),
+                        error = %e,
+                        "MSE/PE negotiation failed; retrying TCP peer as plaintext"
+                    );
+                    let (plain, _) = utp::connect_peer_stream(
+                        binder,
+                        PeerTransport::Tcp,
+                        peer_addr.socket_addr(),
+                    )
+                    .await?;
+                    plain
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        peer = %peer_addr.socket_addr(),
+                        error = %e,
+                        "MSE/PE negotiation timed out; retrying TCP peer as plaintext"
+                    );
+                    let (plain, _) = utp::connect_peer_stream(
+                        binder,
+                        PeerTransport::Tcp,
+                        peer_addr.socket_addr(),
+                    )
+                    .await?;
+                    plain
+                }
+            }
+        }
+        (PeerTransport::Utp, _) => stream,
+    };
     let (read_half, mut write_half) = tokio::io::split(stream);
     let hs = Handshake {
         info_hash,
@@ -2784,6 +2874,7 @@ async fn endgame_peer_session(
     limiter: ShapedLimiter,
     utp_enabled: bool,
     utp_prefer_tcp: bool,
+    encryption_mode: PeerEncryptionMode,
 ) -> Result<bool> {
     if !binder.traffic_allowed() {
         return Ok(false);
@@ -2796,6 +2887,7 @@ async fn endgame_peer_session(
         peer_id,
         utp_enabled,
         utp_prefer_tcp,
+        encryption_mode,
     )
     .await?;
     tracing::debug!(peer = %peer_addr.socket_addr(), transport = transport.as_str(), "endgame peer connected");
@@ -3078,6 +3170,7 @@ fn spawn_parallel_peer_task(
     limiter: ShapedLimiter,
     utp_enabled: bool,
     utp_prefer_tcp: bool,
+    encryption_mode: PeerEncryptionMode,
     pex_enabled: bool,
     allow_ipv6: bool,
     pex_max_peers: usize,
@@ -3097,6 +3190,7 @@ fn spawn_parallel_peer_task(
             limiter,
             utp_enabled,
             utp_prefer_tcp,
+            encryption_mode,
             pex_enabled,
             allow_ipv6,
             pex_max_peers,
@@ -3297,6 +3391,7 @@ async fn parallel_peer_session(
     limiter: ShapedLimiter,
     utp_enabled: bool,
     utp_prefer_tcp: bool,
+    encryption_mode: PeerEncryptionMode,
     pex_enabled: bool,
     allow_ipv6: bool,
     pex_max_peers: usize,
@@ -3312,6 +3407,7 @@ async fn parallel_peer_session(
         peer_id,
         utp_enabled,
         utp_prefer_tcp,
+        encryption_mode,
     )
     .await?;
     tracing::debug!(peer = %peer_addr.socket_addr(), transport = transport.as_str(), "parallel peer connected");
@@ -3743,6 +3839,22 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn preferred_encryption_preserves_transport_preference() {
+        assert_eq!(
+            peer_transport_order(true, false, PeerEncryptionMode::Preferred),
+            vec![PeerTransport::Utp, PeerTransport::Tcp]
+        );
+        assert_eq!(
+            peer_transport_order(true, true, PeerEncryptionMode::Preferred),
+            vec![PeerTransport::Tcp, PeerTransport::Utp]
+        );
+        assert_eq!(
+            peer_transport_order(true, false, PeerEncryptionMode::Required),
+            vec![PeerTransport::Tcp]
+        );
     }
 
     #[test]
