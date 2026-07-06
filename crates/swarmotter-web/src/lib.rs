@@ -526,6 +526,11 @@ mod tests {
             "id=\"view-doctor\"",
             "class=\"view-grid\"",
             "class=\"settings-layout\"",
+            "class=\"settings-header\"",
+            "class=\"settings-shell\"",
+            "class=\"settings-nav\"",
+            "data-settings-target=\"api\"",
+            "data-settings-panel=\"api\"",
             "class=\"watch-layout\"",
         ] {
             assert!(
@@ -558,6 +563,13 @@ mod tests {
         for needle in [
             ".view-grid",
             ".settings-layout",
+            ".settings-header",
+            ".settings-shell",
+            ".settings-nav",
+            ".settings-nav-item",
+            ".settings-detail",
+            ".settings-panel",
+            ".settings-panel[hidden]",
             ".settings-wide",
             ".settings-form-grid",
             ".settings-field",
@@ -640,6 +652,10 @@ mod tests {
 
         for needle in [
             "function renderSettingsEditor(",
+            "let activeSettingsPanel = \"api\";",
+            "function activateSettingsPanel(",
+            "$$(\".settings-nav-item\").forEach",
+            "const panel = invalid?.closest(\"[data-settings-panel]\")?.dataset.settingsPanel;",
             "function collectSettingsConfig(",
             "autopilot: {",
             "mode: settingsString(\"cfg-autopilot-mode\")",

@@ -72,6 +72,10 @@ The Settings tab includes an Autopilot card for the global
 `disabled` / `observe` / `act` mode. Torrent Details keeps the per-torrent
 override control.
 
+The Settings screen uses a two-panel layout: section navigation on the left and
+the selected settings group on the right. Save, reload, and reset controls sit
+in the Settings header. Saving still submits the full configuration snapshot.
+
 The details page renders a compact "why is this slow?" report with these fields:
 
 - active/global/autopilot mode state.

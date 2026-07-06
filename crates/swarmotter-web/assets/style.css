@@ -213,7 +213,6 @@ nav { display: flex; gap: 0.3rem; }
     margin-top: 0.35rem;
   }
 }
-.settings-layout,
 .watch-layout {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
@@ -221,12 +220,72 @@ nav { display: flex; gap: 0.3rem; }
   margin-top: 0.75rem;
   align-items: start;
 }
-.settings-layout .card,
 .watch-layout .card {
   margin-bottom: 0;
 }
-.settings-layout .settings-wide {
-  grid-column: 1 / -1;
+.settings-layout {
+  display: grid;
+  gap: 0.85rem;
+}
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.settings-header h2 {
+  margin: 0;
+}
+.settings-header .settings-actions {
+  margin: 0;
+}
+.settings-shell {
+  display: grid;
+  grid-template-columns: minmax(11rem, 14rem) minmax(0, 1fr);
+  gap: 1rem;
+  align-items: start;
+}
+.settings-nav {
+  position: sticky;
+  top: 0.75rem;
+  display: grid;
+  gap: 0.2rem;
+  padding: 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--card);
+}
+.settings-nav-item {
+  width: 100%;
+  min-height: 2.1rem;
+  text-align: left;
+  background: transparent;
+  color: var(--fg);
+  border: 1px solid transparent;
+  padding: 0.35rem 0.55rem;
+}
+.settings-nav-item:hover {
+  background: var(--button-ghost-bg);
+  opacity: 1;
+}
+.settings-nav-item.active {
+  background: var(--tab-bg);
+  border-color: var(--border);
+}
+.settings-detail {
+  min-width: 0;
+}
+.settings-panel {
+  margin-bottom: 0;
+}
+.settings-panel[hidden] {
+  display: none;
+}
+#settings-save-status {
+  margin-top: 1rem;
+}
+.settings-wide {
+  min-width: 0;
 }
 .settings-form-grid {
   display: grid;
@@ -287,6 +346,22 @@ nav { display: flex; gap: 0.3rem; }
   border: 1px solid var(--border);
   border-radius: 4px;
   background: var(--toast-bg);
+}
+@media (max-width: 720px) {
+  .settings-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .settings-header .settings-actions {
+    justify-content: flex-start;
+  }
+  .settings-shell {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .settings-nav {
+    position: static;
+    grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+  }
 }
 .settings-list {
   min-height: 8rem;

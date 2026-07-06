@@ -30,6 +30,10 @@ MVP release.
   refresh, peer-worker tuning, peer-backoff relaxation, and queue-slot release
   using existing contained telemetry.
   ADR-0035 records the control and containment decision.
+- **Web UI Settings two-panel layout:** Settings now uses a left section
+  navigation menu with one editable detail panel visible at a time, while
+  preserving the existing full-configuration save path and keeping the
+  Save/Reload/Reset controls in a single header action row.
 
 ### Fixed
 

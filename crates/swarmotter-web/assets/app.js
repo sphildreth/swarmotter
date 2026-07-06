@@ -27,6 +27,7 @@ let logEventSource = null;
 let lastEventStreamErrorAt = 0;
 let fullConfigSnapshot = null;
 let autopilotModeUpdateInFlight = false;
+let activeSettingsPanel = "api";
 
 const EVENT_KINDS = [
   "torrent_added",
@@ -1437,6 +1438,30 @@ function renderSettingsEditor(cfg) {
 
   renderWatchFolderEditors(cfg.watch || []);
   setSettingsValue("toast-seconds", String(Math.round(toastDisplayMs / 1000)));
+  activateSettingsPanel(activeSettingsPanel, { focus: false });
+}
+
+function activateSettingsPanel(panelName, options = {}) {
+  const panels = $$("[data-settings-panel]");
+  if (!panels.length) return;
+  const target = panels.some(panel => panel.dataset.settingsPanel === panelName)
+    ? panelName
+    : "api";
+  activeSettingsPanel = target;
+  panels.forEach(panel => {
+    const active = panel.dataset.settingsPanel === target;
+    panel.classList.toggle("active", active);
+    panel.hidden = !active;
+  });
+  $$(".settings-nav-item").forEach(button => {
+    const active = button.dataset.settingsTarget === target;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-current", active ? "page" : "false");
+  });
+  if (options.focus) {
+    const panel = $(`[data-settings-panel="${target}"]`);
+    if (panel) panel.focus({ preventScroll: true });
+  }
 }
 
 function collectSettingsConfig() {
@@ -1581,7 +1606,13 @@ function watchOptionalString(row, field) {
 $("#settings-editor").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
-  if (!form.reportValidity()) return;
+  if (!form.checkValidity()) {
+    const invalid = form.querySelector(":invalid");
+    const panel = invalid?.closest("[data-settings-panel]")?.dataset.settingsPanel;
+    if (panel) activateSettingsPanel(panel, { focus: false });
+    form.reportValidity();
+    return;
+  }
   const status = $("#settings-save-status");
   try {
     const result = await api("/settings", {
@@ -1916,6 +1947,11 @@ $("#clear-torrent-filters-btn").addEventListener("click", clearTorrentFilters);
 $("#select-all-torrents-btn").addEventListener("click", selectAllVisibleTorrents);
 $("#deselect-all-torrents-btn").addEventListener("click", deselectAllTorrents);
 $("#remove-selected-torrents-btn").addEventListener("click", removeSelectedTorrents);
+$$(".settings-nav-item").forEach(button => {
+  button.addEventListener("click", () => {
+    activateSettingsPanel(button.dataset.settingsTarget, { focus: true });
+  });
+});
 const themeToggle = $("#theme-toggle");
 if (themeToggle) themeToggle.addEventListener("click", toggleTheme);
 

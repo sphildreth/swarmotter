@@ -150,9 +150,36 @@
 
     <!-- Settings view -->
     <section id="view-settings" class="view hidden">
-      <h2>Settings</h2>
       <form id="settings-editor" class="settings-layout">
-        <div id="settings-api" class="card">
+        <div class="settings-header">
+          <h2>Settings</h2>
+          <div class="settings-actions" aria-label="Settings actions">
+            <button id="save-settings-btn" type="submit">Save Settings</button>
+            <button id="reload-settings-btn" type="button" class="secondary">Reload</button>
+            <button id="reset-downloads-btn" type="button" class="danger">Reset</button>
+          </div>
+        </div>
+
+        <div class="settings-shell">
+          <nav class="settings-nav" aria-label="Settings sections">
+            <button type="button" class="settings-nav-item active" data-settings-target="api">API</button>
+            <button type="button" class="settings-nav-item" data-settings-target="compatibility">Compatibility</button>
+            <button type="button" class="settings-nav-item" data-settings-target="autopilot">Autopilot</button>
+            <button type="button" class="settings-nav-item" data-settings-target="storage">Storage</button>
+            <button type="button" class="settings-nav-item" data-settings-target="network">Network</button>
+            <button type="button" class="settings-nav-item" data-settings-target="torrent">Torrent</button>
+            <button type="button" class="settings-nav-item" data-settings-target="bandwidth">Bandwidth</button>
+            <button type="button" class="settings-nav-item" data-settings-target="queue">Queue</button>
+            <button type="button" class="settings-nav-item" data-settings-target="seeding">Seeding</button>
+            <button type="button" class="settings-nav-item" data-settings-target="dht">DHT</button>
+            <button type="button" class="settings-nav-item" data-settings-target="pex">PEX</button>
+            <button type="button" class="settings-nav-item" data-settings-target="watch">Watch folders</button>
+            <button type="button" class="settings-nav-item" data-settings-target="logging">Logging</button>
+            <button type="button" class="settings-nav-item" data-settings-target="interface">Interface</button>
+          </nav>
+
+          <div class="settings-detail">
+        <div id="settings-api" class="card settings-panel active" data-settings-panel="api" tabindex="-1">
           <h3>API</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Bind address</span><input id="cfg-api-bind-address" type="text" required></label>
@@ -162,12 +189,12 @@
           </div>
         </div>
 
-        <div id="settings-compatibility" class="card">
+        <div id="settings-compatibility" class="card settings-panel" data-settings-panel="compatibility" tabindex="-1" hidden>
           <h3>Compatibility</h3>
           <label class="settings-check"><input id="cfg-compat-transmission-enabled" type="checkbox"><span>Transmission RPC API</span></label>
         </div>
 
-        <div id="settings-autopilot" class="card">
+        <div id="settings-autopilot" class="card settings-panel" data-settings-panel="autopilot" tabindex="-1" hidden>
           <h3>Autopilot</h3>
           <div class="settings-form-grid">
             <label class="settings-field">
@@ -181,7 +208,7 @@
           </div>
         </div>
 
-        <div id="settings-storage" class="card">
+        <div id="settings-storage" class="card settings-panel" data-settings-panel="storage" tabindex="-1" hidden>
           <h3>Storage</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Download directory</span><input id="cfg-storage-download-dir" type="text"></label>
@@ -191,7 +218,7 @@
           </div>
         </div>
 
-        <div id="settings-network" class="card settings-wide">
+        <div id="settings-network" class="card settings-panel" data-settings-panel="network" tabindex="-1" hidden>
           <h3>Network containment</h3>
           <div class="settings-form-grid">
             <label class="settings-field">
@@ -213,7 +240,7 @@
           </div>
         </div>
 
-        <div id="settings-torrent" class="card">
+        <div id="settings-torrent" class="card settings-panel" data-settings-panel="torrent" tabindex="-1" hidden>
           <h3>Torrent</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Listen port</span><input id="cfg-torrent-listen-port" type="number" min="1" max="65535" step="1" required></label>
@@ -224,7 +251,7 @@
           </div>
         </div>
 
-        <div id="settings-bandwidth" class="card">
+        <div id="settings-bandwidth" class="card settings-panel" data-settings-panel="bandwidth" tabindex="-1" hidden>
           <h3>Bandwidth</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Global download B/s</span><input id="cfg-bandwidth-global-download" type="number" min="0" step="1" required></label>
@@ -237,7 +264,7 @@
           </div>
         </div>
 
-        <div id="settings-queue" class="card">
+        <div id="settings-queue" class="card settings-panel" data-settings-panel="queue" tabindex="-1" hidden>
           <h3>Queue</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Max active downloads</span><input id="cfg-queue-max-active-downloads" type="number" min="0" step="1" required></label>
@@ -246,7 +273,7 @@
           </div>
         </div>
 
-        <div id="settings-seeding" class="card">
+        <div id="settings-seeding" class="card settings-panel" data-settings-panel="seeding" tabindex="-1" hidden>
           <h3>Seeding</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Global ratio limit</span><input id="cfg-seeding-global-ratio-limit" type="number" min="0" step="0.01"></label>
@@ -254,7 +281,7 @@
           </div>
         </div>
 
-        <div id="settings-dht" class="card">
+        <div id="settings-dht" class="card settings-panel" data-settings-panel="dht" tabindex="-1" hidden>
           <h3>DHT</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Port</span><input id="cfg-dht-port" type="number" min="1" max="65535" step="1" required></label>
@@ -263,7 +290,7 @@
           <label class="settings-field"><span>Bootstrap nodes</span><textarea id="cfg-dht-bootstrap-nodes" class="settings-list" rows="5" spellcheck="false"></textarea></label>
         </div>
 
-        <div id="settings-pex" class="card">
+        <div id="settings-pex" class="card settings-panel" data-settings-panel="pex" tabindex="-1" hidden>
           <h3>PEX</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Max peers</span><input id="cfg-pex-max-peers" type="number" min="0" step="1" required></label>
@@ -271,7 +298,7 @@
           </div>
         </div>
 
-        <div id="settings-watch" class="card settings-wide">
+        <div id="settings-watch" class="card settings-panel" data-settings-panel="watch" tabindex="-1" hidden>
           <div class="settings-card-heading">
             <h3>Watch folders</h3>
             <button id="add-watch-folder-btn" type="button">Add Folder</button>
@@ -279,7 +306,7 @@
           <div id="settings-watch-list" class="settings-watch-list"></div>
         </div>
 
-        <div id="settings-logging" class="card">
+        <div id="settings-logging" class="card settings-panel" data-settings-panel="logging" tabindex="-1" hidden>
           <h3>Logging</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Level</span><input id="cfg-logging-level" type="text" list="logging-level-options" required></label>
@@ -296,7 +323,7 @@
           </div>
         </div>
 
-        <div id="settings-interface" class="card">
+        <div id="settings-interface" class="card settings-panel" data-settings-panel="interface" tabindex="-1" hidden>
           <h3>Interface</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Toast display seconds</span><input id="toast-seconds" type="number" min="1" max="60" step="1"></label>
@@ -304,15 +331,11 @@
           </div>
         </div>
 
-        <div class="settings-actions settings-wide">
-          <button id="save-settings-btn" type="submit">Save Settings</button>
-          <button id="reload-settings-btn" type="button" class="secondary">Reload</button>
-          <button id="reset-downloads-btn" type="button" class="danger">Reset</button>
-        </div>
-
         <div id="settings-save-status" class="card settings-wide">
           <h3>Save status</h3>
           <p class="muted">No save operation yet.</p>
+        </div>
+          </div>
         </div>
       </form>
     </section>
