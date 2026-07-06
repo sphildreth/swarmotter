@@ -98,6 +98,14 @@ pub struct StorageConfig {
     pub download_dir: Option<String>,
     #[serde(default)]
     pub incomplete_dir: Option<String>,
+    /// Minimum free bytes to keep available on storage roots after planned
+    /// torrent writes. `0` disables byte-reserve enforcement.
+    #[serde(default)]
+    pub minimum_free_space_bytes: u64,
+    /// Minimum percent of the storage root to keep available after planned
+    /// torrent writes. `0` disables percent-reserve enforcement.
+    #[serde(default)]
+    pub minimum_free_space_percent: u8,
     /// Whether to preallocate files on disk.
     #[serde(default)]
     pub preallocate: bool,
@@ -115,6 +123,8 @@ impl Default for StorageConfig {
         Self {
             download_dir: None,
             incomplete_dir: None,
+            minimum_free_space_bytes: 0,
+            minimum_free_space_percent: 0,
             preallocate: false,
             sparse: true,
         }
@@ -371,6 +381,11 @@ impl Config {
         if self.dht.port == 0 {
             return Err(CoreError::InvalidConfig("dht.port must be > 0".into()));
         }
+        if self.storage.minimum_free_space_percent > 100 {
+            return Err(CoreError::InvalidConfig(
+                "storage.minimum_free_space_percent must be between 0 and 100".into(),
+            ));
+        }
         for w in &self.watch {
             if w.path.is_empty() {
                 return Err(CoreError::InvalidConfig(
@@ -524,6 +539,8 @@ bind_address = "0.0.0.0:9091"
 [storage]
 download_dir = "/data/downloads"
 incomplete_dir = "/data/incomplete"
+minimum_free_space_bytes = 1048576
+minimum_free_space_percent = 5
 
 [network]
 mode = "strict"
@@ -541,6 +558,38 @@ listen_port = 51413
         assert_eq!(cfg.api.bind_address, "0.0.0.0:9091");
         assert_eq!(cfg.network.required_interface.as_deref(), Some("tun0"));
         assert!(cfg.storage.download_dir.as_deref() == Some("/data/downloads"));
+        assert_eq!(cfg.storage.minimum_free_space_bytes, 1_048_576);
+        assert_eq!(cfg.storage.minimum_free_space_percent, 5);
+    }
+
+    #[test]
+    fn storage_free_space_percent_validates_range() {
+        let err = Config::from_toml_str(
+            r#"
+[storage]
+minimum_free_space_percent = 101
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("minimum_free_space_percent"));
+    }
+
+    #[test]
+    fn storage_reserve_env_overrides_apply() {
+        let cfg = Config::default()
+            .apply_env_overrides(&[
+                (
+                    "SWARMOTTER_STORAGE__MINIMUM_FREE_SPACE_BYTES".into(),
+                    "4096".into(),
+                ),
+                (
+                    "SWARMOTTER_STORAGE__MINIMUM_FREE_SPACE_PERCENT".into(),
+                    "7".into(),
+                ),
+            ])
+            .unwrap();
+        assert_eq!(cfg.storage.minimum_free_space_bytes, 4096);
+        assert_eq!(cfg.storage.minimum_free_space_percent, 7);
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod peers;
 pub mod queue;
 pub mod settings;
 pub mod stats;
+pub mod storage;
 pub mod torrents;
 pub mod trackers;
 pub mod transmission;

@@ -559,6 +559,7 @@ mod tests {
             "watch-scan-result",
             "log-controls",
             "log-stream",
+            "doctor-storage",
             "doctor-summary",
             "doctor-application",
             "doctor-checks",
@@ -595,7 +596,7 @@ mod tests {
             "id=\"doctor-application\"",
             "<h3>Application</h3>",
             "api(\"/version\")",
-            "function renderDoctor(report, version = null)",
+            "function renderDoctor(report, version = null, storageRoots = null)",
             "[\"Version\", version?.version || \"unknown\"]",
             "[\"Commit\", version?.commit || \"unknown\"]",
             "[\"Target\", version?.target || \"unknown\"]",
@@ -630,6 +631,7 @@ mod tests {
             ".network-layout",
             ".card-subsection",
             ".health-payload",
+            ".storage-root-table",
             "#health-badge",
         ] {
             assert!(
@@ -652,6 +654,8 @@ mod tests {
             "cfg-storage-incomplete-dir",
             "cfg-storage-preallocate",
             "cfg-storage-sparse",
+            "cfg-storage-minimum-free-space-bytes",
+            "cfg-storage-minimum-free-space-percent",
             "cfg-network-mode",
             "cfg-network-required-interface",
             "cfg-network-required-source-ipv4",
@@ -708,6 +712,8 @@ mod tests {
             "function collectSettingsConfig(",
             "autopilot: {",
             "mode: settingsString(\"cfg-autopilot-mode\")",
+            "minimum_free_space_bytes: settingsInteger(\"cfg-storage-minimum-free-space-bytes\", 0),",
+            "minimum_free_space_percent: settingsInteger(\"cfg-storage-minimum-free-space-percent\", 0),",
             "function renderWatchFolderEditors(",
             "function collectWatchFolderEditors(",
             "method: \"PUT\"",
@@ -737,6 +743,27 @@ mod tests {
                     && !APP_JS.contains(old_surface)
                     && !STYLE_CSS.contains(old_surface),
                 "Settings editor still contains old raw/partial config surface {old_surface}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_doctor_displays_storage_diagnostics() {
+        assert!(
+            INDEX_HTML.contains("id=\"doctor-storage\""),
+            "Doctor view is missing storage diagnostics card id doctor-storage"
+        );
+        for needle in [
+            "api(\"/storage/roots\")",
+            "renderDoctorStorageRoots",
+            "function renderDoctor(",
+            "#doctor-storage",
+            "Storage diagnostics",
+            "Minimum free percent",
+        ] {
+            assert!(
+                APP_JS.contains(needle) || INDEX_HTML.contains(needle),
+                "Doctor storage diagnostics wiring is incomplete: {needle}"
             );
         }
     }

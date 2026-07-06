@@ -42,6 +42,8 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
         .route("/version", get(handlers::health::version))
         // Stats
         .route("/stats", get(handlers::stats::global_stats))
+        // Storage
+        .route("/storage/roots", get(handlers::storage::storage_roots))
         // Autopilot
         .route("/autopilot/status", get(handlers::autopilot::status))
         // Torrent management

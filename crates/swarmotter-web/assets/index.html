@@ -275,6 +275,8 @@
           <div class="settings-form-grid">
             <label class="settings-field"><span>Download directory</span><input id="cfg-storage-download-dir" type="text"></label>
             <label class="settings-field"><span>Incomplete directory</span><input id="cfg-storage-incomplete-dir" type="text"></label>
+            <label class="settings-field"><span>Minimum free space bytes</span><input id="cfg-storage-minimum-free-space-bytes" type="number" min="0" step="1"></label>
+            <label class="settings-field"><span>Minimum free space percent</span><input id="cfg-storage-minimum-free-space-percent" type="number" min="0" max="100" step="1"></label>
             <label class="settings-check"><input id="cfg-storage-preallocate" type="checkbox"><span>Preallocate files</span></label>
             <label class="settings-check"><input id="cfg-storage-sparse" type="checkbox"><span>Sparse files</span></label>
           </div>
@@ -440,6 +442,10 @@
         <div id="doctor-summary" class="card">
           <h3>Health summary</h3>
           <p class="muted">System diagnostics summary appears here.</p>
+        </div>
+        <div id="doctor-storage" class="card">
+          <h3>Storage diagnostics</h3>
+          <p class="muted">Storage-root diagnostics appear here.</p>
         </div>
         <div id="doctor-application" class="card">
           <h3>Application</h3>

@@ -90,7 +90,11 @@ order. For JSON magnet adds, set either `paused: true` or
 `start_behavior: "paused"`. For raw `.torrent` uploads, use
 `?paused=true` or `?start_behavior=paused` on `/torrents` or
 `/torrents/file`. `paused` and `start_behavior` must agree when both are
-provided. Strict fail-closed network blocking can still put the new torrent in
+provided. If add-time free-space preflight is configured, add requests can fail
+before write with a storage-capacity error when the target root does not meet the
+reserve configured under `[storage]`.
+
+Strict fail-closed network blocking can still put the new torrent in
 `network_blocked` instead of `paused`.
 
 Successful add responses mean the torrent record was registered and inserted
@@ -232,6 +236,43 @@ and reports fields that require restart.
 | GET | `/network/diagnostics` | Detailed network/path diagnostics. |
 
 See [Network Containment](network-containment.md) for health state meanings.
+
+## Storage
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/storage/roots` | Return diagnostics for configured storage roots, including free space and availability. |
+
+The storage diagnostics response currently includes per-root identity and space
+data needed by operators and automation. Typical fields include:
+
+```json
+{
+  "roots": [
+    {
+      "path": "/mnt/media/downloads",
+      "roles": ["download"],
+      "exists": true,
+      "is_directory": true,
+      "writable": true,
+      "filesystem_type": "ext",
+      "total_space_bytes": 1024,
+      "free_space_bytes": 128,
+      "available_space_bytes": 120,
+      "required_free_space_bytes": 64,
+      "reserve_satisfied": true,
+      "torrent_count": 4,
+      "active_torrents": 2,
+      "active_write_rate": 1048576,
+      "active_recheck_rate": 0,
+      "warnings": []
+    }
+  ],
+  "minimum_free_space_bytes": 0,
+  "minimum_free_space_percent": 0,
+  "generated_at": 1783227600
+}
+```
 
 ## Watch folders
 

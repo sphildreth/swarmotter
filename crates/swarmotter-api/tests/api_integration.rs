@@ -1444,6 +1444,33 @@ async fn network_diagnostics_endpoint() {
 }
 
 #[tokio::test]
+async fn storage_roots_endpoint_reports_reserve_configuration() {
+    let root = std::env::temp_dir().join(format!(
+        "swarmotter-storage-api-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let mut cfg = Config::default();
+    cfg.storage.download_dir = Some(root.display().to_string());
+    cfg.storage.minimum_free_space_bytes = 4096;
+    cfg.storage.minimum_free_space_percent = 5;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let (status, value) = get_json(&app, "/api/v1/storage/roots").await;
+    assert_eq!(status, StatusCode::OK);
+    let data = &value["data"];
+    assert_eq!(data["minimum_free_space_bytes"], 4096);
+    assert_eq!(data["minimum_free_space_percent"], 5);
+    let roots = data["roots"].as_array().unwrap();
+    assert_eq!(roots.len(), 1);
+    assert_eq!(roots[0]["path"], root.display().to_string());
+    assert!(roots[0]["available_space_bytes"].is_u64());
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn watch_status_endpoint_reflects_config() {
     let mut cfg = Config::default();
     cfg.watch.push(WatchFolderConfig {

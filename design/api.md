@@ -39,11 +39,25 @@ ADR-0009 and ADR-0010.
   libraries should use `GET /api/v1/torrents/query` for explicit filtering,
   sorting, pagination, counts, and grouping without changing the legacy
   response shape; see ADR-0036.
+- Storage add-time preflight is part of `/api/v1` compatibility: when
+  configured reserves are not met on the target storage root, add requests reject
+  before data write.
 - Optional compatibility endpoints, currently `/transmission/rpc`, are isolated
   from the native API and delegate to native daemon operations rather than a
   second torrent engine.
 - Authentication policy is shared: when API auth is enabled, compatibility
   adapters must map their auth mechanism back to `api.auth_token`.
+
+## Storage API contract
+
+- `GET /api/v1/storage/roots` exposes storage-root diagnostics used for
+  operator visibility and add-time preflight checks.
+
+## Storage configuration contract
+
+- `[storage].minimum_free_space_bytes` and `[storage].minimum_free_space_percent`
+  define the reserve rule used by add/start-time checks. These values are
+  validated and enforced before payload writes.
 
 ## Autopilot API contract
 

@@ -67,6 +67,20 @@ The underlying `/api/v1/torrents/query` endpoint also supports label, storage
 root, peer/rate threshold, counts-only, and optional grouping parameters for
 external automation and future UI views.
 
+## Storage root diagnostics
+
+The Doctor view surfaces storage diagnostics from `GET /api/v1/storage/roots`
+so operators can:
+
+- review per-root free/available bytes before large add bursts,
+- identify which roots are close to configured reserve thresholds, and
+- diagnose storage pressure alongside active write/recheck activity in future views.
+
+Storage reserve fields in configuration are `[storage].minimum_free_space_bytes`
+and `[storage].minimum_free_space_percent`. When configured, add operations are
+rejected before writing data when the target root cannot satisfy the configured
+reserve.
+
 ## Performance diagnostics and autopilot visibility
 
 The torrent detail view uses `/api/v1/torrents/:hash/stats` as its primary

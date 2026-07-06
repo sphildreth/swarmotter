@@ -17,6 +17,8 @@ max_request_body_bytes = 16777216
 [storage]
 download_dir = "/data/downloads"
 incomplete_dir = "/data/incomplete"
+minimum_free_space_bytes = 0
+minimum_free_space_percent = 0
 preallocate = false
 sparse = true
 

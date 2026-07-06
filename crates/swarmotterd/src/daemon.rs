@@ -33,6 +33,9 @@ use swarmotter_core::models::stats::{
     AutopilotActionKind, AutopilotDecision, AutopilotInput, GlobalStats, PeerSchedulerDiagnostics,
     TorrentDiagnostics,
 };
+use swarmotter_core::models::storage::{
+    StorageDiagnostics, StorageRootDiagnostics, StorageRootRole,
+};
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{TrackerId, TrackerInfo, TrackerKind, TrackerStatus};
 use swarmotter_core::models::{
@@ -151,6 +154,14 @@ struct QueueReconcileState {
     dirty: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+struct StorageRootAccumulator {
+    roles: Vec<StorageRootRole>,
+    torrent_count: usize,
+    active_torrents: usize,
+    active_write_rate: u64,
+}
+
 #[derive(Debug, Clone)]
 struct EngineStartSnapshot {
     meta: meta::TorrentMeta,
@@ -252,6 +263,20 @@ fn default_download_dir_string() -> String {
         .to_string()
 }
 
+fn resolve_download_dir_from_config(download_dir: Option<&str>, cfg: &Config) -> String {
+    download_dir
+        .map(str::to_string)
+        .or_else(|| cfg.storage.download_dir.clone())
+        .unwrap_or_else(default_download_dir_string)
+}
+
+fn resolve_incomplete_dir_from_config(download_dir: &str, cfg: &Config) -> String {
+    cfg.storage
+        .incomplete_dir
+        .clone()
+        .unwrap_or_else(|| download_dir.to_string())
+}
+
 impl DaemonRuntime {
     #[allow(dead_code)]
     pub fn new(config: Config, startup_health: NetworkHealth) -> Self {
@@ -329,6 +354,18 @@ impl DaemonRuntime {
         if let Some(d) = options.download_dir {
             t.download_dir = Some(d);
         }
+        if let Err(e) = self
+            .preflight_storage_for_download(t.download_dir.as_deref(), t.meta.total_length)
+            .await
+        {
+            tracing::warn!(
+                info_hash = %hash,
+                error = %e,
+                error_code = %e.code(),
+                "torrent file add rejected by storage preflight"
+            );
+            return Err(e);
+        }
         apply_network_state(&mut t, &self.network_health).await;
         let blocked = t.state == TorrentState::NetworkBlocked;
         let start_paused = options.paused && !blocked;
@@ -385,6 +422,18 @@ impl DaemonRuntime {
         t.magnet_trackers = m.trackers.clone();
         if let Some(d) = options.download_dir {
             t.download_dir = Some(d);
+        }
+        if let Err(e) = self
+            .preflight_storage_for_download(t.download_dir.as_deref(), 0)
+            .await
+        {
+            tracing::warn!(
+                info_hash = %hash,
+                error = %e,
+                error_code = %e.code(),
+                "magnet add rejected by storage reserve preflight"
+            );
+            return Err(e);
         }
         apply_network_state(&mut t, &self.network_health).await;
         let blocked = t.state == TorrentState::NetworkBlocked;
@@ -484,14 +533,8 @@ impl DaemonRuntime {
     }
 
     async fn resolve_download_dir_override(&self, download_dir: Option<&str>) -> String {
-        if let Some(d) = download_dir {
-            return d.to_string();
-        }
         let cfg = self.config.lock().await;
-        cfg.storage
-            .download_dir
-            .clone()
-            .unwrap_or_else(default_download_dir_string)
+        resolve_download_dir_from_config(download_dir, &cfg)
     }
 
     /// Resolve the active write directory for a torrent. Incomplete downloads
@@ -499,10 +542,25 @@ impl DaemonRuntime {
     /// write directly to the final download directory.
     async fn resolve_incomplete_dir(&self, download_dir: &str) -> String {
         let cfg = self.config.lock().await;
-        cfg.storage
-            .incomplete_dir
-            .clone()
-            .unwrap_or_else(|| download_dir.to_string())
+        resolve_incomplete_dir_from_config(download_dir, &cfg)
+    }
+
+    async fn preflight_storage_for_download(
+        &self,
+        download_dir: Option<&str>,
+        total_length: u64,
+    ) -> Result<()> {
+        let cfg = self.config.lock().await.clone();
+        if cfg.storage.minimum_free_space_bytes == 0 && cfg.storage.minimum_free_space_percent == 0
+        {
+            return Ok(());
+        }
+        let complete_dir = resolve_download_dir_from_config(download_dir, &cfg);
+        let active_dir = resolve_incomplete_dir_from_config(&complete_dir, &cfg);
+        for dir in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
+            swarmotter_core::storage::check_storage_preflight(&dir, &cfg.storage, total_length)?;
+        }
+        Ok(())
     }
 
     async fn configured_peer_worker_limit(&self, active_downloads: usize) -> usize {
@@ -697,6 +755,8 @@ impl DaemonRuntime {
 
         let state = if error.is_network_blocked() {
             TorrentState::NetworkBlocked
+        } else if matches!(&error, CoreError::Storage(_)) {
+            TorrentState::StorageError
         } else {
             TorrentState::Error
         };
@@ -777,6 +837,8 @@ impl DaemonRuntime {
             allow_ipv6,
             pex_enabled,
             pex_max_peers,
+            minimum_free_space_bytes,
+            minimum_free_space_percent,
             magnet,
             needs_metadata,
         ) = {
@@ -791,6 +853,8 @@ impl DaemonRuntime {
             let allow_ipv6 = cfg.torrent.allow_ipv6 && cfg.network.allow_ipv6;
             let pex_enabled = cfg.pex.enabled;
             let pex_max_peers = cfg.pex.max_peers;
+            let minimum_free_space_bytes = cfg.storage.minimum_free_space_bytes;
+            let minimum_free_space_percent = cfg.storage.minimum_free_space_percent;
             let max_peer_workers = effective_peer_worker_limit(
                 cfg.bandwidth.max_peers,
                 cfg.bandwidth.max_peers_per_torrent,
@@ -807,6 +871,8 @@ impl DaemonRuntime {
                 allow_ipv6,
                 pex_enabled,
                 pex_max_peers,
+                minimum_free_space_bytes,
+                minimum_free_space_percent,
                 magnet,
                 snapshot.needs_metadata,
             )
@@ -814,6 +880,36 @@ impl DaemonRuntime {
 
         if !self.registry.lock().await.contains(&hash) {
             return;
+        }
+
+        let preflight_content_bytes = if needs_metadata { 0 } else { meta.total_length };
+        if preflight_content_bytes > 0
+            || minimum_free_space_bytes > 0
+            || minimum_free_space_percent > 0
+        {
+            let mut cfg = self.config.lock().await.storage.clone();
+            cfg.minimum_free_space_bytes = minimum_free_space_bytes;
+            cfg.minimum_free_space_percent = minimum_free_space_percent;
+            for dir in unique_pathbufs([PathBuf::from(&active_dir), PathBuf::from(&complete_dir)]) {
+                if let Err(e) = swarmotter_core::storage::check_storage_preflight(
+                    &dir,
+                    &cfg,
+                    preflight_content_bytes,
+                ) {
+                    tracing::warn!(
+                        info_hash = %hash,
+                        error = %e,
+                        error_code = %e.code(),
+                        "engine start blocked by storage preflight"
+                    );
+                    let mut reg = self.registry.lock().await;
+                    if let Some(t) = reg.get_mut(&hash) {
+                        t.state = TorrentState::StorageError;
+                        t.error = Some(e.to_string());
+                    }
+                    return;
+                }
+            }
         }
 
         let state = Arc::new(Mutex::new(EngineState::default()));
@@ -877,6 +973,7 @@ impl DaemonRuntime {
         .with_transport(utp_enabled, utp_prefer_tcp)
         .with_preallocate(preallocate)
         .with_sparse(sparse)
+        .with_storage_reserve(minimum_free_space_bytes, minimum_free_space_percent)
         .with_peer_worker_limit(max_peer_workers)
         .with_allow_ipv6(allow_ipv6)
         .with_pex(pex_enabled, pex_max_peers);
@@ -2923,6 +3020,81 @@ impl DaemonOps for DaemonRuntime {
         }
     }
 
+    async fn storage_roots(&self) -> StorageDiagnostics {
+        self.reconcile_engine_progress().await;
+        let cfg = self.config.lock().await.clone();
+        let mut roots: HashMap<String, StorageRootAccumulator> = HashMap::new();
+
+        let download_dir = resolve_download_dir_from_config(None, &cfg);
+        add_storage_root_role(
+            &mut roots,
+            download_dir.clone(),
+            if cfg.storage.download_dir.is_some() {
+                StorageRootRole::Download
+            } else {
+                StorageRootRole::DefaultDownload
+            },
+        );
+        let incomplete_dir = resolve_incomplete_dir_from_config(&download_dir, &cfg);
+        add_storage_root_role(
+            &mut roots,
+            incomplete_dir.clone(),
+            StorageRootRole::Incomplete,
+        );
+
+        for folder in &cfg.watch {
+            if let Some(path) = folder.download_dir.as_ref() {
+                add_storage_root_role(&mut roots, path.clone(), StorageRootRole::WatchDownload);
+            }
+        }
+
+        {
+            let reg = self.registry.lock().await;
+            for torrent in reg.torrents.values() {
+                let complete_dir =
+                    resolve_download_dir_from_config(torrent.download_dir.as_deref(), &cfg);
+                if torrent.download_dir.is_some() {
+                    add_storage_root_role(
+                        &mut roots,
+                        complete_dir.clone(),
+                        StorageRootRole::TorrentOverride,
+                    );
+                }
+                add_storage_root_usage(&mut roots, complete_dir.clone(), torrent);
+                let active_dir = resolve_incomplete_dir_from_config(&complete_dir, &cfg);
+                add_storage_root_role(&mut roots, active_dir.clone(), StorageRootRole::Incomplete);
+                if active_dir != complete_dir {
+                    add_storage_root_usage(&mut roots, active_dir, torrent);
+                }
+            }
+        }
+
+        let mut roots = roots
+            .into_iter()
+            .map(|(path, acc)| {
+                swarmotter_core::storage::inspect_storage_root(
+                    Path::new(&path),
+                    acc.roles,
+                    &cfg.storage,
+                    swarmotter_core::storage::StorageRootUsage {
+                        torrent_count: acc.torrent_count,
+                        active_torrents: acc.active_torrents,
+                        active_write_rate: acc.active_write_rate,
+                        active_recheck_rate: Some(0),
+                    },
+                )
+            })
+            .collect::<Vec<StorageRootDiagnostics>>();
+        roots.sort_by(|a, b| a.path.cmp(&b.path));
+
+        StorageDiagnostics {
+            roots,
+            minimum_free_space_bytes: cfg.storage.minimum_free_space_bytes,
+            minimum_free_space_percent: cfg.storage.minimum_free_space_percent,
+            generated_at: now(),
+        }
+    }
+
     async fn doctor_report(&self) -> DoctorReport {
         let cfg = self.config.lock().await.clone();
         let network = self.network_health.lock().await.clone();
@@ -3195,6 +3367,30 @@ where
         }
     }
     out
+}
+
+fn add_storage_root_role(
+    roots: &mut HashMap<String, StorageRootAccumulator>,
+    path: String,
+    role: StorageRootRole,
+) {
+    let entry = roots.entry(path).or_default();
+    if !entry.roles.contains(&role) {
+        entry.roles.push(role);
+    }
+}
+
+fn add_storage_root_usage(
+    roots: &mut HashMap<String, StorageRootAccumulator>,
+    path: String,
+    torrent: &Torrent,
+) {
+    let entry = roots.entry(path).or_default();
+    entry.torrent_count += 1;
+    if torrent.state.is_active() {
+        entry.active_torrents += 1;
+        entry.active_write_rate = entry.active_write_rate.saturating_add(torrent.rate_down);
+    }
 }
 
 fn push_display_path(paths: &mut Vec<String>, path: &Path) {
@@ -4259,6 +4455,33 @@ mod tests {
             Some("tracker announce timed out")
         );
         assert_eq!(secondary_row.last_message, None);
+    }
+
+    #[tokio::test]
+    async fn storage_preflight_rejects_torrent_file_add_before_registration() {
+        let root = unique_dir("storage-preflight");
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(root.display().to_string());
+        cfg.storage.minimum_free_space_bytes = u64::MAX;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "too-large.bin",
+            b"0123456789abcdef",
+            8,
+            None,
+            false,
+        );
+
+        let err = runtime.add_torrent_file(bytes, None).await.unwrap_err();
+
+        assert_eq!(err.code().as_str(), "storage_error");
+        assert!(runtime.registry.lock().await.torrents.is_empty());
+        assert!(runtime.queue.lock().await.order.is_empty());
     }
 
     #[tokio::test]

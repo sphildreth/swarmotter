@@ -264,11 +264,21 @@ function fmtPercentFromFraction(n, digits = 1) {
   n = finiteNumber(n);
   return n === null ? "" : (n * 100).toFixed(digits) + "%";
 }
+function fmtPercent(value) {
+  value = finiteNumber(value);
+  return value === null ? "" : `${value}%`;
+}
 function fmtProgress(bytesCompleted, totalLength) {
   const completed = finiteNumber(bytesCompleted);
   const total = finiteNumber(totalLength);
   if (completed === null || total === null || total <= 0) return "";
   return (Math.min(completed, total) / total * 100).toFixed(1) + "%";
+}
+function fmtUnixSeconds(seconds) {
+  const value = finiteNumber(seconds);
+  if (value === null) return "";
+  const timestamp = new Date(value * 1000);
+  return Number.isNaN(timestamp.getTime()) ? "" : timestamp.toLocaleString();
 }
 function renderProgressCell(bytesCompleted, totalLength) {
   const completed = finiteNumber(bytesCompleted);
@@ -1703,6 +1713,8 @@ function renderSettingsEditor(cfg) {
 
   setSettingsValue("cfg-storage-download-dir", storage.download_dir);
   setSettingsValue("cfg-storage-incomplete-dir", storage.incomplete_dir);
+  setSettingsValue("cfg-storage-minimum-free-space-bytes", storage.minimum_free_space_bytes);
+  setSettingsValue("cfg-storage-minimum-free-space-percent", storage.minimum_free_space_percent);
   setSettingsChecked("cfg-storage-preallocate", storage.preallocate);
   setSettingsChecked("cfg-storage-sparse", storage.sparse);
 
@@ -1797,6 +1809,8 @@ function collectSettingsConfig() {
     storage: {
       download_dir: settingsOptionalString("cfg-storage-download-dir"),
       incomplete_dir: settingsOptionalString("cfg-storage-incomplete-dir"),
+      minimum_free_space_bytes: settingsInteger("cfg-storage-minimum-free-space-bytes", 0),
+      minimum_free_space_percent: settingsInteger("cfg-storage-minimum-free-space-percent", 0),
       preallocate: settingsField("cfg-storage-preallocate").checked,
       sparse: settingsField("cfg-storage-sparse").checked,
     },
@@ -2190,11 +2204,17 @@ function appendLogLine(line) {
 async function refreshDoctor() {
   try {
     const report = await api("/doctor");
-    const version = await api("/version").catch((e) => {
-      log("version error: " + e.message);
-      return null;
-    });
-    renderDoctor(report, version);
+    const [version, storageRoots] = await Promise.all([
+      api("/version").catch((e) => {
+        log("version error: " + e.message);
+        return null;
+      }),
+      api("/storage/roots").catch((e) => {
+        log("storage roots error: " + e.message);
+        return { error: e.message };
+      }),
+    ]);
+    renderDoctor(report, version, storageRoots);
     updateHealthBadge(report);
     return report;
   } catch (e) {
@@ -2211,7 +2231,86 @@ async function refreshDoctorBadge() {
   }
 }
 
-function renderDoctor(report, version = null) {
+function renderStorageRootWarnings(root) {
+  const warnings = Array.isArray(root?.warnings) ? root.warnings.filter(Boolean) : [];
+  if (!warnings.length) return "";
+  const items = warnings.map(w => `<li>${escapeHtml(String(w))}</li>`).join("");
+  return `<ul class="storage-root-warnings compact-list">${items}</ul>`;
+}
+
+function renderDoctorStorageRoots(storageRoots = {}) {
+  if (!storageRoots || storageRoots.error) {
+    return `
+      <h3>Storage diagnostics</h3>
+      <p class="muted">${escapeHtml(storageRoots?.error || "Storage diagnostics are unavailable.")}</p>
+    `;
+  }
+  const roots = Array.isArray(storageRoots.roots) ? storageRoots.roots : [];
+  const generatedAt = fmtUnixSeconds(storageRoots.generated_at);
+  const header = renderKv([
+    ["Minimum free bytes", fmtBytes(storageRoots.minimum_free_space_bytes)],
+    ["Minimum free percent", fmtPercent(storageRoots.minimum_free_space_percent)],
+    ["Generated", generatedAt],
+  ]);
+  if (!roots.length) {
+    return `
+      <h3>Storage diagnostics</h3>
+      ${header}
+      <p class="muted">No storage root diagnostics were returned.</p>
+    `;
+  }
+  const rows = roots.map((root) => {
+    const roles = Array.isArray(root?.roles) ? root.roles.join(", ") : "";
+    const free = `${fmtBytes(root.free_space_bytes)} / ${fmtBytes(root.available_space_bytes)}`;
+    const total = fmtBytes(root.total_space_bytes);
+    const required = fmtBytes(root.required_free_space_bytes);
+    const warnings = renderStorageRootWarnings(root);
+    const status = [
+      root.exists ? "exists" : "missing",
+      root.is_directory ? "dir" : "file",
+      root.writable ? "writable" : "read-only",
+    ].filter(Boolean).join(", ");
+    return `
+      <tr>
+        <td>${escapeHtml(root.path || "")}</td>
+        <td>${escapeHtml(roles || "")}</td>
+        <td>${escapeHtml(status)}</td>
+        <td>${escapeHtml(root.filesystem_type || "")}</td>
+        <td>${escapeHtml(total ? `${total}` : "")}</td>
+        <td>free ${escapeHtml(free)}</td>
+        <td>${escapeHtml(required || "")}</td>
+        <td>${renderStatus(root.reserve_satisfied ? "ok" : "warning")}</td>
+        <td>${fmtCount(root.torrent_count)}</td>
+        <td>${fmtCount(root.active_torrents)}</td>
+        <td>${fmtRate(root.active_write_rate)} / ${fmtRate(root.active_recheck_rate)}</td>
+        <td>${warnings || ""}</td>
+      </tr>`;
+  }).join("");
+  return `
+    <h3>Storage diagnostics</h3>
+    ${header}
+    <table class="storage-root-table">
+      <thead>
+        <tr>
+          <th>Path</th>
+          <th>Roles</th>
+          <th>State</th>
+          <th>Filesystem</th>
+          <th>Total</th>
+          <th>Free / Available</th>
+          <th>Required free</th>
+          <th>Reserve</th>
+          <th>Torrents</th>
+          <th>Active</th>
+          <th>Rates</th>
+          <th>Warnings</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+function renderDoctor(report, version = null, storageRoots = null) {
   $("#doctor-summary").innerHTML = `
     <h3>Health summary</h3>
     ${renderKv([
@@ -2219,6 +2318,7 @@ function renderDoctor(report, version = null) {
       ["Summary", report.summary || ""],
       ["Checks", String((report.checks || []).length)],
     ])}`;
+  $("#doctor-storage").innerHTML = renderDoctorStorageRoots(storageRoots);
   $("#doctor-application").innerHTML = `
     <h3>Application</h3>
     ${renderKv([

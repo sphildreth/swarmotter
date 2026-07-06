@@ -21,6 +21,7 @@ use swarmotter_core::models::diagnostics::{
 use swarmotter_core::models::network::NetworkHealth;
 use swarmotter_core::models::peer::Peer;
 use swarmotter_core::models::stats::{AutopilotDecision, GlobalStats, TorrentDiagnostics};
+use swarmotter_core::models::storage::StorageDiagnostics;
 use swarmotter_core::models::torrent::TorrentFile;
 use swarmotter_core::models::torrent::TorrentSummary;
 use swarmotter_core::models::tracker::TrackerInfo;
@@ -156,6 +157,31 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn network_health(&self) -> NetworkHealth;
     /// Rich network diagnostics for API dashboards.
     async fn network_diagnostics(&self) -> NetworkDiagnostics;
+    /// Storage root diagnostics for API dashboards.
+    async fn storage_roots(&self) -> StorageDiagnostics {
+        let cfg = self.get_config().await;
+        let root = cfg.storage.download_dir.clone().unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("swarmotter-downloads")
+                .display()
+                .to_string()
+        });
+        let root = swarmotter_core::storage::inspect_storage_root(
+            std::path::Path::new(&root),
+            vec![swarmotter_core::models::storage::StorageRootRole::Download],
+            &cfg.storage,
+            swarmotter_core::storage::StorageRootUsage::default(),
+        );
+        StorageDiagnostics {
+            roots: vec![root],
+            minimum_free_space_bytes: cfg.storage.minimum_free_space_bytes,
+            minimum_free_space_percent: cfg.storage.minimum_free_space_percent,
+            generated_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
     /// Doctor/system health checks.
     async fn doctor_report(&self) -> DoctorReport;
     /// Recent daemon log lines.

@@ -210,6 +210,12 @@ Remote HTTP/HTTPS URLs for torrent metadata are rejected by this adapter.
 | `incomplete_dir` | unset | Active write directory for incomplete downloads. |
 | `preallocate` | `false` | Pre-size files before downloading. |
 | `sparse` | `true` | When `false`, active payload files are sized up front even if `preallocate = false`. |
+| `minimum_free_space_bytes` | `0` | If > 0, reject new adds when target-root usable space falls below this number of bytes. |
+| `minimum_free_space_percent` | `0` | If > 0, reject new adds when free space on the target root falls below this percent of total root size. |
+
+The minimum reserve fields apply to add/start-time preflight and are checked
+before payload data is written. Both fields are optional; when both are set,
+the preflight uses the stricter reserve.
 
 When `incomplete_dir` is set, SwarmOtter writes partial pieces and partial
 fast-resume metadata there while the torrent is downloading. After every piece

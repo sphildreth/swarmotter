@@ -193,6 +193,8 @@ pub struct TorrentEngine {
     utp_prefer_tcp: bool,
     preallocate: bool,
     sparse: bool,
+    minimum_free_space_bytes: u64,
+    minimum_free_space_percent: u8,
     max_peer_workers: Arc<AtomicUsize>,
     allow_ipv6: bool,
     pex_enabled: bool,
@@ -258,6 +260,8 @@ impl TorrentEngine {
             utp_prefer_tcp: true,
             preallocate: true,
             sparse: true,
+            minimum_free_space_bytes: 0,
+            minimum_free_space_percent: 0,
             max_peer_workers: Arc::new(AtomicUsize::new(DEFAULT_PEER_WORKER_LIMIT)),
             allow_ipv6: true,
             pex_enabled: true,
@@ -302,6 +306,17 @@ impl TorrentEngine {
     /// are sized up front even if full preallocation is disabled.
     pub fn with_sparse(mut self, sparse: bool) -> Self {
         self.sparse = sparse;
+        self
+    }
+
+    /// Configure storage free-space reserves enforced before payload writes.
+    pub fn with_storage_reserve(
+        mut self,
+        minimum_free_space_bytes: u64,
+        minimum_free_space_percent: u8,
+    ) -> Self {
+        self.minimum_free_space_bytes = minimum_free_space_bytes;
+        self.minimum_free_space_percent = minimum_free_space_percent;
         self
     }
 
@@ -381,6 +396,8 @@ impl TorrentEngine {
             s.tracker_message = Some("torrent data plane blocked by containment".into());
             return Ok(s.clone());
         }
+
+        self.storage_preflight()?;
 
         let complete_storage = StorageIo::new(self.meta.clone(), self.complete_dir.clone());
         if self.download_dir != self.complete_dir {
@@ -721,6 +738,28 @@ impl TorrentEngine {
                 Vec::new()
             }
         }
+    }
+
+    fn storage_preflight(&self) -> Result<()> {
+        if self.minimum_free_space_bytes == 0 && self.minimum_free_space_percent == 0 {
+            return Ok(());
+        }
+        let mut paths = vec![self.download_dir.clone()];
+        if self.complete_dir != self.download_dir {
+            paths.push(self.complete_dir.clone());
+        }
+        for path in paths {
+            swarmotter_core::storage::check_storage_preflight(
+                &path,
+                &swarmotter_core::config::StorageConfig {
+                    minimum_free_space_bytes: self.minimum_free_space_bytes,
+                    minimum_free_space_percent: self.minimum_free_space_percent,
+                    ..Default::default()
+                },
+                self.meta.total_length,
+            )?;
+        }
+        Ok(())
     }
 
     /// Attempt to download missing pieces from a single peer. Returns true if

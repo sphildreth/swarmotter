@@ -30,6 +30,13 @@ MVP release.
   refresh, peer-worker tuning, peer-backoff relaxation, and queue-slot release
   using existing contained telemetry.
   ADR-0035 records the control and containment decision.
+- **Disk-aware storage diagnostics and preflight:** added
+  `GET /api/v1/storage/roots` for per-root storage diagnostics, configurable
+  free-space reserve enforcement under `[storage]`
+  (`minimum_free_space_bytes`, `minimum_free_space_percent`), add/start-time
+  storage preflight before payload writes, Settings fields for the reserve
+  values, and a Doctor storage diagnostics card. ADR-0037 records this phased
+  contract.
 - **Web UI Settings two-panel layout:** Settings now uses a left section
   navigation menu with one editable detail panel visible at a time, while
   preserving the existing full-configuration save path and keeping the

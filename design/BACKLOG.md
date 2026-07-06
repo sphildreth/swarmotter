@@ -28,10 +28,8 @@ project.
 
 | Priority | Feature | User Value | Source Signals |
 | --- | --- | --- | --- |
-| P0 | Adaptive swarm performance autopilot | Improve real download throughput, reduce bad-peer waste, explain speed bottlenecks | Transmission [#3945](https://github.com/transmission/transmission/issues/3945), qBittorrent [#24254](https://github.com/qbittorrent/qBittorrent/issues/24254), [#24053](https://github.com/qbittorrent/qBittorrent/issues/24053), [#23050](https://github.com/qbittorrent/qBittorrent/issues/23050), [#23476](https://github.com/qbittorrent/qBittorrent/issues/23476), [#24330](https://github.com/qbittorrent/qBittorrent/issues/24330) |
 | P0 | Disk-aware storage optimizer | Better performance and fewer storage surprises on Btrfs, NAS, HDD, and constrained disks | qBittorrent [#23683](https://github.com/qbittorrent/qBittorrent/issues/23683), [#22949](https://github.com/qbittorrent/qBittorrent/issues/22949), [#23572](https://github.com/qbittorrent/qBittorrent/issues/23572), Transmission [#5064](https://github.com/transmission/transmission/issues/5064), [#5594](https://github.com/transmission/transmission/issues/5594), [#1060](https://github.com/transmission/transmission/issues/1060) |
 | P0 | Policy profiles and inherited torrent settings | Apply consistent path, ratio, queue, bandwidth, tracker, and file rules by label/category/profile | qBittorrent [#9939](https://github.com/qbittorrent/qBittorrent/issues/9939), [#24500](https://github.com/qbittorrent/qBittorrent/issues/24500), [#23722](https://github.com/qbittorrent/qBittorrent/issues/23722), [#24131](https://github.com/qbittorrent/qBittorrent/issues/24131), Transmission [#6710](https://github.com/transmission/transmission/issues/6710), [#1461](https://github.com/transmission/transmission/issues/1461), [#6425](https://github.com/transmission/transmission/issues/6425) |
-| P0 | Large-library Web UI operations console | Keep the UI fast and useful with hundreds or thousands of torrents | qBittorrent [#24558](https://github.com/qbittorrent/qBittorrent/issues/24558), [#23127](https://github.com/qbittorrent/qBittorrent/issues/23127), [#23449](https://github.com/qbittorrent/qBittorrent/issues/23449), [#9796](https://github.com/qbittorrent/qBittorrent/issues/9796), [#22111](https://github.com/qbittorrent/qBittorrent/issues/22111), Transmission [#3813](https://github.com/transmission/transmission/issues/3813), [#8237](https://github.com/transmission/transmission/issues/8237) |
 | P0 | Ecosystem Compatibility API | Operate alongside Sonarr/Radarr/Flood via qBittorrent-compatible and Transmission-compatible API shims | Deluge API parity requests, Flood UI, Sonarr/Radarr integration, self-hosting ecosystem (2026) |
 | P0 | Per-Profile / Per-Torrent Network-Path Binding | Assign a contained network path (namespace/VPN endpoint/interface) per profile, label, or torrent; fail-closed per path | rTorrent/Flood multi-user isolation, Deluge multi-profile routing, self-hosting VPN routing patterns |
 | P0 | Multi-User / Multi-Tenant Support | Role-based access control, per-user torrent isolation, per-user quotas, and shared-server deployments | qBittorrent [#3327](https://github.com/qbittorrent/qBittorrent/issues/3327), Flood multi-user, rTorrent+ruTorrent multi-user, Deluge thin-client auth |
@@ -67,7 +65,7 @@ project.
 | P2 | Protocol modernization roadmap | Stay ahead of compatibility and swarm reachability changes; BEP 52 v2/hybrid handling | qBittorrent [#23421](https://github.com/qbittorrent/qBittorrent/issues/23421), [#24600](https://github.com/qbittorrent/qBittorrent/issues/24600), Transmission [#3387](https://github.com/transmission/transmission/issues/3387), [#3705](https://github.com/transmission/transmission/issues/3705), [#993](https://github.com/transmission/transmission/issues/993) |
 | P2 | Long-horizon observability | Preserve useful history beyond current live status and make operational events auditable | Transmission [#5591](https://github.com/transmission/transmission/issues/5591), qBittorrent [#22832](https://github.com/qbittorrent/qBittorrent/issues/22832), [#18525](https://github.com/qbittorrent/qBittorrent/issues/18525), [#24330](https://github.com/qbittorrent/qBittorrent/issues/24330) |
 | P2 | Settings search and low-risk UI personalization | Make dense configuration easier to operate without turning the UI into a theme project | qBittorrent [#23654](https://github.com/qbittorrent/qBittorrent/issues/23654), [#22877](https://github.com/qbittorrent/qBittorrent/issues/22877), [#22913](https://github.com/qbittorrent/qBittorrent/issues/22913), Transmission [#4304](https://github.com/transmission/transmission/issues/4304), [#5648](https://github.com/transmission/transmission/issues/5648) |
-| P2 | Time-of-Day and Adaptive Bandwidth Policies | Time-of-day schedules merged with the adaptive autopilot into a single per-profile bandwidth policy surface | qBittorrent scheduler, aria2 bandwidth scheduling, Deluge scheduler, adaptive autopilot (P0) |
+| P2 | Time-of-Day and Adaptive Bandwidth Policies | Time-of-day schedules merged with the implemented adaptive autopilot into a single per-profile bandwidth policy surface | qBittorrent scheduler, aria2 bandwidth scheduling, Deluge scheduler, adaptive autopilot |
 | P2 | Backup / Restore & Bulk Import/Export | Export/import torrent list and state for migration and disaster recovery of large libraries | qBittorrent backup, Deluge export, Flood backup/restore |
 | P2 | Thin Client / Remote Session Architecture | Connect a native or web client to a remote daemon via a streaming RPC protocol without SSH tunneling | Deluge thin-client architecture, qBittorrent remote session requests, Flood multi-backend |
 | P2 | OpenTelemetry Observability | Distributed tracing, span export, and OTLP metrics export for cloud-native monitoring | OpenTelemetry standard, Flood OpenAPI+Swagger, cloud-native deployment patterns |
@@ -82,51 +80,6 @@ project.
 | P3 | Documentation Discoverability | Search index for `docs/` and a built-in help pane in the Web UI tied to daemon version | mdBook search, DocSearch, Sonarr/Radarr in-app help |
 
 ## P0 Features
-
-### Adaptive Swarm Performance Autopilot
-
-Problem: users can see many peers but poor throughput, with little guidance on
-whether the bottleneck is upload saturation, bad peers, tracker quality, DHT
-freshness, disk I/O, transport mix, network containment, or queue policy.
-
-Requested elsewhere:
-
-- Transmission users requested automatic speed limits based on available
-  bandwidth in [transmission#3945](https://github.com/transmission/transmission/issues/3945).
-- qBittorrent users requested blocking peers with poor progress/upload behavior
-  in [qbittorrent#24254](https://github.com/qbittorrent/qBittorrent/issues/24254).
-- qBittorrent users requested tracker scalability, DNS caching, and IPv6
-  prioritization in [qbittorrent#24053](https://github.com/qbittorrent/qBittorrent/issues/24053).
-- Queue starvation from stalled or slow torrents appears in
-  [qbittorrent#23050](https://github.com/qbittorrent/qBittorrent/issues/23050)
-  and [qbittorrent#23476](https://github.com/qbittorrent/qBittorrent/issues/23476).
-- Users want to know when a torrent last received data in
-  [qbittorrent#24330](https://github.com/qbittorrent/qBittorrent/issues/24330).
-
-SwarmOtter feature shape:
-
-- Add a per-torrent performance model that tracks useful peer rate, stale peer
-  rate, tracker contribution, DHT/PEX freshness, last useful data time,
-  disk-write pressure, and containment state.
-- Add an optional adaptive bandwidth mode that tunes global upload/download
-  limits using measured latency and throughput while respecting configured hard
-  caps.
-- Add peer and tracker scoring that affects retry order, connection attempts,
-  and UI diagnostics.
-- Add queue mitigation for stalled torrents that are blocking active slots.
-- Add an API and UI "why is this slow?" report with specific causes and recent
-  autopilot actions.
-
-Acceptance direction:
-
-- The daemon must log and expose every automatic decision.
-- The user must be able to disable or enable feature modes globally through
-  `[autopilot].mode` (`disabled` / `observe` / `act`, default `observe`) and
-  per torrent through the API.
-- All network measurements must use the existing contained data plane; no
-  separate uncontained probing is allowed.
-- Current documentation and acceptance for this phase are recorded in
-  `ADR-0035-adaptive-swarm-performance-autopilot.md`.
 
 ### Disk-Aware Storage Optimizer
 
@@ -149,19 +102,14 @@ Requested elsewhere:
 - Transmission has a Btrfs/subvolume move-performance issue in
   [transmission#1060](https://github.com/transmission/transmission/issues/1060).
 
-SwarmOtter feature shape:
+Remaining SwarmOtter feature shape:
 
-- Detect filesystem type, free space, mount options, write throughput, and
-  verification throughput per configured storage root.
+- Extend current storage-root diagnostics with mount options, sustained write
+  throughput, and verification throughput per configured storage root.
 - Add disk-aware queue controls: active byte cap, active write-pressure cap,
   per-storage-root concurrency, and recheck concurrency.
 - Add optional CoW-aware write strategy for Btrfs-like filesystems, including
   preallocation policy, sparse policy, and clearly surfaced trade-offs.
-- Add UI/API storage diagnostics showing free space, active write rate, active
-  recheck rate, and torrents mapped to each root.
-- Add disk-space pre-check enforcement: prevent starting new downloads when
-  free space on the target storage root falls below a configurable threshold.
-  Reject add requests with a clear error before any data is written.
 - Add state-directory controls for logs, resume files, database/state, and
   temporary files so high-write paths can be placed intentionally.
 
@@ -171,7 +119,8 @@ Acceptance direction:
 - CoW-related behavior must be explicit and documented because checksumming,
   compression, snapshots, and fragmentation trade off differently per
   filesystem.
-- Implementing this requires an ADR.
+- Further optimizer phases require ADR updates when they change storage
+  strategy, persistence, or runtime scheduling behavior.
 
 ### Policy Profiles and Inherited Torrent Settings
 
@@ -213,45 +162,6 @@ Acceptance direction:
   create-time snapshots.
 - Implementing this requires an ADR because it changes persistent settings and
   runtime behavior.
-
-### Large-Library Web UI Operations Console
-
-Problem: Web UIs that work for a few torrents degrade with hundreds or
-thousands. SwarmOtter can differentiate by treating the Web UI as an operations
-console for large libraries.
-
-Requested elsewhere:
-
-- qBittorrent users requested virtualized/non-laggy Web UI tables in
-  [qbittorrent#24558](https://github.com/qbittorrent/qBittorrent/issues/24558).
-- qBittorrent users requested pagination in
-  [qbittorrent#23127](https://github.com/qbittorrent/qBittorrent/issues/23127).
-- qBittorrent users requested counts-only API endpoints in
-  [qbittorrent#23449](https://github.com/qbittorrent/qBittorrent/issues/23449).
-- qBittorrent tracks broad Web UI parity work in
-  [qbittorrent#9796](https://github.com/qbittorrent/qBittorrent/issues/9796)
-  and [qbittorrent#22111](https://github.com/qbittorrent/qBittorrent/issues/22111).
-- Transmission users requested grouping in the Web UI in
-  [transmission#3813](https://github.com/transmission/transmission/issues/3813)
-  and sorting by time left in
-  [transmission#8237](https://github.com/transmission/transmission/issues/8237).
-
-SwarmOtter feature shape:
-
-- Add server-side list filtering, sorting, grouping, pagination, and counts.
-- Add a virtualized torrent table in the Web UI.
-- Add saved filters for state, label, tracker, health, storage root, and
-  performance condition.
-- Add bulk operations with clear confirmations for destructive actions.
-- Add details drawers or pages that do not require reloading the full list.
-
-Acceptance direction:
-
-- The torrent list must remain responsive with large torrent counts.
-- API responses must support incremental UI refreshes without sending the full
-  world on every poll.
-- Bulk operations must use the same API permissions and confirmation semantics
-  as single-torrent operations.
 
 ### Ecosystem Compatibility API
 
@@ -1284,8 +1194,8 @@ Acceptance direction:
 
 Problem: SwarmOtter's current persistent state is built from per-torrent
 JSON resume files plus an in-memory registry. This works for v1.0.0 but
-does not scale cheaply for the operations that the backlog already
-targets: the large-library operations console (P0), the operator audit
+does not scale cheaply for the operations that the product already
+targets: the implemented large-library operations console, the operator audit
 log (P1), long-horizon observability (P2), and queue/health history all
 want indexed, queryable history. Reconstructing that history from resume
 files on every restart is wasteful and slow for thousands of torrents.
@@ -1311,8 +1221,8 @@ SwarmOtter feature shape:
 - Provide migration from the resume-file-only model so existing
   deployments upgrade without losing state.
 - Integrate with long-horizon observability (existing P2), the operator
-  audit log (existing P1), and the large-library operations console
-  (existing P0).
+  audit log (existing P1), and the implemented large-library operations
+  console.
 
 Acceptance direction:
 
@@ -1422,7 +1332,7 @@ Acceptance direction:
 
 ### Time-of-Day and Adaptive Bandwidth Policies
 
-Problem: the Adaptive Swarm Performance Autopilot (P0) tunes global
+Problem: the implemented adaptive swarm performance autopilot tunes global
 bandwidth live based on measured throughput, latency, and queue state.
 Operators also want time-of-day schedules (e.g. limit upload during
 business hours, full-speed downloads overnight). These are two facets of
@@ -1432,7 +1342,7 @@ bandwidth-policy surface so the user mental model is one feature.
 Requested elsewhere:
 
 - qBittorrent, aria2, and Deluge ship bandwidth scheduling features.
-- The adaptive autopilot (P0) is the SwarmOtter counterpart to live
+- The adaptive autopilot is the SwarmOtter counterpart to live
   throughput tuning; combining it with scheduling makes the policy surface
   complete.
 
@@ -1444,7 +1354,7 @@ SwarmOtter feature shape:
 - Schedule and adaptive autopilot share the same per-profile bandwidth
   resolution; the operator chooses the active mode per profile (adaptive,
   scheduled, or both with explicit precedence).
-- Complements (does not replace) the adaptive autopilot (P0).
+- Complements (does not replace) the implemented adaptive autopilot.
 
 Acceptance direction:
 
@@ -1651,7 +1561,7 @@ SwarmOtter feature shape:
   usable on small/touch viewports.
 - Keep the function-over-form posture (see ADR-0006): no heavy UI
   framework, no animation work, no theme marketplace.
-- Reuse the existing large-library operations console (existing P0)
+- Reuse the implemented large-library operations console
   server-side filtering and pagination so the mobile view does not load
   the full list.
 

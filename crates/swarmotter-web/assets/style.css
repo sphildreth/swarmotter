@@ -752,6 +752,30 @@ pre#log-stream {
 }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; overflow-wrap: anywhere; }
+.storage-root-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.45rem;
+  font-size: 0.85rem;
+}
+.storage-root-table th,
+.storage-root-table td {
+  text-align: left;
+  padding: 0.35rem 0.45rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.storage-root-table thead th {
+  color: var(--muted);
+  font-weight: 600;
+}
+.storage-root-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+.storage-root-table .storage-root-warnings {
+  margin: 0;
+  padding-left: 1rem;
+}
 .status-pill {
   display: inline-block;
   padding: 0.12rem 0.45rem;
