@@ -71,7 +71,7 @@ jobs:
             -e RUST_TARGET="${{ matrix.rust_target }}" \
             -e SWARMOTTER_BUILD_COMMIT="${{ github.sha }}" \
             "${RELEASE_RUST_IMAGE}" \
-            bash -lc '
+            bash -c '
               set -Eeuo pipefail
               rustup target add "$RUST_TARGET"
               if [[ "$RUST_TARGET" == "aarch64-unknown-linux-gnu" ]]; then

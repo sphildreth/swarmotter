@@ -7,7 +7,7 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
-## [1.1.2] - [2026-07-06]
+## [1.1.3] - [2026-07-06]
 
 ### Fixed
 
@@ -16,7 +16,9 @@ date or duration estimates.
   bookworm glibc floor before publishing. The release container image continues
   to stage those same prebuilt binaries, but the staged `swarmotterd` binary no
   longer depends on newer GitHub runner glibc versions that are unavailable in
-  the runtime image.
+  the runtime image. The release workflow now invokes the container shell
+  without login-shell PATH reset so `cargo`, `rustc`, and `rustup` from the
+  Rust image are available during artifact builds.
 
 ## [1.1.1] - [2026-07-06]
 
