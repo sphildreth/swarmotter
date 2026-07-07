@@ -8,6 +8,7 @@ const MAX_LOG_LINES = 500;
 const TOAST_DISPLAY_STORAGE_KEY = "swarmotter.toastDisplayMs";
 const THEME_STORAGE_KEY = "swarmotter.theme";
 const TORRENT_QUERY_STORAGE_KEY = "swarmotter.torrentQueryView";
+const API_TOKEN_STORAGE_KEY = "swarmotter.apiToken";
 const TORRENT_DEFAULT_PER_PAGE = 200;
 const TORRENT_MAX_PER_PAGE = 500;
 const THEME_DARK = "dark";
@@ -68,13 +69,14 @@ let torrentTableBuilt = false;
 let torrentTableReady = Promise.resolve();
 let bulkRemoveInFlight = false;
 let magnetAddInFlight = false;
-let logEventSource = null;
+let logEventStreamController = null;
 let lastEventStreamErrorAt = 0;
 let fullConfigSnapshot = null;
 let autopilotModeUpdateInFlight = false;
 let activeSettingsPanel = "api";
 let torrentQueryRefreshTimer = null;
 let isApplyingSortFromServer = false;
+let apiTokenPromptInFlight = null;
 let torrentQueryState = {
   q: "",
   state: "",
@@ -288,11 +290,74 @@ function renderProgressCell(bytesCompleted, totalLength) {
   return `<progress value="${safeCompleted}" max="${total}"></progress> ${fmtProgress(safeCompleted, total)}`;
 }
 
-async function api(path, opts = {}) {
-  const res = await fetch(API + path, opts);
+function loadApiToken() {
+  try {
+    return window.localStorage.getItem(API_TOKEN_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function saveApiToken(token) {
+  const normalized = String(token || "").trim();
+  try {
+    if (normalized) window.localStorage.setItem(API_TOKEN_STORAGE_KEY, normalized);
+    else window.localStorage.removeItem(API_TOKEN_STORAGE_KEY);
+  } catch {}
+  return normalized;
+}
+
+function withApiAuth(opts = {}) {
+  const next = { ...opts };
+  const headers = new Headers(opts.headers || {});
+  const token = loadApiToken();
+  if (token && !headers.has("x-swarmotter-auth") && !headers.has("authorization")) {
+    headers.set("x-swarmotter-auth", token);
+  }
+  next.headers = headers;
+  return next;
+}
+
+async function readResponseJson(res) {
   const text = await res.text();
   let body;
   try { body = JSON.parse(text); } catch { body = { success: false, error: { code: "parse_error", message: text } }; }
+  return body;
+}
+
+async function responseErrorMessage(res) {
+  try {
+    const body = await readResponseJson(res.clone());
+    return body?.error?.message || body?.error?.code || res.statusText || `HTTP ${res.status}`;
+  } catch {
+    return res.statusText || `HTTP ${res.status}`;
+  }
+}
+
+async function promptForApiToken(message = "API token required") {
+  if (apiTokenPromptInFlight) return apiTokenPromptInFlight;
+  apiTokenPromptInFlight = Promise.resolve().then(() => {
+    const token = window.prompt(`${message}\n\nEnter SwarmOtter API token:`, loadApiToken());
+    if (token === null) return "";
+    return saveApiToken(token);
+  }).finally(() => {
+    apiTokenPromptInFlight = null;
+  });
+  return apiTokenPromptInFlight;
+}
+
+async function apiFetch(path, opts = {}, retryAuth = true) {
+  const res = await fetch(API + path, withApiAuth(opts));
+  if (res.status === 401 && retryAuth) {
+    const token = await promptForApiToken(await responseErrorMessage(res));
+    if (token) return apiFetch(path, opts, false);
+  }
+  return res;
+}
+
+async function api(path, opts = {}) {
+  const res = await apiFetch(path, opts);
+  const body = await readResponseJson(res);
   if (!body.success && body.error) {
     const err = new Error(body.error.message || body.error.code);
     err.code = body.error.code;
@@ -1949,11 +2014,13 @@ $("#settings-editor").addEventListener("submit", async (event) => {
   }
   const status = $("#settings-save-status");
   try {
+    const nextConfig = collectSettingsConfig();
     const result = await api("/settings", {
       method: "PUT",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(collectSettingsConfig()),
+      body: JSON.stringify(nextConfig),
     });
+    if (nextConfig.api.auth_token) saveApiToken(nextConfig.api.auth_token);
     fullConfigSnapshot = result.config;
     renderSettingsEditor(result.config);
     renderConfigSaveStatus(result);
@@ -2160,25 +2227,65 @@ function renderLogSnapshot(snapshot) {
 }
 
 function connectEventStream() {
-  if (logEventSource) return;
+  if (logEventStreamController) return;
+  readEventStream();
+}
+
+async function readEventStream() {
+  const controller = new AbortController();
+  logEventStreamController = controller;
   try {
-    logEventSource = new EventSource(API + "/events");
-    logEventSource.onopen = () => appendLogLine("[event stream connected]");
-    EVENT_KINDS.forEach(kind => {
-      logEventSource.addEventListener(kind, (event) => {
-        appendEventLine(kind, event.data);
-      });
+    const res = await apiFetch("/events", {
+      headers: { accept: "text/event-stream" },
+      signal: controller.signal,
     });
-    logEventSource.onerror = () => {
+    if (!res.ok || !res.body) throw new Error(await responseErrorMessage(res));
+    appendLogLine("[event stream connected]");
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      buffer = drainEventStreamBuffer(buffer);
+    }
+  } catch (e) {
+    if (!controller.signal.aborted) {
       const nowMs = Date.now();
       if (nowMs - lastEventStreamErrorAt > 10000) {
-        appendLogLine("[event stream disconnected; browser will retry]");
+        appendLogLine("[event stream unavailable] " + e.message);
         lastEventStreamErrorAt = nowMs;
       }
-    };
-  } catch (e) {
-    appendLogLine("[event stream unavailable] " + e.message);
+    }
+  } finally {
+    if (logEventStreamController === controller) {
+      logEventStreamController = null;
+      if (!$("#view-logs").classList.contains("hidden")) {
+        window.setTimeout(connectEventStream, 10000);
+      }
+    }
   }
+}
+
+function drainEventStreamBuffer(buffer) {
+  let sep;
+  while ((sep = buffer.indexOf("\n\n")) >= 0) {
+    const raw = buffer.slice(0, sep);
+    buffer = buffer.slice(sep + 2);
+    dispatchEventStreamBlock(raw);
+  }
+  return buffer;
+}
+
+function dispatchEventStreamBlock(raw) {
+  let kind = "message";
+  const data = [];
+  for (const line of raw.split(/\r?\n/)) {
+    if (line.startsWith("event:")) kind = line.slice(6).trim();
+    else if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+  }
+  if (EVENT_KINDS.includes(kind)) appendEventLine(kind, data.join("\n"));
 }
 
 function appendEventLine(kind, raw) {

@@ -296,6 +296,25 @@ mod tests {
     }
 
     #[test]
+    fn web_ui_sends_api_auth_token_when_configured() {
+        for needle in [
+            "const API_TOKEN_STORAGE_KEY = \"swarmotter.apiToken\";",
+            "headers.set(\"x-swarmotter-auth\", token);",
+            "async function promptForApiToken(",
+            "async function apiFetch(",
+            "if (res.status === 401 && retryAuth)",
+            "saveApiToken(nextConfig.api.auth_token);",
+            "accept: \"text/event-stream\"",
+            "function dispatchEventStreamBlock(",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "Web UI API auth support is missing {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn web_ui_supports_bulk_torrent_selection() {
         for id in [
             "select-all-torrents-btn",
