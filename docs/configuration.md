@@ -161,6 +161,8 @@ The adaptive swarm performance autopilot is configurable and can be staged safel
 - In `act` mode, SwarmOtter can apply bounded daemon/engine actions such as
   discovery refresh, peer-worker adjustment, peer-backoff relaxation, and
   queue-slot release.
+- Queue-slot release is prioritized for active torrents with no recent block
+  progress so queued torrents are not blocked behind stalled work.
 - Per-torrent control is an override through API/UI.
 - Recommendations are constrained by existing hard caps and never ignore
   `bandwidth`, `queue`, or containment limits.

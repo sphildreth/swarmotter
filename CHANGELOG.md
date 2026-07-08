@@ -19,6 +19,11 @@ date or duration estimates.
 
 ### Fixed
 
+- **Autopilot stalled queue-slot release:** autopilot now preserves the start of
+  a zero-download streak and prioritizes queue-slot release when an active
+  torrent has no recent block progress. This prevents stalled active torrents
+  from pinning download slots ahead of queued torrents during unattended bulk
+  downloads.
 - **Selfish completion reconciliation:** `torrent.selfish = true` now removes
   already-completed managed torrent records during runtime reconciliation while
   preserving downloaded data. This prevents completed torrents from remaining

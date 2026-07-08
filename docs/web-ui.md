@@ -125,6 +125,8 @@ The details page renders a compact "why is this slow?" report with these fields:
 - active/global/autopilot mode state.
 - machine-readable reason identifiers and recommendations or applied-action
   candidates.
+- no-progress queue-slot release recommendations when a stalled active torrent
+  is eligible to let queued work proceed.
 - snapshot signals and network-conditions impact for operational context.
 
 The UI should present autopilot recommendations as human-readable entries with

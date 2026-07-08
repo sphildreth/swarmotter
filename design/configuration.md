@@ -37,6 +37,8 @@ and validation behavior are release-facing. Breaking changes should follow
 `VERSIONING_GUIDE.md`.
 - Autopilot control is compatible through `[autopilot].mode`, with exactly
   three values: `disabled`, `observe`, and `act`. Default is `act`.
+  In `act` mode, stalled active torrents with no recent block progress are
+  eligible for bounded queue-slot release so queued torrents can proceed.
 
 Compatibility adapter settings belong under `[compatibility.*]` so optional
 adapter surfaces remain isolated from native daemon configuration.
