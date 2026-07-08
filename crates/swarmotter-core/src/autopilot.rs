@@ -28,9 +28,9 @@ pub enum AutopilotMode {
     /// Autopilot decisions are disabled.
     Disabled,
     /// Observe and report causes without applying recommendations.
-    #[default]
     Observe,
     /// Return apply-ready recommendations from deterministic heuristics.
+    #[default]
     Act,
 }
 
@@ -45,7 +45,7 @@ pub struct AutopilotConfig {
 impl Default for AutopilotConfig {
     fn default() -> Self {
         Self {
-            mode: AutopilotMode::Observe,
+            mode: AutopilotMode::Act,
         }
     }
 }

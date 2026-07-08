@@ -1776,7 +1776,7 @@ function renderSettingsEditor(cfg) {
   setSettingsChecked("cfg-compat-transmission-enabled", transmission.enabled);
   setSettingsChecked("cfg-compat-qbittorrent-enabled", qbittorrent.enabled);
 
-  setSettingsValue("cfg-autopilot-mode", autopilot.mode || "observe");
+  setSettingsValue("cfg-autopilot-mode", autopilot.mode || "act");
 
   setSettingsValue("cfg-storage-download-dir", storage.download_dir);
   setSettingsValue("cfg-storage-incomplete-dir", storage.incomplete_dir);

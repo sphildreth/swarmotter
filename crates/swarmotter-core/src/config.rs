@@ -477,12 +477,12 @@ mod tests {
         assert!(!cfg.compatibility.transmission.enabled);
         assert!(matches!(
             cfg.autopilot.mode,
-            crate::autopilot::AutopilotMode::Observe
+            crate::autopilot::AutopilotMode::Act
         ));
     }
 
     #[test]
-    fn autopilot_config_defaults_to_observe() {
+    fn autopilot_config_defaults_to_act() {
         let toml = r#"
 [torrent]
 listen_port = 51413
@@ -490,7 +490,7 @@ listen_port = 51413
         let cfg = Config::from_toml_str(toml).unwrap();
         assert!(matches!(
             cfg.autopilot.mode,
-            crate::autopilot::AutopilotMode::Observe
+            crate::autopilot::AutopilotMode::Act
         ));
     }
 
@@ -498,12 +498,12 @@ listen_port = 51413
     fn autopilot_config_parses_and_env_override() {
         let toml = r#"
 [autopilot]
-mode = "act"
+mode = "observe"
 "#;
         let cfg = Config::from_toml_str(toml).unwrap();
         assert!(matches!(
             cfg.autopilot.mode,
-            crate::autopilot::AutopilotMode::Act
+            crate::autopilot::AutopilotMode::Observe
         ));
 
         let cfg = Config::default();

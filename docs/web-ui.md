@@ -113,8 +113,8 @@ In autopilot visibility mode, the UI reads:
   for per-torrent decision views and mode override controls.
 
 The Settings tab includes an Autopilot card for the global
-`disabled` / `observe` / `act` mode. Torrent Details keeps the per-torrent
-override control.
+`disabled` / `observe` / `act` mode. The default is `act`, and Torrent Details
+keeps the per-torrent override control.
 
 The Settings screen uses a two-panel layout: section navigation on the left and
 the selected settings group on the right. Save, reload, and reset controls sit

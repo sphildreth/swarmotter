@@ -47,8 +47,8 @@ validate_dns = true
 
 # --- Autopilot ---
 [autopilot]
-# Optional: disabled (off), observe (reasons only), or act (recommendations).
-mode = "observe"
+# Optional: disabled (off), observe (reasons only), or act (bounded actions).
+mode = "act"
 
 # --- Torrent peer listener (data plane) ---
 [torrent]
@@ -65,10 +65,11 @@ utp_prefer_tcp = true
 # attempts MSE/PE first while preserving plaintext fallback for compatibility.
 encryption_mode = "preferred"
 # Selfish mode removes a torrent from SwarmOtter immediately after the download
-# completes. Downloaded files are kept, but SwarmOtter will not seed the torrent
-# after completion. Useful when SwarmOtter should fetch content and then stop
-# managing the torrent without seeding. Default is false (normal completion and
-# seeding behavior).
+# completes. Already-completed managed records are also removed on runtime
+# reconciliation. Downloaded files are kept, but SwarmOtter will not seed the
+# torrent after completion. Useful when SwarmOtter should fetch content and then
+# stop managing the torrent without seeding. Default is false (normal completion
+# and seeding behavior).
 selfish = false
 
 # --- Bandwidth ---

@@ -197,8 +197,9 @@ UDP socket (see ADR-0020).
 - [x] Optional selfish completion policy (`torrent.selfish`): when enabled, the
       daemon removes a torrent immediately after its download completes (engine
       and seeder stopped, record removed from the registry) while preserving the
-      downloaded data on disk (no delete-data behavior); SwarmOtter does not
-      seed the torrent after completion. When disabled (default), normal
+      downloaded data on disk (no delete-data behavior); already-completed
+      managed records are also removed on runtime reconciliation. SwarmOtter
+      does not seed the torrent after completion. When disabled (default), normal
       completion and seeding behavior is unchanged. Covered by daemon
       integration tests (selfish removal + data preserved; default keeps the
       completed torrent; `delete_data = true` still deletes data when requested)

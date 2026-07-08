@@ -7,6 +7,24 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [1.1.4] - [2026-07-08]
+
+### Changed
+
+- **Autopilot act mode default:** `[autopilot].mode` now defaults to `act` so
+  stalled active torrents can receive bounded queue/discovery/peer-worker
+  mitigation without requiring an explicit settings change. Operators can still
+  select `observe` for diagnostics-only behavior or `disabled` to turn
+  autopilot off.
+
+### Fixed
+
+- **Selfish completion reconciliation:** `torrent.selfish = true` now removes
+  already-completed managed torrent records during runtime reconciliation while
+  preserving downloaded data. This prevents completed torrents from remaining
+  visible in the API/Web UI when they completed before the setting was enabled
+  or before the daemon observed the completion callback.
+
 ## [1.1.3] - [2026-07-06]
 
 ### Fixed

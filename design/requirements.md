@@ -40,7 +40,8 @@ time or duration estimates.
   seed-forever option, stop at target, upload/download accounting, ratio
   calculation. An optional **selfish** completion policy
   (`torrent.selfish`) removes a torrent from the daemon immediately after its
-  download completes while preserving the downloaded data and not seeding it.
+  download completes while preserving the downloaded data and not seeding it;
+  already-completed managed records are also removed on runtime reconciliation.
 - **Bandwidth:** global and per-torrent download/upload limits, alternate
   speed mode, maximum peers globally and per torrent, rate-limit state.
 - **API:** complete REST API covering all user-facing features, JSON

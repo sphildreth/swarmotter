@@ -29,8 +29,8 @@ sparse = true
 mode = "disabled"
 
 [autopilot]
-# Optional: disabled (off), observe (reasons only), or act (recommendations).
-mode = "observe"
+# Optional: disabled (off), observe (reasons only), or act (bounded actions).
+mode = "act"
 
 [torrent]
 listen_port = 51413

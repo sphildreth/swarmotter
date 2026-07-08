@@ -36,6 +36,10 @@ Adopt an adaptive autopilot model with three parts:
    by global `disabled` / `observe` / `act` modes plus per-torrent mode
    overrides. Automatic actions remain bounded by configured hard caps from
    `[bandwidth]`, `[queue]`, and network containment health.
+   The default global mode is `act` so stalled active torrents can release
+   queue slots or refresh discovery without requiring an explicit operator
+   change. Operators that want diagnostics-only behavior can select `observe`,
+   and operators that want no autopilot analysis can select `disabled`.
 3. Containment contract: use only the existing contained torrent data-plane signals
    and network diagnostics in all measurements and never issue uncontained probes.
 
@@ -49,6 +53,10 @@ for operators reviewing automation outcomes.
   peer/transport/queue signals, and action history.
 - The daemon can evolve from static limits toward dynamic decisions without changing
   the primary control-plane path model.
+- Default operation applies bounded queue/discovery/peer-worker mitigation for
+  active torrents that meet deterministic slow/stalled criteria. This improves
+  large-library throughput behavior, but operators who prefer manual-only
+  tuning must set `[autopilot].mode = "observe"` or `"disabled"`.
 - Autopilot behavior is constrained by existing fail-closed containment and does
   not bypass `[network]` policy or data-plane enforcement.
 - New decision and disablement states must be surfaced in configuration and UI
