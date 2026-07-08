@@ -42,9 +42,11 @@ The key constraints for such a mode are:
   `remove_torrent(delete_data = false)` driven automatically on completion.
 - When `selfish = false`, the existing completion/seeding behavior is
   unchanged.
-- The policy is scoped to the download-completion path in the engine task. It
-  does not fire on manual `recheck` of already-present data, to avoid
-  surprising removal during a verify operation.
+- Runtime reconciliation also treats `selfish = true` as an invariant: any
+  torrent record already in `completed` or `seeding` state is removed with
+  `delete_data = false` during progress/config reconciliation. This covers
+  stale records that completed before the setting was enabled, before a
+  restart, or before the daemon observed the completion callback.
 
 ## Consequences
 
@@ -56,6 +58,9 @@ The key constraints for such a mode are:
 - The removal is implemented as an associated function taking shared
   `Arc<Mutex<...>>` handles (not `&self`) precisely so the engine task can
   call it safely without awaiting its own join handle (which would deadlock).
+- A completed torrent may also disappear on the next settings save, progress
+  reconciliation, list query, stats query, or health loop after `selfish` is
+  enabled, even if it completed earlier.
 - Selfish mode never deletes data; explicit `remove_torrent(delete_data =
   true)` via the API continues to delete payload data when requested,
   independent of the selfish setting.

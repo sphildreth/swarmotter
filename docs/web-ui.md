@@ -113,8 +113,8 @@ In autopilot visibility mode, the UI reads:
   for per-torrent decision views and mode override controls.
 
 The Settings tab includes an Autopilot card for the global
-`disabled` / `observe` / `act` mode. Torrent Details keeps the per-torrent
-override control.
+`disabled` / `observe` / `act` mode. The default is `act`, and Torrent Details
+keeps the per-torrent override control.
 
 The Settings screen uses a two-panel layout: section navigation on the left and
 the selected settings group on the right. Save, reload, and reset controls sit
@@ -125,6 +125,8 @@ The details page renders a compact "why is this slow?" report with these fields:
 - active/global/autopilot mode state.
 - machine-readable reason identifiers and recommendations or applied-action
   candidates.
+- no-progress queue-slot release recommendations when a stalled active torrent
+  is eligible to let queued work proceed.
 - snapshot signals and network-conditions impact for operational context.
 
 The UI should present autopilot recommendations as human-readable entries with

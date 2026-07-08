@@ -28,9 +28,9 @@ pub enum AutopilotMode {
     /// Autopilot decisions are disabled.
     Disabled,
     /// Observe and report causes without applying recommendations.
-    #[default]
     Observe,
     /// Return apply-ready recommendations from deterministic heuristics.
+    #[default]
     Act,
 }
 
@@ -45,7 +45,7 @@ pub struct AutopilotConfig {
 impl Default for AutopilotConfig {
     fn default() -> Self {
         Self {
-            mode: AutopilotMode::Observe,
+            mode: AutopilotMode::Act,
         }
     }
 }
@@ -158,13 +158,10 @@ impl AutopilotAnalyzer {
             };
         }
 
-        let action = causes
-            .iter()
-            .find_map(|cause| Self::action_for_cause(*cause, input))
-            .map(|mut action| {
-                action.rationale = format!("autopilot recommend: {}", action.rationale);
-                action
-            });
+        let action = Self::action_for_causes(&causes, input).map(|mut action| {
+            action.rationale = format!("autopilot recommend: {}", action.rationale);
+            action
+        });
         let apply = action.is_some();
 
         AutopilotDecision {
@@ -229,6 +226,25 @@ impl AutopilotAnalyzer {
         causes.sort_unstable();
         causes.dedup();
         causes
+    }
+
+    fn action_for_causes(causes: &[SlowCause], input: &AutopilotInput) -> Option<AutopilotAction> {
+        const ACTION_PRIORITY: [SlowCause; 9] = [
+            SlowCause::NoRecentProgress,
+            SlowCause::PeerFailureStorm,
+            SlowCause::PeerBackoffSaturation,
+            SlowCause::NoKnownPeers,
+            SlowCause::DiscoveryBlackout,
+            SlowCause::TrackerIssues,
+            SlowCause::NoUsefulPeers,
+            SlowCause::PeerWorkersAtCap,
+            SlowCause::ThroughputBelowReference,
+        ];
+
+        ACTION_PRIORITY
+            .into_iter()
+            .filter(|cause| causes.contains(cause))
+            .find_map(|cause| Self::action_for_cause(cause, input))
     }
 
     fn action_for_cause(cause: SlowCause, input: &AutopilotInput) -> Option<AutopilotAction> {
@@ -431,6 +447,53 @@ mod tests {
         assert_eq!(
             decision.action.as_ref().expect("action").kind,
             AutopilotActionKind::ExpandDiscovery
+        );
+    }
+
+    #[test]
+    fn stalled_no_peer_torrent_releases_queue_slot() {
+        let input = AutopilotInput {
+            state: TorrentState::Downloading,
+            piece_count: 1,
+            known_peers: 0,
+            rate_down: 0,
+            no_progress_seconds: Some(NO_PROGRESS_SECONDS),
+            ..Default::default()
+        };
+        let decision = AutopilotAnalyzer::new().analyze(&input, AutopilotMode::Act);
+
+        assert!(decision.snapshot.causes.contains(&SlowCause::NoKnownPeers));
+        assert!(decision
+            .snapshot
+            .causes
+            .contains(&SlowCause::NoRecentProgress));
+        assert_eq!(
+            decision.action.as_ref().expect("action").kind,
+            AutopilotActionKind::ReleaseQueueSlot
+        );
+    }
+
+    #[test]
+    fn stalled_useless_peer_torrent_releases_queue_slot() {
+        let input = AutopilotInput {
+            state: TorrentState::Downloading,
+            piece_count: 1,
+            known_peers: 10,
+            useful_peers: Some(0),
+            rate_down: 0,
+            no_progress_seconds: Some(NO_PROGRESS_SECONDS),
+            ..Default::default()
+        };
+        let decision = AutopilotAnalyzer::new().analyze(&input, AutopilotMode::Act);
+
+        assert!(decision.snapshot.causes.contains(&SlowCause::NoUsefulPeers));
+        assert!(decision
+            .snapshot
+            .causes
+            .contains(&SlowCause::NoRecentProgress));
+        assert_eq!(
+            decision.action.as_ref().expect("action").kind,
+            AutopilotActionKind::ReleaseQueueSlot
         );
     }
 }

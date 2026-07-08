@@ -115,6 +115,7 @@ struct RateSample {
     rate_up: u64,
     last_download_at: Option<Instant>,
     last_upload_at: Option<Instant>,
+    no_download_since: Option<Instant>,
     at: Instant,
     /// Highest observed download rate for this torrent, considering both the
     /// current smoothed rate and the instantaneous reconciliation sample. Used
@@ -1324,6 +1325,57 @@ impl DaemonRuntime {
         }
     }
 
+    async fn sweep_selfish_completed_torrents_best_effort(&self, reason: &'static str) {
+        if let Err(e) = self.sweep_selfish_completed_torrents(reason).await {
+            tracing::warn!(
+                reason,
+                error = %e,
+                "selfish completed torrent sweep failed"
+            );
+        }
+    }
+
+    async fn sweep_selfish_completed_torrents(
+        &self,
+        reason: &'static str,
+    ) -> Result<Vec<InfoHash>> {
+        if !self.config.lock().await.torrent.selfish {
+            return Ok(Vec::new());
+        }
+
+        let hashes: Vec<InfoHash> = {
+            let reg = self.registry.lock().await;
+            reg.torrents
+                .iter()
+                .filter_map(|(hash, torrent)| {
+                    matches!(
+                        torrent.state,
+                        TorrentState::Completed | TorrentState::Seeding
+                    )
+                    .then_some(*hash)
+                })
+                .collect()
+        };
+
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let removed = self
+            .remove_torrents_with_single_reconcile(hashes, false)
+            .await?;
+        if !removed.is_empty() {
+            tracing::info!(
+                count = removed.len(),
+                reason,
+                selfish = true,
+                delete_data = false,
+                "selfish mode removed already-completed torrents; downloaded data preserved"
+            );
+        }
+        Ok(removed)
+    }
+
     /// Selfish-mode completion: remove a finished torrent from the daemon
     /// without deleting its downloaded data. Stops the inbound seeder and
     /// clears all live engine/seeder bookkeeping, then removes the torrent
@@ -1453,10 +1505,13 @@ impl DaemonRuntime {
                         let up_delta = s.uploaded.saturating_sub(prev.uploaded);
                         let inst_down = ((down_delta as f64) / secs) as u64;
                         let inst_up = ((up_delta as f64) / secs) as u64;
-                        let last_download_at = if down_delta > 0 {
-                            Some(now)
+                        let (last_download_at, no_download_since) = if down_delta > 0 {
+                            (Some(now), None)
                         } else {
-                            prev.last_download_at
+                            (
+                                prev.last_download_at,
+                                Some(prev.no_download_since.unwrap_or(prev.at)),
+                            )
                         };
                         let last_upload_at = if up_delta > 0 {
                             Some(now)
@@ -1494,6 +1549,7 @@ impl DaemonRuntime {
                                 rate_up: t.rate_up,
                                 last_download_at,
                                 last_upload_at,
+                                no_download_since,
                                 at: now,
                                 peak_rate_down: peak,
                                 peak_rate_up,
@@ -1510,6 +1566,7 @@ impl DaemonRuntime {
                             rate_up: t.rate_up,
                             last_download_at: None,
                             last_upload_at: None,
+                            no_download_since: Some(now),
                             at: now,
                             peak_rate_down: 0,
                             peak_rate_up: 0,
@@ -1566,6 +1623,8 @@ impl DaemonRuntime {
         }
         drop(reg);
         drop(samples);
+        self.sweep_selfish_completed_torrents_best_effort("engine_progress")
+            .await;
         self.reconcile_seeders().await;
     }
 
@@ -1862,6 +1921,8 @@ impl DaemonRuntime {
         *self.network_health.lock().await = net::evaluate(&cfg.network, &probe);
         self.reconcile_queue().await;
         self.apply_peer_worker_limits().await;
+        self.sweep_selfish_completed_torrents_best_effort("runtime_config")
+            .await;
         self.reconcile_seeders().await;
     }
 
@@ -3575,6 +3636,8 @@ fn latest_progress_instant(
         }
     }
     latest
+        .or_else(|| sample.and_then(|sample| sample.no_download_since))
+        .or_else(|| sample.map(|sample| sample.at))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3853,6 +3916,7 @@ mod tests {
                 rate_up: 100,
                 last_download_at: None,
                 last_upload_at: None,
+                no_download_since: None,
                 at: Instant::now() - Duration::from_secs(2),
                 peak_rate_down: 0,
                 peak_rate_up: 0,
@@ -4083,6 +4147,7 @@ mod tests {
                 rate_up: 1,
                 last_download_at: Some(Instant::now()),
                 last_upload_at: Some(Instant::now()),
+                no_download_since: None,
                 at: Instant::now(),
                 peak_rate_down: 1,
                 peak_rate_up: 1,
@@ -4102,6 +4167,70 @@ mod tests {
             runtime.rate_samples.lock().await.contains_key(&hash),
             "rate samples should survive normal engine task exit"
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_config_sweeps_existing_completed_torrents_when_selfish() {
+        let mut cfg = Config::default();
+        cfg.torrent.selfish = true;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "selfish-sweep.bin",
+            b"already complete payload",
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = meta.info_hash;
+        let mut torrent = Torrent::new(meta.clone(), 1);
+        torrent.state = TorrentState::Completed;
+        torrent.date_completed = Some(2);
+        for piece in 0..meta.piece_count() {
+            torrent.progress.have_piece(piece);
+        }
+        runtime.registry.lock().await.add(torrent).unwrap();
+        runtime.queue.lock().await.add(hash);
+        runtime.engine_states.lock().await.insert(
+            hash,
+            Arc::new(Mutex::new(EngineState {
+                piece_count: meta.piece_count(),
+                total_length: meta.total_length,
+                bytes_completed: meta.total_length,
+                finished: true,
+                ..Default::default()
+            })),
+        );
+        runtime.rate_samples.lock().await.insert(
+            hash,
+            RateSample {
+                downloaded: 1,
+                uploaded: 0,
+                rate_down: 1,
+                rate_up: 0,
+                last_download_at: Some(Instant::now()),
+                last_upload_at: None,
+                no_download_since: None,
+                at: Instant::now(),
+                peak_rate_down: 1,
+                peak_rate_up: 0,
+            },
+        );
+
+        runtime.apply_runtime_config_fields().await;
+
+        assert!(
+            runtime.registry.lock().await.get(&hash).is_none(),
+            "selfish mode should remove completed torrents already in the registry"
+        );
+        assert_eq!(runtime.queue.lock().await.position(&hash), None);
+        assert!(!runtime.engine_states.lock().await.contains_key(&hash));
+        assert!(!runtime.rate_samples.lock().await.contains_key(&hash));
     }
 
     #[tokio::test]
@@ -4233,7 +4362,8 @@ mod tests {
 
     #[tokio::test]
     async fn autopilot_decision_uses_live_engine_telemetry() {
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.autopilot.mode = AutopilotMode::Observe;
         let health = NetworkHealth::blocked(
             NetworkContainmentMode::Disabled,
             swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
@@ -4277,6 +4407,7 @@ mod tests {
                 rate_up: 0,
                 last_download_at: None,
                 last_upload_at: None,
+                no_download_since: Some(Instant::now() - Duration::from_secs(45)),
                 at: Instant::now() - Duration::from_secs(45),
                 peak_rate_down: 0,
                 peak_rate_up: 0,
@@ -4387,6 +4518,127 @@ mod tests {
             decision.action.unwrap().kind,
             AutopilotActionKind::ExpandDiscovery
         ));
+    }
+
+    #[tokio::test]
+    async fn autopilot_act_mode_releases_stalled_active_queue_slot() {
+        let mut cfg = Config::default();
+        cfg.autopilot.mode = AutopilotMode::Act;
+        cfg.queue.max_active_downloads = 1;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let stalled_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "autopilot-stalled.bin",
+            b"stalled payload",
+            8,
+            None,
+            false,
+        );
+        let queued_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "autopilot-queued.bin",
+            b"queued payload",
+            8,
+            None,
+            false,
+        );
+        let stalled_meta = swarmotter_core::meta::parse_torrent(&stalled_bytes).unwrap();
+        let queued_meta = swarmotter_core::meta::parse_torrent(&queued_bytes).unwrap();
+        let stalled_hash = stalled_meta.info_hash;
+        let queued_hash = queued_meta.info_hash;
+        let mut stalled = Torrent::new(stalled_meta.clone(), 1);
+        stalled.state = TorrentState::Downloading;
+        runtime.registry.lock().await.add(stalled).unwrap();
+        runtime
+            .registry
+            .lock()
+            .await
+            .add(Torrent::new(queued_meta, 2))
+            .unwrap();
+        {
+            let mut queue = runtime.queue.lock().await;
+            queue.add(stalled_hash);
+            queue.add(queued_hash);
+        }
+        let stalled_since = Instant::now() - Duration::from_secs(45);
+        runtime.engine_states.lock().await.insert(
+            stalled_hash,
+            Arc::new(Mutex::new(EngineState {
+                piece_count: stalled_meta.piece_count(),
+                total_length: stalled_meta.total_length,
+                tracker_ok: false,
+                dht_discovery_ok: false,
+                pex_discovery_ok: false,
+                peer_scheduler: PeerSchedulerDiagnostics {
+                    peer_worker_limit: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })),
+        );
+        runtime.rate_samples.lock().await.insert(
+            stalled_hash,
+            RateSample {
+                downloaded: 0,
+                uploaded: 0,
+                rate_down: 0,
+                rate_up: 0,
+                last_download_at: None,
+                last_upload_at: None,
+                no_download_since: Some(stalled_since),
+                at: stalled_since,
+                peak_rate_down: 0,
+                peak_rate_up: 0,
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        runtime.engine_cmds.lock().await.insert(stalled_hash, tx);
+        runtime
+            .engine_handles
+            .lock()
+            .await
+            .insert(stalled_hash, tokio::spawn(async {}));
+        runtime.queue_reconcile.lock().await.scheduled = true;
+
+        runtime.refresh_autopilot_decisions(true).await;
+
+        let decision = runtime
+            .autopilot_decisions
+            .lock()
+            .await
+            .get(&stalled_hash)
+            .cloned()
+            .unwrap();
+        assert!(decision
+            .snapshot
+            .causes
+            .contains(&swarmotter_core::models::stats::SlowCause::NoRecentProgress));
+        assert!(matches!(
+            decision.action.unwrap().kind,
+            AutopilotActionKind::ReleaseQueueSlot
+        ));
+        assert_eq!(
+            runtime
+                .registry
+                .lock()
+                .await
+                .get(&stalled_hash)
+                .unwrap()
+                .state,
+            TorrentState::Queued
+        );
+        assert_eq!(runtime.queue.lock().await.position(&queued_hash), Some(1));
+        assert_eq!(runtime.queue.lock().await.position(&stalled_hash), Some(2));
+        assert!(runtime
+            .engine_retry_after
+            .lock()
+            .await
+            .get(&stalled_hash)
+            .is_some_and(|retry_at| *retry_at > Instant::now()));
+        assert_eq!(runtime.desired_download_hashes().await, vec![queued_hash]);
     }
 
     #[tokio::test]

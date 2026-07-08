@@ -16,7 +16,7 @@ with double underscores:
 SWARMOTTER_API__BIND_ADDRESS=0.0.0.0:9091
 SWARMOTTER_API__REQUIRE_AUTH=true
 SWARMOTTER_API__AUTH_TOKEN=replace-with-a-long-random-token
-SWARMOTTER_AUTOPILOT__MODE=observe
+SWARMOTTER_AUTOPILOT__MODE=act
 SWARMOTTER_NETWORK__MODE=strict
 SWARMOTTER_NETWORK__REQUIRED_INTERFACE=br0
 SWARMOTTER_TORRENT__LISTEN_PORT=51413
@@ -154,13 +154,15 @@ unlimited or high is better for raw transfer throughput.
 
 The adaptive swarm performance autopilot is configurable and can be staged safely:
 
-- Global behavior is controlled by `[autopilot].mode`, defaulting to `observe`.
+- Global behavior is controlled by `[autopilot].mode`, defaulting to `act`.
 - `mode` is one of `disabled`, `observe`, or `act`.
 - In `observe` mode, SwarmOtter reports slowdown causes without applying
   tuning actions.
 - In `act` mode, SwarmOtter can apply bounded daemon/engine actions such as
   discovery refresh, peer-worker adjustment, peer-backoff relaxation, and
   queue-slot release.
+- Queue-slot release is prioritized for active torrents with no recent block
+  progress so queued torrents are not blocked behind stalled work.
 - Per-torrent control is an override through API/UI.
 - Recommendations are constrained by existing hard caps and never ignore
   `bandwidth`, `queue`, or containment limits.
@@ -169,7 +171,7 @@ Example:
 
 ```toml
 [autopilot]
-mode = "observe"  # optional; defaults to observe
+mode = "act"  # optional; defaults to act
 ```
 
 ## Option reference
@@ -287,7 +289,7 @@ or network namespace.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `mode` | `observe` | Autopilot mode: `disabled` (no analysis), `observe` (reasons only), or `act` (reasons plus bounded automatic actions). |
+| `mode` | `act` | Autopilot mode: `disabled` (no analysis), `observe` (reasons only), or `act` (reasons plus bounded automatic actions). |
 
 ### `[torrent]`
 
@@ -298,7 +300,7 @@ or network namespace.
 | `utp_enabled` | `true` | Enables uTP peer transport through contained UDP sockets. |
 | `utp_prefer_tcp` | `true` | Tries TCP first, with uTP fallback. |
 | `encryption_mode` | `preferred` | TCP MSE/PE peer wire mode. `disabled` permits plaintext handshakes. `preferred` enables MSE/PE with plaintext fallback for TCP attempts while preserving the configured TCP/uTP preference. `required` refuses plaintext and requires encrypted TCP stream negotiation. Changing this setting is reported as restart-required for already-running torrent tasks. |
-| `selfish` | `false` | Removes a torrent after verified completion and does not seed it. |
+| `selfish` | `false` | Removes a torrent after verified completion and does not seed it; already-completed managed records are also removed on runtime reconciliation while preserving downloaded data. |
 
 ### `[bandwidth]`
 
