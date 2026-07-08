@@ -163,6 +163,11 @@ The adaptive swarm performance autopilot is configurable and can be staged safel
   queue-slot release.
 - Queue-slot release is prioritized for active torrents with no recent block
   progress so queued torrents are not blocked behind stalled work.
+- Unfinished engine exits and retryable metadata-discovery exits return to the
+  queue with bounded retry backoff, which prevents stale active-looking records
+  from occupying download slots.
+- Queue reconciliation also recovers active records that no longer have a
+  running engine task, returning them to the queue behind waiting work.
 - Per-torrent control is an override through API/UI.
 - Recommendations are constrained by existing hard caps and never ignore
   `bandwidth`, `queue`, or containment limits.

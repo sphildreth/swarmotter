@@ -767,6 +767,12 @@ mod tests {
             "method: \"PUT\"",
             "api(\"/reset\"",
             "Reset all downloads?",
+            "let resetError = null;",
+            "selectedTorrents.clear();",
+            "const remaining = finiteNumber(query?.total);",
+            "Reset incomplete",
+            "torrents are still listed after reset.",
+            "Reset refresh failed",
             "Configuration saved",
         ] {
             assert!(

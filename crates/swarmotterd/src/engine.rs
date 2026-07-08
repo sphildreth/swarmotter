@@ -120,6 +120,9 @@ pub struct EngineState {
     pub last_announce: Option<u64>,
     pub peer_scheduler: PeerSchedulerDiagnostics,
     pub finished: bool,
+    /// True when the engine stopped because the daemon explicitly requested
+    /// shutdown, pause, or queue rotation.
+    pub stopped_by_command: bool,
     /// Recent tracker/announce failures counted across poll windows.
     pub tracker_failures_recent: u32,
     /// Whether DHT discovery succeeded recently.
@@ -464,7 +467,10 @@ impl TorrentEngine {
         loop {
             // Handle pending commands.
             match self.poll_commands().await {
-                CommandOutcome::Stop => break,
+                CommandOutcome::Stop => {
+                    self.state.lock().await.stopped_by_command = true;
+                    break;
+                }
                 CommandOutcome::Reannounce => {
                     let refreshed = self.refresh_discovery_peers().await;
                     merge_unique_peers(&mut discovered, refreshed);
