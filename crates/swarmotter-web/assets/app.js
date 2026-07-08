@@ -477,8 +477,7 @@ async function refreshTorrents() {
     applyTorrentQueryControls(torrentQueryState);
     if (query?.page_count > 0 && query?.page > query?.page_count) {
       torrentQueryState.page = query.page_count;
-      refreshTorrents();
-      return;
+      return refreshTorrents();
     }
     observeTorrentRemovals(torrents);
     syncSelectedTorrents(torrents);
@@ -497,8 +496,10 @@ async function refreshTorrents() {
     }
     updateTorrentTableViewState();
     updateClearFiltersButton();
+    return query;
   } catch (e) {
     log("torrent list error: " + e.message);
+    return null;
   }
 }
 
@@ -2051,15 +2052,31 @@ $("#reset-downloads-btn").addEventListener("click", async () => {
   if (!confirmed) return;
   const button = $("#reset-downloads-btn");
   button.disabled = true;
+  let result = null;
+  let resetError = null;
   try {
-    const result = await api("/reset", { method: "POST" });
+    result = await api("/reset", { method: "POST" });
+  } catch (e) {
+    resetError = e;
+  }
+  try {
     currentHash = null;
     knownTorrents.clear();
     expectedRemovedTorrents.clear();
+    selectedTorrents.clear();
     torrentsLoaded = false;
-    await refreshTorrents();
+    const query = await refreshTorrents();
     if (!$("#view-logs").classList.contains("hidden")) await refreshLogs();
     await refreshDoctorBadge();
+    if (resetError) {
+      showError("Reset failed", resetError);
+      return;
+    }
+    const remaining = finiteNumber(query?.total);
+    if (remaining !== null && remaining > 0) {
+      showError("Reset incomplete", new Error(`${fmtCount(remaining)} torrents are still listed after reset.`));
+      return;
+    }
     const detail = [
       `${fmtCount(result.torrents_removed)} torrents`,
       `${fmtCount(result.storage_entries_removed)} storage entries`,
@@ -2067,7 +2084,7 @@ $("#reset-downloads-btn").addEventListener("click", async () => {
     ].join(" cleared; ");
     showToast("Reset complete", detail, "success");
   } catch (e) {
-    showError("Reset failed", e);
+    showError("Reset refresh failed", e);
   } finally {
     button.disabled = false;
   }

@@ -43,6 +43,9 @@ Adopt an adaptive autopilot model with three parts:
    When an active torrent has no recent block progress, queue-slot release is
    prioritized over additional discovery or peer-worker tuning so queued work
    can proceed instead of waiting behind a stalled active set.
+   The autopilot loop also reconciles the queue periodically so stale
+   active-looking records without running engine tasks are returned behind
+   waiting queue work instead of blocking it indefinitely.
 3. Containment contract: use only the existing contained torrent data-plane signals
    and network diagnostics in all measurements and never issue uncontained probes.
 
@@ -63,6 +66,9 @@ for operators reviewing automation outcomes.
 - Autopilot must preserve no-download streak state across rate reconciliation
   so torrents that never receive a first useful block can still age into the
   queue-release path.
+- Unfinished engine exits and retryable metadata-discovery exits must release
+  active download slots by returning the torrent to queued state with bounded
+  retry backoff.
 - Autopilot behavior is constrained by existing fail-closed containment and does
   not bypass `[network]` policy or data-plane enforcement.
 - New decision and disablement states must be surfaced in configuration and UI

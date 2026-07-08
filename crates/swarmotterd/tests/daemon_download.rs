@@ -12,13 +12,21 @@
 #![allow(clippy::field_reassign_with_default)]
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
+use tower::ServiceExt;
 
-use swarmotter_api::state::DaemonOps;
+use swarmotter_api::state::{AddTorrentOptions, AppState, BuildInfo, DaemonOps};
 use swarmotter_core::config::Config;
 use swarmotter_core::meta::{build_multi_file_torrent, build_single_file_torrent, parse_torrent};
+use swarmotter_core::models::network::{
+    NetworkContainmentMode, NetworkContainmentStatus, NetworkHealth,
+};
 use swarmotter_core::peer::{self, Bitfield, Handshake, Message, PeerAddr};
 use swarmotterd::daemon::DaemonRuntime;
 
@@ -42,6 +50,18 @@ fn pick_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+fn app_state(runtime: Arc<DaemonRuntime>, config: Config) -> swarmotter_api::state::SharedState {
+    let daemon: Arc<dyn DaemonOps> = runtime;
+    Arc::new(AppState {
+        daemon,
+        config: Arc::new(Mutex::new(config)),
+        build: BuildInfo::default(),
+        broker: swarmotter_api::handlers::events::EventBroker::default(),
+        transmission: swarmotter_api::state::TransmissionCompatState::default(),
+        qbittorrent: swarmotter_api::state::QbittorrentCompatState::default(),
+    })
 }
 
 /// A minimal seed peer serving a known payload.
@@ -249,6 +269,74 @@ async fn spawn_tracker(addr: SocketAddr, seed: PeerAddr) {
             });
         }
     });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reset_endpoint_with_real_daemon_clears_torrent_query_results() {
+    let root = unique_dir("reset-route");
+    let download_dir = root.join("downloads");
+    let incomplete_dir = root.join("incomplete");
+    std::fs::create_dir_all(&download_dir).unwrap();
+    std::fs::create_dir_all(&incomplete_dir).unwrap();
+
+    let mut cfg = Config::default();
+    cfg.storage.download_dir = Some(download_dir.display().to_string());
+    cfg.storage.incomplete_dir = Some(incomplete_dir.display().to_string());
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = Arc::new(DaemonRuntime::with_paths(cfg.clone(), health, None, None));
+    let torrent_bytes =
+        build_single_file_torrent("reset-route.bin", b"reset route payload", 8, None, false);
+    let hash = DaemonOps::add_torrent_file(
+        runtime.as_ref(),
+        torrent_bytes,
+        AddTorrentOptions::new(None, true),
+    )
+    .await
+    .unwrap();
+    assert!(runtime.get_torrent(&hash).await.is_some());
+
+    let app = swarmotter_api::app_router(app_state(runtime.clone(), cfg));
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/reset")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["data"]["torrents_removed"], 1);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents/query?per_page=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["data"]["total"], 0);
+    assert!(value["data"]["rows"].as_array().unwrap().is_empty());
+    assert!(runtime.list_torrents().await.is_empty());
+
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

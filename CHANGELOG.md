@@ -7,6 +7,24 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [1.1.5] - [2026-07-08]
+
+### Fixed
+
+- **Unattended queue recovery:** unfinished engine exits now requeue the
+  torrent with a retry backoff and release the active download slot so queued
+  torrents can proceed. Retryable magnet metadata discovery failures also
+  return to queued state instead of remaining listed as active with no running
+  engine. Queue reconciliation also recovers stale active records that have no
+  running engine task and moves them behind waiting work.
+- **Autopilot decision responsiveness:** per-torrent autopilot diagnostics now
+  compute the requested torrent directly instead of refreshing every torrent,
+  preventing the endpoint from hanging behind unrelated engine state.
+- **Reset lifecycle verification:** the Web UI now refreshes torrent data after
+  every reset attempt and reports an incomplete reset if the API still lists
+  torrent records. The daemon also logs reset requests before cleanup and clears
+  retry bookkeeping as part of reset state cleanup.
+
 ## [1.1.4] - [2026-07-08]
 
 ### Changed
