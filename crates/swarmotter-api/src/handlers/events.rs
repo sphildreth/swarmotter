@@ -95,7 +95,7 @@ impl EventBroker {
 
 impl Default for EventBroker {
     fn default() -> Self {
-        Self::new(256)
+        Self::new(4096)
     }
 }
 

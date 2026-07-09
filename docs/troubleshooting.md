@@ -249,3 +249,65 @@ Common causes:
 In strict interface mode, hostname trackers and DHT bootstrap hostnames need
 constrained DNS. On Linux, SwarmOtter accepts systemd-resolved link DNS for the
 required interface, for example DNS servers shown by `resolvectl dns br0`.
+
+## Performance with large libraries (1,000+ torrents)
+
+When managing large torrent libraries, monitor these indicators:
+
+### Symptoms of resource exhaustion
+
+- API responses slow down significantly (multiple seconds).
+- SSE/WebSocket subscribers receive `events_dropped` lag notifications.
+- Torrents stay in `queued` state despite available slots.
+- Daemon logs show repeated peer connection failures or tracker timeouts.
+- High CPU usage from lock contention or excessive reconciliation.
+
+### Check file descriptor usage
+
+Each active torrent requires 50+ file descriptors. Check the daemon's current
+limit and usage:
+
+```bash
+PID=$(pgrep swarmotterd)
+cat /proc/$PID/limits | grep "Max open files"
+ls /proc/$PID/fd | wc -l
+```
+
+If usage approaches the limit, increase it (see
+[Deployment](deployment.md#file-descriptor-requirements)).
+
+### Check scheduler saturation
+
+The stats endpoint reports scheduler pressure:
+
+```bash
+curl -sS http://127.0.0.1:9091/api/v1/stats | jq .scheduler
+```
+
+Key fields:
+
+- `requested_downloads` vs `granted_downloads`: if requested exceeds granted,
+  the download slot cap is the bottleneck.
+- `requested_metadata` vs `granted_metadata`: if requested exceeds granted,
+  the metadata fetch slot cap is the bottleneck.
+- `peer_worker_saturation`: `true` means the global peer worker cap is fully
+  consumed; active torrents may have fewer peers than configured.
+- `retry_backoff_count`: high values indicate many torrents waiting for retry
+  after transient failures.
+
+### Check event subscriber lag
+
+If SSE or WebSocket clients report `events_dropped`, the broadcast buffer
+(default 4,096) is overflowing. This happens during reconciliation bursts when
+many torrents change state simultaneously. Clients should reconnect and
+request a full state refresh after receiving a lag notification.
+
+### Reduce resource pressure
+
+If performance degrades with large libraries:
+
+1. Lower `max_active_downloads` to reduce concurrent peer connections.
+2. Lower `max_peers_per_torrent` to reduce per-torrent resource usage.
+3. Set a global `max_peers` cap to bound total connection count.
+4. Ensure file descriptor limits are sufficient (65,536+ for 1,000 torrents).
+5. Enable `autopilot.mode = "act"` for automatic stalled-torrent mitigation.

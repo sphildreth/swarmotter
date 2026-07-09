@@ -415,6 +415,7 @@ pub struct PieceAssembler {
     pub piece_length: usize,
     pub buf: Vec<u8>,
     pub received: Vec<bool>,
+    received_count: usize,
 }
 
 impl PieceAssembler {
@@ -424,6 +425,7 @@ impl PieceAssembler {
             piece_length,
             buf: vec![0u8; piece_length],
             received: vec![false; blocks_for(piece_length)],
+            received_count: 0,
         }
     }
 
@@ -446,10 +448,11 @@ impl PieceAssembler {
         }
         self.buf[off..end].copy_from_slice(block);
         let block_index = off / BLOCK_SIZE as usize;
-        if block_index < self.received.len() {
+        if block_index < self.received.len() && !self.received[block_index] {
             self.received[block_index] = true;
+            self.received_count += 1;
         }
-        Ok(self.received.iter().all(|b| *b))
+        Ok(self.received_count == self.received.len())
     }
 
     /// Return the assembled piece data once complete.

@@ -333,6 +333,66 @@ new torrents queued until resume/start-now is requested. Queue move operations
 change the real scheduling order, and `max_active_downloads` controls how many
 queued downloads may run at once.
 
+### Performance tuning for large libraries
+
+When managing 1,000+ torrents, consider these configuration adjustments to
+maintain responsive performance:
+
+**Queue limits:**
+- Set `max_active_downloads` to a reasonable value (e.g., 50-100) to prevent
+  resource exhaustion. With 1,000 torrents all downloading simultaneously,
+  peer connections and file descriptors can overwhelm the system.
+- Set `max_active_metadata_fetches` to limit concurrent magnet metadata
+  fetches (default 100). High values can cause tracker rate limiting.
+- Set `max_active_seeds` to limit concurrent seeders (default 5). Seeding
+  torrents consume upload bandwidth and peer connections.
+
+**Peer limits:**
+- Set `max_peers` to cap total peer connections across all torrents. With
+  1,000 torrents and 50 peers each, that's 50,000 connections. A global cap
+  of 5,000-10,000 is often sufficient.
+- Set `max_peers_per_torrent` to limit per-torrent peer connections (default
+  64). Lower values (e.g., 30-50) reduce resource usage with minimal impact
+  on download speed for well-seeded torrents.
+
+**Bandwidth limits:**
+- Set `global_download` and `global_upload` to prevent network saturation.
+  The atomic rate limiter efficiently distributes bandwidth across all active
+  torrents without mutex contention.
+- Use alternate speed limits (`alt_download`, `alt_upload`, `alt_enabled`)
+  for scheduled bandwidth reduction during peak hours.
+
+**File descriptors:**
+- Ensure the daemon has sufficient file descriptor limits (see
+  [Deployment](deployment.md#file-descriptor-requirements)). Each active
+  torrent requires 50+ file descriptors for peer connections, trackers, and
+  file handles.
+
+**Autopilot:**
+- Enable `autopilot.mode = "act"` (default) to allow automatic queue slot
+  release for stalled torrents, peer worker adjustments, and discovery
+  refresh. This helps maintain throughput across large libraries without
+  manual intervention.
+
+Example configuration for a 1,000-torrent library:
+
+```toml
+[queue]
+max_active_downloads = 50
+max_active_metadata_fetches = 100
+max_active_seeds = 20
+auto_start = true
+
+[bandwidth]
+global_download = 0
+global_upload = 0
+max_peers = 10000
+max_peers_per_torrent = 50
+
+[autopilot]
+mode = "act"
+```
+
 ### `[seeding]`
 
 | Option | Default | Meaning |

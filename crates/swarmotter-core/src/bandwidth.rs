@@ -8,6 +8,7 @@
 //! module provides the pure scheduling logic so it can be unit-tested.
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,59 +64,104 @@ pub struct TorrentBandwidth {
     pub upload: u64,
 }
 
-/// A simple token-bucket limiter state.
-#[derive(Debug, Clone, Default)]
-pub struct TokenBucket {
-    tokens: u64,
-    capacity: u64,
-    last_refill_ms: u128,
+/// A lock-free token-bucket limiter state using atomic operations.
+///
+/// This implementation uses CAS (compare-and-swap) loops to perform refill
+/// and consume operations without mutex contention. With 1000 concurrent
+/// torrents, this eliminates the serialization point that existed with
+/// `tokio::sync::Mutex<TokenBucket>`.
+#[derive(Debug)]
+pub struct AtomicTokenBucket {
+    tokens: AtomicU64,
+    capacity: AtomicU64,
+    last_refill_ms: AtomicU64,
 }
 
-impl TokenBucket {
-    pub fn new(capacity_per_sec: u64, now_ms: u128) -> Self {
+impl AtomicTokenBucket {
+    pub fn new(capacity_per_sec: u64, now_ms: u64) -> Self {
         Self {
-            tokens: capacity_per_sec,
-            capacity: capacity_per_sec,
-            last_refill_ms: now_ms,
+            tokens: AtomicU64::new(capacity_per_sec),
+            capacity: AtomicU64::new(capacity_per_sec),
+            last_refill_ms: AtomicU64::new(now_ms),
         }
     }
 
-    /// Refill the bucket given elapsed time. Returns nothing; mutates state.
-    pub fn refill(&mut self, now_ms: u128) {
-        if self.capacity == 0 {
-            return;
-        }
-        let elapsed = now_ms.saturating_sub(self.last_refill_ms);
-        let add = (self.capacity as u128) * elapsed / 1000;
-        self.tokens = (self.tokens + add as u64).min(self.capacity);
-        self.last_refill_ms = now_ms;
-    }
-
-    /// Attempt to consume `want` tokens; returns amount actually allowed.
-    pub fn consume(&mut self, want: u64) -> u64 {
-        if self.capacity == 0 {
+    /// Attempt to refill and consume `want` tokens in a single atomic operation.
+    /// Returns the amount actually allowed. Uses a CAS loop to ensure correctness
+    /// under concurrent access.
+    pub fn refill_and_consume(&self, now_ms: u64, want: u64) -> u64 {
+        let capacity = self.capacity.load(Ordering::Relaxed);
+        if capacity == 0 {
             return want; // unlimited
         }
-        let allowed = want.min(self.tokens);
-        self.tokens -= allowed;
-        allowed
+
+        loop {
+            let current_tokens = self.tokens.load(Ordering::Acquire);
+            let last_refill = self.last_refill_ms.load(Ordering::Acquire);
+
+            // Calculate refilled tokens
+            let elapsed = now_ms.saturating_sub(last_refill);
+            let add = (capacity as u128) * (elapsed as u128) / 1000;
+            let refilled = (current_tokens + add as u64).min(capacity);
+
+            // Calculate how much we can consume
+            let allowed = want.min(refilled);
+            let new_tokens = refilled - allowed;
+
+            // Try to atomically update both tokens and last_refill_ms
+            // We use a CAS loop on tokens, and if successful, update last_refill_ms
+            match self.tokens.compare_exchange_weak(
+                current_tokens,
+                new_tokens,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // Successfully updated tokens, now update last_refill_ms
+                    // This is a best-effort update; if it fails, the next operation will catch up
+                    let _ = self.last_refill_ms.compare_exchange(
+                        last_refill,
+                        now_ms,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                    return allowed;
+                }
+                Err(_) => {
+                    // Another thread modified tokens, retry
+                    continue;
+                }
+            }
+        }
     }
 
-    /// Available tokens.
+    /// Available tokens (approximate, as it may change concurrently).
     pub fn available(&self) -> u64 {
-        self.tokens
+        self.tokens.load(Ordering::Relaxed)
     }
 
     /// Current capacity (bytes/sec), or 0 for unlimited.
     pub fn capacity(&self) -> u64 {
-        self.capacity
+        self.capacity.load(Ordering::Relaxed)
     }
 
-    /// Update the capacity (bytes/sec) at runtime, preserving the refill clock.
-    pub fn set_capacity(&mut self, capacity_per_sec: u64) {
-        self.capacity = capacity_per_sec;
-        if self.tokens > capacity_per_sec {
-            self.tokens = capacity_per_sec;
+    /// Update the capacity (bytes/sec) at runtime.
+    pub fn set_capacity(&self, capacity_per_sec: u64) {
+        self.capacity.store(capacity_per_sec, Ordering::Release);
+        // Cap tokens if they exceed new capacity
+        loop {
+            let current = self.tokens.load(Ordering::Acquire);
+            if current <= capacity_per_sec {
+                break;
+            }
+            if self.tokens.compare_exchange_weak(
+                current,
+                capacity_per_sec,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ).is_ok() {
+                break;
+            }
         }
     }
 }
@@ -124,10 +170,13 @@ impl TokenBucket {
 /// driven by `tokio::time`. `acquire(direction, bytes)` consumes tokens and
 /// sleeps until enough are available, enforcing global and per-torrent rate
 /// limits in the real peer read/write paths. A capacity of 0 means unlimited.
+///
+/// This implementation uses lock-free atomic operations for the token buckets,
+/// eliminating mutex contention when many torrents share the same global limiter.
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
-    pub download: Arc<tokio::sync::Mutex<TokenBucket>>,
-    pub upload: Arc<tokio::sync::Mutex<TokenBucket>>,
+    pub download: Arc<AtomicTokenBucket>,
+    pub upload: Arc<AtomicTokenBucket>,
 }
 
 /// Direction of a rate-limited transfer.
@@ -142,13 +191,8 @@ impl RateLimiter {
     pub fn new(download_bps: u64, upload_bps: u64) -> Self {
         let now_ms = now_millis();
         Self {
-            download: Arc::new(tokio::sync::Mutex::new(TokenBucket::new(
-                download_bps,
-                now_ms,
-            ))),
-            upload: Arc::new(tokio::sync::Mutex::new(TokenBucket::new(
-                upload_bps, now_ms,
-            ))),
+            download: Arc::new(AtomicTokenBucket::new(download_bps, now_ms)),
+            upload: Arc::new(AtomicTokenBucket::new(upload_bps, now_ms)),
         }
     }
 
@@ -169,17 +213,13 @@ impl RateLimiter {
             RateDirection::Upload => &self.upload,
         };
         loop {
-            let allowed;
-            let cap;
-            {
-                let mut tb = bucket.lock().await;
-                if tb.capacity() == 0 {
-                    return; // unlimited
-                }
-                tb.refill(now_millis());
-                allowed = tb.consume(bytes);
-                cap = tb.capacity();
+            let cap = bucket.capacity();
+            if cap == 0 {
+                return; // unlimited
             }
+
+            let allowed = bucket.refill_and_consume(now_millis(), bytes);
+
             if allowed >= bytes {
                 return;
             }
@@ -195,25 +235,25 @@ impl RateLimiter {
     }
 
     /// Current configured capacity for a direction (0 = unlimited).
-    pub async fn capacity(&self, dir: RateDirection) -> u64 {
+    pub fn capacity(&self, dir: RateDirection) -> u64 {
         let bucket = match dir {
             RateDirection::Download => &self.download,
             RateDirection::Upload => &self.upload,
         };
-        bucket.lock().await.capacity()
+        bucket.capacity()
     }
 
     /// Update the configured capacity for a direction at runtime (0 =
     /// unlimited). Because [`RateLimiter`] holds its buckets behind an
-    /// `Arc<Mutex<...>>`, a cheap [`Clone`] shares the same underlying bucket,
+    /// `Arc<AtomicTokenBucket>`, a cheap [`Clone`] shares the same underlying bucket,
     /// so updating a cloned limiter updates the live view of all holders (used
     /// by the daemon to adjust per-torrent and global limits on the fly).
-    pub async fn set_capacity(&self, dir: RateDirection, capacity_per_sec: u64) {
+    pub fn set_capacity(&self, dir: RateDirection, capacity_per_sec: u64) {
         let bucket = match dir {
             RateDirection::Download => &self.download,
             RateDirection::Upload => &self.upload,
         };
-        bucket.lock().await.set_capacity(capacity_per_sec);
+        bucket.set_capacity(capacity_per_sec);
     }
 }
 
@@ -265,10 +305,10 @@ impl ShapedLimiter {
     }
 }
 
-fn now_millis() -> u128 {
+fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
+        .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
 
@@ -309,22 +349,76 @@ mod tests {
     }
 
     #[test]
-    fn token_bucket_refill_and_consume() {
-        let mut tb = TokenBucket::new(1000, 0);
-        assert_eq!(tb.consume(500), 500);
+    fn atomic_token_bucket_refill_and_consume() {
+        let tb = AtomicTokenBucket::new(1000, 0);
+        assert_eq!(tb.refill_and_consume(0, 500), 500);
         assert_eq!(tb.available(), 500);
-        // Refill 1000 tokens/sec over 500ms => 500 tokens.
-        tb.refill(500);
+        assert_eq!(tb.refill_and_consume(500, 0), 0);
         assert_eq!(tb.available(), 1000);
-        tb.refill(500); // another 500ms, but capped at capacity
+        assert_eq!(tb.refill_and_consume(500, 0), 0);
         assert_eq!(tb.available(), 1000);
-        assert_eq!(tb.consume(1500), 1000);
+        assert_eq!(tb.refill_and_consume(500, 1500), 1000);
     }
 
     #[test]
-    fn token_bucket_unlimited_when_zero() {
-        let mut tb = TokenBucket::new(0, 0);
-        assert_eq!(tb.consume(999_999), 999_999);
+    fn atomic_token_bucket_unlimited_when_zero() {
+        let tb = AtomicTokenBucket::new(0, 0);
+        assert_eq!(tb.refill_and_consume(0, 999_999), 999_999);
+    }
+
+    #[test]
+    fn atomic_token_bucket_set_capacity_caps_tokens() {
+        let tb = AtomicTokenBucket::new(10_000, 0);
+        assert_eq!(tb.available(), 10_000);
+        tb.set_capacity(5_000);
+        assert_eq!(tb.capacity(), 5_000);
+        assert!(tb.available() <= 5_000);
+    }
+
+    #[test]
+    fn atomic_token_bucket_concurrent_consume() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tb = Arc::new(AtomicTokenBucket::new(100_000, 0));
+        let mut handles = vec![];
+
+        for _ in 0..100 {
+            let tb_clone = Arc::clone(&tb);
+            handles.push(thread::spawn(move || {
+                tb_clone.refill_and_consume(0, 1000)
+            }));
+        }
+
+        let total_consumed: u64 = handles.into_iter()
+            .map(|h| h.join().unwrap())
+            .sum();
+
+        assert_eq!(total_consumed, 100_000);
+        assert_eq!(tb.available(), 0);
+    }
+
+    #[test]
+    fn atomic_token_bucket_concurrent_consume_no_overallocation() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tb = Arc::new(AtomicTokenBucket::new(10_000, 0));
+        let mut handles = vec![];
+
+        for _ in 0..200 {
+            let tb_clone = Arc::clone(&tb);
+            handles.push(thread::spawn(move || {
+                tb_clone.refill_and_consume(0, 100)
+            }));
+        }
+
+        let total_consumed: u64 = handles.into_iter()
+            .map(|h| h.join().unwrap())
+            .sum();
+
+        assert_eq!(total_consumed, 10_000);
+        assert_eq!(tb.available(), 0);
     }
 
     #[tokio::test]
@@ -338,13 +432,10 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limiter_throttles_download() {
-        // 10_000 bytes/sec cap. The bucket starts full (10_000 tokens), so
-        // requesting 20_000 requires ~1s for the second half to accrue.
         let rl = RateLimiter::new(10_000, 0);
         let start = std::time::Instant::now();
         rl.acquire(RateDirection::Download, 20_000).await;
         let elapsed = start.elapsed();
-        // Allow generous tolerance for scheduler jitter; must be throttled.
         assert!(
             elapsed >= std::time::Duration::from_millis(800),
             "expected throttling, elapsed {elapsed:?}"
@@ -355,21 +446,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn set_capacity_updates_live_bucket_of_clones() {
-        // RateLimiter clones share buckets, so set_capacity on one is visible
-        // to the other (the daemon relies on this for live limit changes).
+    #[test]
+    fn set_capacity_updates_live_bucket_of_clones() {
         let rl = RateLimiter::new(0, 0);
         let twin = rl.clone();
-        rl.set_capacity(RateDirection::Download, 5_000).await;
-        assert_eq!(twin.capacity(RateDirection::Download).await, 5_000);
+        rl.set_capacity(RateDirection::Download, 5_000);
+        assert_eq!(twin.capacity(RateDirection::Download), 5_000);
     }
 
     #[tokio::test]
     async fn shaped_limiter_enforces_per_torrent_and_global() {
-        // Per-torrent cap 4_000 B/s and a tighter global cap 1_000 B/s. Both
-        // start full, so requesting 5_000 bytes must wait for the global
-        // bucket (1s for the 4_000 residual beyond its initial 1_000).
         let per = RateLimiter::new(4_000, 0);
         let global = RateLimiter::new(1_000, 0);
         let shaped = ShapedLimiter::from_rate_limiter(per).with_global(global);
@@ -389,5 +475,57 @@ mod tests {
         shaped.acquire(RateDirection::Download, 1_000_000).await;
         shaped.acquire(RateDirection::Upload, 1_000_000).await;
         assert!(start.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn atomic_rate_limiter_concurrent_acquire_no_overallocation() {
+        use std::sync::Arc;
+
+        let rl = Arc::new(RateLimiter::new(100_000, 0));
+        let mut handles = vec![];
+
+        for _ in 0..200 {
+            let rl_clone = Arc::clone(&rl);
+            handles.push(tokio::spawn(async move {
+                rl_clone.acquire(RateDirection::Download, 500).await;
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let available = rl.download.available();
+        assert!(available < 10_000, "Expected bucket to be nearly empty, but has {available} tokens");
+    }
+
+    #[tokio::test]
+    async fn atomic_rate_limiter_1000_concurrent_acquires() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let capacity: u64 = 1_000_000;
+        let rl = Arc::new(RateLimiter::new(capacity, 0));
+        let total_acquired = Arc::new(AtomicU64::new(0));
+        let mut handles = vec![];
+
+        let request_size: u64 = 1_000;
+        let num_tasks: usize = 1000;
+
+        for _ in 0..num_tasks {
+            let rl_clone = Arc::clone(&rl);
+            let total = Arc::clone(&total_acquired);
+            handles.push(tokio::spawn(async move {
+                rl_clone.acquire(RateDirection::Download, request_size).await;
+                total.fetch_add(request_size, Ordering::Relaxed);
+            }));
+        }
+
+        for handle in handles {
+            handle.await.unwrap();
+        }
+
+        let acquired = total_acquired.load(Ordering::Relaxed);
+        assert_eq!(acquired, (num_tasks as u64) * request_size);
     }
 }

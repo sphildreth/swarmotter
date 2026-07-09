@@ -8,7 +8,7 @@
 
 use crate::hash::InfoHash;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Queue limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +75,8 @@ pub struct QueueState {
     order_set: HashSet<InfoHash>,
     #[serde(skip, default)]
     bypass_set: HashSet<InfoHash>,
+    #[serde(skip, default)]
+    order_index: HashMap<InfoHash, usize>,
 }
 
 impl QueueState {
@@ -85,6 +87,7 @@ impl QueueState {
             bypass: Vec::new(),
             order_set: HashSet::new(),
             bypass_set: HashSet::new(),
+            order_index: HashMap::new(),
         };
         state.rebuild_membership_sets();
         state
@@ -93,6 +96,7 @@ impl QueueState {
     fn rebuild_membership_sets(&mut self) {
         self.order_set = self.order.iter().copied().collect();
         self.bypass_set = self.bypass.iter().copied().collect();
+        self.order_index = self.order.iter().enumerate().map(|(i, h)| (*h, i)).collect();
     }
 
     fn sync_membership_sets(&mut self) {
@@ -106,7 +110,9 @@ impl QueueState {
         self.sync_membership_sets();
         for hash in hashes {
             if self.order_set.insert(hash) {
+                let pos = self.order.len();
                 self.order.push(hash);
+                self.order_index.insert(hash, pos);
             }
         }
     }
@@ -115,7 +121,9 @@ impl QueueState {
     pub fn add(&mut self, hash: InfoHash) {
         self.sync_membership_sets();
         if self.order_set.insert(hash) {
+            let pos = self.order.len();
             self.order.push(hash);
+            self.order_index.insert(hash, pos);
         }
     }
 
@@ -124,6 +132,7 @@ impl QueueState {
         self.sync_membership_sets();
         if self.order_set.remove(hash) {
             self.order.retain(|h| h != hash);
+            self.rebuild_membership_sets();
         }
         self.bypass_set.remove(hash);
         self.bypass.retain(|h| h != hash);
@@ -144,9 +153,11 @@ impl QueueState {
     /// Move a torrent up one position.
     pub fn move_up(&mut self, hash: &InfoHash) {
         self.sync_membership_sets();
-        if let Some(i) = self.order.iter().position(|h| h == hash) {
+        if let Some(&i) = self.order_index.get(hash) {
             if i > 0 {
                 self.order.swap(i, i - 1);
+                self.order_index.insert(self.order[i], i);
+                self.order_index.insert(self.order[i - 1], i - 1);
             }
         }
     }
@@ -154,9 +165,11 @@ impl QueueState {
     /// Move a torrent down one position.
     pub fn move_down(&mut self, hash: &InfoHash) {
         self.sync_membership_sets();
-        if let Some(i) = self.order.iter().position(|h| h == hash) {
+        if let Some(&i) = self.order_index.get(hash) {
             if i + 1 < self.order.len() {
                 self.order.swap(i, i + 1);
+                self.order_index.insert(self.order[i], i);
+                self.order_index.insert(self.order[i + 1], i + 1);
             }
         }
     }
@@ -164,18 +177,20 @@ impl QueueState {
     /// Move a torrent to the top of the queue.
     pub fn move_to_top(&mut self, hash: &InfoHash) {
         self.sync_membership_sets();
-        if let Some(i) = self.order.iter().position(|h| h == hash) {
+        if let Some(&i) = self.order_index.get(hash) {
             let h = self.order.remove(i);
             self.order.insert(0, h);
+            self.rebuild_membership_sets();
         }
     }
 
     /// Move a torrent to the bottom of the queue.
     pub fn move_to_bottom(&mut self, hash: &InfoHash) {
         self.sync_membership_sets();
-        if let Some(i) = self.order.iter().position(|h| h == hash) {
+        if let Some(&i) = self.order_index.get(hash) {
             let h = self.order.remove(i);
             self.order.push(h);
+            self.rebuild_membership_sets();
         }
     }
 
@@ -197,6 +212,7 @@ impl QueueState {
         }
         kept.extend(moved);
         self.order = kept;
+        self.rebuild_membership_sets();
     }
 
     /// Mark a torrent to start now (bypass queue).
@@ -227,7 +243,7 @@ impl QueueState {
 
     /// Position of a torrent (1-based) or None if not queued.
     pub fn position(&self, hash: &InfoHash) -> Option<usize> {
-        self.order.iter().position(|h| h == hash).map(|i| i + 1)
+        self.order_index.get(hash).map(|&i| i + 1)
     }
 
     /// Determine which torrents are allowed to download given the limits.
