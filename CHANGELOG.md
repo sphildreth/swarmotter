@@ -7,7 +7,7 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
-## [1.2.0] - [2026-07-09]
+## [1.2.0] - [2026-07-09] [UNREALEASED]
 
 ### Added
 
@@ -26,9 +26,29 @@ date or duration estimates.
   mixed-state daemon scheduler library across all torrent states and a
   2,000-torrent API add/query/recheck/reannounce/remove/reset flow using
   generated lawful torrent files.
+- **Runtime event publishing:** the daemon now publishes torrent add/change,
+  metadata, completion, removal, error, settings, network status, and stats
+  events through the existing SSE/WebSocket broker. Event streams include
+  keep-alives or pings and surface subscriber lag instead of silently dropping
+  missed updates.
 
 ### Fixed
 
+- **Storage I/O scaling:** payload block reads and writes now reuse cached
+  per-file handles instead of reopening files for every block. Block writes no
+  longer flush on every write; storage flushes pending cached writes before
+  verification/read and move/remove boundaries. See
+  [ADR-0043](design/adr/0043-cached-storage-io-flush-boundaries.md).
+- **Read API scaling:** torrent list, single-torrent, stats, diagnostics, and
+  storage-root reads no longer trigger hidden full-engine progress
+  reconciliation. Reconciliation now snapshots live engine state first, hoists
+  config/network reads out of the per-torrent loop, and keeps registry mutation
+  in a shorter critical section.
+- **Progress summary scaling:** in-memory piece progress now uses a packed
+  bitfield with a cached completed-piece count, avoiding full piece-vector
+  scans on every torrent summary.
+- **Stats aggregation scaling:** global stats now computes counts and transfer
+  totals in one registry pass instead of repeatedly scanning the torrent map.
 - **Torrent lifecycle caps:** queue reconciliation now force-clears over-limit
   active downloads instead of waiting indefinitely for a graceful engine stop,
   and metadata progress reconciliation no longer reactivates queued retry work

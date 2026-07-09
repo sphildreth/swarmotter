@@ -26,7 +26,11 @@ ADR-0009 and ADR-0010.
   rather than changing `/api/v1` in place.
 - Error codes are part of the automation contract. Rename or removal requires
   the same compatibility treatment as a breaking API field change.
-- SSE and WebSocket events share the same event object shape.
+- SSE and WebSocket events share the same event object shape. The daemon
+  publishes lifecycle and status changes through the shared broker so clients
+  can subscribe instead of polling list endpoints for every update.
+- SSE streams use keep-alives, WebSocket streams use pings, and subscribers that
+  fall behind the broker buffer receive an `events_dropped` notice.
 - Native torrent add requests support add-time options such as paused start
   behavior without requiring add-then-pause sequencing; see ADR-0029.
 - Add requests return after registration and queue insertion; expensive queue

@@ -14,10 +14,13 @@
 //! `<download_dir>/<name>/<file-relative-path>`. For a single-file torrent the
 //! relative path is empty, so the file is `<download_dir>/<name>`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 
 use crate::error::{CoreError, Result};
 use crate::hash::InfoHash;
@@ -30,6 +33,13 @@ use crate::storage::{piece_file_ranges, verify_piece};
 pub struct StorageIo {
     meta: TorrentMeta,
     download_dir: PathBuf,
+    file_handles: Arc<Mutex<HashMap<usize, CachedFileHandle>>>,
+}
+
+#[derive(Clone)]
+struct CachedFileHandle {
+    file: Arc<Mutex<fs::File>>,
+    writable: bool,
 }
 
 impl StorageIo {
@@ -37,6 +47,7 @@ impl StorageIo {
         Self {
             meta,
             download_dir: download_dir.into(),
+            file_handles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -200,20 +211,13 @@ impl StorageIo {
         let mut data_off = 0usize;
         for slice in slices {
             self.ensure_file_dirs(slice.file_index).await?;
-            let path = self.file_path(slice.file_index)?;
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&path)
-                .await
-                .map_err(CoreError::from)?;
+            let file = self.open_file_handle(slice.file_index, true).await?;
+            let mut file = file.lock().await;
             file.seek(std::io::SeekFrom::Start(slice.offset_in_file))
                 .await
                 .map_err(CoreError::from)?;
             let chunk = &data[data_off..data_off + slice.length as usize];
             file.write_all(chunk).await.map_err(CoreError::from)?;
-            file.flush().await.map_err(CoreError::from)?;
             data_off += slice.length as usize;
         }
         Ok(())
@@ -269,14 +273,11 @@ impl StorageIo {
             )));
         };
         let slices = byte_ranges_to_file_slices(&self.meta, start, end);
+        self.flush_writable_file_slices(&slices).await?;
         let mut out = Vec::with_capacity((end - start) as usize);
         for slice in slices {
-            let path = self.file_path(slice.file_index)?;
-            let mut file = fs::OpenOptions::new()
-                .read(true)
-                .open(&path)
-                .await
-                .map_err(CoreError::from)?;
+            let file = self.open_file_handle(slice.file_index, false).await?;
+            let mut file = file.lock().await;
             file.seek(std::io::SeekFrom::Start(slice.offset_in_file))
                 .await
                 .map_err(CoreError::from)?;
@@ -303,14 +304,11 @@ impl StorageIo {
         let abs_start = piece_start + offset;
         let abs_end = abs_start + length as u64;
         let slices = byte_ranges_to_file_slices(&self.meta, abs_start, abs_end);
+        self.flush_writable_file_slices(&slices).await?;
         let mut out = Vec::with_capacity(length);
         for slice in slices {
-            let path = self.file_path(slice.file_index)?;
-            let mut file = fs::OpenOptions::new()
-                .read(true)
-                .open(&path)
-                .await
-                .map_err(CoreError::from)?;
+            let file = self.open_file_handle(slice.file_index, false).await?;
+            let mut file = file.lock().await;
             file.seek(std::io::SeekFrom::Start(slice.offset_in_file))
                 .await
                 .map_err(CoreError::from)?;
@@ -319,6 +317,80 @@ impl StorageIo {
             out.extend_from_slice(&buf);
         }
         Ok(out)
+    }
+
+    async fn open_file_handle(
+        &self,
+        index: usize,
+        create_if_missing: bool,
+    ) -> Result<Arc<Mutex<fs::File>>> {
+        if let Some(handle) = self.file_handles.lock().await.get(&index).cloned() {
+            if handle.writable || !create_if_missing {
+                return Ok(handle.file);
+            }
+        }
+
+        let path = self.file_path(index)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true).truncate(false);
+        if create_if_missing {
+            options.write(true).create(true);
+        }
+        let file = CachedFileHandle {
+            file: Arc::new(Mutex::new(
+                options.open(&path).await.map_err(CoreError::from)?,
+            )),
+            writable: create_if_missing,
+        };
+
+        let mut handles = self.file_handles.lock().await;
+        if create_if_missing {
+            handles.insert(index, file.clone());
+            return Ok(file.file);
+        }
+        Ok(handles
+            .entry(index)
+            .or_insert_with(|| file.clone())
+            .file
+            .clone())
+    }
+
+    async fn flush_writable_file_slices(&self, slices: &[FileSliceRange]) -> Result<()> {
+        let handles = {
+            let handles = self.file_handles.lock().await;
+            slices
+                .iter()
+                .filter_map(|slice| {
+                    handles
+                        .get(&slice.file_index)
+                        .filter(|handle| handle.writable)
+                        .map(|handle| handle.file.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        for file in handles {
+            file.lock().await.flush().await.map_err(CoreError::from)?;
+        }
+        Ok(())
+    }
+
+    async fn flush_all_writable_handles(&self) -> Result<()> {
+        let handles = {
+            let handles = self.file_handles.lock().await;
+            handles
+                .values()
+                .filter(|handle| handle.writable)
+                .map(|handle| handle.file.clone())
+                .collect::<Vec<_>>()
+        };
+        for file in handles {
+            file.lock().await.flush().await.map_err(CoreError::from)?;
+        }
+        Ok(())
+    }
+
+    async fn clear_file_handles(&self) {
+        self.file_handles.lock().await.clear();
     }
 
     /// Verify a piece by reading it from disk and comparing its SHA-1 to the
@@ -412,6 +484,8 @@ impl StorageIo {
         if self.download_dir == destination.download_dir {
             return Ok(destination);
         }
+        self.flush_all_writable_handles().await?;
+        self.clear_file_handles().await;
 
         for (index, file) in self.meta.files.iter().enumerate() {
             let src = self.file_path(index)?;
@@ -447,6 +521,8 @@ impl StorageIo {
 
     /// Remove all torrent data files and the resume file.
     pub async fn remove_all(&self) -> Result<()> {
+        self.flush_all_writable_handles().await?;
+        self.clear_file_handles().await;
         for i in 0..self.meta.files.len() {
             let p = self.file_path(i)?;
             let _ = fs::remove_file(&p).await;
@@ -683,6 +759,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn storage_reuses_file_handles_for_repeated_block_io() {
+        let content = b"0123456789abcdef";
+        let bytes = build_single_file_torrent("reuse.bin", content, 8, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("handle-reuse");
+        let store = StorageIo::new(meta.clone(), dir.clone());
+
+        store.write_block(0, 0, &content[..8]).await.unwrap();
+        let first_handle = store
+            .file_handles
+            .lock()
+            .await
+            .get(&0)
+            .unwrap()
+            .file
+            .clone();
+        assert_eq!(store.file_handles.lock().await.len(), 1);
+
+        let clone = store.clone();
+        clone.write_block(1, 0, &content[8..]).await.unwrap();
+        let second_handle = clone
+            .file_handles
+            .lock()
+            .await
+            .get(&0)
+            .unwrap()
+            .file
+            .clone();
+        assert!(Arc::ptr_eq(&first_handle, &second_handle));
+        assert_eq!(clone.read_block(0, 0, 8).await.unwrap(), &content[..8]);
+        assert_eq!(clone.file_handles.lock().await.len(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn write_piece_writes_single_file_piece() {
         let content = b"0123456789abcdeflast";
         let bytes = build_single_file_torrent("piece.bin", content, 16, None, false);
@@ -753,14 +865,15 @@ mod tests {
         store.write_block(0, 0, b"hell").await.unwrap();
         store.write_block(1, 0, b"owor").await.unwrap();
         store.write_block(2, 0, b"ld!!").await.unwrap();
+        // All pieces verify against metadata, flushing pending cached writes
+        // before the raw filesystem assertions below inspect the files.
+        assert!(store.verify_piece_on_disk(0).await.unwrap());
+        assert!(store.verify_piece_on_disk(1).await.unwrap());
+        assert!(store.verify_piece_on_disk(2).await.unwrap());
         let a = std::fs::read(dir.join("dir").join("a.txt")).unwrap();
         assert_eq!(&a, b"hello");
         let b = std::fs::read(dir.join("dir").join("sub").join("b.bin")).unwrap();
         assert_eq!(&b, b"world!!");
-        // All pieces verify against metadata.
-        assert!(store.verify_piece_on_disk(0).await.unwrap());
-        assert!(store.verify_piece_on_disk(1).await.unwrap());
-        assert!(store.verify_piece_on_disk(2).await.unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
 

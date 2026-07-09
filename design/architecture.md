@@ -23,7 +23,9 @@ SwarmOtter is a Rust async daemon with these layers:
   (see `configuration.md` and ADR-0020).
 - **Storage layer** (`swarmotter-core::storage`): file layout, partial/sparse
   files, piece read/write and verification, fast resume, forced recheck,
-  move/rename, missing/changed file detection logic.
+  move/rename, missing/changed file detection logic. Runtime storage I/O reuses
+  per-torrent file handles and flushes cached writes at read/verification and
+  move/remove boundaries rather than after every block write; see ADR-0043.
 - **API layer** (`swarmotter-api`): REST endpoints plus SSE/WebSocket events
   built on `axum`. The API is a first-class product surface (see ADR-0004 and
   `api.md`). It talks to the daemon through the `DaemonOps` trait, so the

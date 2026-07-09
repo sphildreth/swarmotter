@@ -26,37 +26,46 @@ use crate::meta::TorrentMeta;
 /// A piece bitset tracking which pieces have been verified on disk.
 #[derive(Debug, Clone)]
 pub struct PieceProgress {
-    pub have: Vec<bool>,
+    bitfield: PieceBitfield,
     pub total: usize,
+    have_count: usize,
 }
 
 impl PieceProgress {
     pub fn new(total: usize) -> Self {
         Self {
-            have: vec![false; total],
+            bitfield: PieceBitfield::new(total),
             total,
+            have_count: 0,
         }
     }
 
     pub fn have_piece(&mut self, index: usize) {
-        if index < self.total {
-            self.have[index] = true;
+        if index < self.total && !self.bitfield.has(index) {
+            self.bitfield.set(index);
+            self.have_count += 1;
         }
     }
 
+    pub fn replace_from_bitfield(&mut self, bitfield: &PieceBitfield, total: usize) {
+        self.bitfield = bitfield.clone();
+        self.total = total;
+        self.have_count = self.bitfield.count(total);
+    }
+
     pub fn pieces_have(&self) -> usize {
-        self.have.iter().filter(|b| **b).count()
+        self.have_count
     }
 
     pub fn is_complete(&self) -> bool {
-        self.pieces_have() == self.total
+        self.have_count == self.total
     }
 
     pub fn fraction(&self) -> f64 {
         if self.total == 0 {
             return 0.0;
         }
-        self.pieces_have() as f64 / self.total as f64
+        self.have_count as f64 / self.total as f64
     }
 }
 
@@ -94,4 +103,31 @@ pub fn verify_piece(meta: &TorrentMeta, index: usize, data: &[u8]) -> bool {
     hasher.update(data);
     let digest = hasher.finalize();
     digest.as_slice() == meta.pieces[index]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn piece_progress_uses_cached_count_and_packed_replacement() {
+        let mut progress = PieceProgress::new(10);
+        assert_eq!(progress.pieces_have(), 0);
+        assert_eq!(progress.fraction(), 0.0);
+
+        progress.have_piece(2);
+        progress.have_piece(2);
+        progress.have_piece(9);
+        assert_eq!(progress.pieces_have(), 2);
+        assert!(!progress.is_complete());
+
+        let mut bitfield = PieceBitfield::new(10);
+        for index in 0..10 {
+            bitfield.set(index);
+        }
+        progress.replace_from_bitfield(&bitfield, 10);
+        assert_eq!(progress.pieces_have(), 10);
+        assert!(progress.is_complete());
+        assert_eq!(progress.fraction(), 1.0);
+    }
 }

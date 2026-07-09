@@ -75,13 +75,14 @@ async fn main() -> Result<()> {
     }
 
     let max_request_body_bytes = config.api.max_request_body_bytes;
-    let runtime = Arc::new(daemon::DaemonRuntime::with_paths(
+    let broker = swarmotter_api::handlers::events::EventBroker::default();
+    let runtime = Arc::new(daemon::DaemonRuntime::with_paths_and_broker(
         config.clone(),
         health,
         args.config.clone(),
         log_file,
+        broker.clone(),
     ));
-    let broker = swarmotter_api::handlers::events::EventBroker::default();
 
     let state = Arc::new(AppState {
         daemon: runtime.clone(),

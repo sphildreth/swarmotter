@@ -19,6 +19,8 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use serde_json::json;
+use swarmotter_api::handlers::events::{Event, EventBroker};
 use swarmotter_api::state::{AddTorrentOptions, DaemonOps};
 use swarmotter_core::autopilot::{AutopilotAnalyzer, AutopilotConfig, AutopilotMode};
 use swarmotter_core::config::Config;
@@ -111,6 +113,8 @@ pub struct DaemonRuntime {
     /// Coalesces queue reconciliation requests triggered by rapid add/import
     /// bursts so API add calls do not wait for engine startup.
     queue_reconcile: Arc<Mutex<QueueReconcileState>>,
+    /// Shared API event broker used by SSE/WebSocket subscribers.
+    event_broker: EventBroker,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -284,6 +288,45 @@ fn resolve_incomplete_dir_from_config(download_dir: &str, cfg: &Config) -> Strin
         .unwrap_or_else(|| download_dir.to_string())
 }
 
+fn torrent_event(kind: &'static str, hash: InfoHash, state: TorrentState) -> Event {
+    let info_hash = hash.to_hex();
+    Event::new(
+        kind,
+        json!({
+            "info_hash": info_hash,
+            "state": state.as_str(),
+        }),
+    )
+    .with_info_hash(info_hash)
+}
+
+fn torrent_removed_event(hash: InfoHash, delete_data: bool) -> Event {
+    let info_hash = hash.to_hex();
+    Event::new(
+        "torrent_removed",
+        json!({
+            "info_hash": info_hash,
+            "delete_data": delete_data,
+        }),
+    )
+    .with_info_hash(info_hash)
+}
+
+fn torrent_metadata_event(hash: InfoHash) -> Event {
+    let info_hash = hash.to_hex();
+    Event::new(
+        "torrent_metadata_received",
+        json!({
+            "info_hash": info_hash,
+        }),
+    )
+    .with_info_hash(info_hash)
+}
+
+fn stats_updated_event() -> Event {
+    Event::new("stats_updated", json!({}))
+}
+
 impl DaemonRuntime {
     #[allow(dead_code)]
     pub fn new(config: Config, startup_health: NetworkHealth) -> Self {
@@ -295,6 +338,22 @@ impl DaemonRuntime {
         startup_health: NetworkHealth,
         config_path: Option<PathBuf>,
         log_file_path: Option<PathBuf>,
+    ) -> Self {
+        Self::with_paths_and_broker(
+            config,
+            startup_health,
+            config_path,
+            log_file_path,
+            EventBroker::default(),
+        )
+    }
+
+    pub fn with_paths_and_broker(
+        config: Config,
+        startup_health: NetworkHealth,
+        config_path: Option<PathBuf>,
+        log_file_path: Option<PathBuf>,
+        event_broker: EventBroker,
     ) -> Self {
         let global_limiter = swarmotter_core::bandwidth::RateLimiter::new(
             config.bandwidth.effective_download(),
@@ -321,7 +380,16 @@ impl DaemonRuntime {
             autopilot_last_action: Arc::new(Mutex::new(HashMap::new())),
             dht_runner: Arc::new(Mutex::new(None)),
             queue_reconcile: Arc::new(Mutex::new(QueueReconcileState::default())),
+            event_broker,
         }
+    }
+
+    fn publish_event(&self, event: Event) {
+        self.event_broker.publish(event);
+    }
+
+    fn publish_torrent_event(&self, kind: &'static str, hash: InfoHash, state: TorrentState) {
+        self.publish_event(torrent_event(kind, hash, state));
     }
 
     #[allow(dead_code)]
@@ -400,6 +468,15 @@ impl DaemonRuntime {
             paused = start_paused,
             "torrent file added"
         );
+        let state = if blocked {
+            TorrentState::NetworkBlocked
+        } else if start_paused {
+            TorrentState::Paused
+        } else {
+            TorrentState::Queued
+        };
+        self.publish_torrent_event("torrent_added", hash, state);
+        self.publish_event(stats_updated_event());
         Ok(hash)
     }
 
@@ -464,6 +541,15 @@ impl DaemonRuntime {
         if !blocked && !start_paused {
             self.schedule_reconcile_queue("magnet_added").await;
         }
+        let state = if blocked {
+            TorrentState::NetworkBlocked
+        } else if start_paused {
+            TorrentState::Paused
+        } else {
+            TorrentState::Queued
+        };
+        self.publish_torrent_event("torrent_added", hash, state);
+        self.publish_event(stats_updated_event());
         Ok(hash)
     }
 
@@ -528,7 +614,15 @@ impl DaemonRuntime {
             }
         }
         self.reconcile_queue().await;
-        Ok(removed.into_iter().map(|(hash, _)| hash).collect())
+        let removed_hashes = removed
+            .into_iter()
+            .map(|(hash, _)| {
+                self.publish_event(torrent_removed_event(hash, delete_data));
+                hash
+            })
+            .collect();
+        self.publish_event(stats_updated_event());
+        Ok(removed_hashes)
     }
 
     /// Resolve the download directory for a torrent: per-torrent override,
@@ -1066,10 +1160,18 @@ impl DaemonRuntime {
             TorrentState::Error
         };
         tracing::warn!(info_hash = %hash, error = %error, "engine task failed");
-        let mut reg = self.registry.lock().await;
-        if let Some(t) = reg.get_mut(&hash) {
-            t.state = state;
-            t.error = Some(error.to_string());
+        let mut changed = false;
+        {
+            let mut reg = self.registry.lock().await;
+            if let Some(t) = reg.get_mut(&hash) {
+                t.state = state;
+                t.error = Some(error.to_string());
+                changed = true;
+            }
+        }
+        if changed {
+            self.publish_torrent_event("torrent_error", hash, state);
+            self.publish_event(stats_updated_event());
         }
         false
     }
@@ -1109,10 +1211,18 @@ impl DaemonRuntime {
         let health = self.network_health.lock().await.clone();
         if !health.traffic_allowed && health.mode != NetworkContainmentMode::Disabled {
             // Network blocked: do not start the engine; mark torrent.
-            let mut reg = self.registry.lock().await;
-            if let Some(t) = reg.get_mut(&hash) {
-                t.state = TorrentState::NetworkBlocked;
-                t.error = Some(health.detail.clone());
+            let mut changed = false;
+            {
+                let mut reg = self.registry.lock().await;
+                if let Some(t) = reg.get_mut(&hash) {
+                    t.state = TorrentState::NetworkBlocked;
+                    t.error = Some(health.detail.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                self.publish_torrent_event("torrent_changed", hash, TorrentState::NetworkBlocked);
+                self.publish_event(stats_updated_event());
             }
             return;
         }
@@ -1212,6 +1322,8 @@ impl DaemonRuntime {
                         t.state = TorrentState::StorageError;
                         t.error = Some(e.to_string());
                     }
+                    self.publish_torrent_event("torrent_error", hash, TorrentState::StorageError);
+                    self.publish_event(stats_updated_event());
                     return;
                 }
             }
@@ -1261,6 +1373,7 @@ impl DaemonRuntime {
         let engine_limiters_arc = self.engine_limiters.clone();
         let seeder_shutdowns_arc = self.seeder_shutdowns.clone();
         let seeder_handles_arc = self.seeder_handles.clone();
+        let event_broker = self.event_broker.clone();
         let runtime_for_task = self.clone();
         // DHT runner for trackerless peer discovery. Gated by config and
         // containment; the engine disables DHT for private torrents.
@@ -1295,20 +1408,26 @@ impl DaemonRuntime {
                 Ok(final_state) => {
                     let finished = final_state.finished;
                     let stopped_by_command = final_state.stopped_by_command;
+                    let mut metadata_received = false;
+                    let mut changed_state = None;
                     {
                         let mut reg = registry.lock().await;
                         if let Some(t) = reg.get_mut(&hash_for_task) {
+                            let previous_state = t.state;
+                            let needed_metadata = t.needs_metadata;
                             // If metadata was fetched via BEP 9, replace the
                             // placeholder meta with the real one and rebuild the
                             // file/piece bookkeeping.
                             if let Some(real) = final_state.resolved_meta.as_ref() {
                                 apply_resolved_metadata(t, real, &final_state);
+                                metadata_received = needed_metadata && !t.needs_metadata;
                             }
                             t.downloaded = final_state.downloaded;
                             t.uploaded = final_state.uploaded;
-                            t.progress.have = (0..final_state.piece_count)
-                                .map(|i| final_state.pieces_have.has(i))
-                                .collect();
+                            t.progress.replace_from_bitfield(
+                                &final_state.pieces_have,
+                                final_state.piece_count,
+                            );
                             if final_state.finished {
                                 t.state = TorrentState::Completed;
                                 t.date_completed = Some(now());
@@ -1317,8 +1436,29 @@ impl DaemonRuntime {
                                 // downloading.
                                 t.state = TorrentState::Downloading;
                             }
+                            if t.state != previous_state {
+                                changed_state = Some(t.state);
+                            }
                         }
                     }
+                    if metadata_received {
+                        runtime_for_task.publish_event(torrent_metadata_event(hash_for_task));
+                    }
+                    if let Some(state) = changed_state {
+                        runtime_for_task.publish_torrent_event(
+                            "torrent_changed",
+                            hash_for_task,
+                            state,
+                        );
+                        if state == TorrentState::Completed {
+                            runtime_for_task.publish_torrent_event(
+                                "torrent_completed",
+                                hash_for_task,
+                                state,
+                            );
+                        }
+                    }
+                    runtime_for_task.publish_event(stats_updated_event());
                     // Selfish completion policy: when enabled, immediately
                     // remove the finished torrent from the daemon (engine and
                     // seeder stopped, record removed) while preserving the
@@ -1334,6 +1474,7 @@ impl DaemonRuntime {
                             engine_limiters_arc.clone(),
                             seeder_shutdowns_arc.clone(),
                             seeder_handles_arc.clone(),
+                            event_broker.clone(),
                         )
                         .await;
                     } else if !finished && !stopped_by_command {
@@ -1395,16 +1536,24 @@ impl DaemonRuntime {
         }
 
         // Mark the torrent as downloading.
-        let mut reg = self.registry.lock().await;
-        if let Some(t) = reg.get_mut(&hash) {
-            if t.state == TorrentState::Queued || t.state == TorrentState::NetworkBlocked {
-                t.state = if needs_metadata {
-                    TorrentState::DownloadingMetadata
-                } else {
-                    TorrentState::Downloading
-                };
-                t.error = None;
+        let mut changed_state = None;
+        {
+            let mut reg = self.registry.lock().await;
+            if let Some(t) = reg.get_mut(&hash) {
+                if t.state == TorrentState::Queued || t.state == TorrentState::NetworkBlocked {
+                    t.state = if needs_metadata {
+                        TorrentState::DownloadingMetadata
+                    } else {
+                        TorrentState::Downloading
+                    };
+                    t.error = None;
+                    changed_state = Some(t.state);
+                }
             }
+        }
+        if let Some(state) = changed_state {
+            self.publish_torrent_event("torrent_changed", hash, state);
+            self.publish_event(stats_updated_event());
         }
     }
 
@@ -1721,6 +1870,7 @@ impl DaemonRuntime {
         engine_limiters: Arc<Mutex<HashMap<InfoHash, swarmotter_core::bandwidth::RateLimiter>>>,
         seeder_shutdowns: Arc<Mutex<HashMap<InfoHash, tokio::sync::watch::Sender<bool>>>>,
         seeder_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
+        event_broker: EventBroker,
     ) {
         let name = registry
             .lock()
@@ -1755,6 +1905,8 @@ impl DaemonRuntime {
             delete_data = false,
             "selfish mode removed completed torrent; downloaded data preserved"
         );
+        event_broker.publish(torrent_removed_event(hash, false));
+        event_broker.publish(stats_updated_event());
     }
 
     async fn make_binder(&self) -> Arc<dyn swarmotter_core::net::NetworkBinder> {
@@ -1775,7 +1927,25 @@ impl DaemonRuntime {
             let probe = OsInterfaceProbe;
             let health = net::evaluate(&cfg.network, &probe);
             let traffic_allowed = health.traffic_allowed;
-            *self.network_health.lock().await = health.clone();
+            let network_changed = {
+                let mut current = self.network_health.lock().await;
+                let changed = current.status != health.status
+                    || current.traffic_allowed != health.traffic_allowed
+                    || current.detail != health.detail;
+                *current = health.clone();
+                changed
+            };
+            if network_changed {
+                self.publish_event(Event::new(
+                    "network_status_changed",
+                    json!({
+                        "status": health.status.as_str(),
+                        "traffic_allowed": health.traffic_allowed,
+                        "detail": health.detail.clone(),
+                    }),
+                ));
+                self.publish_event(stats_updated_event());
+            }
 
             // Reconcile live engine progress into torrent records.
             self.reconcile_engine_progress().await;
@@ -1814,21 +1984,38 @@ impl DaemonRuntime {
             self.engine_handles.lock().await.keys().copied().collect();
         let now = Instant::now();
         let retry_after = self.engine_retry_after.lock().await.clone();
-        let mut samples = self.rate_samples.lock().await;
+        let previous_samples = self.rate_samples.lock().await.clone();
+        let global_download_limit = self.config.lock().await.bandwidth.effective_download();
+        let network_health = self.network_health.lock().await.clone();
+        let mut snapshots = Vec::with_capacity(states.len());
+        for (hash, state) in states {
+            let state = state.lock().await.clone();
+            let engine_is_running = running_engines.contains(&hash);
+            let retry_suppressed = retry_after
+                .get(&hash)
+                .is_some_and(|retry_at| *retry_at > now);
+            snapshots.push((hash, state, engine_is_running, retry_suppressed));
+        }
+
+        let mut sample_updates = Vec::new();
+        let mut events = Vec::new();
         let mut reg = self.registry.lock().await;
         let calc = HealthCalculator::new();
-        for (hash, state) in &states {
-            let s = state.lock().await;
+        for (hash, s, engine_is_running, retry_suppressed) in &snapshots {
             if let Some(t) = reg.get_mut(hash) {
-                let engine_is_running = running_engines.contains(hash);
-                let retry_suppressed = retry_after
-                    .get(hash)
-                    .is_some_and(|retry_at| *retry_at > now);
+                let previous_state = t.state;
+                let needed_metadata = t.needs_metadata;
                 if let Some(real) = s.resolved_meta.as_ref() {
-                    apply_resolved_metadata(t, real, &s);
+                    apply_resolved_metadata(t, real, s);
+                    if needed_metadata && !t.needs_metadata {
+                        events.push(torrent_metadata_event(*hash));
+                    }
                 }
-                let mut peak = samples.get(hash).map(|p| p.peak_rate_down).unwrap_or(0);
-                if let Some(prev) = samples.get(hash).copied() {
+                let mut peak = previous_samples
+                    .get(hash)
+                    .map(|p| p.peak_rate_down)
+                    .unwrap_or(0);
+                if let Some(prev) = previous_samples.get(hash).copied() {
                     let elapsed = now.duration_since(prev.at);
                     if elapsed >= Duration::from_millis(250) {
                         let secs = elapsed.as_secs_f64();
@@ -1861,7 +2048,7 @@ impl DaemonRuntime {
                             log_torrent_throughput_peak(
                                 hash,
                                 t,
-                                &s,
+                                s,
                                 inst_down,
                                 inst_up,
                                 previous_peak_down,
@@ -1871,7 +2058,7 @@ impl DaemonRuntime {
                                 now,
                             );
                         }
-                        samples.insert(
+                        sample_updates.push((
                             *hash,
                             RateSample {
                                 downloaded: s.downloaded,
@@ -1885,10 +2072,10 @@ impl DaemonRuntime {
                                 peak_rate_down: peak,
                                 peak_rate_up,
                             },
-                        );
+                        ));
                     }
                 } else {
-                    samples.insert(
+                    sample_updates.push((
                         *hash,
                         RateSample {
                             downloaded: s.downloaded,
@@ -1902,10 +2089,10 @@ impl DaemonRuntime {
                             peak_rate_down: 0,
                             peak_rate_up: 0,
                         },
-                    );
+                    ));
                 }
-                t.progress.have = (0..s.piece_count).map(|i| s.pieces_have.has(i)).collect();
-                t.progress.total = s.piece_count;
+                t.progress
+                    .replace_from_bitfield(&s.pieces_have, s.piece_count);
                 t.downloaded = s.downloaded;
                 t.uploaded = s.uploaded;
                 t.active_peer_workers = s.active_peers;
@@ -1913,7 +2100,7 @@ impl DaemonRuntime {
                 if !t.state.is_error() && t.state != TorrentState::Paused {
                     if s.finished {
                         t.state = TorrentState::Completed;
-                    } else if engine_is_running && !retry_suppressed {
+                    } else if *engine_is_running && !*retry_suppressed {
                         if t.needs_metadata {
                             t.state = TorrentState::DownloadingMetadata;
                         } else if t.state == TorrentState::Queued
@@ -1948,14 +2135,31 @@ impl DaemonRuntime {
                     s.peers.len(),
                     s.tracker_message.as_deref(),
                     peak,
-                    self.config.lock().await.bandwidth.effective_download(),
-                    self.network_health.lock().await.clone(),
+                    global_download_limit,
+                    network_health.clone(),
                 );
                 t.health = calc.compute(&health_input);
+                if t.state != previous_state {
+                    events.push(torrent_event("torrent_changed", *hash, t.state));
+                    if t.state == TorrentState::Completed {
+                        events.push(torrent_event("torrent_completed", *hash, t.state));
+                    }
+                }
             }
         }
         drop(reg);
-        drop(samples);
+        for event in events {
+            self.publish_event(event);
+        }
+        if !snapshots.is_empty() {
+            self.publish_event(stats_updated_event());
+        }
+        if !sample_updates.is_empty() {
+            let mut samples = self.rate_samples.lock().await;
+            for (hash, sample) in sample_updates {
+                samples.insert(hash, sample);
+            }
+        }
         self.sweep_selfish_completed_torrents_best_effort("engine_progress")
             .await;
         self.reconcile_seeders().await;
@@ -2695,10 +2899,8 @@ fn apply_resolved_metadata(
     t.meta = real.clone();
     t.needs_metadata = false;
     t.magnet_info_hash = None;
-    t.progress.have = (0..real.piece_count())
-        .map(|i| state.pieces_have.has(i))
-        .collect();
-    t.progress.total = real.piece_count();
+    t.progress
+        .replace_from_bitfield(&state.pieces_have, real.piece_count());
     t.files = real
         .files
         .iter()
@@ -2719,7 +2921,6 @@ fn apply_resolved_metadata(
 #[async_trait]
 impl DaemonOps for DaemonRuntime {
     async fn list_torrents(&self) -> Vec<TorrentSummary> {
-        self.reconcile_engine_progress().await;
         let positions: HashMap<InfoHash, usize> = self
             .queue
             .lock()
@@ -2743,7 +2944,6 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn get_torrent(&self, hash: &InfoHash) -> Option<TorrentSummary> {
-        self.reconcile_engine_progress().await;
         let position = self.queue.lock().await.position(hash);
         self.registry.lock().await.get(hash).map(|t| {
             let mut summary = t.to_summary();
@@ -2797,6 +2997,8 @@ impl DaemonOps for DaemonRuntime {
         }
         self.queue.lock().await.clear_bypass(hash);
         self.reconcile_queue().await;
+        self.publish_torrent_event("torrent_changed", *hash, TorrentState::Paused);
+        self.publish_event(stats_updated_event());
         Ok(())
     }
 
@@ -2818,6 +3020,8 @@ impl DaemonOps for DaemonRuntime {
             queue.start_now(hash);
         }
         self.reconcile_queue().await;
+        self.publish_torrent_event("torrent_changed", *hash, TorrentState::Queued);
+        self.publish_event(stats_updated_event());
         Ok(())
     }
 
@@ -2835,6 +3039,7 @@ impl DaemonOps for DaemonRuntime {
             queue.start_now(hash);
         }
         self.reconcile_queue().await;
+        self.publish_event(stats_updated_event());
         Ok(())
     }
 
@@ -2847,10 +3052,14 @@ impl DaemonOps for DaemonRuntime {
         {
             let mut reg = self.registry.lock().await;
             match reg.get_mut(hash) {
-                Some(t) => t.state = TorrentState::Checking,
+                Some(t) => {
+                    t.state = TorrentState::Checking;
+                }
                 None => return Err(CoreError::NotFound("torrent".into())),
             }
         }
+        self.publish_torrent_event("torrent_changed", *hash, TorrentState::Checking);
+        self.publish_event(stats_updated_event());
         // Run a real storage recheck on disk.
         let (meta, storage_dir) = {
             let reg = self.registry.lock().await;
@@ -2871,15 +3080,26 @@ impl DaemonOps for DaemonRuntime {
         );
         match storage.recheck().await {
             Ok(bf) => {
+                let mut final_state = None;
                 let mut reg = self.registry.lock().await;
                 if let Some(t) = reg.get_mut(hash) {
-                    t.progress.have = (0..meta.piece_count()).map(|i| bf.has(i)).collect();
+                    t.progress.replace_from_bitfield(&bf, meta.piece_count());
                     if bf.count(meta.piece_count()) == meta.piece_count() {
                         t.state = TorrentState::Completed;
                         t.date_completed = Some(now());
+                        final_state = Some(TorrentState::Completed);
                     } else if t.state == TorrentState::Checking {
                         t.state = TorrentState::Paused;
+                        final_state = Some(TorrentState::Paused);
                     }
+                }
+                drop(reg);
+                if let Some(state) = final_state {
+                    self.publish_torrent_event("torrent_changed", *hash, state);
+                    if state == TorrentState::Completed {
+                        self.publish_torrent_event("torrent_completed", *hash, state);
+                    }
+                    self.publish_event(stats_updated_event());
                 }
             }
             Err(e) => {
@@ -2888,6 +3108,9 @@ impl DaemonOps for DaemonRuntime {
                     t.state = TorrentState::StorageError;
                     t.error = Some(e.to_string());
                 }
+                drop(reg);
+                self.publish_torrent_event("torrent_error", *hash, TorrentState::StorageError);
+                self.publish_event(stats_updated_event());
             }
         }
         Ok(())
@@ -3212,6 +3435,8 @@ impl DaemonOps for DaemonRuntime {
             }
         }
         self.apply_runtime_config_fields().await;
+        self.publish_event(Event::new("settings_changed", json!({})));
+        self.publish_event(stats_updated_event());
         Ok(())
     }
 
@@ -3235,6 +3460,8 @@ impl DaemonOps for DaemonRuntime {
             *cfg = next.clone();
         }
         self.apply_runtime_config_fields().await;
+        self.publish_event(Event::new("settings_changed", json!({})));
+        self.publish_event(stats_updated_event());
 
         Ok(ConfigUpdateResult {
             persisted: config_path.is_some(),
@@ -3323,6 +3550,10 @@ impl DaemonOps for DaemonRuntime {
             log_paths = ?log_paths,
             "download state reset by API request"
         );
+        for hash in registry_hashes {
+            self.publish_event(torrent_removed_event(hash, true));
+        }
+        self.publish_event(stats_updated_event());
 
         Ok(ResetResult {
             torrents_removed: torrents.len(),
@@ -3432,7 +3663,6 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn storage_roots(&self) -> StorageDiagnostics {
-        self.reconcile_engine_progress().await;
         let cfg = self.config.lock().await.clone();
         let mut roots: HashMap<String, StorageRootAccumulator> = HashMap::new();
 
@@ -3576,46 +3806,51 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn global_stats(&self) -> GlobalStats {
-        self.reconcile_engine_progress().await;
         let desired = self.desired_download_hashes().await;
         let scheduler = self.scheduler_diagnostics(&desired).await;
         let reg = self.registry.lock().await;
-        let active_downloads = reg
-            .torrents
-            .values()
-            .filter(|t| {
-                matches!(
-                    t.state,
-                    TorrentState::Downloading | TorrentState::DownloadingMetadata
-                )
-            })
-            .count();
-        let active_seeds = reg
-            .torrents
-            .values()
-            .filter(|t| matches!(t.state, TorrentState::Seeding))
-            .count();
-        let paused = reg
-            .torrents
-            .values()
-            .filter(|t| matches!(t.state, TorrentState::Paused))
-            .count();
+
+        let mut active_downloads = 0;
+        let mut active_seeds = 0;
+        let mut paused = 0;
+        let mut download_rate = 0;
+        let mut upload_rate = 0;
+        let mut total_downloaded = 0;
+        let mut total_uploaded = 0;
+        for t in reg.torrents.values() {
+            match t.state {
+                TorrentState::Downloading | TorrentState::DownloadingMetadata => {
+                    active_downloads += 1;
+                }
+                TorrentState::Seeding => {
+                    active_seeds += 1;
+                }
+                TorrentState::Paused => {
+                    paused += 1;
+                }
+                _ => {}
+            }
+            download_rate += t.rate_down;
+            upload_rate += t.rate_up;
+            total_downloaded += t.downloaded;
+            total_uploaded += t.uploaded;
+        }
+
         GlobalStats {
-            download_rate: reg.torrents.values().map(|t| t.rate_down).sum(),
-            upload_rate: reg.torrents.values().map(|t| t.rate_up).sum(),
+            download_rate,
+            upload_rate,
             torrent_count: reg.torrents.len(),
             active_downloads,
             active_seeds,
             paused,
-            total_downloaded: reg.torrents.values().map(|t| t.downloaded).sum(),
-            total_uploaded: reg.torrents.values().map(|t| t.uploaded).sum(),
+            total_downloaded,
+            total_uploaded,
             scheduler,
             ..Default::default()
         }
     }
 
     async fn torrent_stats(&self, hash: &InfoHash) -> Option<TorrentDiagnostics> {
-        self.reconcile_engine_progress().await;
         let engine_state = self.engine_states.lock().await.get(hash).cloned();
         let live = if let Some(state) = engine_state {
             let s = state.lock().await;
@@ -4205,6 +4440,7 @@ fn build_health_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt as _;
     use swarmotter_api::state::DaemonOps;
 
     fn unique_dir(label: &str) -> PathBuf {
@@ -4224,6 +4460,98 @@ mod tests {
         let mut bytes = [0u8; 20];
         bytes[..4].copy_from_slice(&n.to_be_bytes());
         bytes
+    }
+
+    #[tokio::test]
+    async fn torrent_add_publishes_event() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let mut events = runtime.event_broker.subscribe();
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "event-add.bin",
+            b"event add payload",
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = runtime
+            .add_torrent_file_with_options(bytes, AddTorrentOptions::new(None, true))
+            .await
+            .unwrap();
+
+        assert_eq!(hash, meta.info_hash);
+        let event = tokio::time::timeout(Duration::from_secs(1), events.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.kind, "torrent_added");
+        assert_eq!(event.info_hash.as_deref(), Some(hash.to_hex().as_str()));
+        let payload: serde_json::Value = serde_json::from_str(&event.json).unwrap();
+        assert_eq!(payload["info_hash"], hash.to_hex());
+        assert_eq!(payload["payload"]["info_hash"], hash.to_hex());
+        assert_eq!(payload["payload"]["state"], "paused");
+    }
+
+    #[tokio::test]
+    async fn reconcile_publishes_completion_events() {
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let mut events = runtime.event_broker.subscribe();
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "event-complete.bin",
+            b"event complete payload",
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = meta.info_hash;
+        let mut torrent = Torrent::new(meta.clone(), 1);
+        torrent.state = TorrentState::Downloading;
+        runtime.registry.lock().await.add(torrent).unwrap();
+        let mut pieces_have =
+            swarmotter_core::storage::resume::PieceBitfield::new(meta.piece_count());
+        for piece in 0..meta.piece_count() {
+            pieces_have.set(piece);
+        }
+        runtime.engine_states.lock().await.insert(
+            hash,
+            Arc::new(Mutex::new(EngineState {
+                piece_count: meta.piece_count(),
+                total_length: meta.total_length,
+                downloaded: meta.total_length,
+                pieces_have,
+                finished: true,
+                ..Default::default()
+            })),
+        );
+
+        runtime.reconcile_engine_progress().await;
+
+        let mut kinds = Vec::new();
+        for _ in 0..3 {
+            let event = tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            kinds.push(event.kind);
+        }
+        assert!(kinds.iter().any(|kind| kind == "torrent_changed"));
+        assert!(kinds.iter().any(|kind| kind == "torrent_completed"));
+        assert!(kinds.iter().any(|kind| kind == "stats_updated"));
     }
 
     #[tokio::test]
@@ -4279,6 +4607,7 @@ mod tests {
             },
         );
 
+        runtime.reconcile_engine_progress().await;
         let summary = runtime.get_torrent(&hash).await.unwrap();
         assert!(summary.rate_down > 0);
         assert!(summary.rate_up > 0);
@@ -4357,6 +4686,7 @@ mod tests {
             })),
         );
 
+        runtime.reconcile_engine_progress().await;
         let summary = runtime.get_torrent(&hash).await.unwrap();
         assert_eq!(summary.state, TorrentState::Downloading);
         assert_eq!(summary.name, "resolved-magnet.bin");
@@ -4414,6 +4744,7 @@ mod tests {
             })),
         );
 
+        runtime.reconcile_engine_progress().await;
         let summary = runtime.get_torrent(&hash).await.unwrap();
         assert_eq!(summary.state, TorrentState::DownloadingMetadata);
         assert_eq!(summary.total_length, "placeholder".len() as u64);
@@ -5682,6 +6013,7 @@ mod tests {
             })),
         );
 
+        runtime.reconcile_engine_progress().await;
         let stats = runtime.torrent_stats(&hash).await.unwrap();
 
         assert_eq!(stats.info_hash, hash);
