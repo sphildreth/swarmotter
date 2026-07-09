@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+const REFILL_IN_PROGRESS: u64 = 1 << 63;
+const REFILL_TIME_MASK: u64 = !REFILL_IN_PROGRESS;
+
 /// Bandwidth limits.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BandwidthLimits {
@@ -86,51 +89,80 @@ impl AtomicTokenBucket {
         }
     }
 
-    /// Attempt to refill and consume `want` tokens in a single atomic operation.
-    /// Returns the amount actually allowed. Uses a CAS loop to ensure correctness
-    /// under concurrent access.
+    /// Attempt to refill and consume `want` tokens.
+    /// Returns the amount actually allowed. Only one caller may apply a refill
+    /// window at a time, which prevents concurrent consumers from double-counting
+    /// the same elapsed time.
     pub fn refill_and_consume(&self, now_ms: u64, want: u64) -> u64 {
-        let capacity = self.capacity.load(Ordering::Relaxed);
-        if capacity == 0 {
+        if self.capacity.load(Ordering::Relaxed) == 0 {
             return want; // unlimited
         }
 
+        self.refill(now_ms & REFILL_TIME_MASK);
+        self.consume(want)
+    }
+
+    fn refill(&self, now_ms: u64) {
         loop {
-            let current_tokens = self.tokens.load(Ordering::Acquire);
-            let last_refill = self.last_refill_ms.load(Ordering::Acquire);
+            let last_raw = self.last_refill_ms.load(Ordering::Acquire);
+            if last_raw & REFILL_IN_PROGRESS != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
 
-            // Calculate refilled tokens
-            let elapsed = now_ms.saturating_sub(last_refill);
-            let add = (capacity as u128) * (elapsed as u128) / 1000;
-            let refilled = (current_tokens + add as u64).min(capacity);
+            let last_refill = last_raw & REFILL_TIME_MASK;
+            if now_ms <= last_refill {
+                return;
+            }
 
-            // Calculate how much we can consume
-            let allowed = want.min(refilled);
-            let new_tokens = refilled - allowed;
-
-            // Try to atomically update both tokens and last_refill_ms
-            // We use a CAS loop on tokens, and if successful, update last_refill_ms
-            match self.tokens.compare_exchange_weak(
-                current_tokens,
-                new_tokens,
+            match self.last_refill_ms.compare_exchange_weak(
+                last_raw,
+                now_ms | REFILL_IN_PROGRESS,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
-                    // Successfully updated tokens, now update last_refill_ms
-                    // This is a best-effort update; if it fails, the next operation will catch up
-                    let _ = self.last_refill_ms.compare_exchange(
-                        last_refill,
-                        now_ms,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
-                    return allowed;
+                    let capacity = self.capacity.load(Ordering::Acquire);
+                    if capacity > 0 {
+                        let elapsed = now_ms.saturating_sub(last_refill);
+                        let add = (capacity as u128) * (elapsed as u128) / 1000;
+                        if add > 0 {
+                            self.add_tokens(add, capacity);
+                        }
+                    }
+                    self.last_refill_ms.store(now_ms, Ordering::Release);
+                    return;
                 }
-                Err(_) => {
-                    // Another thread modified tokens, retry
-                    continue;
-                }
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn add_tokens(&self, add: u128, capacity: u64) {
+        loop {
+            let current = self.tokens.load(Ordering::Acquire);
+            let refilled = ((current as u128 + add).min(capacity as u128)) as u64;
+            if self
+                .tokens
+                .compare_exchange_weak(current, refilled, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return;
+            }
+        }
+    }
+
+    fn consume(&self, want: u64) -> u64 {
+        loop {
+            let current = self.tokens.load(Ordering::Acquire);
+            let allowed = want.min(current);
+            let new_tokens = current - allowed;
+            if self
+                .tokens
+                .compare_exchange_weak(current, new_tokens, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return allowed;
             }
         }
     }
@@ -154,12 +186,16 @@ impl AtomicTokenBucket {
             if current <= capacity_per_sec {
                 break;
             }
-            if self.tokens.compare_exchange_weak(
-                current,
-                capacity_per_sec,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ).is_ok() {
+            if self
+                .tokens
+                .compare_exchange_weak(
+                    current,
+                    capacity_per_sec,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
                 break;
             }
         }
@@ -385,14 +421,10 @@ mod tests {
 
         for _ in 0..100 {
             let tb_clone = Arc::clone(&tb);
-            handles.push(thread::spawn(move || {
-                tb_clone.refill_and_consume(0, 1000)
-            }));
+            handles.push(thread::spawn(move || tb_clone.refill_and_consume(0, 1000)));
         }
 
-        let total_consumed: u64 = handles.into_iter()
-            .map(|h| h.join().unwrap())
-            .sum();
+        let total_consumed: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
 
         assert_eq!(total_consumed, 100_000);
         assert_eq!(tb.available(), 0);
@@ -408,17 +440,41 @@ mod tests {
 
         for _ in 0..200 {
             let tb_clone = Arc::clone(&tb);
-            handles.push(thread::spawn(move || {
-                tb_clone.refill_and_consume(0, 100)
-            }));
+            handles.push(thread::spawn(move || tb_clone.refill_and_consume(0, 100)));
         }
 
-        let total_consumed: u64 = handles.into_iter()
-            .map(|h| h.join().unwrap())
-            .sum();
+        let total_consumed: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
 
         assert_eq!(total_consumed, 10_000);
         assert_eq!(tb.available(), 0);
+    }
+
+    #[test]
+    fn atomic_token_bucket_concurrent_refill_no_overallocation() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        for _ in 0..25 {
+            let tb = Arc::new(AtomicTokenBucket::new(1_000, 0));
+            assert_eq!(tb.refill_and_consume(0, 1_000), 1_000);
+            assert_eq!(tb.available(), 0);
+
+            let workers = 64;
+            let barrier = Arc::new(Barrier::new(workers));
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let tb_clone = Arc::clone(&tb);
+                let barrier_clone = Arc::clone(&barrier);
+                handles.push(thread::spawn(move || {
+                    barrier_clone.wait();
+                    tb_clone.refill_and_consume(1_000, 1_000)
+                }));
+            }
+
+            let total_consumed: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+            assert_eq!(total_consumed, 1_000);
+            assert_eq!(tb.available(), 0);
+        }
     }
 
     #[tokio::test]
@@ -496,13 +552,16 @@ mod tests {
         }
 
         let available = rl.download.available();
-        assert!(available < 10_000, "Expected bucket to be nearly empty, but has {available} tokens");
+        assert!(
+            available < 10_000,
+            "Expected bucket to be nearly empty, but has {available} tokens"
+        );
     }
 
     #[tokio::test]
     async fn atomic_rate_limiter_1000_concurrent_acquires() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
 
         let capacity: u64 = 1_000_000;
         let rl = Arc::new(RateLimiter::new(capacity, 0));
@@ -516,7 +575,9 @@ mod tests {
             let rl_clone = Arc::clone(&rl);
             let total = Arc::clone(&total_acquired);
             handles.push(tokio::spawn(async move {
-                rl_clone.acquire(RateDirection::Download, request_size).await;
+                rl_clone
+                    .acquire(RateDirection::Download, request_size)
+                    .await;
                 total.fetch_add(request_size, Ordering::Relaxed);
             }));
         }

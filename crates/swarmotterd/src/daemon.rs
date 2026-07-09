@@ -1540,7 +1540,8 @@ impl DaemonRuntime {
         if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
             let _ = tx.send(EngineCommand::Stop).await;
         }
-        if let Some(handle) = self.engine_handles.write().await.remove(hash) {
+        let handle = self.engine_handles.write().await.remove(hash);
+        if let Some(handle) = handle {
             let _ = handle.await;
         }
         // Stop the inbound peer listener / seeder too.
@@ -1555,7 +1556,8 @@ impl DaemonRuntime {
         if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
             let _ = tx.try_send(EngineCommand::Stop);
         }
-        if let Some(handle) = self.engine_handles.write().await.remove(hash) {
+        let handle = self.engine_handles.write().await.remove(hash);
+        if let Some(handle) = handle {
             handle.abort();
             let _ = handle.await;
         }
@@ -1583,8 +1585,7 @@ impl DaemonRuntime {
         }
         {
             let mut queue = self.queue.lock().await;
-            queue.order.clear();
-            queue.bypass.clear();
+            queue.clear();
         }
         self.engine_states.write().await.clear();
         self.engine_cmds.lock().await.clear();
@@ -1671,7 +1672,8 @@ impl DaemonRuntime {
         if let Some(tx) = self.seeder_shutdowns.lock().await.remove(hash) {
             let _ = tx.send(true);
         }
-        if let Some(handle) = self.seeder_handles.lock().await.remove(hash) {
+        let handle = self.seeder_handles.lock().await.remove(hash);
+        if let Some(handle) = handle {
             let _ = handle.await;
         }
     }
@@ -1680,7 +1682,8 @@ impl DaemonRuntime {
         if let Some(tx) = self.seeder_shutdowns.lock().await.remove(hash) {
             let _ = tx.send(true);
         }
-        if let Some(handle) = self.seeder_handles.lock().await.remove(hash) {
+        let handle = self.seeder_handles.lock().await.remove(hash);
+        if let Some(handle) = handle {
             handle.abort();
             let _ = handle.await;
         }
@@ -1860,7 +1863,8 @@ impl DaemonRuntime {
         if let Some(tx) = seeder_shutdowns.lock().await.remove(&hash) {
             let _ = tx.send(true);
         }
-        if let Some(handle) = seeder_handles.lock().await.remove(&hash) {
+        let seeder_handle = seeder_handles.lock().await.remove(&hash);
+        if let Some(handle) = seeder_handle {
             let _ = handle.await;
         }
         // Clear live engine bookkeeping. We deliberately do NOT await the
@@ -1870,7 +1874,8 @@ impl DaemonRuntime {
         engine_cmds.lock().await.remove(&hash);
         engine_states.write().await.remove(&hash);
         engine_limiters.write().await.remove(&hash);
-        if let Some(handle) = engine_handles.write().await.remove(&hash) {
+        let engine_handle = engine_handles.write().await.remove(&hash);
+        if let Some(handle) = engine_handle {
             drop(handle);
         }
         // Remove the torrent record; downloaded data is preserved (no
@@ -2420,16 +2425,14 @@ impl DaemonRuntime {
     async fn apply_runtime_config_fields(&self) {
         let cfg = self.config.read().await.clone();
         self.queue.lock().await.limits = cfg.queue.clone();
-        self.global_limiter
-            .set_capacity(
-                swarmotter_core::bandwidth::RateDirection::Download,
-                cfg.bandwidth.effective_download(),
-            );
-        self.global_limiter
-            .set_capacity(
-                swarmotter_core::bandwidth::RateDirection::Upload,
-                cfg.bandwidth.effective_upload(),
-            );
+        self.global_limiter.set_capacity(
+            swarmotter_core::bandwidth::RateDirection::Download,
+            cfg.bandwidth.effective_download(),
+        );
+        self.global_limiter.set_capacity(
+            swarmotter_core::bandwidth::RateDirection::Upload,
+            cfg.bandwidth.effective_upload(),
+        );
         let probe = OsInterfaceProbe;
         *self.network_health.write().await = net::evaluate(&cfg.network, &probe);
         self.apply_peer_worker_limits().await;
@@ -4561,7 +4564,7 @@ mod tests {
         }));
         runtime
             .engine_states
-            .lock()
+            .write()
             .await
             .insert(hash, state.clone());
         runtime.rate_samples.write().await.insert(
@@ -4588,7 +4591,7 @@ mod tests {
         assert_eq!(summary.uploaded, 1_200);
         let peak_sample = runtime
             .rate_samples
-            .lock()
+            .read()
             .await
             .get(&hash)
             .copied()
@@ -4785,7 +4788,7 @@ mod tests {
         }
         assert!(runtime
             .engine_retry_after
-            .lock()
+            .read()
             .await
             .get(&hash)
             .is_some_and(|retry_at| *retry_at > Instant::now()));
@@ -4869,7 +4872,7 @@ mod tests {
         assert_eq!(runtime.queue.lock().await.position(&first_hash), Some(2));
         assert!(runtime
             .engine_retry_after
-            .lock()
+            .read()
             .await
             .get(&first_hash)
             .is_some_and(|retry_at| *retry_at > Instant::now()));
@@ -5556,7 +5559,7 @@ mod tests {
         );
         runtime
             .engine_states
-            .lock()
+            .write()
             .await
             .insert(hash, Arc::new(Mutex::new(EngineState::default())));
 
@@ -5648,12 +5651,12 @@ mod tests {
 
         assert!(runtime
             .engine_handles
-            .lock()
+            .read()
             .await
             .contains_key(&first_hash));
         assert!(!runtime
             .engine_handles
-            .lock()
+            .read()
             .await
             .contains_key(&second_hash));
         {
@@ -5783,17 +5786,17 @@ mod tests {
         runtime.engine_cmds.lock().await.insert(hash, tx);
         runtime
             .engine_handles
-            .lock()
+            .write()
             .await
             .insert(hash, tokio::spawn(async {}));
         runtime
             .engine_states
-            .lock()
+            .write()
             .await
             .insert(hash, Arc::new(Mutex::new(EngineState::default())));
         runtime
             .engine_limiters
-            .lock()
+            .write()
             .await
             .insert(hash, swarmotter_core::bandwidth::RateLimiter::new(0, 0));
         runtime.rate_samples.write().await.insert(
@@ -6113,7 +6116,7 @@ mod tests {
         let blocked_state = Arc::new(Mutex::new(EngineState::default()));
         runtime
             .engine_states
-            .lock()
+            .write()
             .await
             .insert(second_hash, blocked_state.clone());
         let _unrelated_guard = blocked_state.lock().await;
@@ -6158,7 +6161,11 @@ mod tests {
             },
             AutopilotMode::Observe,
         );
-        runtime.autopilot_decisions.write().await.insert(hash, stale);
+        runtime
+            .autopilot_decisions
+            .write()
+            .await
+            .insert(hash, stale);
         runtime.engine_states.write().await.insert(
             hash,
             Arc::new(Mutex::new(EngineState {
@@ -6191,7 +6198,7 @@ mod tests {
         assert_eq!(decision.snapshot.active_peer_workers, 2);
         let cached = runtime
             .autopilot_decisions
-            .lock()
+            .read()
             .await
             .get(&hash)
             .cloned()
@@ -6288,7 +6295,7 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), EngineCommand::Reannounce));
         let decision = runtime
             .autopilot_decisions
-            .lock()
+            .read()
             .await
             .get(&hash)
             .cloned()
@@ -6394,7 +6401,7 @@ mod tests {
 
         let decision = runtime
             .autopilot_decisions
-            .lock()
+            .read()
             .await
             .get(&stalled_hash)
             .cloned()
@@ -6421,7 +6428,7 @@ mod tests {
         assert_eq!(runtime.queue.lock().await.position(&stalled_hash), Some(2));
         assert!(runtime
             .engine_retry_after
-            .lock()
+            .read()
             .await
             .get(&stalled_hash)
             .is_some_and(|retry_at| *retry_at > Instant::now()));
@@ -6483,7 +6490,7 @@ mod tests {
         );
         runtime
             .engine_states
-            .lock()
+            .write()
             .await
             .insert(hash, Arc::new(Mutex::new(state)));
 
@@ -6582,7 +6589,7 @@ mod tests {
         runtime.queue.lock().await.add(hash);
         runtime
             .engine_retry_after
-            .lock()
+            .write()
             .await
             .insert(hash, Instant::now() + Duration::from_secs(60));
 
@@ -6994,7 +7001,7 @@ mod tests {
         );
         runtime
             .engine_retry_after
-            .lock()
+            .write()
             .await
             .insert(hashes[1], Instant::now() + ENGINE_INCOMPLETE_RETRY_DELAY);
 

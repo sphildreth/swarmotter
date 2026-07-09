@@ -7,7 +7,7 @@
 //! pure over a queue state so it can be unit-tested without the daemon.
 
 use crate::hash::InfoHash;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// Queue limits.
@@ -64,7 +64,7 @@ pub struct QueueEntry {
 }
 
 /// Queue state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct QueueState {
     pub limits: QueueLimits,
     /// Ordered list of info hashes (position = index).
@@ -77,6 +77,35 @@ pub struct QueueState {
     bypass_set: HashSet<InfoHash>,
     #[serde(skip, default)]
     order_index: HashMap<InfoHash, usize>,
+}
+
+impl<'de> Deserialize<'de> for QueueState {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct QueueStateSerde {
+            #[serde(default)]
+            limits: QueueLimits,
+            #[serde(default)]
+            order: Vec<InfoHash>,
+            #[serde(default)]
+            bypass: Vec<InfoHash>,
+        }
+
+        let restored = QueueStateSerde::deserialize(deserializer)?;
+        let mut state = Self {
+            limits: restored.limits,
+            order: restored.order,
+            bypass: restored.bypass,
+            order_set: HashSet::new(),
+            bypass_set: HashSet::new(),
+            order_index: HashMap::new(),
+        };
+        state.rebuild_membership_sets();
+        Ok(state)
+    }
 }
 
 impl QueueState {
@@ -94,15 +123,51 @@ impl QueueState {
     }
 
     fn rebuild_membership_sets(&mut self) {
-        self.order_set = self.order.iter().copied().collect();
-        self.bypass_set = self.bypass.iter().copied().collect();
-        self.order_index = self.order.iter().enumerate().map(|(i, h)| (*h, i)).collect();
+        self.order_set.clear();
+        self.order_index.clear();
+        let mut order = Vec::with_capacity(self.order.len());
+        for hash in self.order.drain(..) {
+            if self.order_set.insert(hash) {
+                self.order_index.insert(hash, order.len());
+                order.push(hash);
+            }
+        }
+        self.order = order;
+
+        self.bypass_set.clear();
+        let mut bypass = Vec::with_capacity(self.bypass.len());
+        for hash in self.bypass.drain(..) {
+            if self.bypass_set.insert(hash) {
+                bypass.push(hash);
+            }
+        }
+        self.bypass = bypass;
     }
 
     fn sync_membership_sets(&mut self) {
-        if self.order_set.len() != self.order.len() || self.bypass_set.len() != self.bypass.len() {
+        if self.order_set.len() != self.order.len()
+            || self.bypass_set.len() != self.bypass.len()
+            || self.order_index.len() != self.order.len()
+        {
             self.rebuild_membership_sets();
         }
+    }
+
+    fn order_index_for(&mut self, hash: &InfoHash) -> Option<usize> {
+        self.sync_membership_sets();
+        if let Some(&i) = self.order_index.get(hash) {
+            if self.order.get(i) == Some(hash) {
+                return Some(i);
+            }
+        }
+        self.rebuild_membership_sets();
+        self.order_index.get(hash).copied()
+    }
+
+    pub fn clear(&mut self) {
+        self.order.clear();
+        self.bypass.clear();
+        self.rebuild_membership_sets();
     }
 
     /// Add many torrents to the end of the queue.
@@ -152,8 +217,7 @@ impl QueueState {
 
     /// Move a torrent up one position.
     pub fn move_up(&mut self, hash: &InfoHash) {
-        self.sync_membership_sets();
-        if let Some(&i) = self.order_index.get(hash) {
+        if let Some(i) = self.order_index_for(hash) {
             if i > 0 {
                 self.order.swap(i, i - 1);
                 self.order_index.insert(self.order[i], i);
@@ -164,8 +228,7 @@ impl QueueState {
 
     /// Move a torrent down one position.
     pub fn move_down(&mut self, hash: &InfoHash) {
-        self.sync_membership_sets();
-        if let Some(&i) = self.order_index.get(hash) {
+        if let Some(i) = self.order_index_for(hash) {
             if i + 1 < self.order.len() {
                 self.order.swap(i, i + 1);
                 self.order_index.insert(self.order[i], i);
@@ -176,8 +239,7 @@ impl QueueState {
 
     /// Move a torrent to the top of the queue.
     pub fn move_to_top(&mut self, hash: &InfoHash) {
-        self.sync_membership_sets();
-        if let Some(&i) = self.order_index.get(hash) {
+        if let Some(i) = self.order_index_for(hash) {
             let h = self.order.remove(i);
             self.order.insert(0, h);
             self.rebuild_membership_sets();
@@ -186,8 +248,7 @@ impl QueueState {
 
     /// Move a torrent to the bottom of the queue.
     pub fn move_to_bottom(&mut self, hash: &InfoHash) {
-        self.sync_membership_sets();
-        if let Some(&i) = self.order_index.get(hash) {
+        if let Some(i) = self.order_index_for(hash) {
             let h = self.order.remove(i);
             self.order.push(h);
             self.rebuild_membership_sets();
@@ -243,7 +304,12 @@ impl QueueState {
 
     /// Position of a torrent (1-based) or None if not queued.
     pub fn position(&self, hash: &InfoHash) -> Option<usize> {
-        self.order_index.get(hash).map(|&i| i + 1)
+        if let Some(&i) = self.order_index.get(hash) {
+            if self.order.get(i) == Some(hash) {
+                return Some(i + 1);
+            }
+        }
+        self.order.iter().position(|h| h == hash).map(|i| i + 1)
     }
 
     /// Determine which torrents are allowed to download given the limits.
@@ -338,6 +404,38 @@ mod tests {
         q.add(h(2));
         assert_eq!(q.position(&h(2)), Some(2));
         assert_eq!(q.position(&h(9)), None);
+    }
+
+    #[test]
+    fn position_index_survives_serde_restore() {
+        let mut q = QueueState::new(QueueLimits::default());
+        q.add(h(1));
+        q.add(h(2));
+        q.add(h(3));
+        q.start_now(&h(3));
+
+        let json = serde_json::to_string(&q).unwrap();
+        let restored: QueueState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.position(&h(1)), Some(1));
+        assert_eq!(restored.position(&h(2)), Some(2));
+        assert_eq!(restored.position(&h(3)), Some(3));
+        assert_eq!(restored.active_download_slots()[0], h(3));
+    }
+
+    #[test]
+    fn queue_recovers_from_stale_public_order_index() {
+        let mut q = QueueState::new(QueueLimits::default());
+        q.add(h(1));
+        q.add(h(2));
+        q.add(h(3));
+
+        q.order.swap(0, 2);
+
+        assert_eq!(q.position(&h(1)), Some(3));
+        q.move_up(&h(1));
+        assert_eq!(q.order, vec![h(3), h(1), h(2)]);
+        assert_eq!(q.position(&h(1)), Some(2));
     }
 
     #[test]
