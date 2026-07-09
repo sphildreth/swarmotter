@@ -3924,24 +3924,25 @@ mod tests {
         // unique blocks and one duplicate must not change the completion
         // status (still not complete on the second block; the third unique
         // block brings it to complete).
-        let mut a = PieceAssembler::new(0, 4 * 16 * 1024);
-        assert!(!a.add_block(0 * 16 * 1024, &vec![0xAB; 16 * 1024]).unwrap());
+        const BLK: usize = 16 * 1024;
+        let mut a = PieceAssembler::new(0, 4 * BLK);
+        assert!(!a.add_block(0, &vec![0xAB; BLK]).unwrap());
         // Duplicate: must not advance the block count. The assembler returns
         // Ok(false) because the piece is still incomplete after the
         // duplicate; the caller would not count this as a new block.
         assert!(
-            !a.add_block(0 * 16 * 1024, &vec![0xAB; 16 * 1024]).unwrap(),
+            !a.add_block(0, &vec![0xAB; BLK]).unwrap(),
             "duplicate block must not signal completion"
         );
-        // First time at offset 1: new block.
-        assert!(!a.add_block(1 * 16 * 1024, &vec![0xCD; 16 * 1024]).unwrap());
-        // First time at offset 2: new block, piece still incomplete.
-        assert!(!a.add_block(2 * 16 * 1024, &vec![0xEF; 16 * 1024]).unwrap());
+        // First time at offset BLK: new block.
+        assert!(!a.add_block(BLK as u32, &vec![0xCD; BLK]).unwrap());
+        // First time at offset 2*BLK: new block, piece still incomplete.
+        assert!(!a.add_block((2 * BLK) as u32, &vec![0xEF; BLK]).unwrap());
         // Final block completes the piece.
-        assert!(a.add_block(3 * 16 * 1024, &vec![0x42; 16 * 1024]).unwrap());
+        assert!(a.add_block((3 * BLK) as u32, &vec![0x42; BLK]).unwrap());
         // The data is well-formed even though one block was "duplicated"
         // (it overwrote the same buffer slot, so the final data is correct).
-        assert_eq!(a.data().len(), 4 * 16 * 1024);
+        assert_eq!(a.data().len(), 4 * BLK);
     }
 
     #[test]

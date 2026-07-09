@@ -89,7 +89,6 @@ async fn run_seed_peer(
         };
         let content = content.clone();
         let meta = meta.clone();
-        let peer_id = peer_id;
         tokio::spawn(async move {
             let _ = serve_one_leecher(stream, content, meta, info_hash, peer_id).await;
         });
@@ -354,7 +353,7 @@ async fn throughput_tuning_baseline_vs_tuned() {
         baseline.elapsed,
         tuned.elapsed
     );
-    std::fs::remove_dir_all(&unique_dir("")).ok();
+    std::fs::remove_dir_all(unique_dir("")).ok();
 }
 
 async fn run_scenario(
@@ -426,17 +425,13 @@ async fn run_scenario(
     while let Some(res) = join_set.join_next().await {
         running -= 1;
         let (_info_hash, expected, outcome) = res.expect("engine task panicked");
-        match outcome {
-            Ok(Ok(final_state)) => {
-                if final_state.finished
-                    && final_state.pieces_have.count(final_state.piece_count)
-                        == final_state.piece_count
-                {
-                    completed += 1;
-                    bytes_downloaded += expected;
-                }
+        if let Ok(Ok(final_state)) = outcome {
+            if final_state.finished
+                && final_state.pieces_have.count(final_state.piece_count) == final_state.piece_count
+            {
+                completed += 1;
+                bytes_downloaded += expected;
             }
-            _ => {}
         }
         // Top up to keep parallel_torrents in flight.
         if next < torrents.len() && running < parallel_torrents {

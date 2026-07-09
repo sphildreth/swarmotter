@@ -1750,10 +1750,10 @@ impl DaemonRuntime {
                 }
             }
         });
-        // Track this alongside the seeder handle so we can abort it on stop.
-        // (We just leak the JoinHandle in this simple version; stopping
-        // happens via the shutdown watch which the task honors.)
-        let _ = handle;
+        // Detach the announce task: it runs until the shutdown watch fires
+        // (the task honors shutdown_rx.changed). Dropping the JoinHandle
+        // detaches the task in tokio without aborting it.
+        drop(handle);
     }
 
     async fn stop_seeder(&self, hash: &InfoHash) {
