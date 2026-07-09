@@ -1170,7 +1170,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "swarmotter-api"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "swarmotter-core"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "swarmotter-web"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "axum",
  "tokio",
@@ -1221,7 +1221,7 @@ dependencies = [
 
 [[package]]
 name = "swarmotterd"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "async-trait",
  "axum",
