@@ -315,21 +315,31 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             out
         })
     }
-    async fn add_tracker(&self, _hash: &InfoHash, _url: String) -> Result<()> {
+    async fn add_tracker(&self, hash: &InfoHash, _url: String) -> Result<()> {
+        if self.registry.lock().await.get(hash).is_none() {
+            return Err(CoreError::NotFound("torrent".into()));
+        }
         Ok(())
     }
-    async fn remove_tracker(&self, _hash: &InfoHash, _url: String) -> Result<()> {
+    async fn remove_tracker(&self, hash: &InfoHash, _url: String) -> Result<()> {
+        if self.registry.lock().await.get(hash).is_none() {
+            return Err(CoreError::NotFound("torrent".into()));
+        }
         Ok(())
     }
     async fn edit_tracker(
         &self,
-        _hash: &InfoHash,
+        hash: &InfoHash,
         _old_url: String,
         _new_url: String,
     ) -> Result<()> {
+        if self.registry.lock().await.get(hash).is_none() {
+            return Err(CoreError::NotFound("torrent".into()));
+        }
         Ok(())
     }
-    async fn list_peers(&self, _hash: &InfoHash) -> Option<Vec<Peer>> {
+    async fn list_peers(&self, hash: &InfoHash) -> Option<Vec<Peer>> {
+        self.registry.lock().await.get(hash)?;
         Some(Vec::new())
     }
     async fn queue_move_up(&self, _hash: &InfoHash) -> Result<()> {

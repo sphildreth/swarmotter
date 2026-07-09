@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 
 use serde_json::json;
@@ -73,47 +73,25 @@ const STALE_INACTIVE_ENGINE_RECOVERY_MESSAGE: &str =
 #[derive(Clone)]
 pub struct DaemonRuntime {
     pub registry: Arc<Mutex<TorrentRegistry>>,
-    pub config: Arc<Mutex<Config>>,
-    pub network_health: Arc<Mutex<NetworkHealth>>,
+    pub config: Arc<RwLock<Config>>,
+    pub network_health: Arc<RwLock<NetworkHealth>>,
     pub watch_imports: Arc<Mutex<Vec<watch::ImportResult>>>,
     config_path: Option<PathBuf>,
     log_file_path: Option<PathBuf>,
-    /// Live engine state per torrent, reconciled into summaries.
-    engine_states: Arc<Mutex<HashMap<InfoHash, Arc<Mutex<EngineState>>>>>,
-    /// Command channels to running engine tasks.
+    engine_states: Arc<RwLock<HashMap<InfoHash, Arc<Mutex<EngineState>>>>>,
     engine_cmds: Arc<Mutex<HashMap<InfoHash, tokio::sync::mpsc::Sender<EngineCommand>>>>,
-    /// Running engine task join handles.
-    engine_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
-    /// Seeder shutdown signal senders per torrent (inbound peer listening).
+    engine_handles: Arc<RwLock<HashMap<InfoHash, JoinHandle<()>>>>,
     seeder_shutdowns: Arc<Mutex<HashMap<InfoHash, tokio::sync::watch::Sender<bool>>>>,
-    /// Running seeder task join handles per torrent.
     seeder_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
-    /// Shared global download/upload rate limiter. Cloned into every engine
-    /// and seeder so the configured global bandwidth cap is enforced as a true
-    /// aggregate across all active torrents.
     global_limiter: swarmotter_core::bandwidth::RateLimiter,
-    /// Per-torrent rate limiters for running engines, keyed by info hash. The
-    /// daemon keeps a clone (cheap: buckets are shared) so per-torrent limit
-    /// changes apply live to a running engine.
-    engine_limiters: Arc<Mutex<HashMap<InfoHash, swarmotter_core::bandwidth::RateLimiter>>>,
-    /// Last byte-counter samples used to calculate API/UI transfer rates.
-    rate_samples: Arc<Mutex<HashMap<InfoHash, RateSample>>>,
-    /// Per-torrent retry suppression for transient engine failures.
-    engine_retry_after: Arc<Mutex<HashMap<InfoHash, Instant>>>,
-    /// Latest computed autopilot decision per torrent, exposed through the API.
-    autopilot_decisions: Arc<Mutex<HashMap<InfoHash, AutopilotDecision>>>,
-    /// Last automatic action time per torrent, used to avoid repeated act-mode
-    /// commands on every background pass.
-    autopilot_last_action: Arc<Mutex<HashMap<InfoHash, Instant>>>,
-    /// Runtime queue state backing queue positions and queue move operations.
+    engine_limiters: Arc<RwLock<HashMap<InfoHash, swarmotter_core::bandwidth::RateLimiter>>>,
+    rate_samples: Arc<RwLock<HashMap<InfoHash, RateSample>>>,
+    engine_retry_after: Arc<RwLock<HashMap<InfoHash, Instant>>>,
+    autopilot_decisions: Arc<RwLock<HashMap<InfoHash, AutopilotDecision>>>,
+    autopilot_last_action: Arc<RwLock<HashMap<InfoHash, Instant>>>,
     queue: Arc<Mutex<QueueState>>,
-    /// Shared DHT runner so the configured DHT port is bound by one runner
-    /// instead of once per active torrent.
     dht_runner: Arc<Mutex<Option<Arc<crate::dht::DhtRunner>>>>,
-    /// Coalesces queue reconciliation requests triggered by rapid add/import
-    /// bursts so API add calls do not wait for engine startup.
     queue_reconcile: Arc<Mutex<QueueReconcileState>>,
-    /// Shared API event broker used by SSE/WebSocket subscribers.
     event_broker: EventBroker,
 }
 
@@ -362,22 +340,22 @@ impl DaemonRuntime {
         Self {
             registry: Arc::new(Mutex::new(TorrentRegistry::default())),
             queue: Arc::new(Mutex::new(QueueState::new(config.queue.clone()))),
-            config: Arc::new(Mutex::new(config)),
-            network_health: Arc::new(Mutex::new(startup_health)),
+            config: Arc::new(RwLock::new(config)),
+            network_health: Arc::new(RwLock::new(startup_health)),
             watch_imports: Arc::new(Mutex::new(Vec::new())),
             config_path,
             log_file_path,
-            engine_states: Arc::new(Mutex::new(HashMap::new())),
+            engine_states: Arc::new(RwLock::new(HashMap::new())),
             engine_cmds: Arc::new(Mutex::new(HashMap::new())),
-            engine_handles: Arc::new(Mutex::new(HashMap::new())),
+            engine_handles: Arc::new(RwLock::new(HashMap::new())),
             seeder_shutdowns: Arc::new(Mutex::new(HashMap::new())),
             seeder_handles: Arc::new(Mutex::new(HashMap::new())),
             global_limiter,
-            engine_limiters: Arc::new(Mutex::new(HashMap::new())),
-            rate_samples: Arc::new(Mutex::new(HashMap::new())),
-            engine_retry_after: Arc::new(Mutex::new(HashMap::new())),
-            autopilot_decisions: Arc::new(Mutex::new(HashMap::new())),
-            autopilot_last_action: Arc::new(Mutex::new(HashMap::new())),
+            engine_limiters: Arc::new(RwLock::new(HashMap::new())),
+            rate_samples: Arc::new(RwLock::new(HashMap::new())),
+            engine_retry_after: Arc::new(RwLock::new(HashMap::new())),
+            autopilot_decisions: Arc::new(RwLock::new(HashMap::new())),
+            autopilot_last_action: Arc::new(RwLock::new(HashMap::new())),
             dht_runner: Arc::new(Mutex::new(None)),
             queue_reconcile: Arc::new(Mutex::new(QueueReconcileState::default())),
             event_broker,
@@ -582,14 +560,14 @@ impl DaemonRuntime {
             queue.remove_many(removed.iter().map(|(hash, _)| *hash));
         }
         {
-            let mut rate_samples = self.rate_samples.lock().await;
+            let mut rate_samples = self.rate_samples.write().await;
             for (hash, _) in &removed {
                 rate_samples.remove(hash);
             }
         }
         {
-            let mut decisions = self.autopilot_decisions.lock().await;
-            let mut last_actions = self.autopilot_last_action.lock().await;
+            let mut decisions = self.autopilot_decisions.write().await;
+            let mut last_actions = self.autopilot_last_action.write().await;
             for (hash, _) in &removed {
                 decisions.remove(hash);
                 last_actions.remove(hash);
@@ -633,7 +611,7 @@ impl DaemonRuntime {
     }
 
     async fn resolve_download_dir_override(&self, download_dir: Option<&str>) -> String {
-        let cfg = self.config.lock().await;
+        let cfg = self.config.read().await;
         resolve_download_dir_from_config(download_dir, &cfg)
     }
 
@@ -641,7 +619,7 @@ impl DaemonRuntime {
     /// use the configured incomplete directory when present; otherwise they
     /// write directly to the final download directory.
     async fn resolve_incomplete_dir(&self, download_dir: &str) -> String {
-        let cfg = self.config.lock().await;
+        let cfg = self.config.read().await;
         resolve_incomplete_dir_from_config(download_dir, &cfg)
     }
 
@@ -650,7 +628,7 @@ impl DaemonRuntime {
         download_dir: Option<&str>,
         total_length: u64,
     ) -> Result<()> {
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config.read().await.clone();
         if cfg.storage.minimum_free_space_bytes == 0 && cfg.storage.minimum_free_space_percent == 0
         {
             return Ok(());
@@ -664,7 +642,7 @@ impl DaemonRuntime {
     }
 
     async fn configured_peer_worker_limit(&self, active_downloads: usize) -> usize {
-        let cfg = self.config.lock().await;
+        let cfg = self.config.read().await;
         effective_peer_worker_limit(
             cfg.bandwidth.max_peers,
             cfg.bandwidth.max_peers_per_torrent,
@@ -683,11 +661,11 @@ impl DaemonRuntime {
     }
 
     async fn scheduler_diagnostics(&self, desired: &[InfoHash]) -> SchedulerDiagnostics {
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config.read().await.clone();
         let mut queue = self.queue.lock().await.clone();
         queue.limits = cfg.queue.clone();
-        let retry_after = self.engine_retry_after.lock().await.clone();
-        let running: HashSet<InfoHash> = self.engine_handles.lock().await.keys().copied().collect();
+        let retry_after = self.engine_retry_after.read().await.clone();
+        let running: HashSet<InfoHash> = self.engine_handles.read().await.keys().copied().collect();
         let now = Instant::now();
         let reg = self.registry.lock().await;
 
@@ -819,7 +797,7 @@ impl DaemonRuntime {
     }
 
     async fn active_download_hashes(&self) -> Vec<InfoHash> {
-        let running: Vec<InfoHash> = self.engine_handles.lock().await.keys().copied().collect();
+        let running: Vec<InfoHash> = self.engine_handles.read().await.keys().copied().collect();
         let reg = self.registry.lock().await;
         running
             .into_iter()
@@ -835,8 +813,8 @@ impl DaemonRuntime {
     }
 
     async fn desired_download_hashes(&self) -> Vec<InfoHash> {
-        let cfg = self.config.lock().await.clone();
-        let retry_after = self.engine_retry_after.lock().await.clone();
+        let cfg = self.config.read().await.clone();
+        let retry_after = self.engine_retry_after.read().await.clone();
         let mut queue = self.queue.lock().await;
         queue.limits = cfg.queue.clone();
         let reg = self.registry.lock().await;
@@ -940,8 +918,8 @@ impl DaemonRuntime {
     }
 
     async fn sweep_stale_active_torrents(&self, reason: &'static str) -> usize {
-        let running: HashSet<InfoHash> = self.engine_handles.lock().await.keys().copied().collect();
-        let retry_after = self.engine_retry_after.lock().await.clone();
+        let running: HashSet<InfoHash> = self.engine_handles.read().await.keys().copied().collect();
+        let retry_after = self.engine_retry_after.read().await.clone();
         let now = Instant::now();
         let recovered = {
             let mut reg = self.registry.lock().await;
@@ -985,7 +963,7 @@ impl DaemonRuntime {
     }
 
     async fn sweep_inactive_engine_handles(&self, reason: &'static str) -> usize {
-        let running: Vec<InfoHash> = self.engine_handles.lock().await.keys().copied().collect();
+        let running: Vec<InfoHash> = self.engine_handles.read().await.keys().copied().collect();
         let stale: Vec<(InfoHash, Option<TorrentState>)> = {
             let reg = self.registry.lock().await;
             running
@@ -1079,8 +1057,8 @@ impl DaemonRuntime {
 
     async fn engine_task_finished(&self, hash: InfoHash) {
         self.engine_cmds.lock().await.remove(&hash);
-        self.engine_handles.lock().await.remove(&hash);
-        self.engine_limiters.lock().await.remove(&hash);
+        self.engine_handles.write().await.remove(&hash);
+        self.engine_limiters.write().await.remove(&hash);
     }
 
     async fn queue_torrent_for_retry(
@@ -1116,7 +1094,7 @@ impl DaemonRuntime {
             queue.move_to_bottom(&hash);
         }
         self.engine_retry_after
-            .lock()
+            .write()
             .await
             .insert(hash, Instant::now() + delay);
         tracing::warn!(
@@ -1182,14 +1160,14 @@ impl DaemonRuntime {
         peer_id: [u8; 20],
     ) -> Option<Arc<crate::dht::DhtRunner>> {
         let (dht_enabled, bootstrap_nodes, dht_port) = {
-            let cfg = self.config.lock().await;
+            let cfg = self.config.read().await;
             (
                 cfg.dht.enabled,
                 cfg.dht.bootstrap_nodes.clone(),
                 cfg.dht.port,
             )
         };
-        if !dht_enabled || !self.network_health.lock().await.traffic_allowed {
+        if !dht_enabled || !self.network_health.read().await.traffic_allowed {
             return None;
         }
         if let Some(existing) = self.dht_runner.lock().await.clone() {
@@ -1208,7 +1186,7 @@ impl DaemonRuntime {
     /// Start the live engine task for a torrent (downloading). No-op if the
     /// torrent is paused, queued, or already running.
     pub async fn start_engine(&self, hash: InfoHash) {
-        let health = self.network_health.lock().await.clone();
+        let health = self.network_health.read().await.clone();
         if !health.traffic_allowed && health.mode != NetworkContainmentMode::Disabled {
             // Network blocked: do not start the engine; mark torrent.
             let mut changed = false;
@@ -1228,10 +1206,10 @@ impl DaemonRuntime {
         }
 
         // Already running?
-        if self.engine_handles.lock().await.contains_key(&hash) {
+        if self.engine_handles.read().await.contains_key(&hash) {
             return;
         }
-        self.engine_retry_after.lock().await.remove(&hash);
+        self.engine_retry_after.write().await.remove(&hash);
 
         let snapshot = {
             let reg = self.registry.lock().await;
@@ -1262,7 +1240,7 @@ impl DaemonRuntime {
                 .await;
             let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
             let magnet = snapshot.magnet_params();
-            let cfg = self.config.lock().await;
+            let cfg = self.config.read().await;
             let preallocate = cfg.storage.preallocate;
             let sparse = cfg.storage.sparse;
             let allow_ipv6 = cfg.torrent.allow_ipv6 && cfg.network.allow_ipv6;
@@ -1302,7 +1280,7 @@ impl DaemonRuntime {
             || minimum_free_space_bytes > 0
             || minimum_free_space_percent > 0
         {
-            let mut cfg = self.config.lock().await.storage.clone();
+            let mut cfg = self.config.read().await.storage.clone();
             cfg.minimum_free_space_bytes = minimum_free_space_bytes;
             cfg.minimum_free_space_percent = minimum_free_space_percent;
             for dir in unique_pathbufs([PathBuf::from(&active_dir), PathBuf::from(&complete_dir)]) {
@@ -1330,7 +1308,7 @@ impl DaemonRuntime {
         }
 
         let state = Arc::new(Mutex::new(EngineState::default()));
-        self.engine_states.lock().await.insert(hash, state.clone());
+        self.engine_states.write().await.insert(hash, state.clone());
 
         let binder: Arc<dyn swarmotter_core::net::NetworkBinder> = self.make_binder().await;
         let peer_id = make_peer_id();
@@ -1346,13 +1324,13 @@ impl DaemonRuntime {
             snapshot.upload_limit,
         );
         self.engine_limiters
-            .lock()
+            .write()
             .await
             .insert(hash, limiter.clone());
         // Peer transport selection (TCP/uTP) from config. All transports stay
         // on the contained binder; fail-closed blocks both.
         let (utp_enabled, utp_prefer_tcp, encryption_mode) = {
-            let cfg = self.config.lock().await;
+            let cfg = self.config.read().await;
             (
                 cfg.torrent.utp_enabled,
                 cfg.torrent.utp_prefer_tcp,
@@ -1464,7 +1442,7 @@ impl DaemonRuntime {
                     // seeder stopped, record removed) while preserving the
                     // downloaded data. This must run after the registry update
                     // above so final stats/name are captured before removal.
-                    if finished && config.lock().await.torrent.selfish {
+                    if finished && config.read().await.torrent.selfish {
                         Self::selfish_remove_completed(
                             hash_for_task,
                             registry.clone(),
@@ -1512,7 +1490,7 @@ impl DaemonRuntime {
             runtime_for_task.engine_task_finished(hash_for_task).await;
             let _ = state_for_summary;
         });
-        self.engine_handles.lock().await.insert(hash, handle);
+        self.engine_handles.write().await.insert(hash, handle);
 
         if !self.registry.lock().await.contains(&hash) {
             self.force_stop_engine(&hash).await;
@@ -1558,38 +1536,40 @@ impl DaemonRuntime {
     }
 
     async fn stop_engine(&self, hash: &InfoHash) {
-        self.engine_retry_after.lock().await.remove(hash);
+        self.engine_retry_after.write().await.remove(hash);
         if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
             let _ = tx.send(EngineCommand::Stop).await;
         }
-        if let Some(handle) = self.engine_handles.lock().await.remove(hash) {
+        let handle = self.engine_handles.write().await.remove(hash);
+        if let Some(handle) = handle {
             let _ = handle.await;
         }
         // Stop the inbound peer listener / seeder too.
         self.stop_seeder(hash).await;
-        self.engine_states.lock().await.remove(hash);
-        self.engine_limiters.lock().await.remove(hash);
-        self.rate_samples.lock().await.remove(hash);
+        self.engine_states.write().await.remove(hash);
+        self.engine_limiters.write().await.remove(hash);
+        self.rate_samples.write().await.remove(hash);
     }
 
     async fn force_stop_engine(&self, hash: &InfoHash) {
-        self.engine_retry_after.lock().await.remove(hash);
+        self.engine_retry_after.write().await.remove(hash);
         if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
             let _ = tx.try_send(EngineCommand::Stop);
         }
-        if let Some(handle) = self.engine_handles.lock().await.remove(hash) {
+        let handle = self.engine_handles.write().await.remove(hash);
+        if let Some(handle) = handle {
             handle.abort();
             let _ = handle.await;
         }
         self.force_stop_seeder(hash).await;
-        self.engine_states.lock().await.remove(hash);
-        self.engine_limiters.lock().await.remove(hash);
-        self.rate_samples.lock().await.remove(hash);
+        self.engine_states.write().await.remove(hash);
+        self.engine_limiters.write().await.remove(hash);
+        self.rate_samples.write().await.remove(hash);
     }
 
     async fn stop_all_torrent_tasks(&self, registry_hashes: &[InfoHash]) {
         let mut hashes = registry_hashes.to_vec();
-        hashes.extend(self.engine_handles.lock().await.keys().copied());
+        hashes.extend(self.engine_handles.read().await.keys().copied());
         hashes.extend(self.seeder_handles.lock().await.keys().copied());
         hashes.sort();
         hashes.dedup();
@@ -1605,19 +1585,18 @@ impl DaemonRuntime {
         }
         {
             let mut queue = self.queue.lock().await;
-            queue.order.clear();
-            queue.bypass.clear();
+            queue.clear();
         }
-        self.engine_states.lock().await.clear();
+        self.engine_states.write().await.clear();
         self.engine_cmds.lock().await.clear();
-        self.engine_handles.lock().await.clear();
-        self.engine_limiters.lock().await.clear();
+        self.engine_handles.write().await.clear();
+        self.engine_limiters.write().await.clear();
         self.seeder_shutdowns.lock().await.clear();
         self.seeder_handles.lock().await.clear();
-        self.rate_samples.lock().await.clear();
-        self.engine_retry_after.lock().await.clear();
-        self.autopilot_decisions.lock().await.clear();
-        self.autopilot_last_action.lock().await.clear();
+        self.rate_samples.write().await.clear();
+        self.engine_retry_after.write().await.clear();
+        self.autopilot_decisions.write().await.clear();
+        self.autopilot_last_action.write().await.clear();
     }
 
     /// Spawn the inbound peer listener / seeder for a torrent. It shares the
@@ -1638,7 +1617,7 @@ impl DaemonRuntime {
         }
         let binder = self.make_binder().await;
         let peer_id = make_peer_id();
-        let listen_port = self.config.lock().await.torrent.listen_port;
+        let listen_port = self.config.read().await.torrent.listen_port;
         // Per-torrent upload limit (0 = unlimited) plus the shared global cap.
         let (dl_limit, ul_limit) = {
             let reg = self.registry.lock().await;
@@ -1660,7 +1639,7 @@ impl DaemonRuntime {
             )))
         };
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let encryption_mode = self.config.lock().await.torrent.encryption_mode;
+        let encryption_mode = self.config.read().await.torrent.encryption_mode;
         let mut seeder = Seeder::with_limiter(
             meta,
             storage,
@@ -1693,7 +1672,8 @@ impl DaemonRuntime {
         if let Some(tx) = self.seeder_shutdowns.lock().await.remove(hash) {
             let _ = tx.send(true);
         }
-        if let Some(handle) = self.seeder_handles.lock().await.remove(hash) {
+        let handle = self.seeder_handles.lock().await.remove(hash);
+        if let Some(handle) = handle {
             let _ = handle.await;
         }
     }
@@ -1702,7 +1682,8 @@ impl DaemonRuntime {
         if let Some(tx) = self.seeder_shutdowns.lock().await.remove(hash) {
             let _ = tx.send(true);
         }
-        if let Some(handle) = self.seeder_handles.lock().await.remove(hash) {
+        let handle = self.seeder_handles.lock().await.remove(hash);
+        if let Some(handle) = handle {
             handle.abort();
             let _ = handle.await;
         }
@@ -1710,9 +1691,9 @@ impl DaemonRuntime {
 
     async fn reconcile_seeders(&self) {
         let now_secs = now();
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config.read().await.clone();
         let seeding_limit = cfg.queue.max_active_seeds;
-        let samples = self.rate_samples.lock().await.clone();
+        let samples = self.rate_samples.read().await.clone();
         let running_seeders: Vec<InfoHash> =
             self.seeder_handles.lock().await.keys().copied().collect();
 
@@ -1790,7 +1771,7 @@ impl DaemonRuntime {
             };
             let complete_dir = self.resolve_download_dir(&torrent_for_dir).await;
             let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
-            let Some(state) = self.engine_states.lock().await.get(&hash).cloned() else {
+            let Some(state) = self.engine_states.read().await.get(&hash).cloned() else {
                 continue;
             };
             self.start_seeder(hash, meta, active_dir, complete_dir, state)
@@ -1812,7 +1793,7 @@ impl DaemonRuntime {
         &self,
         reason: &'static str,
     ) -> Result<Vec<InfoHash>> {
-        if !self.config.lock().await.torrent.selfish {
+        if !self.config.read().await.torrent.selfish {
             return Ok(Vec::new());
         }
 
@@ -1865,9 +1846,9 @@ impl DaemonRuntime {
         hash: InfoHash,
         registry: Arc<Mutex<TorrentRegistry>>,
         engine_cmds: Arc<Mutex<HashMap<InfoHash, tokio::sync::mpsc::Sender<EngineCommand>>>>,
-        engine_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
-        engine_states: Arc<Mutex<HashMap<InfoHash, Arc<Mutex<EngineState>>>>>,
-        engine_limiters: Arc<Mutex<HashMap<InfoHash, swarmotter_core::bandwidth::RateLimiter>>>,
+        engine_handles: Arc<RwLock<HashMap<InfoHash, JoinHandle<()>>>>,
+        engine_states: Arc<RwLock<HashMap<InfoHash, Arc<Mutex<EngineState>>>>>,
+        engine_limiters: Arc<RwLock<HashMap<InfoHash, swarmotter_core::bandwidth::RateLimiter>>>,
         seeder_shutdowns: Arc<Mutex<HashMap<InfoHash, tokio::sync::watch::Sender<bool>>>>,
         seeder_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
         event_broker: EventBroker,
@@ -1882,7 +1863,8 @@ impl DaemonRuntime {
         if let Some(tx) = seeder_shutdowns.lock().await.remove(&hash) {
             let _ = tx.send(true);
         }
-        if let Some(handle) = seeder_handles.lock().await.remove(&hash) {
+        let seeder_handle = seeder_handles.lock().await.remove(&hash);
+        if let Some(handle) = seeder_handle {
             let _ = handle.await;
         }
         // Clear live engine bookkeeping. We deliberately do NOT await the
@@ -1890,9 +1872,10 @@ impl DaemonRuntime {
         // this method, so awaiting it would deadlock. Dropping the detached
         // handle is safe because the task is already returning.
         engine_cmds.lock().await.remove(&hash);
-        engine_states.lock().await.remove(&hash);
-        engine_limiters.lock().await.remove(&hash);
-        if let Some(handle) = engine_handles.lock().await.remove(&hash) {
+        engine_states.write().await.remove(&hash);
+        engine_limiters.write().await.remove(&hash);
+        let engine_handle = engine_handles.write().await.remove(&hash);
+        if let Some(handle) = engine_handle {
             drop(handle);
         }
         // Remove the torrent record; downloaded data is preserved (no
@@ -1910,7 +1893,7 @@ impl DaemonRuntime {
     }
 
     async fn make_binder(&self) -> Arc<dyn swarmotter_core::net::NetworkBinder> {
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config.read().await.clone();
         Arc::new(ContainedBinder::new(
             cfg.network.clone(),
             Arc::new(OsInterfaceProbe),
@@ -1923,12 +1906,12 @@ impl DaemonRuntime {
     pub async fn network_health_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let cfg = self.config.lock().await.clone();
+            let cfg = self.config.read().await.clone();
             let probe = OsInterfaceProbe;
             let health = net::evaluate(&cfg.network, &probe);
             let traffic_allowed = health.traffic_allowed;
             let network_changed = {
-                let mut current = self.network_health.lock().await;
+                let mut current = self.network_health.write().await;
                 let changed = current.status != health.status
                     || current.traffic_allowed != health.traffic_allowed
                     || current.detail != health.detail;
@@ -1953,7 +1936,7 @@ impl DaemonRuntime {
             if !traffic_allowed && health.mode != NetworkContainmentMode::Disabled {
                 // Stop all running engines and mark torrents network_blocked.
                 let hashes: Vec<InfoHash> =
-                    self.engine_handles.lock().await.keys().copied().collect();
+                    self.engine_handles.read().await.keys().copied().collect();
                 for h in hashes {
                     self.stop_engine(&h).await;
                     let mut reg = self.registry.lock().await;
@@ -1979,14 +1962,14 @@ impl DaemonRuntime {
     /// Copy live engine state (pieces, byte counts) into the torrent records
     /// so API/UI summaries reflect real progress while downloading.
     async fn reconcile_engine_progress(&self) {
-        let states = self.engine_states.lock().await.clone();
+        let states = self.engine_states.read().await.clone();
         let running_engines: HashSet<InfoHash> =
-            self.engine_handles.lock().await.keys().copied().collect();
+            self.engine_handles.read().await.keys().copied().collect();
         let now = Instant::now();
-        let retry_after = self.engine_retry_after.lock().await.clone();
-        let previous_samples = self.rate_samples.lock().await.clone();
-        let global_download_limit = self.config.lock().await.bandwidth.effective_download();
-        let network_health = self.network_health.lock().await.clone();
+        let retry_after = self.engine_retry_after.read().await.clone();
+        let previous_samples = self.rate_samples.read().await.clone();
+        let global_download_limit = self.config.read().await.bandwidth.effective_download();
+        let network_health = self.network_health.read().await.clone();
         let mut snapshots = Vec::with_capacity(states.len());
         for (hash, state) in states {
             let state = state.lock().await.clone();
@@ -2155,7 +2138,7 @@ impl DaemonRuntime {
             self.publish_event(stats_updated_event());
         }
         if !sample_updates.is_empty() {
-            let mut samples = self.rate_samples.lock().await;
+            let mut samples = self.rate_samples.write().await;
             for (hash, sample) in sample_updates {
                 samples.insert(hash, sample);
             }
@@ -2179,11 +2162,11 @@ impl DaemonRuntime {
     async fn refresh_autopilot_decisions(&self, apply_actions: bool) {
         self.reconcile_engine_progress().await;
 
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config.read().await.clone();
         let global_mode = cfg.autopilot.mode;
-        let network = self.network_health.lock().await.clone();
-        let states = self.engine_states.lock().await.clone();
-        let samples = self.rate_samples.lock().await.clone();
+        let network = self.network_health.read().await.clone();
+        let states = self.engine_states.read().await.clone();
+        let samples = self.rate_samples.read().await.clone();
         let active_downloads = self.active_download_hashes().await.len().max(1);
         let torrents: Vec<Torrent> = self
             .registry
@@ -2219,7 +2202,7 @@ impl DaemonRuntime {
             decisions.insert(hash, decision);
         }
 
-        *self.autopilot_decisions.lock().await = decisions;
+        *self.autopilot_decisions.write().await = decisions;
     }
 
     async fn apply_autopilot_decision(
@@ -2238,7 +2221,7 @@ impl DaemonRuntime {
         let now = Instant::now();
         if self
             .autopilot_last_action
-            .lock()
+            .read()
             .await
             .get(&hash)
             .is_some_and(|at| now.saturating_duration_since(*at) < AUTOPILOT_ACTION_COOLDOWN)
@@ -2267,7 +2250,7 @@ impl DaemonRuntime {
         };
 
         if applied {
-            self.autopilot_last_action.lock().await.insert(hash, now);
+            self.autopilot_last_action.write().await.insert(hash, now);
             tracing::info!(
                 info_hash = %hash,
                 action_kind = ?action.kind,
@@ -2314,7 +2297,7 @@ impl DaemonRuntime {
     }
 
     async fn apply_autopilot_queue_release(&self, hash: InfoHash) -> bool {
-        if !self.engine_handles.lock().await.contains_key(&hash) {
+        if !self.engine_handles.read().await.contains_key(&hash) {
             return false;
         }
         self.force_stop_engine(&hash).await;
@@ -2338,7 +2321,7 @@ impl DaemonRuntime {
             queue.move_to_bottom(&hash);
         }
         self.engine_retry_after
-            .lock()
+            .write()
             .await
             .insert(hash, Instant::now() + AUTOPILOT_QUEUE_RELEASE_RETRY_DELAY);
         self.schedule_reconcile_queue("autopilot_queue_release")
@@ -2367,12 +2350,11 @@ impl DaemonRuntime {
         }
         t.download_limit = download_limit;
         drop(reg);
-        if let Some(rl) = self.engine_limiters.lock().await.get(&hash).cloned() {
+        if let Some(rl) = self.engine_limiters.read().await.get(&hash).cloned() {
             rl.set_capacity(
                 swarmotter_core::bandwidth::RateDirection::Download,
                 download_limit,
-            )
-            .await;
+            );
         }
         true
     }
@@ -2387,7 +2369,7 @@ impl DaemonRuntime {
     }
 
     async fn scan_watch_folders(&self) -> Result<()> {
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config.read().await.clone();
         for folder in &cfg.watch {
             let path = std::path::Path::new(&folder.path);
             let files = watch::scan_torrent_files(path, folder.recursive);
@@ -2441,22 +2423,18 @@ impl DaemonRuntime {
     }
 
     async fn apply_runtime_config_fields(&self) {
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config.read().await.clone();
         self.queue.lock().await.limits = cfg.queue.clone();
-        self.global_limiter
-            .set_capacity(
-                swarmotter_core::bandwidth::RateDirection::Download,
-                cfg.bandwidth.effective_download(),
-            )
-            .await;
-        self.global_limiter
-            .set_capacity(
-                swarmotter_core::bandwidth::RateDirection::Upload,
-                cfg.bandwidth.effective_upload(),
-            )
-            .await;
+        self.global_limiter.set_capacity(
+            swarmotter_core::bandwidth::RateDirection::Download,
+            cfg.bandwidth.effective_download(),
+        );
+        self.global_limiter.set_capacity(
+            swarmotter_core::bandwidth::RateDirection::Upload,
+            cfg.bandwidth.effective_upload(),
+        );
         let probe = OsInterfaceProbe;
-        *self.network_health.lock().await = net::evaluate(&cfg.network, &probe);
+        *self.network_health.write().await = net::evaluate(&cfg.network, &probe);
         self.apply_peer_worker_limits().await;
         self.schedule_reconcile_queue("runtime_config").await;
         self.sweep_selfish_completed_torrents_best_effort("runtime_config")
@@ -3003,7 +2981,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn resume(&self, hash: &InfoHash) -> Result<()> {
-        self.engine_retry_after.lock().await.remove(hash);
+        self.engine_retry_after.write().await.remove(hash);
         {
             let mut reg = self.registry.lock().await;
             match reg.get_mut(hash) {
@@ -3026,7 +3004,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn start_now(&self, hash: &InfoHash) -> Result<()> {
-        self.engine_retry_after.lock().await.remove(hash);
+        self.engine_retry_after.write().await.remove(hash);
         {
             let reg = self.registry.lock().await;
             if reg.get(hash).is_none() {
@@ -3186,17 +3164,15 @@ impl DaemonOps for DaemonRuntime {
         // buckets with the clone the daemon retains). The seeder reads limits
         // at start; a running seeder picks up the upload cap via the shared
         // global limiter and on its next start.
-        if let Some(rl) = self.engine_limiters.lock().await.get(hash).cloned() {
+        if let Some(rl) = self.engine_limiters.read().await.get(hash).cloned() {
             rl.set_capacity(
                 swarmotter_core::bandwidth::RateDirection::Download,
                 limits.download,
-            )
-            .await;
+            );
             rl.set_capacity(
                 swarmotter_core::bandwidth::RateDirection::Upload,
                 limits.upload,
-            )
-            .await;
+            );
         }
         Ok(())
     }
@@ -3257,7 +3233,7 @@ impl DaemonOps for DaemonRuntime {
         // Transmission emulation do not report successful announces as errors.
         let engine_trackers = self
             .engine_states
-            .lock()
+            .read()
             .await
             .get(hash)
             .and_then(|s| s.try_lock().ok())
@@ -3347,7 +3323,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn list_peers(&self, hash: &InfoHash) -> Option<Vec<Peer>> {
-        let states = self.engine_states.lock().await;
+        let states = self.engine_states.read().await;
         let state = states.get(hash)?;
         let s = state.lock().await;
         let peers = s
@@ -3415,12 +3391,12 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn get_config(&self) -> Config {
-        self.config.lock().await.clone()
+        self.config.read().await.clone()
     }
 
     async fn update_settings(&self, patch: swarmotter_api::state::SettingsPatch) -> Result<()> {
         {
-            let mut cfg = self.config.lock().await;
+            let mut cfg = self.config.write().await;
             if let Some(b) = patch.bandwidth {
                 cfg.bandwidth = b;
             }
@@ -3442,7 +3418,7 @@ impl DaemonOps for DaemonRuntime {
 
     async fn replace_config(&self, mut next: Config) -> Result<ConfigUpdateResult> {
         let (previous, config_path) = {
-            let cfg = self.config.lock().await;
+            let cfg = self.config.read().await;
             (cfg.clone(), self.config_path.clone())
         };
         if next.api.auth_token.is_none() {
@@ -3456,7 +3432,7 @@ impl DaemonOps for DaemonRuntime {
 
         let restart_required_fields = restart_required_fields(&previous, &next);
         {
-            let mut cfg = self.config.lock().await;
+            let mut cfg = self.config.write().await;
             *cfg = next.clone();
         }
         self.apply_runtime_config_fields().await;
@@ -3514,7 +3490,7 @@ impl DaemonOps for DaemonRuntime {
             }
         }
 
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config.read().await.clone();
         let download_dir = cfg
             .storage
             .download_dir
@@ -3565,12 +3541,12 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn network_health(&self) -> NetworkHealth {
-        self.network_health.lock().await.clone()
+        self.network_health.read().await.clone()
     }
 
     async fn network_diagnostics(&self) -> NetworkDiagnostics {
-        let cfg = self.config.lock().await.clone();
-        let health = self.network_health.lock().await.clone();
+        let cfg = self.config.read().await.clone();
+        let health = self.network_health.read().await.clone();
         let probe = OsInterfaceProbe;
         let interfaces = probe
             .list()
@@ -3663,7 +3639,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn storage_roots(&self) -> StorageDiagnostics {
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config.read().await.clone();
         let mut roots: HashMap<String, StorageRootAccumulator> = HashMap::new();
 
         let download_dir = resolve_download_dir_from_config(None, &cfg);
@@ -3737,8 +3713,8 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn doctor_report(&self) -> DoctorReport {
-        let cfg = self.config.lock().await.clone();
-        let network = self.network_health.lock().await.clone();
+        let cfg = self.config.read().await.clone();
+        let network = self.network_health.read().await.clone();
         let mut checks = Vec::new();
         push_check(
             &mut checks,
@@ -3851,7 +3827,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn torrent_stats(&self, hash: &InfoHash) -> Option<TorrentDiagnostics> {
-        let engine_state = self.engine_states.lock().await.get(hash).cloned();
+        let engine_state = self.engine_states.read().await.get(hash).cloned();
         let live = if let Some(state) = engine_state {
             let s = state.lock().await;
             Some(LiveTorrentDiagnostics::from_engine_state(
@@ -3906,15 +3882,15 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn autopilot_status(&self) -> AutopilotConfig {
-        self.config.lock().await.autopilot.clone()
+        self.config.read().await.autopilot.clone()
     }
 
     async fn torrent_autopilot_decision(&self, hash: &InfoHash) -> Option<AutopilotDecision> {
         let torrent = self.registry.lock().await.get(hash).cloned()?;
-        let cfg = self.config.lock().await.clone();
-        let network = self.network_health.lock().await.clone();
+        let cfg = self.config.read().await.clone();
+        let network = self.network_health.read().await.clone();
         let mode = effective_autopilot_mode(cfg.autopilot.mode, torrent.autopilot_mode_override);
-        let state = self.engine_states.lock().await.get(hash).cloned();
+        let state = self.engine_states.read().await.get(hash).cloned();
         let state = match state {
             Some(state) => tokio::time::timeout(AUTOPILOT_STATE_LOCK_TIMEOUT, state.lock())
                 .await
@@ -3925,13 +3901,13 @@ impl DaemonOps for DaemonRuntime {
         let input = build_autopilot_input(
             &torrent,
             state.as_ref(),
-            self.rate_samples.lock().await.get(hash).copied(),
+            self.rate_samples.read().await.get(hash).copied(),
             Instant::now(),
             &network,
         );
         let decision = AutopilotAnalyzer::new().analyze(&input, mode);
         self.autopilot_decisions
-            .lock()
+            .write()
             .await
             .insert(*hash, decision.clone());
         Some(decision)
@@ -3958,7 +3934,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn watch_status(&self) -> WatchStatus {
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config.read().await.clone();
         let history = self.watch_imports.lock().await.clone();
         let enabled = !cfg.watch.is_empty();
         let folders = cfg
@@ -4114,8 +4090,8 @@ async fn truncate_log_file(path: &Path) -> Result<()> {
 }
 
 /// Apply current network containment state to a torrent's lifecycle state.
-async fn apply_network_state(t: &mut Torrent, health: &Arc<Mutex<NetworkHealth>>) {
-    let h = health.lock().await;
+async fn apply_network_state(t: &mut Torrent, health: &Arc<RwLock<NetworkHealth>>) {
+    let h = health.read().await;
     if !h.traffic_allowed && h.mode != NetworkContainmentMode::Disabled {
         t.state = TorrentState::NetworkBlocked;
         t.error = Some(h.detail.clone());
@@ -4385,7 +4361,7 @@ fn build_health_input(
     // considered useful and unchoked, and peers that have only been seen but
     // not heard from are treated as having no missing pieces.
     let mut peers: Vec<EnginePeerHealth> = Vec::new();
-    for (_addr, p) in peer_health.iter() {
+    for p in peer_health.values() {
         let last_valid = p.last_valid_block;
         let last_seen = p.last_seen;
         let last_seen_recent = last_seen
@@ -4526,7 +4502,7 @@ mod tests {
         for piece in 0..meta.piece_count() {
             pieces_have.set(piece);
         }
-        runtime.engine_states.lock().await.insert(
+        runtime.engine_states.write().await.insert(
             hash,
             Arc::new(Mutex::new(EngineState {
                 piece_count: meta.piece_count(),
@@ -4588,10 +4564,10 @@ mod tests {
         }));
         runtime
             .engine_states
-            .lock()
+            .write()
             .await
             .insert(hash, state.clone());
-        runtime.rate_samples.lock().await.insert(
+        runtime.rate_samples.write().await.insert(
             hash,
             RateSample {
                 downloaded: 1_000,
@@ -4615,7 +4591,7 @@ mod tests {
         assert_eq!(summary.uploaded, 1_200);
         let peak_sample = runtime
             .rate_samples
-            .lock()
+            .read()
             .await
             .get(&hash)
             .copied()
@@ -4665,7 +4641,7 @@ mod tests {
         torrent.needs_metadata = true;
         torrent.magnet_info_hash = Some(hash);
         runtime.registry.lock().await.add(torrent).unwrap();
-        runtime.engine_handles.lock().await.insert(
+        runtime.engine_handles.write().await.insert(
             hash,
             tokio::spawn(async {
                 std::future::pending::<()>().await;
@@ -4675,7 +4651,7 @@ mod tests {
         let mut pieces_have =
             swarmotter_core::storage::resume::PieceBitfield::new(real_meta.piece_count());
         pieces_have.set(0);
-        runtime.engine_states.lock().await.insert(
+        runtime.engine_states.write().await.insert(
             hash,
             Arc::new(Mutex::new(EngineState {
                 pieces_have,
@@ -4730,13 +4706,13 @@ mod tests {
         torrent.needs_metadata = true;
         torrent.magnet_info_hash = Some(hash);
         runtime.registry.lock().await.add(torrent).unwrap();
-        runtime.engine_handles.lock().await.insert(
+        runtime.engine_handles.write().await.insert(
             hash,
             tokio::spawn(async {
                 std::future::pending::<()>().await;
             }),
         );
-        runtime.engine_states.lock().await.insert(
+        runtime.engine_states.write().await.insert(
             hash,
             Arc::new(Mutex::new(EngineState {
                 tracker_message: Some("fetching metadata via BEP 9".into()),
@@ -4780,7 +4756,7 @@ mod tests {
         torrent.magnet_info_hash = Some(hash);
         runtime.registry.lock().await.add(torrent).unwrap();
         runtime.queue.lock().await.add(hash);
-        runtime.engine_states.lock().await.insert(
+        runtime.engine_states.write().await.insert(
             hash,
             Arc::new(Mutex::new(EngineState {
                 piece_count,
@@ -4812,7 +4788,7 @@ mod tests {
         }
         assert!(runtime
             .engine_retry_after
-            .lock()
+            .read()
             .await
             .get(&hash)
             .is_some_and(|retry_at| *retry_at > Instant::now()));
@@ -4896,7 +4872,7 @@ mod tests {
         assert_eq!(runtime.queue.lock().await.position(&first_hash), Some(2));
         assert!(runtime
             .engine_retry_after
-            .lock()
+            .read()
             .await
             .get(&first_hash)
             .is_some_and(|retry_at| *retry_at > Instant::now()));
@@ -4985,7 +4961,7 @@ mod tests {
         {
             let mut reg = runtime.registry.lock().await;
             let mut queue = runtime.queue.lock().await;
-            let mut states = runtime.engine_states.lock().await;
+            let mut states = runtime.engine_states.write().await;
             for idx in 1..=100u8 {
                 let hash = InfoHash::from_bytes([idx; 20]);
                 let mut torrent = Torrent::new(placeholder_meta.clone(), idx as u64);
@@ -5132,7 +5108,7 @@ mod tests {
         }
         runtime.queue.lock().await.add_many(hashes.iter().copied());
         {
-            let mut retry_after = runtime.engine_retry_after.lock().await;
+            let mut retry_after = runtime.engine_retry_after.write().await;
             let retry_until = Instant::now() + MAGNET_METADATA_NO_PEERS_RETRY_DELAY;
             for hash in &hashes {
                 retry_after.insert(*hash, retry_until);
@@ -5230,9 +5206,6 @@ mod tests {
                 } else if idx < QUEUED_DOWNLOAD_START + QUEUED_DOWNLOAD_COUNT {
                     torrent.state = TorrentState::Queued;
                     torrent.needs_metadata = false;
-                } else if idx < QUEUED_METADATA_START + QUEUED_METADATA_COUNT {
-                    torrent.state = TorrentState::Queued;
-                    torrent.needs_metadata = true;
                 } else if idx < BACKOFF_METADATA_START + BACKOFF_METADATA_COUNT {
                     torrent.state = TorrentState::Queued;
                     torrent.needs_metadata = true;
@@ -5268,7 +5241,7 @@ mod tests {
 
         runtime.queue.lock().await.add_many(hashes.iter().copied());
         {
-            let mut handles = runtime.engine_handles.lock().await;
+            let mut handles = runtime.engine_handles.write().await;
             for hash in hashes.iter().take(LIVE_DOWNLOAD_COUNT).chain(
                 hashes
                     .iter()
@@ -5284,7 +5257,7 @@ mod tests {
             }
         }
         {
-            let mut retry_after = runtime.engine_retry_after.lock().await;
+            let mut retry_after = runtime.engine_retry_after.write().await;
             for hash in hashes
                 .iter()
                 .skip(BACKOFF_METADATA_START)
@@ -5451,7 +5424,7 @@ mod tests {
             LIVE_DOWNLOAD_COUNT + LIVE_METADATA_COUNT
         );
         assert_eq!(
-            runtime.engine_retry_after.lock().await.len(),
+            runtime.engine_retry_after.read().await.len(),
             BACKOFF_METADATA_COUNT
         );
         assert!(stats.scheduler.download_slots_saturated);
@@ -5578,7 +5551,7 @@ mod tests {
         runtime.queue.lock().await.add(hash);
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         runtime.engine_cmds.lock().await.insert(hash, tx);
-        runtime.engine_handles.lock().await.insert(
+        runtime.engine_handles.write().await.insert(
             hash,
             tokio::spawn(async {
                 std::future::pending::<()>().await;
@@ -5586,7 +5559,7 @@ mod tests {
         );
         runtime
             .engine_states
-            .lock()
+            .write()
             .await
             .insert(hash, Arc::new(Mutex::new(EngineState::default())));
 
@@ -5598,9 +5571,9 @@ mod tests {
         .expect("stale queued handles should be force-cleared promptly");
 
         assert_eq!(recovered, 1);
-        assert!(!runtime.engine_handles.lock().await.contains_key(&hash));
+        assert!(!runtime.engine_handles.read().await.contains_key(&hash));
         assert!(!runtime.engine_cmds.lock().await.contains_key(&hash));
-        assert!(!runtime.engine_states.lock().await.contains_key(&hash));
+        assert!(!runtime.engine_states.read().await.contains_key(&hash));
         {
             let reg = runtime.registry.lock().await;
             let torrent = reg.get(&hash).unwrap();
@@ -5657,7 +5630,7 @@ mod tests {
             queue.add(second_hash);
         }
         {
-            let mut handles = runtime.engine_handles.lock().await;
+            let mut handles = runtime.engine_handles.write().await;
             handles.insert(
                 first_hash,
                 tokio::spawn(async {
@@ -5678,12 +5651,12 @@ mod tests {
 
         assert!(runtime
             .engine_handles
-            .lock()
+            .read()
             .await
             .contains_key(&first_hash));
         assert!(!runtime
             .engine_handles
-            .lock()
+            .read()
             .await
             .contains_key(&second_hash));
         {
@@ -5749,7 +5722,7 @@ mod tests {
         }
 
         {
-            let mut handles = runtime.engine_handles.lock().await;
+            let mut handles = runtime.engine_handles.write().await;
             for hash in hashes.iter().take(18) {
                 handles.insert(
                     *hash,
@@ -5781,7 +5754,7 @@ mod tests {
                 .count(),
             18
         );
-        let running = runtime.engine_handles.lock().await;
+        let running = runtime.engine_handles.read().await;
         let blocked_startable = desired
             .iter()
             .filter(|hash| !hashes[..18].contains(hash) && running.contains_key(hash))
@@ -5813,20 +5786,20 @@ mod tests {
         runtime.engine_cmds.lock().await.insert(hash, tx);
         runtime
             .engine_handles
-            .lock()
+            .write()
             .await
             .insert(hash, tokio::spawn(async {}));
         runtime
             .engine_states
-            .lock()
+            .write()
             .await
             .insert(hash, Arc::new(Mutex::new(EngineState::default())));
         runtime
             .engine_limiters
-            .lock()
+            .write()
             .await
             .insert(hash, swarmotter_core::bandwidth::RateLimiter::new(0, 0));
-        runtime.rate_samples.lock().await.insert(
+        runtime.rate_samples.write().await.insert(
             hash,
             RateSample {
                 downloaded: 1,
@@ -5845,14 +5818,14 @@ mod tests {
         runtime.engine_task_finished(hash).await;
 
         assert!(!runtime.engine_cmds.lock().await.contains_key(&hash));
-        assert!(!runtime.engine_handles.lock().await.contains_key(&hash));
-        assert!(!runtime.engine_limiters.lock().await.contains_key(&hash));
+        assert!(!runtime.engine_handles.read().await.contains_key(&hash));
+        assert!(!runtime.engine_limiters.read().await.contains_key(&hash));
         assert!(
-            runtime.engine_states.lock().await.contains_key(&hash),
+            runtime.engine_states.read().await.contains_key(&hash),
             "diagnostic state should survive normal engine task exit"
         );
         assert!(
-            runtime.rate_samples.lock().await.contains_key(&hash),
+            runtime.rate_samples.read().await.contains_key(&hash),
             "rate samples should survive normal engine task exit"
         );
     }
@@ -5884,7 +5857,7 @@ mod tests {
         }
         runtime.registry.lock().await.add(torrent).unwrap();
         runtime.queue.lock().await.add(hash);
-        runtime.engine_states.lock().await.insert(
+        runtime.engine_states.write().await.insert(
             hash,
             Arc::new(Mutex::new(EngineState {
                 piece_count: meta.piece_count(),
@@ -5894,7 +5867,7 @@ mod tests {
                 ..Default::default()
             })),
         );
-        runtime.rate_samples.lock().await.insert(
+        runtime.rate_samples.write().await.insert(
             hash,
             RateSample {
                 downloaded: 1,
@@ -5917,8 +5890,8 @@ mod tests {
             "selfish mode should remove completed torrents already in the registry"
         );
         assert_eq!(runtime.queue.lock().await.position(&hash), None);
-        assert!(!runtime.engine_states.lock().await.contains_key(&hash));
-        assert!(!runtime.rate_samples.lock().await.contains_key(&hash));
+        assert!(!runtime.engine_states.read().await.contains_key(&hash));
+        assert!(!runtime.rate_samples.read().await.contains_key(&hash));
     }
 
     #[tokio::test]
@@ -5973,7 +5946,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        runtime.engine_states.lock().await.insert(
+        runtime.engine_states.write().await.insert(
             hash,
             Arc::new(Mutex::new(EngineState {
                 piece_count: meta.piece_count(),
@@ -6068,7 +6041,7 @@ mod tests {
         let mut torrent = Torrent::new(meta.clone(), 1);
         torrent.state = TorrentState::Downloading;
         runtime.registry.lock().await.add(torrent).unwrap();
-        runtime.engine_states.lock().await.insert(
+        runtime.engine_states.write().await.insert(
             hash,
             Arc::new(Mutex::new(EngineState {
                 piece_count: meta.piece_count(),
@@ -6081,7 +6054,7 @@ mod tests {
                 ..Default::default()
             })),
         );
-        runtime.rate_samples.lock().await.insert(
+        runtime.rate_samples.write().await.insert(
             hash,
             RateSample {
                 downloaded: 0,
@@ -6143,7 +6116,7 @@ mod tests {
         let blocked_state = Arc::new(Mutex::new(EngineState::default()));
         runtime
             .engine_states
-            .lock()
+            .write()
             .await
             .insert(second_hash, blocked_state.clone());
         let _unrelated_guard = blocked_state.lock().await;
@@ -6188,8 +6161,12 @@ mod tests {
             },
             AutopilotMode::Observe,
         );
-        runtime.autopilot_decisions.lock().await.insert(hash, stale);
-        runtime.engine_states.lock().await.insert(
+        runtime
+            .autopilot_decisions
+            .write()
+            .await
+            .insert(hash, stale);
+        runtime.engine_states.write().await.insert(
             hash,
             Arc::new(Mutex::new(EngineState {
                 piece_count: meta.piece_count(),
@@ -6221,7 +6198,7 @@ mod tests {
         assert_eq!(decision.snapshot.active_peer_workers, 2);
         let cached = runtime
             .autopilot_decisions
-            .lock()
+            .read()
             .await
             .get(&hash)
             .cloned()
@@ -6293,7 +6270,7 @@ mod tests {
             .await
             .add(Torrent::new(meta.clone(), 1))
             .unwrap();
-        runtime.engine_states.lock().await.insert(
+        runtime.engine_states.write().await.insert(
             hash,
             Arc::new(Mutex::new(EngineState {
                 piece_count: meta.piece_count(),
@@ -6306,7 +6283,7 @@ mod tests {
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         runtime.engine_cmds.lock().await.insert(hash, tx);
-        runtime.engine_handles.lock().await.insert(
+        runtime.engine_handles.write().await.insert(
             hash,
             tokio::spawn(async {
                 std::future::pending::<()>().await;
@@ -6318,7 +6295,7 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), EngineCommand::Reannounce));
         let decision = runtime
             .autopilot_decisions
-            .lock()
+            .read()
             .await
             .get(&hash)
             .cloned()
@@ -6375,7 +6352,7 @@ mod tests {
             queue.add(queued_hash);
         }
         let stalled_since = Instant::now() - Duration::from_secs(45);
-        runtime.engine_states.lock().await.insert(
+        runtime.engine_states.write().await.insert(
             stalled_hash,
             Arc::new(Mutex::new(EngineState {
                 piece_count: stalled_meta.piece_count(),
@@ -6390,7 +6367,7 @@ mod tests {
                 ..Default::default()
             })),
         );
-        runtime.rate_samples.lock().await.insert(
+        runtime.rate_samples.write().await.insert(
             stalled_hash,
             RateSample {
                 downloaded: 0,
@@ -6407,7 +6384,7 @@ mod tests {
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         runtime.engine_cmds.lock().await.insert(stalled_hash, tx);
-        runtime.engine_handles.lock().await.insert(
+        runtime.engine_handles.write().await.insert(
             stalled_hash,
             tokio::spawn(async {
                 std::future::pending::<()>().await;
@@ -6424,7 +6401,7 @@ mod tests {
 
         let decision = runtime
             .autopilot_decisions
-            .lock()
+            .read()
             .await
             .get(&stalled_hash)
             .cloned()
@@ -6451,7 +6428,7 @@ mod tests {
         assert_eq!(runtime.queue.lock().await.position(&stalled_hash), Some(2));
         assert!(runtime
             .engine_retry_after
-            .lock()
+            .read()
             .await
             .get(&stalled_hash)
             .is_some_and(|retry_at| *retry_at > Instant::now()));
@@ -6513,7 +6490,7 @@ mod tests {
         );
         runtime
             .engine_states
-            .lock()
+            .write()
             .await
             .insert(hash, Arc::new(Mutex::new(state)));
 
@@ -6612,7 +6589,7 @@ mod tests {
         runtime.queue.lock().await.add(hash);
         runtime
             .engine_retry_after
-            .lock()
+            .write()
             .await
             .insert(hash, Instant::now() + Duration::from_secs(60));
 
@@ -6628,7 +6605,7 @@ mod tests {
             .contains(&incomplete_dir.display().to_string()));
         assert!(runtime.registry.lock().await.torrents.is_empty());
         assert!(runtime.queue.lock().await.order.is_empty());
-        assert!(runtime.engine_retry_after.lock().await.is_empty());
+        assert!(runtime.engine_retry_after.read().await.is_empty());
         assert!(download_dir.is_dir());
         assert!(incomplete_dir.is_dir());
         assert!(tokio::fs::read_dir(&download_dir)
@@ -6755,7 +6732,7 @@ mod tests {
             queue.clear_bypass(&second_hash);
             queue.move_to_top(&first_hash);
         }
-        runtime.config.lock().await.queue.auto_start = true;
+        runtime.config.write().await.queue.auto_start = true;
         assert_eq!(runtime.desired_download_hashes().await, vec![first_hash]);
     }
 
@@ -6785,7 +6762,7 @@ mod tests {
 
         assert!(runtime.registry.lock().await.contains(&magnet_hash));
         assert_eq!(runtime.queue.lock().await.position(&magnet_hash), Some(1));
-        assert!(runtime.engine_handles.lock().await.is_empty());
+        assert!(runtime.engine_handles.read().await.is_empty());
         {
             let state = runtime.queue_reconcile.lock().await;
             assert!(state.scheduled);
@@ -6808,7 +6785,7 @@ mod tests {
 
         assert!(runtime.registry.lock().await.contains(&file_hash));
         assert_eq!(runtime.queue.lock().await.position(&file_hash), Some(2));
-        assert!(runtime.engine_handles.lock().await.is_empty());
+        assert!(runtime.engine_handles.read().await.is_empty());
         {
             let state = runtime.queue_reconcile.lock().await;
             assert!(state.scheduled);
@@ -6845,7 +6822,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(runtime.config.lock().await.queue.max_active_downloads, 50);
+        assert_eq!(runtime.config.read().await.queue.max_active_downloads, 50);
         assert_eq!(runtime.queue.lock().await.limits.max_active_downloads, 50);
         let state = runtime.queue_reconcile.lock().await;
         assert!(state.scheduled);
@@ -6910,7 +6887,7 @@ mod tests {
         assert_eq!(runtime.registry.lock().await.torrents.len(), 3);
         assert_eq!(runtime.queue.lock().await.order.len(), 3);
         assert_eq!(runtime.queue.lock().await.position(&first_hash), Some(1));
-        assert!(runtime.engine_handles.lock().await.is_empty());
+        assert!(runtime.engine_handles.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -6939,7 +6916,7 @@ mod tests {
 
         assert_eq!(runtime.registry.lock().await.torrents.len(), ADD_COUNT);
         assert_eq!(runtime.queue.lock().await.order.len(), ADD_COUNT);
-        assert!(runtime.engine_handles.lock().await.is_empty());
+        assert!(runtime.engine_handles.read().await.is_empty());
         {
             let state = runtime.queue_reconcile.lock().await;
             assert!(state.scheduled);
@@ -6972,7 +6949,7 @@ mod tests {
         assert_eq!(removed.len(), REMOVE_COUNT);
         assert!(runtime.registry.lock().await.torrents.is_empty());
         assert!(runtime.queue.lock().await.order.is_empty());
-        assert!(runtime.engine_handles.lock().await.is_empty());
+        assert!(runtime.engine_handles.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -7007,7 +6984,7 @@ mod tests {
             }
         }
         runtime.queue.lock().await.add_many(hashes.iter().copied());
-        runtime.rate_samples.lock().await.insert(
+        runtime.rate_samples.write().await.insert(
             hashes[0],
             RateSample {
                 downloaded: 1,
@@ -7024,7 +7001,7 @@ mod tests {
         );
         runtime
             .engine_retry_after
-            .lock()
+            .write()
             .await
             .insert(hashes[1], Instant::now() + ENGINE_INCOMPLETE_RETRY_DELAY);
 
@@ -7040,9 +7017,9 @@ mod tests {
         assert!(runtime.registry.lock().await.torrents.is_empty());
         assert!(runtime.queue.lock().await.order.is_empty());
         assert!(runtime.queue.lock().await.bypass.is_empty());
-        assert!(runtime.rate_samples.lock().await.is_empty());
-        assert!(runtime.engine_retry_after.lock().await.is_empty());
-        assert!(runtime.engine_handles.lock().await.is_empty());
+        assert!(runtime.rate_samples.read().await.is_empty());
+        assert!(runtime.engine_retry_after.read().await.is_empty());
+        assert!(runtime.engine_handles.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -7071,7 +7048,7 @@ mod tests {
         assert_eq!(summary.state, TorrentState::Paused);
         assert_eq!(summary.queue_position, Some(1));
         assert!(runtime.desired_download_hashes().await.is_empty());
-        assert!(runtime.engine_handles.lock().await.is_empty());
+        assert!(runtime.engine_handles.read().await.is_empty());
         assert!(!runtime.queue_reconcile.lock().await.scheduled);
     }
 

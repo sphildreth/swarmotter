@@ -71,6 +71,62 @@ sudo systemctl enable --now swarmotterd
 Make sure the service user can read the config and write the storage
 directories.
 
+## File descriptor requirements
+
+SwarmOtter opens many file descriptors during operation. Each active torrent
+requires:
+
+- **Peer connections:** up to 50 TCP sockets per torrent (configurable via
+  `max_peers_per_torrent`)
+- **Tracker connections:** 1-3 TCP sockets per announce cycle (no connection
+  pooling)
+- **File handles:** 1 per file in the torrent (cached, not evicted)
+- **uTP UDP sockets:** 1 per uTP connection (if enabled)
+- **Seeder listener:** 1 TCP listener per torrent
+
+For 1,000 concurrent torrents with 50 peers each, expect **50,000+ concurrent
+file descriptors**. The default `ulimit -n` on most Linux systems is 1,024,
+which is insufficient.
+
+### Configuring file descriptor limits
+
+**For systemd services**, add to the service unit:
+
+```ini
+[Service]
+LimitNOFILE=65536
+```
+
+**For shell sessions**, add to `/etc/security/limits.conf`:
+
+```text
+swarmotter soft nofile 65536
+swarmotter hard nofile 65536
+```
+
+**For Docker containers**, use the `--ulimit` flag:
+
+```bash
+docker run --ulimit nofile=65536:65536 ...
+```
+
+Or in `compose.yml`:
+
+```yaml
+services:
+  swarmotter:
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+```
+
+Verify the limit is applied:
+
+```bash
+cat /proc/$(pgrep swarmotterd)/limits | grep "Max open files"
+```
+
 ## Homelab Docker Compose with Gluetun
 
 The production container image is published to:

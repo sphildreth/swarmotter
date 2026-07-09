@@ -2135,3 +2135,713 @@ async fn torrent_autopilot_routes_support_get_and_mode_override() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v["data"]["autopilot_mode_override"].is_null());
 }
+
+async fn post_empty(
+    app: &Router,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    (status, value)
+}
+
+async fn delete_uri(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    (status, value)
+}
+
+#[tokio::test]
+async fn queue_move_endpoints_cover_all_actions() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let hash = add_named_test_magnet(&app, 100, "queue-1", true, "/tmp/dl").await;
+
+    for action in ["move-up", "move-down", "move-top", "move-bottom"] {
+        let (status, v) = post_empty(
+            &app,
+            &format!("/api/v1/torrents/{hash}/queue/{action}"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "queue/{action} status");
+        assert_eq!(v["success"], true, "queue/{action} success");
+    }
+
+    let bad = "not-a-hex-hash";
+    for action in ["move-up", "move-down", "move-top", "move-bottom"] {
+        let (status, _v) = post_empty(
+            &app,
+            &format!("/api/v1/torrents/{bad}/queue/{action}"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(
+            status.is_client_error() || status.is_server_error(),
+            "queue/{action} with bad hash should error, got {status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_peers_returns_empty_for_added_torrent() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let hash = add_named_test_magnet(&app, 200, "peers-1", true, "/tmp/dl").await;
+
+    let (status, v) = get_json(&app, &format!("/api/v1/torrents/{hash}/peers")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["success"], true);
+    assert!(v["data"].is_array());
+    assert_eq!(v["data"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn list_peers_rejects_bad_hash() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let (status, _v) = get_json(&app, "/api/v1/torrents/not-a-hex/peers").await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "bad hash must error, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn watch_scan_and_history_endpoints() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let (status, v) = post_empty(&app, "/api/v1/watch/scan", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["success"], true);
+
+    let (status, v) = get_json(&app, "/api/v1/watch/history").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["success"], true);
+    assert!(v["data"].is_array());
+}
+
+#[tokio::test]
+async fn trackers_crud_and_bad_hash() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let hash = add_named_test_magnet(&app, 300, "trackers-1", true, "/tmp/dl").await;
+
+    let (status, v) = get_json(&app, &format!("/api/v1/torrents/{hash}/trackers")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(v["success"], true);
+    assert!(v["data"].is_array());
+
+    let (status, v) = post_empty(
+        &app,
+        &format!("/api/v1/torrents/{hash}/trackers"),
+        serde_json::json!({ "url": "udp://tracker.example.com:80/announce" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add_tracker status");
+    assert_eq!(v["success"], true);
+
+    // The :url path segment can't contain '/', so use a tracker id without slashes.
+    let tracker_id = "udp%3A%2F%2Ftracker.example.com%3A80%2Fannounce";
+    let (status, v) = delete_uri(
+        &app,
+        &format!("/api/v1/torrents/{hash}/trackers/{tracker_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "remove_tracker status");
+    assert_eq!(v["success"], true);
+
+    let (status, v) = post_empty(
+        &app,
+        &format!("/api/v1/torrents/{hash}/trackers/edit"),
+        serde_json::json!({
+            "old_url": "udp://tracker.example.com:80/announce",
+            "new_url": "udp://tracker.example.com:81/announce",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "edit_tracker status");
+    assert_eq!(v["success"], true);
+
+    let bad = "not-hex";
+    let (status, _v) = get_json(&app, &format!("/api/v1/torrents/{bad}/trackers")).await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "list_trackers bad hash must error, got {status}"
+    );
+
+    let (status, _v) = post_empty(
+        &app,
+        &format!("/api/v1/torrents/{bad}/trackers"),
+        serde_json::json!({ "url": "udp://x" }),
+    )
+    .await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "add_tracker bad hash must error, got {status}"
+    );
+
+    let (status, _v) = delete_uri(
+        &app,
+        &format!("/api/v1/torrents/{bad}/trackers/udp%3A%2F%2Fx"),
+    )
+    .await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "remove_tracker bad hash must error, got {status}"
+    );
+
+    let (status, _v) = post_empty(
+        &app,
+        &format!("/api/v1/torrents/{bad}/trackers/edit"),
+        serde_json::json!({ "old_url": "a", "new_url": "b" }),
+    )
+    .await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "edit_tracker bad hash must error, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn trackers_crud_against_missing_torrent_returns_404() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    // 40 hex chars, parses cleanly, but no torrent with this hash exists.
+    let ghost = "0000000000000000000000000000000000000000";
+
+    let (status, v) = get_json(&app, &format!("/api/v1/torrents/{ghost}/trackers")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "list_trackers ghost");
+    assert_eq!(v["success"], false);
+
+    let (status, _v) = post_empty(
+        &app,
+        &format!("/api/v1/torrents/{ghost}/trackers"),
+        serde_json::json!({ "url": "udp://tracker.example.com:80/announce" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "add_tracker ghost");
+
+    let (status, _v) = delete_uri(
+        &app,
+        &format!("/api/v1/torrents/{ghost}/trackers/udp%3A%2F%2Fx"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "remove_tracker ghost");
+
+    let (status, _v) = post_empty(
+        &app,
+        &format!("/api/v1/torrents/{ghost}/trackers/edit"),
+        serde_json::json!({ "old_url": "a", "new_url": "b" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "edit_tracker ghost");
+}
+
+#[tokio::test]
+async fn files_list_wanted_priority_rename_and_bad_hash() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let hash = add_named_test_magnet(&app, 400, "files-1", true, "/tmp/dl").await;
+
+    let (status, v) = get_json(&app, &format!("/api/v1/torrents/{hash}/files")).await;
+    assert_eq!(status, StatusCode::OK, "list_files status");
+    assert_eq!(v["success"], true);
+    assert!(v["data"].is_array());
+
+    let (status, v) = post_empty(
+        &app,
+        &format!("/api/v1/torrents/{hash}/files/wanted"),
+        serde_json::json!({ "file_indices": [0], "wanted": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "set_wanted status");
+    assert_eq!(v["success"], true);
+
+    let (status, v) = post_empty(
+        &app,
+        &format!("/api/v1/torrents/{hash}/files/priority"),
+        serde_json::json!({ "file_indices": [0], "priority": "high" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "set_priority status");
+    assert_eq!(v["success"], true);
+
+    let (status, v) = post_empty(
+        &app,
+        &format!("/api/v1/torrents/{hash}/files/0/rename"),
+        serde_json::json!({ "new_path": "renamed.bin" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rename_path status");
+    assert_eq!(v["success"], true);
+
+    // patch_files delegates to set_wanted
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/torrents/{hash}/files"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "file_indices": [0], "wanted": false }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "patch_files status");
+
+    let bad = "not-hex";
+    let (status, _v) = get_json(&app, &format!("/api/v1/torrents/{bad}/files")).await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "list_files bad hash must error, got {status}"
+    );
+
+    let (status, _v) = post_empty(
+        &app,
+        &format!("/api/v1/torrents/{bad}/files/wanted"),
+        serde_json::json!({ "file_indices": [0], "wanted": true }),
+    )
+    .await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "set_wanted bad hash must error, got {status}"
+    );
+
+    let (status, _v) = post_empty(
+        &app,
+        &format!("/api/v1/torrents/{bad}/files/priority"),
+        serde_json::json!({ "file_indices": [0], "priority": "low" }),
+    )
+    .await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "set_priority bad hash must error, got {status}"
+    );
+
+    let (status, _v) = post_empty(
+        &app,
+        &format!("/api/v1/torrents/{bad}/files/0/rename"),
+        serde_json::json!({ "new_path": "x" }),
+    )
+    .await;
+    assert!(
+        status.is_client_error() || status.is_server_error(),
+        "rename_path bad hash must error, got {status}"
+    );
+}
+
+#[tokio::test]
+async fn list_peers_against_missing_torrent_returns_404() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let ghost = "0000000000000000000000000000000000000000";
+    let (status, v) = get_json(&app, &format!("/api/v1/torrents/{ghost}/peers")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(v["success"], false);
+}
+
+async fn transmission_state_with_torrent() -> (Router, String, i64) {
+    let mut cfg = Config::default();
+    cfg.compatibility.transmission.enabled = true;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+    let session = transmission_session(app.clone(), None).await;
+    let add = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "torrent_add",
+        "params": { "filename": known_magnet(), "paused": true },
+        "id": 1
+    });
+    let (_status, body) = transmission_rpc(app.clone(), &session, add, None).await;
+    let torrent_id = body["result"]["torrent_added"]["id"].as_i64().unwrap();
+    (app, session, torrent_id)
+}
+
+#[tokio::test]
+async fn transmission_rpc_covers_remaining_dispatch_methods() {
+    let (app, session, torrent_id) = transmission_state_with_torrent().await;
+
+    // torrent_start_now
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "torrent_start_now",
+            "params": { "ids": [torrent_id] },
+            "id": 10
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_object());
+
+    // torrent_stop
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "torrent_stop",
+            "params": { "ids": [torrent_id] },
+            "id": 11
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_object());
+
+    // torrent_verify
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "torrent_verify",
+            "params": { "ids": [torrent_id] },
+            "id": 12
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_object());
+
+    // torrent_reannounce
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "torrent_reannounce",
+            "params": { "ids": [torrent_id] },
+            "id": 13
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_object());
+
+    // torrent_set with labels + limits
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "torrent_set",
+            "params": {
+                "ids": [torrent_id],
+                "labels": ["alpha", "beta"],
+                "downloadLimit": 4096,
+                "downloadLimited": true,
+                "uploadLimit": 2048,
+                "uploadLimited": true
+            },
+            "id": 14
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_object());
+
+    // torrent_set_location
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "torrent_set_location",
+            "params": { "ids": [torrent_id], "location": "/tmp/new-loc" },
+            "id": 15
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_object());
+
+    // torrent_set_location missing location -> error
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "torrent_set_location",
+            "params": { "ids": [torrent_id] },
+            "id": 16
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["error"].is_object());
+    assert_eq!(body["error"]["code"], -32602);
+
+    // torrent_rename_path
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "torrent_rename_path",
+            "params": { "ids": [torrent_id], "path": "test", "name": "renamed.txt" },
+            "id": 17
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_object());
+
+    // torrent_rename_path missing path -> error
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "torrent_rename_path",
+            "params": { "ids": [torrent_id], "name": "x" },
+            "id": 18
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["error"].is_object());
+    assert_eq!(body["error"]["code"], -32602);
+
+    // queue_move_*
+    for (name, id) in [
+        ("queue_move_top", 20),
+        ("queue_move_up", 21),
+        ("queue_move_down", 22),
+        ("queue_move_bottom", 23),
+    ] {
+        let (status, body) = transmission_rpc(
+            app.clone(),
+            &session,
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": name,
+                "params": { "ids": [torrent_id] },
+                "id": id
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name} status");
+        assert!(body["result"].is_object(), "{name} result");
+    }
+
+    // free_space
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "free_space",
+            "params": { "path": "/tmp" },
+            "id": 30
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["path"], "/tmp");
+    assert!(body["result"]["size_bytes"].is_number());
+
+    // free_space default path
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "free_space",
+            "params": {},
+            "id": 31
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"]["path"].is_string());
+
+    // port_test
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "port_test",
+            "params": { "ip_protocol": "tcp" },
+            "id": 32
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["port_is_open"], false);
+    assert_eq!(body["result"]["ip_protocol"], "tcp");
+
+    // port_test default protocol
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "port_test",
+            "params": {},
+            "id": 33
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"]["ip_protocol"].is_string());
+
+    // session_set: change download_dir via patch
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session_set",
+            "params": { "download_dir": "/tmp/swarmotter-test-dl" },
+            "id": 40
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_object());
+
+    // session_stats
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session_stats",
+            "id": 41
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_object());
+
+    // session_close
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session_close",
+            "id": 42
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"].is_object());
+
+    // blocklist_update
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "blocklist_update",
+            "id": 43
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["blocklist_size"], 0);
+
+    // Unknown method -> method_not_found (-32601)
+    let (status, body) = transmission_rpc(
+        app,
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "nonexistent_method",
+            "id": 99
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["error"]["code"], -32601);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("nonexistent_method"));
+
+    // Sanity: the torrent_id was used across all calls.
+    assert!(torrent_id > 0);
+}
+
+#[tokio::test]
+async fn transmission_rpc_returns_error_on_invalid_json_body() {
+    let mut cfg = Config::default();
+    cfg.compatibility.transmission.enabled = true;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+    let session = transmission_session(app.clone(), None).await;
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/transmission/rpc")
+                .header("content-type", "application/json")
+                .header("x-transmission-session-id", &session)
+                .body(Body::from("not a json body"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}

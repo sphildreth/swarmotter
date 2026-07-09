@@ -7,7 +7,7 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
-## [1.2.0] - [2026-07-09] [UNREALEASED]
+## [1.2.0] - [2026-07-09]
 
 ### Added
 
@@ -31,9 +31,42 @@ date or duration estimates.
   events through the existing SSE/WebSocket broker. Event streams include
   keep-alives or pings and surface subscriber lag instead of silently dropping
   missed updates.
+- **PR precheck helper:** `scripts/do-pr-prechecks.py` now runs the pull-request
+  quality gate with Rich progress feedback, including stable Rust component
+  setup, formatting, workspace check, Clippy, and tests.
 
 ### Fixed
 
+- **Bandwidth limiter contention:** global and per-torrent rate limiters now use
+  lock-free atomic token buckets instead of `tokio::sync::Mutex`, eliminating
+  serialization across all active torrents during block transfers. Concurrent
+  acquire operations use CAS loops for refill-and-consume without mutex
+  contention, and refill ownership is coordinated atomically so concurrent
+  consumers cannot double-count the same refill window. As a result, 1,000
+  concurrent torrents sharing a global limiter no longer serialize on the same
+  two locks.
+- **Daemon state lock contention:** read-heavy daemon state maps (`config`,
+  `network_health`, `engine_states`, `engine_handles`, `engine_limiters`,
+  `rate_samples`, `engine_retry_after`, `autopilot_decisions`,
+  `autopilot_last_action`) now use `tokio::sync::RwLock` instead of
+  `tokio::sync::Mutex`, allowing concurrent readers during progress
+  reconciliation, API reads, and autopilot analysis without blocking on
+  write-only operations.
+- **Piece assembler completion check:** `PieceAssembler::add_block` now tracks
+  a received-block counter for O(1) completion detection instead of scanning
+  the entire received-block vector on every block arrival.
+- **Queue position lookups:** `QueueState` now maintains a `HashMap<InfoHash,
+  usize>` position index for O(1) `position()`, `move_up()`, and `move_down()`
+  operations instead of linear scans of the order vector. Move-to-top,
+  move-to-bottom, remove, serde restore, and runtime clear operations rebuild
+  the index after mutation so persisted queues and reset flows keep accurate
+  positions.
+- **Torrent lifecycle lock scope:** engine and seeder shutdown paths now remove
+  join handles from shared maps before awaiting task completion, preventing
+  slow task teardown from blocking unrelated lifecycle readers and writers.
+- **Event broadcast buffer:** the SSE/WebSocket event broker default capacity
+  increased from 256 to 4,096 messages, preventing subscriber lag notifications
+  during reconciliation bursts with large torrent libraries.
 - **Storage I/O scaling:** payload block reads and writes now reuse cached
   per-file handles instead of reopening files for every block. Block writes no
   longer flush on every write; storage flushes pending cached writes before
