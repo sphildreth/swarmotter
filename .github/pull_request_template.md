@@ -6,7 +6,7 @@
 
 Before requesting review, confirm the following:
 
-- [ ] `cargo fmt`, `cargo check`, and `cargo test` pass.
+- [ ] `scripts/do-pr-prechecks.py` passes.
 - [ ] An ADR was created or updated if this change introduces, removes, or
   materially alters an architectural decision. **Was an ADR required?**
 - [ ] `design/` documentation was updated where the corresponding surface

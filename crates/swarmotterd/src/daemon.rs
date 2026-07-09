@@ -4361,7 +4361,7 @@ fn build_health_input(
     // considered useful and unchoked, and peers that have only been seen but
     // not heard from are treated as having no missing pieces.
     let mut peers: Vec<EnginePeerHealth> = Vec::new();
-    for (_addr, p) in peer_health.iter() {
+    for p in peer_health.values() {
         let last_valid = p.last_valid_block;
         let last_seen = p.last_seen;
         let last_seen_recent = last_seen

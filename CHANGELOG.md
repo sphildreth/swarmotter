@@ -31,6 +31,9 @@ date or duration estimates.
   events through the existing SSE/WebSocket broker. Event streams include
   keep-alives or pings and surface subscriber lag instead of silently dropping
   missed updates.
+- **PR precheck helper:** `scripts/do-pr-prechecks.py` now runs the pull-request
+  quality gate with Rich progress feedback, including stable Rust component
+  setup, formatting, workspace check, Clippy, and tests.
 
 ### Fixed
 
