@@ -5,7 +5,8 @@
 // exercise the BitTorrent protocol locally without contacting any public
 // tracker or webseed. All content is generated and non-copyrighted.
 //
-// Usage: cargo run --release --example gen_test_torrents -- [count] [out_dir]
+// Usage: cargo run --release --example gen_test_torrents -- \
+//   [count] [piece_length] [pieces_per_file] [out_dir] [tracker_url] [private]
 
 use std::env;
 use std::fs;
@@ -22,11 +23,10 @@ fn main() {
         .unwrap_or(16 * 1024);
     let pieces_per_file: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
 
-    let out_dir = PathBuf::from(
-        args.get(4)
-            .cloned()
-            .unwrap_or_else(|| "/home/steven/.cache/swarmotter/test_torrents".to_string()),
-    );
+    let out_dir = args
+        .get(4)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| env::temp_dir().join("swarmotter-test-torrents"));
     fs::create_dir_all(&out_dir).unwrap();
 
     let tracker_url = args

@@ -1657,63 +1657,87 @@ impl DaemonRuntime {
         if let Some(complete_storage) = complete_storage {
             seeder = seeder.with_complete_storage(complete_storage);
         }
-        self.seeder_shutdowns.lock().await.insert(hash, shutdown_tx);
+        self.seeder_shutdowns
+            .lock()
+            .await
+            .insert(hash, shutdown_tx.clone());
+        let announce_handle = self
+            .spawn_seeder_announce(
+                hash,
+                meta.clone(),
+                peer_id,
+                listen_port,
+                shutdown_tx.subscribe(),
+            )
+            .await;
         let hash_for_task = hash;
-        let registry = self.registry.clone();
+        let shutdown_tx_for_task = shutdown_tx.clone();
+        let runtime_for_task = self.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
+            let _ = started_rx.await;
             if let Err(e) = seeder.run().await {
                 tracing::debug!(info_hash = %hash_for_task, error = %e, "seeder task ended");
             }
-            // If the seeder exits (e.g. network blocked), clear its handle.
-            let _ = registry;
+            // Stop the tracker announce sidecar on every seeder exit path,
+            // including containment changes and listener errors.
+            let _ = shutdown_tx_for_task.send(true);
+            if let Some(handle) = announce_handle {
+                let _ = handle.await;
+            }
+            runtime_for_task.seeder_task_finished(hash_for_task).await;
         });
         self.seeder_handles.lock().await.insert(hash, handle);
-
-        // Spawn a parallel seeder announce loop so the seeder advertises its
-        // own peer port to trackers. Without this, a fresh daemon that only
-        // has completed torrents never appears in tracker peer lists, and
-        // leechers in the same swarm see no peers. The loop announces on
-        // start, then every `tracker.interval` (5 minutes default) and on
-        // shutdown.
-        self.start_seeder_announce(hash, meta.clone(), peer_id, listen_port)
-            .await;
+        let _ = started_tx.send(());
     }
 
-    /// Spawn a sidecar task that periodically announces the seeder to the
-    /// torrent's trackers, so the seeder is visible in the swarm.
-    async fn start_seeder_announce(
+    async fn seeder_task_finished(&self, hash: InfoHash) {
+        self.seeder_shutdowns.lock().await.remove(&hash);
+        self.seeder_handles.lock().await.remove(&hash);
+    }
+
+    /// Spawn an owned sidecar task that periodically announces the seeder to
+    /// the torrent's trackers, so the seeder is visible in the swarm. The
+    /// returned handle is awaited by the seeder task after signaling shutdown,
+    /// so the sidecar cannot outlive the seeder lifecycle.
+    async fn spawn_seeder_announce(
         &self,
         hash: InfoHash,
         meta: swarmotter_core::meta::TorrentMeta,
         peer_id: [u8; 20],
         listen_port: u16,
-    ) {
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> Option<JoinHandle<()>> {
         let trackers: Vec<String> =
             tracker::announce_tiers(meta.announce.as_deref(), &meta.announce_list)
                 .into_iter()
                 .flatten()
                 .collect();
         if trackers.is_empty() {
-            return;
+            return None;
         }
-        let seeder_shutdowns = self.seeder_shutdowns.clone();
         let binder = self.make_binder().await;
-        let handle = tokio::spawn(async move {
-            let mut shutdown_rx = match seeder_shutdowns.lock().await.get(&hash).cloned() {
-                Some(tx) => tx.subscribe(),
-                None => return,
-            };
+        Some(tokio::spawn(async move {
+            if *shutdown_rx.borrow() {
+                return;
+            }
             // Initial announce: started event so trackers see the seeder
             // immediately rather than waiting for the first interval tick.
-            Self::seeder_announce_once(
-                &trackers,
-                hash,
-                peer_id,
-                listen_port,
-                binder.as_ref(),
-                AnnounceEvent::Started,
-            )
-            .await;
+            tokio::select! {
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        return;
+                    }
+                }
+                _ = Self::seeder_announce_once(
+                    &trackers,
+                    hash,
+                    peer_id,
+                    listen_port,
+                    binder.as_ref(),
+                    AnnounceEvent::Started,
+                ) => {}
+            }
             let mut interval = tokio::time::interval(Duration::from_secs(300));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // Skip the immediate first tick because we already announced above.
@@ -1722,8 +1746,8 @@ impl DaemonRuntime {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
-                            // Best-effort stopped announce; do not block
-                            // shutdown on tracker reachability.
+                            // Best-effort stopped announce, bounded by the
+                            // per-tracker announce timeout.
                             Self::seeder_announce_once(
                                 &trackers,
                                 hash,
@@ -1749,11 +1773,7 @@ impl DaemonRuntime {
                     }
                 }
             }
-        });
-        // Detach the announce task: it runs until the shutdown watch fires
-        // (the task honors shutdown_rx.changed). Dropping the JoinHandle
-        // detaches the task in tokio without aborting it.
-        drop(handle);
+        }))
     }
 
     async fn stop_seeder(&self, hash: &InfoHash) {

@@ -871,6 +871,7 @@ impl TorrentEngine {
                 if let Some(piece_index) = self.pick_piece(peer_bf.as_ref(), have) {
                     let plen = self.piece_length(piece_index) as u32;
                     let reqs = block_requests(plen);
+                    let expected_blocks: HashMap<u32, u32> = reqs.iter().copied().collect();
                     // Send all block requests for this piece.
                     for (off, len) in &reqs {
                         peer::write_message(
@@ -907,12 +908,29 @@ impl TorrentEngine {
                                 offset,
                                 block,
                             } => {
-                                if piece as usize == piece_index
-                                    && assembler.add_block(offset, &block).unwrap_or(false)
-                                {
-                                    received_blocks += 1;
-                                    record_peer_block(&self.state, *peer_addr, block.len() as u64)
+                                if piece as usize == piece_index {
+                                    let Some(expected_len) = expected_blocks.get(&offset).copied()
+                                    else {
+                                        continue;
+                                    };
+                                    if block.len() != expected_len as usize {
+                                        continue;
+                                    }
+                                    let block_index = offset as usize / peer::BLOCK_SIZE as usize;
+                                    let was_missing = assembler
+                                        .received
+                                        .get(block_index)
+                                        .map(|received| !*received)
+                                        .unwrap_or(false);
+                                    if assembler.add_block(offset, &block).is_ok() && was_missing {
+                                        received_blocks += 1;
+                                        record_peer_block(
+                                            &self.state,
+                                            *peer_addr,
+                                            block.len() as u64,
+                                        )
                                         .await;
+                                    }
                                 }
                             }
                             Message::Choke => {
@@ -1202,6 +1220,7 @@ impl TorrentEngine {
         let mut next_candidate = 0usize;
         let mut next_discovery_refresh = Instant::now() + PEER_REFRESH_INTERVAL;
 
+        let planned_session_count = max_active.min(candidates.len()).max(1);
         while next_candidate < candidates.len() && tasks.len() < max_active {
             spawn_parallel_peer_task(
                 &mut tasks,
@@ -1222,7 +1241,7 @@ impl TorrentEngine {
                 self.pex_enabled && !self.meta.is_private(),
                 self.allow_ipv6,
                 self.pex_max_peers,
-                candidates.len(),
+                planned_session_count,
             );
             next_candidate += 1;
         }
@@ -1305,6 +1324,7 @@ impl TorrentEngine {
                 next_discovery_refresh = Instant::now() + PEER_REFRESH_INTERVAL;
             }
 
+            let planned_session_count = max_active.min(candidates.len()).max(1);
             while !complete && next_candidate < candidates.len() && tasks.len() < max_active {
                 spawn_parallel_peer_task(
                     &mut tasks,
@@ -1325,7 +1345,7 @@ impl TorrentEngine {
                     self.pex_enabled && !self.meta.is_private(),
                     self.allow_ipv6,
                     self.pex_max_peers,
-                    candidates.len(),
+                    planned_session_count,
                 );
                 next_candidate += 1;
             }
@@ -2803,13 +2823,27 @@ fn piece_shard(peer_addr: SocketAddr, piece_count: usize) -> usize {
     if piece_count == 0 {
         return 0;
     }
-    // FNV-1a over the address bytes — cheap, deterministic, no allocation.
+    // FNV-1a over the address bytes: cheap, deterministic, no allocation.
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in peer_addr.ip().to_string().as_bytes() {
-        hash ^= *byte as u64;
+    let mut hash_byte = |byte: u8| {
+        hash ^= byte as u64;
         hash = hash.wrapping_mul(0x100000001b3);
+    };
+    match peer_addr.ip() {
+        std::net::IpAddr::V4(ip) => {
+            for byte in ip.octets() {
+                hash_byte(byte);
+            }
+        }
+        std::net::IpAddr::V6(ip) => {
+            for byte in ip.octets() {
+                hash_byte(byte);
+            }
+        }
     }
-    hash ^= (peer_addr.port() as u64).wrapping_mul(0x100000001b3);
+    for byte in peer_addr.port().to_be_bytes() {
+        hash_byte(byte);
+    }
     (hash as usize) % piece_count
 }
 
@@ -3043,11 +3077,19 @@ async fn endgame_peer_session(
                             if block.len() != expected_len as usize {
                                 continue;
                             }
-                            if assembler.add_block(offset, &block).unwrap_or(false) {
+                            let block_index = offset as usize / peer::BLOCK_SIZE as usize;
+                            let was_missing = assembler
+                                .received
+                                .get(block_index)
+                                .map(|received| !*received)
+                                .unwrap_or(false);
+                            if assembler.add_block(offset, &block).is_ok() {
                                 session_outstanding.remove(&offset);
-                                received += 1;
-                                record_peer_block(&state, peer_addr, block.len() as u64).await;
-                                outstanding.lock().await.delivered(piece, offset);
+                                if was_missing {
+                                    received += 1;
+                                    record_peer_block(&state, peer_addr, block.len() as u64).await;
+                                    outstanding.lock().await.delivered(piece, offset);
+                                }
                             }
                         } else if piece as usize != piece_index {
                             // A block for a piece we no longer need (completed
@@ -3395,15 +3437,16 @@ where
 {
     let mut reserved_any = false;
     // Cap the per-peer reservation count at min(NORMAL_PEER_PIECE_WINDOW,
-    // ceil(remaining_pieces / candidate_count)). The candidate count is the
-    // number of peer sessions that will share this round's piece pool. With
+    // ceil(remaining_pieces / active_session_count)). The active session count
+    // is the bounded number of peer sessions sharing this round's piece pool. With
     // a wide per-peer window and a small piece count, reserving the full
     // window monopolises all pieces for one peer; dividing the available
     // work by the candidate count keeps fairness across peers.
     let remaining_pieces = {
+        let work = shared.lock().await;
         let mut count = 0usize;
         for i in 0..piece_count {
-            if peer_bf.has(i) && !shared.lock().await.have.has(i) {
+            if peer_bf.has(i) && !work.have.has(i) && !work.reserved.contains(&i) {
                 count += 1;
             }
         }
@@ -3912,13 +3955,11 @@ mod tests {
 
     #[test]
     fn piece_assembler_reports_duplicate_with_overwrite() {
-        // The download loop in this module previously treated every successful
-        // (Ok) return from `PieceAssembler::add_block` as a new block, which
-        // caused the per-piece `received_blocks` counter to advance on
-        // duplicates and then call `data()` on an incomplete buffer, producing
-        // spurious SHA-1 mismatches. The fix is on the caller side: only count
-        // a block as received when `add_block` returns `Ok(true)`. This test
-        // pins the assembler semantics so the caller fix can be relied on.
+        // The download loops must treat this return value as a piece-complete
+        // signal, not as "a new block was accepted". Callers track whether a
+        // specific requested block was missing before calling `add_block`.
+        // This test pins the assembler semantics so caller-side duplicate
+        // accounting remains explicit.
         use swarmotter_core::peer::PieceAssembler;
         // Use the actual BLOCK_SIZE (16 KiB). For a piece of 4 blocks, three
         // unique blocks and one duplicate must not change the completion

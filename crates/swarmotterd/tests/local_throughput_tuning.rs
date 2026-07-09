@@ -353,7 +353,6 @@ async fn throughput_tuning_baseline_vs_tuned() {
         baseline.elapsed,
         tuned.elapsed
     );
-    std::fs::remove_dir_all(unique_dir("")).ok();
 }
 
 async fn run_scenario(
