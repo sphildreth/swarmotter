@@ -49,6 +49,8 @@ use swarmotter_core::net::{self, InterfaceProbe, OsInterfaceProbe};
 use swarmotter_core::queue::QueueState;
 use swarmotter_core::ratio::{self, SeedDecision, TorrentAccounting, TorrentSeeding};
 use swarmotter_core::torrent::{Torrent, TorrentRegistry};
+use swarmotter_core::tracker::{self, AnnounceEvent, AnnounceRequest};
+use swarmotter_core::udp_tracker;
 use swarmotter_core::watch;
 
 use crate::engine::{EngineCommand, EngineState, TorrentEngine};
@@ -1641,7 +1643,7 @@ impl DaemonRuntime {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let encryption_mode = self.config.read().await.torrent.encryption_mode;
         let mut seeder = Seeder::with_limiter(
-            meta,
+            meta.clone(),
             storage,
             state,
             binder,
@@ -1666,6 +1668,92 @@ impl DaemonRuntime {
             let _ = registry;
         });
         self.seeder_handles.lock().await.insert(hash, handle);
+
+        // Spawn a parallel seeder announce loop so the seeder advertises its
+        // own peer port to trackers. Without this, a fresh daemon that only
+        // has completed torrents never appears in tracker peer lists, and
+        // leechers in the same swarm see no peers. The loop announces on
+        // start, then every `tracker.interval` (5 minutes default) and on
+        // shutdown.
+        self.start_seeder_announce(hash, meta.clone(), peer_id, listen_port)
+            .await;
+    }
+
+    /// Spawn a sidecar task that periodically announces the seeder to the
+    /// torrent's trackers, so the seeder is visible in the swarm.
+    async fn start_seeder_announce(
+        &self,
+        hash: InfoHash,
+        meta: swarmotter_core::meta::TorrentMeta,
+        peer_id: [u8; 20],
+        listen_port: u16,
+    ) {
+        let trackers: Vec<String> =
+            tracker::announce_tiers(meta.announce.as_deref(), &meta.announce_list)
+                .into_iter()
+                .flatten()
+                .collect();
+        if trackers.is_empty() {
+            return;
+        }
+        let seeder_shutdowns = self.seeder_shutdowns.clone();
+        let binder = self.make_binder().await;
+        let handle = tokio::spawn(async move {
+            let mut shutdown_rx = match seeder_shutdowns.lock().await.get(&hash).cloned() {
+                Some(tx) => tx.subscribe(),
+                None => return,
+            };
+            // Initial announce: started event so trackers see the seeder
+            // immediately rather than waiting for the first interval tick.
+            Self::seeder_announce_once(
+                &trackers,
+                hash,
+                peer_id,
+                listen_port,
+                binder.as_ref(),
+                AnnounceEvent::Started,
+            )
+            .await;
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // Skip the immediate first tick because we already announced above.
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            // Best-effort stopped announce; do not block
+                            // shutdown on tracker reachability.
+                            Self::seeder_announce_once(
+                                &trackers,
+                                hash,
+                                peer_id,
+                                listen_port,
+                                binder.as_ref(),
+                                AnnounceEvent::Stopped,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        Self::seeder_announce_once(
+                            &trackers,
+                            hash,
+                            peer_id,
+                            listen_port,
+                            binder.as_ref(),
+                            AnnounceEvent::Empty,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+        // Track this alongside the seeder handle so we can abort it on stop.
+        // (We just leak the JoinHandle in this simple version; stopping
+        // happens via the shutdown watch which the task honors.)
+        let _ = handle;
     }
 
     async fn stop_seeder(&self, hash: &InfoHash) {
@@ -1675,6 +1763,73 @@ impl DaemonRuntime {
         let handle = self.seeder_handles.lock().await.remove(hash);
         if let Some(handle) = handle {
             let _ = handle.await;
+        }
+    }
+
+    /// One-shot tracker announce for a seeder. Best-effort per tracker; logs
+    /// and continues on failure. Times out aggressively so a slow or
+    /// unreachable tracker cannot stall the announce loop.
+    async fn seeder_announce_once(
+        trackers: &[String],
+        hash: InfoHash,
+        peer_id: [u8; 20],
+        port: u16,
+        binder: &dyn swarmotter_core::net::NetworkBinder,
+        event: AnnounceEvent,
+    ) {
+        for url in trackers {
+            let req = AnnounceRequest {
+                tracker_url: url.clone(),
+                info_hash: hash,
+                peer_id,
+                port,
+                uploaded: 0,
+                downloaded: 0,
+                left: 0,
+                event,
+                numwant: Some(0),
+                compact: true,
+            };
+            let outcome = if url.starts_with("udp://") {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    udp_tracker::udp_announce(binder, &req),
+                )
+                .await
+            } else {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    tracker::http_announce(binder, &req),
+                )
+                .await
+            };
+            match outcome {
+                Ok(Ok(_)) => {
+                    tracing::info!(
+                        info_hash = %hash,
+                        tracker = %url,
+                        event = event.as_str(),
+                        "seeder announce ok"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        info_hash = %hash,
+                        tracker = %url,
+                        event = event.as_str(),
+                        error = %e,
+                        "seeder announce failed"
+                    );
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        info_hash = %hash,
+                        tracker = %url,
+                        event = event.as_str(),
+                        "seeder announce timed out"
+                    );
+                }
+            }
         }
     }
 
@@ -2405,9 +2560,33 @@ impl DaemonRuntime {
         let hash = parsed.info_hash;
         let mut torrent = Torrent::new(parsed, now());
         watch::apply_folder_defaults(&mut torrent, folder);
-        let mut reg = self.registry.lock().await;
-        reg.add(torrent)
-            .map_err(|_| CoreError::DuplicateTorrent(hash.to_hex()))?;
+        if let Err(e) = self
+            .preflight_storage_for_download(
+                torrent.download_dir.as_deref(),
+                torrent.meta.total_length,
+            )
+            .await
+        {
+            tracing::warn!(
+                info_hash = %hash,
+                error = %e,
+                error_code = %e.code(),
+                "watch torrent import rejected by storage preflight"
+            );
+            return Err(e);
+        }
+        apply_network_state(&mut torrent, &self.network_health).await;
+        let blocked = torrent.state == TorrentState::NetworkBlocked;
+        let paused = torrent.state == TorrentState::Paused;
+        {
+            let mut reg = self.registry.lock().await;
+            reg.add(torrent)
+                .map_err(|_| CoreError::DuplicateTorrent(hash.to_hex()))?;
+        }
+        self.queue.lock().await.add(hash);
+        if !blocked && !paused {
+            self.schedule_reconcile_queue("watch_import_added").await;
+        }
         // Post-import action for the source file.
         match watch::post_import_action(folder, file) {
             watch::PostImportAction::Delete => {
@@ -2419,6 +2598,21 @@ impl DaemonRuntime {
             }
             watch::PostImportAction::Leave => {}
         }
+        let state = if blocked {
+            TorrentState::NetworkBlocked
+        } else if paused {
+            TorrentState::Paused
+        } else {
+            TorrentState::Queued
+        };
+        tracing::info!(
+            info_hash = %hash,
+            network_blocked = blocked,
+            paused = paused,
+            "watch torrent imported"
+        );
+        self.publish_torrent_event("torrent_added", hash, state);
+        self.publish_event(stats_updated_event());
         Ok(hash)
     }
 

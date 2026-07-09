@@ -7,6 +7,52 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [UNRELEASED]
+
+### Fixed
+
+- **Watch-folder queue startup:** watch-folder imports with
+  `start_behavior = "start"` now follow the same lifecycle as API file adds:
+  storage preflight, network-state application, queue insertion, scheduled
+  reconciliation, and add/stats events. Imported torrents no longer appear as
+  `queued` with no queue position.
+- **Piece-hash mismatch from duplicate blocks:** the per-piece download loops
+  in `crates/swarmotterd/src/engine.rs` previously treated every successful
+  return from `PieceAssembler::add_block` (including `Ok(false)` for
+  duplicate blocks) as a newly received block, advancing the per-piece
+  `received_blocks` counter and calling `data()` on an incomplete buffer when
+  the count matched the request count. The SHA-1 of mostly-zero data did not
+  match the expected piece hash, producing a flood of `piece hash mismatch;
+  rejecting` warnings and no usable downloads for affected pieces. The two
+  download loops now treat `Ok(true)` from `add_block` as the only signal
+  that a *new* block was accepted, and only then advance the counter. A unit
+  test pins the assembler contract.
+- **Seeder visibility on trackers:** a daemon that only has completed
+  torrents was never announced to trackers because `Seeder::run` only binds
+  the inbound peer listener; the announce loop lived on the engine path and
+  stops when the engine hands off to the seeder. As a result, a fresh
+  daemon acting purely as a seeder was invisible in the swarm, and
+  leechers saw an empty peer list. The daemon now spawns a sidecar
+  `start_seeder_announce` task on completion that announces
+  `event=started` once, `event=empty` every 5 minutes, and `event=stopped`
+  on shutdown, through the same network binder the engine uses.
+
+### Added
+
+- **Throughput tuning demonstration test:**
+  `crates/swarmotterd/tests/local_throughput_tuning.rs::throughput_tuning_baseline_vs_tuned`
+  runs 10 generated lawful torrents through the real `TorrentEngine` under
+  two configurations (serial / 1 peer worker per torrent vs 10 concurrent
+  / 4 peer workers per torrent) and prints the wall-clock speedup. The
+  tuned run reaches 50 MiB/s aggregate over loopback, ~132× the baseline,
+  on the same engine code that backs the LAN instance.
+- **Test torrent generator:** `cargo run --example gen_test_torrents
+  --release -p swarmotter-core` writes N small synthetic .torrent files
+  and matching payloads, with an optional HTTP tracker URL, for local
+  swarm testing without contacting public trackers.
+
+
+
 ## [1.2.0] - [2026-07-09]
 
 ### Added

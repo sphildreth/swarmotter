@@ -130,6 +130,7 @@ async fn watch_folder_imports_torrent() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].name, "watched");
     assert_eq!(list[0].state, TorrentState::Paused);
+    assert_eq!(list[0].queue_position, Some(1));
     assert!(list[0].labels.contains(&"watched".to_string()));
 
     // The source file should have been deleted after import.
@@ -139,6 +140,61 @@ async fn watch_folder_imports_torrent() {
     let hist = runtime.watch_history().await;
     assert_eq!(hist.len(), 1);
     assert!(hist[0].success);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn watch_folder_start_import_is_queued_for_scheduler() {
+    use swarmotter_core::config::{StartBehavior, WatchFolderConfig};
+    let mut cfg = Config::default();
+    cfg.network.mode = swarmotter_core::models::network::NetworkContainmentMode::Disabled;
+    let healthy = NetworkHealth::blocked(
+        swarmotter_core::models::network::NetworkContainmentMode::Disabled,
+        NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "swarmotter-watch-start-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bytes = build_single_file_torrent(
+        "watched-start",
+        b"watched start payload data here",
+        8,
+        None,
+        false,
+    );
+    std::fs::write(dir.join("start.torrent"), &bytes).unwrap();
+
+    cfg.watch = vec![WatchFolderConfig {
+        path: dir.display().to_string(),
+        recursive: false,
+        download_dir: None,
+        label: Some("watched".into()),
+        start_behavior: StartBehavior::Start,
+        archive_dir: None,
+        failure_dir: None,
+        delete_after_import: true,
+    }];
+
+    let runtime = Arc::new(DaemonRuntime::new(cfg, healthy));
+    runtime.watch_scan().await.unwrap();
+
+    let list = runtime.list_torrents().await;
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].name, "watched-start");
+    assert_eq!(list[0].state, TorrentState::Queued);
+    assert_eq!(list[0].queue_position, Some(1));
+
+    let stats = runtime.global_stats().await;
+    assert_eq!(stats.scheduler.queued_torrents, 1);
+    assert_eq!(stats.scheduler.requested_downloads, 1);
 
     std::fs::remove_dir_all(&dir).ok();
 }

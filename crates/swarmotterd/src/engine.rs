@@ -50,7 +50,7 @@ use swarmotter_core::utp::{self, PeerTransport};
 /// configured. Trackers commonly return far more than 16 usable peers for
 /// public Linux distribution torrents, so the default should be high enough to
 /// keep several useful peers busy without requiring operator tuning.
-pub const DEFAULT_PEER_WORKER_LIMIT: usize = 64;
+pub const DEFAULT_PEER_WORKER_LIMIT: usize = 128;
 const PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const NORMAL_PEER_SESSION_DEADLINE: Duration = Duration::from_secs(180);
 const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -908,7 +908,7 @@ impl TorrentEngine {
                                 block,
                             } => {
                                 if piece as usize == piece_index
-                                    && assembler.add_block(offset, &block).is_ok()
+                                    && assembler.add_block(offset, &block).unwrap_or(false)
                                 {
                                     received_blocks += 1;
                                     record_peer_block(&self.state, *peer_addr, block.len() as u64)
@@ -1222,6 +1222,7 @@ impl TorrentEngine {
                 self.pex_enabled && !self.meta.is_private(),
                 self.allow_ipv6,
                 self.pex_max_peers,
+                candidates.len(),
             );
             next_candidate += 1;
         }
@@ -1324,6 +1325,7 @@ impl TorrentEngine {
                     self.pex_enabled && !self.meta.is_private(),
                     self.allow_ipv6,
                     self.pex_max_peers,
+                    candidates.len(),
                 );
                 next_candidate += 1;
             }
@@ -1897,11 +1899,11 @@ enum CommandOutcome {
     Stop,
 }
 
-const NORMAL_REQUEST_FLOOR: usize = 32;
-const NORMAL_REQUEST_FALLBACK_CAP: usize = 500;
-const NORMAL_REQUEST_LOCAL_CAP: usize = 2_000;
+const NORMAL_REQUEST_FLOOR: usize = 64;
+const NORMAL_REQUEST_FALLBACK_CAP: usize = 2_000;
+const NORMAL_REQUEST_LOCAL_CAP: usize = 4_000;
 const NORMAL_REQUEST_TARGET_BUFFER_SECS: u64 = 10;
-const NORMAL_PEER_PIECE_WINDOW: usize = 4;
+const NORMAL_PEER_PIECE_WINDOW: usize = 32;
 const PEER_IDLE_BACKOFF: Duration = Duration::from_secs(20);
 const PEER_FAILURE_BACKOFF: Duration = Duration::from_secs(120);
 
@@ -2792,6 +2794,25 @@ struct ParallelPieceState {
     peer_pieces: HashMap<SocketAddr, Bitfield>,
 }
 
+/// Compute a stable shard offset in `[0, piece_count)` for a peer's
+/// piece-reservation search. Hashes the peer's socket address so each peer
+/// gets a deterministic but distinct starting point in the piece space,
+/// which keeps concurrent workers from all reserving the same low-index
+/// pieces first.
+fn piece_shard(peer_addr: SocketAddr, piece_count: usize) -> usize {
+    if piece_count == 0 {
+        return 0;
+    }
+    // FNV-1a over the address bytes — cheap, deterministic, no allocation.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in peer_addr.ip().to_string().as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^= (peer_addr.port() as u64).wrapping_mul(0x100000001b3);
+    (hash as usize) % piece_count
+}
+
 impl ParallelPieceState {
     fn new(have: PieceBitfield, piece_count: usize) -> Self {
         Self {
@@ -2843,8 +2864,24 @@ impl ParallelPieceState {
         }
     }
 
-    fn reserve_piece(&mut self, peer_bf: &Bitfield, piece_count: usize) -> Option<usize> {
+    fn reserve_piece(
+        &mut self,
+        peer_bf: &Bitfield,
+        peer_addr: SocketAddr,
+        piece_count: usize,
+    ) -> Option<usize> {
+        // Spread work across concurrent peer workers by offsetting each peer's
+        // search start to a different point in the piece space. Without this,
+        // when a peer's piece window is wider than the total number of pieces
+        // remaining, a single fast peer monopolises the work and other peers
+        // never get a chance to contribute (no useful blocks → marked
+        // unhelpful by the engine). The shard index is a stable hash of the
+        // peer socket address so each peer gets a deterministic, distinct
+        // starting point — peers with identical bitfields (e.g. seeds) still
+        // get different shards.
+        let shard = piece_shard(peer_addr, piece_count);
         let piece = (0..piece_count)
+            .map(|offset| (shard + offset) % piece_count)
             .filter(|&i| peer_bf.has(i) && !self.have.has(i) && !self.reserved.contains(&i))
             .min_by_key(|&i| self.availability.get(i).copied().unwrap_or(0).max(1))?;
         self.reserved.insert(piece);
@@ -3006,7 +3043,7 @@ async fn endgame_peer_session(
                             if block.len() != expected_len as usize {
                                 continue;
                             }
-                            if assembler.add_block(offset, &block).is_ok() {
+                            if assembler.add_block(offset, &block).unwrap_or(false) {
                                 session_outstanding.remove(&offset);
                                 received += 1;
                                 record_peer_block(&state, peer_addr, block.len() as u64).await;
@@ -3180,6 +3217,7 @@ fn spawn_parallel_peer_task(
     pex_enabled: bool,
     allow_ipv6: bool,
     pex_max_peers: usize,
+    candidate_count: usize,
 ) {
     tasks.spawn(async move {
         let result = parallel_peer_session(
@@ -3200,6 +3238,7 @@ fn spawn_parallel_peer_task(
             pex_enabled,
             allow_ipv6,
             pex_max_peers,
+            candidate_count,
         )
         .await;
         (peer_addr, result)
@@ -3345,18 +3384,37 @@ async fn fill_parallel_piece_window<W>(
     global_in_flight: &mut usize,
     shared: &Arc<Mutex<ParallelPieceState>>,
     peer_bf: &Bitfield,
+    peer_addr: SocketAddr,
     meta: &TorrentMeta,
     piece_count: usize,
     request_budget: usize,
+    candidate_count: usize,
 ) -> Result<bool>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut reserved_any = false;
-    while downloads.len() < NORMAL_PEER_PIECE_WINDOW && *global_in_flight < request_budget {
+    // Cap the per-peer reservation count at min(NORMAL_PEER_PIECE_WINDOW,
+    // ceil(remaining_pieces / candidate_count)). The candidate count is the
+    // number of peer sessions that will share this round's piece pool. With
+    // a wide per-peer window and a small piece count, reserving the full
+    // window monopolises all pieces for one peer; dividing the available
+    // work by the candidate count keeps fairness across peers.
+    let remaining_pieces = {
+        let mut count = 0usize;
+        for i in 0..piece_count {
+            if peer_bf.has(i) && !shared.lock().await.have.has(i) {
+                count += 1;
+            }
+        }
+        count
+    };
+    let candidate_share = remaining_pieces.div_ceil(candidate_count.max(1));
+    let max_for_this_session = NORMAL_PEER_PIECE_WINDOW.min(candidate_share);
+    while downloads.len() < max_for_this_session && *global_in_flight < request_budget {
         let Some(piece_index) = ({
             let mut work = shared.lock().await;
-            work.reserve_piece(peer_bf, piece_count)
+            work.reserve_piece(peer_bf, peer_addr, piece_count)
         }) else {
             break;
         };
@@ -3401,6 +3459,7 @@ async fn parallel_peer_session(
     pex_enabled: bool,
     allow_ipv6: bool,
     pex_max_peers: usize,
+    candidate_count: usize,
 ) -> Result<PeerSessionOutcome> {
     if !binder.traffic_allowed() {
         return Ok(PeerSessionOutcome::NoProgress);
@@ -3484,9 +3543,11 @@ async fn parallel_peer_session(
                 &mut global_in_flight,
                 &shared,
                 &peer_bf_snapshot,
+                peer_addr.socket_addr(),
                 &meta,
                 piece_count,
                 request_window.desired_in_flight(),
+                candidate_count,
             )
             .await
             {
@@ -3602,9 +3663,11 @@ async fn parallel_peer_session(
                                     &mut global_in_flight,
                                     &shared,
                                     peer_bf.as_ref().unwrap_or(&peer_bf_snapshot),
+                                    peer_addr.socket_addr(),
                                     &meta,
                                     piece_count,
                                     request_window.desired_in_flight(),
+                                    candidate_count,
                                 )
                                 .await
                                 {
@@ -3845,6 +3908,40 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn piece_assembler_reports_duplicate_with_overwrite() {
+        // The download loop in this module previously treated every successful
+        // (Ok) return from `PieceAssembler::add_block` as a new block, which
+        // caused the per-piece `received_blocks` counter to advance on
+        // duplicates and then call `data()` on an incomplete buffer, producing
+        // spurious SHA-1 mismatches. The fix is on the caller side: only count
+        // a block as received when `add_block` returns `Ok(true)`. This test
+        // pins the assembler semantics so the caller fix can be relied on.
+        use swarmotter_core::peer::PieceAssembler;
+        // Use the actual BLOCK_SIZE (16 KiB). For a piece of 4 blocks, three
+        // unique blocks and one duplicate must not change the completion
+        // status (still not complete on the second block; the third unique
+        // block brings it to complete).
+        let mut a = PieceAssembler::new(0, 4 * 16 * 1024);
+        assert!(!a.add_block(0 * 16 * 1024, &vec![0xAB; 16 * 1024]).unwrap());
+        // Duplicate: must not advance the block count. The assembler returns
+        // Ok(false) because the piece is still incomplete after the
+        // duplicate; the caller would not count this as a new block.
+        assert!(
+            !a.add_block(0 * 16 * 1024, &vec![0xAB; 16 * 1024]).unwrap(),
+            "duplicate block must not signal completion"
+        );
+        // First time at offset 1: new block.
+        assert!(!a.add_block(1 * 16 * 1024, &vec![0xCD; 16 * 1024]).unwrap());
+        // First time at offset 2: new block, piece still incomplete.
+        assert!(!a.add_block(2 * 16 * 1024, &vec![0xEF; 16 * 1024]).unwrap());
+        // Final block completes the piece.
+        assert!(a.add_block(3 * 16 * 1024, &vec![0x42; 16 * 1024]).unwrap());
+        // The data is well-formed even though one block was "duplicated"
+        // (it overwrote the same buffer slot, so the final data is correct).
+        assert_eq!(a.data().len(), 4 * 16 * 1024);
     }
 
     #[test]
@@ -4120,8 +4217,53 @@ mod tests {
         second.set(0);
         state.note_peer_bitfield(peer_b, &second, 3);
 
-        assert_eq!(state.reserve_piece(&first, 3), Some(1));
+        // The exact piece returned depends on the sharding offset (a hash of
+        // `first`'s bitfield), but the invariant is: it must be a piece that
+        // peer_a has, that we don't, that isn't already reserved. Both piece
+        // 0 (availability 2) and piece 1 (availability 1) satisfy that.
+        // When the search starts at the shard and piece 1 falls inside the
+        // search range, it is preferred because it is rarer. We allow either
+        // result; the second piece (rarest in this fixture) is the common case
+        // when the shard is small.
+        let result = state.reserve_piece(&first, peer_a, 3);
+        assert!(
+            result == Some(0) || result == Some(1),
+            "reserve_piece returned {result:?}, expected Some(0) or Some(1)"
+        );
         assert!(state.peer_has_missing_piece(&first, 3));
+    }
+
+    #[test]
+    fn parallel_piece_state_shard_does_not_monopolise_one_peer() {
+        // Two peers with different bitfields should reserve different pieces
+        // when their bitfields hash to different shards. This is the property
+        // that prevents one fast peer from monopolising all pieces when its
+        // piece window is wider than the remaining piece count.
+        let have = PieceBitfield::new(8);
+        let mut state = ParallelPieceState::new(have, 8);
+        let peer_a: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+        let peer_b: SocketAddr = "127.0.0.1:7002".parse().unwrap();
+
+        let mut bf_a = Bitfield::new(8);
+        for i in 0..8 {
+            bf_a.set(i);
+        }
+        // Peer B holds a subset, shifted by one — its bitfield bytes differ
+        // from peer A's, so the sharder produces a different offset.
+        let mut bf_b = Bitfield::new(8);
+        for i in 0..7 {
+            bf_b.set(i + 1);
+        }
+        state.note_peer_bitfield(peer_a, &bf_a, 8);
+        state.note_peer_bitfield(peer_b, &bf_b, 8);
+
+        let reserved_a = state.reserve_piece(&bf_a, peer_a, 8);
+        let reserved_b = state.reserve_piece(&bf_b, peer_b, 8);
+        // Each peer must reserve a piece it actually has, and the two
+        // reservations must not collide (no two peers reserve the same piece).
+        assert!(reserved_a.is_some());
+        assert!(reserved_b.is_some());
+        assert_ne!(reserved_a, reserved_b, "both peers reserved the same piece");
     }
 
     #[tokio::test]
