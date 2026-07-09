@@ -7,6 +7,27 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [1.1.6] - [2026-07-09]
+
+### Fixed
+
+- **Runtime queue setting changes:** runtime settings updates now schedule queue
+  reconciliation instead of awaiting engine startup inline, so raising
+  `queue.max_active_downloads` can return promptly and continue filling active
+  slots after the client request completes.
+- **Queue lifecycle recovery:** queue reconciliation now clears stale engine
+  bookkeeping for torrents that are no longer active, preventing queued
+  torrents from retaining handles that make engine startup skip them.
+- **Autopilot queue-slot release:** act-mode recovery now force-stops stalled
+  engine tasks when releasing an active queue slot, so a nonresponsive download
+  cannot block the rest of the queue from being promoted.
+- **Autopilot diagnostics freshness:** per-torrent autopilot decisions are
+  recomputed from current torrent and engine state instead of returning stale
+  cached snapshots.
+- **Large queue regression coverage:** daemon tests now cover queue lifecycle
+  recovery for 100- and 1,000-torrent queues with the default high-concurrency
+  active slot target.
+
 ## [1.1.5] - [2026-07-08]
 
 ### Fixed
