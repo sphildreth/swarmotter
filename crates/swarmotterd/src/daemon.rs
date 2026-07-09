@@ -5230,9 +5230,6 @@ mod tests {
                 } else if idx < QUEUED_DOWNLOAD_START + QUEUED_DOWNLOAD_COUNT {
                     torrent.state = TorrentState::Queued;
                     torrent.needs_metadata = false;
-                } else if idx < QUEUED_METADATA_START + QUEUED_METADATA_COUNT {
-                    torrent.state = TorrentState::Queued;
-                    torrent.needs_metadata = true;
                 } else if idx < BACKOFF_METADATA_START + BACKOFF_METADATA_COUNT {
                     torrent.state = TorrentState::Queued;
                     torrent.needs_metadata = true;

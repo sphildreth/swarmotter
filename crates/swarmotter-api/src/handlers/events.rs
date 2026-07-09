@@ -172,7 +172,7 @@ fn make_event_stream(
             }
             Some(Ok(axum::response::sse::Event::default()
                 .event(event.kind)
-                .data(event.json.to_string())))
+                .data(&event.json)))
         }
         Err(BroadcastStreamRecvError::Lagged(skipped)) => {
             tracing::warn!(skipped, "event subscriber lagged behind broadcast buffer");

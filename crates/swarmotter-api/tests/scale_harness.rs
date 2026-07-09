@@ -114,8 +114,7 @@ async fn ignored_scale_harness_add_query_retry_remove_reset_2000_torrents() {
         ADD_COUNT as u64
     );
 
-    for index in 0..RECHECK_COUNT {
-        let hash = &hashes[index];
+    for hash in hashes.iter().take(RECHECK_COUNT) {
         assert_eq!(
             post_empty_body(&app, "POST", &format!("/api/v1/torrents/{hash}/recheck")).await,
             StatusCode::OK,
