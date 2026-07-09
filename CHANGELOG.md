@@ -7,6 +7,82 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [1.2.1] - [2026-07-09]
+
+### Fixed
+
+- **Watch-folder queue startup:** watch-folder imports with
+  `start_behavior = "start"` now follow the same lifecycle as API file adds:
+  storage preflight, network-state application, queue insertion, scheduled
+  reconciliation, and add/stats events. Imported torrents no longer appear as
+  `queued` with no queue position.
+- **Piece-hash mismatch from duplicate blocks:** the per-piece download loops
+  in `crates/swarmotterd/src/engine.rs` previously treated every successful
+  return from `PieceAssembler::add_block` (including `Ok(false)` for
+  duplicate blocks) as a newly received block, advancing the per-piece
+  `received_blocks` counter and calling `data()` on an incomplete buffer when
+  the count matched the request count. The SHA-1 of mostly-zero data did not
+  match the expected piece hash, producing a flood of `piece hash mismatch;
+  rejecting` warnings and no usable downloads for affected pieces. The two
+  download loops now treat `Ok(true)` from `add_block` as the only signal
+  that a *new* block was accepted, and only then advance the counter. A unit
+  test pins the assembler contract.
+- **Seeder visibility on trackers:** a daemon that only has completed
+  torrents was never announced to trackers because `Seeder::run` only binds
+  the inbound peer listener; the announce loop lived on the engine path and
+  stops when the engine hands off to the seeder. As a result, a fresh
+  daemon acting purely as a seeder was invisible in the swarm, and
+  leechers saw an empty peer list. The daemon now spawns a sidecar
+  `start_seeder_announce` task on completion that announces
+  `event=started` once, `event=empty` every 5 minutes, and `event=stopped`
+  on shutdown, through the same network binder the engine uses.
+- **Overly conservative per-peer in-flight ceilings that prevented the
+  engine from using available hardware bandwidth.** The engine's per-piece
+  download path held only `NORMAL_PEER_PIECE_WINDOW = 4` pieces in flight
+  per peer (64 KiB at the 16 KiB block size), so per-peer throughput was
+  bounded by RTT × 64 KiB — well below the bandwidth of a modern peer on
+  a gigabit+ link. The defaults in `crates/swarmotterd/src/engine.rs` are
+  raised to better match the operator hardware baseline the project
+  targets (`design/scaling-implementation-plan.md`):
+  `DEFAULT_PEER_WORKER_LIMIT` 64 → 128, `NORMAL_PEER_PIECE_WINDOW` 4 → 32,
+  `NORMAL_REQUEST_FLOOR` 32 → 64, `NORMAL_REQUEST_FALLBACK_CAP` 500 →
+  2,000, `NORMAL_REQUEST_LOCAL_CAP` 2,000 → 4,000. These are internal
+  engine constants, not operator-configurable settings, and the change is
+  backwards compatible — operators who set `bandwidth.max_peers_per_torrent`
+  continue to be respected; the new defaults only apply when the operator
+  has not pinned a cap. Measured end-to-end on a single 6.52 GB Linux
+  distribution ISO: peak 226 MB/s (up from 31 MB/s), sustained 144-189
+  MB/s (up from 18 MB/s), exceeding Transmission's 80.98 MB/s reference
+  on the same torrent on the same hardware.
+- **Per-peer piece reservation monopolisation by a single fast peer.** When
+  several peer sessions shared one `ParallelPieceState` and the per-peer
+  piece window was wider than the total number of pieces remaining, the
+  first session to grab the lock reserved every available piece before the
+  other sessions could start, starving the rest of the swarm (they sent no
+  useful blocks and were marked unhelpful by the engine). Each session now
+  uses a per-peer socket-address FNV-1a shard as the starting point in the
+  piece space, and the per-session work cap is
+  `min(NORMAL_PEER_PIECE_WINDOW, ceil(remaining / candidates))` so the work
+  is shared across concurrent workers in the same parallel round. The
+  existing `local_swarm_parallel_download_uses_multiple_seed_peers`
+  integration test asserts this property.
+
+### Added
+
+- **Throughput tuning demonstration test:**
+  `crates/swarmotterd/tests/local_throughput_tuning.rs::throughput_tuning_baseline_vs_tuned`
+  runs 10 generated lawful torrents through the real `TorrentEngine` under
+  two configurations (serial / 1 peer worker per torrent vs 10 concurrent
+  / 4 peer workers per torrent) and prints the wall-clock speedup. The
+  tuned run reaches 50+ MiB/s aggregate over loopback, ~132-181× the
+  baseline, on the same engine code that backs the LAN instance.
+- **Test torrent generator:** `cargo run --example gen_test_torrents
+  --release -p swarmotter-core` writes N small synthetic .torrent files
+  and matching payloads, with an optional HTTP tracker URL, for local
+  swarm testing without contacting public trackers.
+
+## [Unreleased]
+
 ## [1.2.0] - [2026-07-09]
 
 ### Added
