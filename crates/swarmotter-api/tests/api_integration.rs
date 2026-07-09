@@ -580,7 +580,7 @@ async fn add_torrent_file_can_start_paused_from_query() {
 
 #[tokio::test]
 async fn rapid_api_magnet_adds_all_register() {
-    const ADD_COUNT: usize = 200;
+    const ADD_COUNT: usize = 1000;
 
     let state = fake_daemon::fake_state();
     let app = swarmotter_api::app_router(state);
@@ -636,7 +636,7 @@ async fn rapid_api_magnet_adds_all_register() {
 
 #[tokio::test]
 async fn bulk_add_accepts_many_magnets_paused() {
-    const ADD_COUNT: usize = 200;
+    const ADD_COUNT: usize = 1000;
 
     let state = fake_daemon::fake_state();
     let app = swarmotter_api::app_router(state);
@@ -685,6 +685,90 @@ async fn bulk_add_accepts_many_magnets_paused() {
     let torrents = v["data"].as_array().unwrap();
     assert_eq!(torrents.len(), ADD_COUNT);
     assert!(torrents.iter().all(|torrent| torrent["state"] == "paused"));
+}
+
+#[tokio::test]
+async fn bulk_query_scales_to_1000_torrents() {
+    const ADD_COUNT: usize = 1000usize;
+    const PAGE_SIZE: usize = 50usize;
+
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let magnets = (0..ADD_COUNT)
+        .map(|index| {
+            let bucket = if index % 2 == 0 {
+                "bulk-even"
+            } else {
+                "bulk-odd"
+            };
+            named_magnet(index, &format!("{bucket}-{index:04}"))
+        })
+        .collect::<Vec<_>>();
+    let body = serde_json::json!({
+        "magnets": magnets,
+        "paused": true
+    })
+    .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/bulk")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["data"]["added"].as_array().unwrap().len(), ADD_COUNT);
+    assert!(v["data"]["failed"].as_array().unwrap().is_empty());
+
+    let (status, value) = get_json(
+        &app,
+        "/api/v1/torrents/query?state=paused&sort=name&dir=asc&per_page=100&page=2&group_by=state",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let data = &value["data"];
+    assert_eq!(data["total"], ADD_COUNT);
+    assert_eq!(data["filtered"], ADD_COUNT);
+    assert_eq!(data["page"], 2);
+    assert_eq!(data["per_page"], 100);
+    assert_eq!(data["rows"].as_array().unwrap().len(), 100);
+    assert_eq!(data["rows"][0]["state"], "paused");
+    assert!(data["counts"]["states"]["paused"].as_u64().unwrap() == 1000);
+    assert!(data["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|group| group["key"] == "paused" && group["count"] == 1000));
+
+    let page_expectation = (500.0 / PAGE_SIZE as f64).ceil() as usize;
+    let (status, value) = get_json(
+        &app,
+        "/api/v1/torrents/query?q=bulk-even&per_page=50&dir=asc&sort=name&page=1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let data = &value["data"];
+    assert_eq!(data["total"], ADD_COUNT);
+    assert_eq!(data["filtered"], 500);
+    assert_eq!(data["page_count"], page_expectation);
+    let rows = data["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), PAGE_SIZE);
+    assert!(rows.iter().all(|row| {
+        row["name"]
+            .as_str()
+            .map(|name| name.starts_with("bulk-even"))
+            .unwrap_or(false)
+    }));
 }
 
 #[tokio::test]
@@ -1104,6 +1188,17 @@ async fn stats_endpoint() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let scheduler = &v["data"]["scheduler"];
+    assert!(scheduler["managed_torrents"].is_u64());
+    assert!(scheduler["requested_downloads"].is_u64());
+    assert!(scheduler["granted_downloads"].is_u64());
+    assert!(scheduler["requested_metadata_fetches"].is_u64());
+    assert!(scheduler["granted_metadata_fetches"].is_u64());
+    assert!(scheduler["peer_worker_budget_saturated"].is_boolean());
 }
 
 #[tokio::test]

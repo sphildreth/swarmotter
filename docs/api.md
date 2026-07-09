@@ -61,6 +61,13 @@ All paths in this section are under `/api/v1`, except the root `/health` alias.
 
 The root `/health` path is also available without the `/api/v1` prefix.
 
+`/stats` returns aggregate transfer counters plus a `scheduler` object for
+large-library diagnostics. Scheduler fields include managed and queued torrent
+counts, running engine counts, requested and granted download/metadata slots,
+retry-backoff counts, active queue limits, peer-worker budget fields, and
+boolean saturation flags for download slots, metadata fetch slots, and peer
+worker budget.
+
 ## Torrent management
 
 | Method | Path | Description |

@@ -21,7 +21,8 @@ pub use network::{NetworkContainmentMode, NetworkContainmentStatus, NetworkHealt
 pub use peer::{EnginePeerHealth, Peer, PeerDirection, PeerFlags};
 pub use stats::{
     AutopilotAction, AutopilotActionKind, AutopilotDecision, AutopilotInput, AutopilotReason,
-    AutopilotSnapshot, GlobalStats, SlowCause, TorrentDiagnostics, TorrentStats,
+    AutopilotSnapshot, GlobalStats, SchedulerDiagnostics, SlowCause, TorrentDiagnostics,
+    TorrentStats,
 };
 pub use storage::{StorageDiagnostics, StorageRootDiagnostics, StorageRootRole};
 pub use torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};

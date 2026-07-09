@@ -7,6 +7,40 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [1.2.0] - [2026-07-09]
+
+### Added
+
+- **Metadata fetch budget:** `[queue].max_active_metadata_fetches` now limits
+  simultaneous magnet metadata fetches independently from resolved download
+  slots, preventing large magnet imports from consuming all active download
+  capacity or starting unbounded metadata discovery work.
+- **Scheduler diagnostics:** `GET /api/v1/stats` now reports scheduler
+  requested/granted/running counts, retry-backoff pressure, configured queue
+  caps, and peer-worker saturation so large-library operators can see which
+  resource pool is limiting progress.
+- **Large-library API coverage:** API integration tests now cover 1,000-torrent
+  rapid add, bulk add, and query/filter/group behavior using generated lawful
+  magnets.
+
+### Fixed
+
+- **Torrent lifecycle caps:** queue reconciliation now force-clears over-limit
+  active downloads instead of waiting indefinitely for a graceful engine stop,
+  and metadata progress reconciliation no longer reactivates queued retry work
+  from stale diagnostics. See
+  [ADR-0040](design/adr/0040-force-clear-over-limit-queue-rotation.md).
+- **Metadata queue regression coverage:** daemon tests now verify no-peer
+  magnet retries remain queued after progress reconciliation and that stale
+  metadata diagnostics cannot reactivate a 100-torrent queue beyond configured
+  active limits.
+- **Large-queue scaling:** queue membership now uses set-backed runtime indexes
+  and batch operations for large add/remove/recovery paths while preserving
+  stable serialized queue order. Daemon regression tests now cover 10,000
+  managed torrent records for stale metadata recovery, metadata retry backoff,
+  and bulk removal. See
+  [ADR-0041](design/adr/0041-set-backed-queue-and-metadata-fetch-budget.md).
+
 ## [1.1.6] - [2026-07-09]
 
 ### Fixed

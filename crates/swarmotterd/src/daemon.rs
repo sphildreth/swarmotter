@@ -31,7 +31,7 @@ use swarmotter_core::models::network::{NetworkContainmentMode, NetworkHealth};
 use swarmotter_core::models::peer::{EnginePeerHealth, Peer};
 use swarmotter_core::models::stats::{
     AutopilotActionKind, AutopilotDecision, AutopilotInput, GlobalStats, PeerSchedulerDiagnostics,
-    TorrentDiagnostics,
+    SchedulerDiagnostics, TorrentDiagnostics,
 };
 use swarmotter_core::models::storage::{
     StorageDiagnostics, StorageRootDiagnostics, StorageRootRole,
@@ -473,8 +473,9 @@ impl DaemonRuntime {
         delete_data: bool,
     ) -> Result<Vec<InfoHash>> {
         let mut unique_hashes = Vec::with_capacity(hashes.len());
+        let mut seen = HashSet::with_capacity(hashes.len());
         for hash in hashes {
-            if !unique_hashes.contains(&hash) {
+            if seen.insert(hash) {
                 unique_hashes.push(hash);
             }
         }
@@ -492,9 +493,7 @@ impl DaemonRuntime {
 
         {
             let mut queue = self.queue.lock().await;
-            for (hash, _) in &removed {
-                queue.remove(hash);
-            }
+            queue.remove_many(removed.iter().map(|(hash, _)| *hash));
         }
         {
             let mut rate_samples = self.rate_samples.lock().await;
@@ -589,6 +588,142 @@ impl DaemonRuntime {
         }
     }
 
+    async fn scheduler_diagnostics(&self, desired: &[InfoHash]) -> SchedulerDiagnostics {
+        let cfg = self.config.lock().await.clone();
+        let mut queue = self.queue.lock().await.clone();
+        queue.limits = cfg.queue.clone();
+        let retry_after = self.engine_retry_after.lock().await.clone();
+        let running: HashSet<InfoHash> = self.engine_handles.lock().await.keys().copied().collect();
+        let now = Instant::now();
+        let reg = self.registry.lock().await;
+
+        let mut requested_downloads = 0usize;
+        let mut requested_metadata_fetches = 0usize;
+        let mut seen = HashSet::new();
+        let bypass_set = queue.bypass.iter().copied().collect::<HashSet<_>>();
+        for hash in queue.bypass.iter().chain(queue.order.iter()) {
+            if !seen.insert(*hash) {
+                continue;
+            }
+            if retry_after
+                .get(hash)
+                .is_some_and(|retry_at| *retry_at > now)
+            {
+                continue;
+            }
+            let Some(torrent) = reg.get(hash) else {
+                continue;
+            };
+            let bypass = bypass_set.contains(hash);
+            let already_active = matches!(
+                torrent.state,
+                TorrentState::Downloading | TorrentState::DownloadingMetadata
+            );
+            if !(queue.limits.auto_start || bypass || already_active) {
+                continue;
+            }
+            if !matches!(
+                torrent.state,
+                TorrentState::Queued
+                    | TorrentState::Downloading
+                    | TorrentState::DownloadingMetadata
+            ) {
+                continue;
+            }
+            if torrent.needs_metadata {
+                requested_metadata_fetches += 1;
+            } else {
+                requested_downloads += 1;
+            }
+        }
+
+        let mut granted_downloads = 0usize;
+        let mut granted_metadata_fetches = 0usize;
+        for hash in desired {
+            if reg.get(hash).is_some_and(|torrent| torrent.needs_metadata) {
+                granted_metadata_fetches += 1;
+            } else {
+                granted_downloads += 1;
+            }
+        }
+
+        let mut running_downloads = 0usize;
+        let mut running_metadata_fetches = 0usize;
+        for hash in &running {
+            let Some(torrent) = reg.get(hash) else {
+                continue;
+            };
+            if !matches!(
+                torrent.state,
+                TorrentState::Downloading | TorrentState::DownloadingMetadata
+            ) {
+                continue;
+            }
+            if torrent.needs_metadata {
+                running_metadata_fetches += 1;
+            } else {
+                running_downloads += 1;
+            }
+        }
+
+        let active_peer_workers = reg
+            .torrents
+            .values()
+            .map(|torrent| torrent.active_peer_workers)
+            .sum();
+        let running_engines = running.len();
+        let effective_peer_worker_limit = effective_peer_worker_limit(
+            cfg.bandwidth.max_peers,
+            cfg.bandwidth.max_peers_per_torrent,
+            running_engines.max(1),
+        );
+        let peer_worker_budget = if running_engines == 0 {
+            0
+        } else if cfg.bandwidth.max_peers == 0 {
+            effective_peer_worker_limit.saturating_mul(running_engines)
+        } else {
+            cfg.bandwidth
+                .max_peers
+                .min(effective_peer_worker_limit.saturating_mul(running_engines))
+        };
+
+        SchedulerDiagnostics {
+            managed_torrents: reg.torrents.len(),
+            queued_torrents: reg
+                .torrents
+                .values()
+                .filter(|torrent| torrent.state == TorrentState::Queued)
+                .count(),
+            running_engines,
+            running_downloads,
+            running_metadata_fetches,
+            requested_downloads,
+            requested_metadata_fetches,
+            granted_downloads,
+            granted_metadata_fetches,
+            retry_backoff_torrents: retry_after
+                .values()
+                .filter(|retry_at| **retry_at > now)
+                .count(),
+            active_download_limit: cfg.queue.max_active_downloads,
+            active_metadata_fetch_limit: cfg.queue.max_active_metadata_fetches,
+            active_seed_limit: cfg.queue.max_active_seeds,
+            peer_worker_global_limit: cfg.bandwidth.max_peers,
+            peer_worker_per_torrent_limit: cfg.bandwidth.max_peers_per_torrent,
+            effective_peer_worker_limit,
+            peer_worker_budget,
+            active_peer_workers,
+            download_slots_saturated: cfg.queue.max_active_downloads > 0
+                && requested_downloads > granted_downloads
+                && granted_downloads >= cfg.queue.max_active_downloads,
+            metadata_fetch_slots_saturated: cfg.queue.max_active_metadata_fetches > 0
+                && requested_metadata_fetches > granted_metadata_fetches
+                && granted_metadata_fetches >= cfg.queue.max_active_metadata_fetches,
+            peer_worker_budget_saturated: peer_worker_budget > 0
+                && active_peer_workers >= peer_worker_budget,
+        }
+    }
+
     async fn active_download_hashes(&self) -> Vec<InfoHash> {
         let running: Vec<InfoHash> = self.engine_handles.lock().await.keys().copied().collect();
         let reg = self.registry.lock().await;
@@ -607,21 +742,35 @@ impl DaemonRuntime {
 
     async fn desired_download_hashes(&self) -> Vec<InfoHash> {
         let cfg = self.config.lock().await.clone();
+        let retry_after = self.engine_retry_after.lock().await.clone();
         let mut queue = self.queue.lock().await;
         queue.limits = cfg.queue.clone();
         let reg = self.registry.lock().await;
-        let retry_after = self.engine_retry_after.lock().await.clone();
         let now = Instant::now();
-        queue.order.retain(|hash| reg.contains(hash));
-        queue.bypass.retain(|hash| reg.contains(hash));
+        let stale_queue_entries = queue
+            .order
+            .iter()
+            .chain(queue.bypass.iter())
+            .filter(|hash| !reg.contains(hash))
+            .copied()
+            .collect::<Vec<_>>();
+        queue.remove_many(stale_queue_entries);
 
-        let limit = queue.limits.max_active_downloads;
+        let download_limit = queue.limits.max_active_downloads;
+        let metadata_limit = queue.limits.max_active_metadata_fetches;
         let mut active = Vec::new();
+        let mut active_set = HashSet::new();
+        let mut active_downloads = 0usize;
+        let mut active_metadata_fetches = 0usize;
+        let bypass_set = queue.bypass.iter().copied().collect::<HashSet<_>>();
         for hash in queue.bypass.iter().chain(queue.order.iter()) {
-            if limit > 0 && active.len() >= limit {
+            let download_slots_full = download_limit > 0 && active_downloads >= download_limit;
+            let metadata_slots_full =
+                metadata_limit > 0 && active_metadata_fetches >= metadata_limit;
+            if download_slots_full && metadata_slots_full {
                 break;
             }
-            if active.contains(hash) {
+            if !active_set.insert(*hash) {
                 continue;
             }
             if retry_after
@@ -633,12 +782,13 @@ impl DaemonRuntime {
             let Some(t) = reg.get(hash) else {
                 continue;
             };
-            let bypass = queue.bypass.contains(hash);
+            let bypass = bypass_set.contains(hash);
             let already_active = matches!(
                 t.state,
                 TorrentState::Downloading | TorrentState::DownloadingMetadata
             );
             let auto_startable = queue.limits.auto_start || bypass || already_active;
+            let metadata_fetch = t.needs_metadata;
             if auto_startable
                 && matches!(
                     t.state,
@@ -647,6 +797,17 @@ impl DaemonRuntime {
                         | TorrentState::DownloadingMetadata
                 )
             {
+                if metadata_fetch {
+                    if metadata_slots_full {
+                        continue;
+                    }
+                    active_metadata_fetches += 1;
+                } else {
+                    if download_slots_full {
+                        continue;
+                    }
+                    active_downloads += 1;
+                }
                 active.push(*hash);
             }
         }
@@ -668,7 +829,7 @@ impl DaemonRuntime {
 
         for hash in current {
             if !desired.contains(&hash) {
-                self.stop_engine(&hash).await;
+                self.force_stop_engine(&hash).await;
                 let mut reg = self.registry.lock().await;
                 if let Some(t) = reg.get_mut(&hash) {
                     if !matches!(t.state, TorrentState::Paused | TorrentState::Completed) {
@@ -711,11 +872,9 @@ impl DaemonRuntime {
 
         {
             let mut queue = self.queue.lock().await;
-            for hash in &recovered {
-                queue.add(*hash);
-                queue.clear_bypass(hash);
-                queue.move_to_bottom(hash);
-            }
+            queue.add_many(recovered.iter().copied());
+            queue.clear_bypass_many(recovered.iter().copied());
+            queue.move_many_to_bottom(recovered.iter().copied());
         }
 
         for hash in &recovered {
@@ -1651,13 +1810,20 @@ impl DaemonRuntime {
     /// so API/UI summaries reflect real progress while downloading.
     async fn reconcile_engine_progress(&self) {
         let states = self.engine_states.lock().await.clone();
+        let running_engines: HashSet<InfoHash> =
+            self.engine_handles.lock().await.keys().copied().collect();
         let now = Instant::now();
+        let retry_after = self.engine_retry_after.lock().await.clone();
         let mut samples = self.rate_samples.lock().await;
         let mut reg = self.registry.lock().await;
         let calc = HealthCalculator::new();
         for (hash, state) in &states {
             let s = state.lock().await;
             if let Some(t) = reg.get_mut(hash) {
+                let engine_is_running = running_engines.contains(hash);
+                let retry_suppressed = retry_after
+                    .get(hash)
+                    .is_some_and(|retry_at| *retry_at > now);
                 if let Some(real) = s.resolved_meta.as_ref() {
                     apply_resolved_metadata(t, real, &s);
                 }
@@ -1747,12 +1913,14 @@ impl DaemonRuntime {
                 if !t.state.is_error() && t.state != TorrentState::Paused {
                     if s.finished {
                         t.state = TorrentState::Completed;
-                    } else if t.needs_metadata {
-                        t.state = TorrentState::DownloadingMetadata;
-                    } else if t.state == TorrentState::Queued
-                        || t.state == TorrentState::DownloadingMetadata
-                    {
-                        t.state = TorrentState::Downloading;
+                    } else if engine_is_running && !retry_suppressed {
+                        if t.needs_metadata {
+                            t.state = TorrentState::DownloadingMetadata;
+                        } else if t.state == TorrentState::Queued
+                            || t.state == TorrentState::DownloadingMetadata
+                        {
+                            t.state = TorrentState::Downloading;
+                        }
                     }
                 }
 
@@ -3409,6 +3577,8 @@ impl DaemonOps for DaemonRuntime {
 
     async fn global_stats(&self) -> GlobalStats {
         self.reconcile_engine_progress().await;
+        let desired = self.desired_download_hashes().await;
+        let scheduler = self.scheduler_diagnostics(&desired).await;
         let reg = self.registry.lock().await;
         let active_downloads = reg
             .torrents
@@ -3439,6 +3609,7 @@ impl DaemonOps for DaemonRuntime {
             paused,
             total_downloaded: reg.torrents.values().map(|t| t.downloaded).sum(),
             total_uploaded: reg.torrents.values().map(|t| t.uploaded).sum(),
+            scheduler,
             ..Default::default()
         }
     }
@@ -4049,6 +4220,12 @@ mod tests {
         p
     }
 
+    fn scale_hash_bytes(n: u32) -> [u8; 20] {
+        let mut bytes = [0u8; 20];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        bytes
+    }
+
     #[tokio::test]
     async fn reconcile_updates_transfer_rates_and_global_stats() {
         let cfg = Config::default();
@@ -4159,6 +4336,12 @@ mod tests {
         torrent.needs_metadata = true;
         torrent.magnet_info_hash = Some(hash);
         runtime.registry.lock().await.add(torrent).unwrap();
+        runtime.engine_handles.lock().await.insert(
+            hash,
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+        );
 
         let mut pieces_have =
             swarmotter_core::storage::resume::PieceBitfield::new(real_meta.piece_count());
@@ -4188,6 +4371,8 @@ mod tests {
         assert!(!torrent.needs_metadata);
         assert_eq!(torrent.progress.total, real_meta.piece_count());
         assert_eq!(torrent.files[0].path, "resolved-magnet.bin");
+        drop(reg);
+        runtime.force_stop_engine(&hash).await;
     }
 
     #[tokio::test]
@@ -4215,6 +4400,12 @@ mod tests {
         torrent.needs_metadata = true;
         torrent.magnet_info_hash = Some(hash);
         runtime.registry.lock().await.add(torrent).unwrap();
+        runtime.engine_handles.lock().await.insert(
+            hash,
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+        );
         runtime.engine_states.lock().await.insert(
             hash,
             Arc::new(Mutex::new(EngineState {
@@ -4226,10 +4417,12 @@ mod tests {
         let summary = runtime.get_torrent(&hash).await.unwrap();
         assert_eq!(summary.state, TorrentState::DownloadingMetadata);
         assert_eq!(summary.total_length, "placeholder".len() as u64);
+
+        runtime.force_stop_engine(&hash).await;
     }
 
     #[tokio::test]
-    async fn retryable_magnet_metadata_no_peers_stays_in_metadata_state() {
+    async fn retryable_magnet_metadata_no_peers_stays_queued_after_progress_reconcile() {
         let cfg = Config::default();
         let health = NetworkHealth::blocked(
             NetworkContainmentMode::Disabled,
@@ -4248,12 +4441,22 @@ mod tests {
         let hash =
             swarmotter_core::hash::InfoHash::from_hex("95c6c298c84fee2eee10c044d673537da158f0f8")
                 .unwrap();
+        let piece_count = placeholder_meta.piece_count();
+        let total_length = placeholder_meta.total_length;
         let mut torrent = Torrent::new(placeholder_meta, 1);
         torrent.state = TorrentState::DownloadingMetadata;
         torrent.needs_metadata = true;
         torrent.magnet_info_hash = Some(hash);
         runtime.registry.lock().await.add(torrent).unwrap();
         runtime.queue.lock().await.add(hash);
+        runtime.engine_states.lock().await.insert(
+            hash,
+            Arc::new(Mutex::new(EngineState {
+                piece_count,
+                total_length,
+                ..Default::default()
+            })),
+        );
 
         let retry = runtime
             .handle_engine_task_error(
@@ -4285,6 +4488,16 @@ mod tests {
         assert!(
             runtime.desired_download_hashes().await.is_empty(),
             "retry backoff should keep no-peer magnets out of active queue slots"
+        );
+
+        runtime.reconcile_engine_progress().await;
+
+        let reg = runtime.registry.lock().await;
+        let torrent = reg.get(&hash).unwrap();
+        assert_eq!(
+            torrent.state,
+            TorrentState::Queued,
+            "stale engine diagnostics must not reactivate a magnet queued for metadata retry"
         );
     }
 
@@ -4418,6 +4631,276 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_metadata_progress_does_not_reactivate_large_queue_above_limit() {
+        let mut cfg = Config::default();
+        cfg.queue.max_active_downloads = 50;
+        cfg.queue.max_active_metadata_fetches = 50;
+        cfg.queue.auto_start = true;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let placeholder_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "magnet placeholder",
+            b"placeholder",
+            8,
+            None,
+            false,
+        );
+        let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
+
+        {
+            let mut reg = runtime.registry.lock().await;
+            let mut queue = runtime.queue.lock().await;
+            let mut states = runtime.engine_states.lock().await;
+            for idx in 1..=100u8 {
+                let hash = InfoHash::from_bytes([idx; 20]);
+                let mut torrent = Torrent::new(placeholder_meta.clone(), idx as u64);
+                torrent.state = TorrentState::DownloadingMetadata;
+                torrent.needs_metadata = true;
+                torrent.magnet_info_hash = Some(hash);
+                reg.add(torrent).unwrap();
+                queue.add(hash);
+                states.insert(
+                    hash,
+                    Arc::new(Mutex::new(EngineState {
+                        piece_count: placeholder_meta.piece_count(),
+                        total_length: placeholder_meta.total_length,
+                        ..Default::default()
+                    })),
+                );
+            }
+        }
+
+        let recovered = runtime.sweep_stale_active_torrents("test").await;
+        assert_eq!(recovered, 100);
+
+        runtime.reconcile_engine_progress().await;
+
+        let active_count = runtime
+            .registry
+            .lock()
+            .await
+            .torrents
+            .values()
+            .filter(|torrent| {
+                matches!(
+                    torrent.state,
+                    TorrentState::Downloading | TorrentState::DownloadingMetadata
+                )
+            })
+            .count();
+        assert_eq!(
+            active_count, 0,
+            "retained metadata diagnostics must not bypass active queue limits"
+        );
+        assert_eq!(runtime.desired_download_hashes().await.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn ten_thousand_stale_metadata_records_recover_without_active_leak() {
+        const TOTAL_TORRENTS: usize = 10_000;
+
+        let mut cfg = Config::default();
+        cfg.queue.max_active_downloads = 50;
+        cfg.queue.max_active_metadata_fetches = 50;
+        cfg.queue.auto_start = true;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let placeholder_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "magnet placeholder",
+            b"placeholder",
+            8,
+            None,
+            false,
+        );
+        let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
+        let hashes = (0..TOTAL_TORRENTS)
+            .map(|idx| InfoHash::from_bytes(scale_hash_bytes(idx as u32)))
+            .collect::<Vec<_>>();
+
+        {
+            let mut reg = runtime.registry.lock().await;
+            for (idx, hash) in hashes.iter().copied().enumerate() {
+                let mut torrent = Torrent::new(placeholder_meta.clone(), (idx + 1) as u64);
+                torrent.state = TorrentState::DownloadingMetadata;
+                torrent.needs_metadata = true;
+                torrent.magnet_info_hash = Some(hash);
+                reg.add(torrent).unwrap();
+            }
+        }
+        runtime.queue.lock().await.add_many(hashes.iter().copied());
+
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.sweep_stale_active_torrents("test"),
+        )
+        .await
+        .expect("stale active recovery should be bounded for 10,000 records");
+
+        assert_eq!(recovered, TOTAL_TORRENTS);
+        let reg = runtime.registry.lock().await;
+        assert_eq!(
+            reg.torrents
+                .values()
+                .filter(|torrent| {
+                    matches!(
+                        torrent.state,
+                        TorrentState::Downloading | TorrentState::DownloadingMetadata
+                    )
+                })
+                .count(),
+            0
+        );
+        drop(reg);
+        assert_eq!(runtime.desired_download_hashes().await.len(), 50);
+        assert_eq!(runtime.queue.lock().await.order.len(), TOTAL_TORRENTS);
+    }
+
+    #[tokio::test]
+    async fn ten_thousand_metadata_retry_backoffs_leave_no_active_desired_slots() {
+        const TOTAL_TORRENTS: usize = 10_000;
+
+        let mut cfg = Config::default();
+        cfg.queue.max_active_downloads = 50;
+        cfg.queue.max_active_metadata_fetches = 50;
+        cfg.queue.auto_start = true;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let placeholder_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "magnet placeholder",
+            b"placeholder",
+            8,
+            None,
+            false,
+        );
+        let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
+        let hashes = (0..TOTAL_TORRENTS)
+            .map(|idx| InfoHash::from_bytes(scale_hash_bytes(idx as u32)))
+            .collect::<Vec<_>>();
+
+        {
+            let mut reg = runtime.registry.lock().await;
+            for (idx, hash) in hashes.iter().copied().enumerate() {
+                let mut torrent = Torrent::new(placeholder_meta.clone(), (idx + 1) as u64);
+                torrent.state = TorrentState::Queued;
+                torrent.needs_metadata = true;
+                torrent.magnet_info_hash = Some(hash);
+                reg.add(torrent).unwrap();
+            }
+        }
+        runtime.queue.lock().await.add_many(hashes.iter().copied());
+        {
+            let mut retry_after = runtime.engine_retry_after.lock().await;
+            let retry_until = Instant::now() + MAGNET_METADATA_NO_PEERS_RETRY_DELAY;
+            for hash in &hashes {
+                retry_after.insert(*hash, retry_until);
+            }
+        }
+
+        let desired =
+            tokio::time::timeout(Duration::from_secs(5), runtime.desired_download_hashes())
+                .await
+                .expect("desired active planning should be bounded for 10,000 retrying magnets");
+
+        assert!(desired.is_empty());
+        assert_eq!(runtime.queue.lock().await.order.len(), TOTAL_TORRENTS);
+    }
+
+    #[tokio::test]
+    async fn metadata_fetch_limit_is_separate_from_download_slot_limit() {
+        let mut cfg = Config::default();
+        cfg.queue.max_active_downloads = 2;
+        cfg.queue.max_active_metadata_fetches = 3;
+        cfg.queue.auto_start = true;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let placeholder_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "magnet placeholder",
+            b"placeholder",
+            8,
+            None,
+            false,
+        );
+        let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
+        let mut metadata_hashes = Vec::new();
+        let mut download_hashes = Vec::new();
+
+        {
+            let mut reg = runtime.registry.lock().await;
+            let mut queue = runtime.queue.lock().await;
+            for idx in 0..6u32 {
+                let hash = InfoHash::from_bytes(scale_hash_bytes(idx));
+                let mut torrent = Torrent::new(placeholder_meta.clone(), idx as u64 + 1);
+                torrent.state = TorrentState::Queued;
+                torrent.needs_metadata = true;
+                torrent.magnet_info_hash = Some(hash);
+                reg.add(torrent).unwrap();
+                queue.add(hash);
+                metadata_hashes.push(hash);
+            }
+            for idx in 0..5u32 {
+                let name = format!("resolved-download-{idx}.bin");
+                let payload = format!("resolved download payload {idx}");
+                let bytes = swarmotter_core::meta::build_single_file_torrent(
+                    &name,
+                    payload.as_bytes(),
+                    8,
+                    None,
+                    false,
+                );
+                let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+                let hash = meta.info_hash;
+                reg.add(Torrent::new(meta, idx as u64 + 10)).unwrap();
+                queue.add(hash);
+                download_hashes.push(hash);
+            }
+        }
+
+        let desired = runtime.desired_download_hashes().await;
+
+        assert_eq!(
+            desired
+                .iter()
+                .filter(|hash| metadata_hashes.contains(hash))
+                .count(),
+            3
+        );
+        assert_eq!(
+            desired
+                .iter()
+                .filter(|hash| download_hashes.contains(hash))
+                .count(),
+            2
+        );
+        assert_eq!(desired.len(), 5);
+
+        let stats = runtime.global_stats().await;
+        assert_eq!(stats.scheduler.requested_metadata_fetches, 6);
+        assert_eq!(stats.scheduler.granted_metadata_fetches, 3);
+        assert_eq!(stats.scheduler.requested_downloads, 5);
+        assert_eq!(stats.scheduler.granted_downloads, 2);
+        assert_eq!(stats.scheduler.active_metadata_fetch_limit, 3);
+        assert_eq!(stats.scheduler.active_download_limit, 2);
+        assert!(stats.scheduler.metadata_fetch_slots_saturated);
+        assert!(stats.scheduler.download_slots_saturated);
+    }
+
+    #[tokio::test]
     async fn queued_torrent_with_stale_engine_handle_is_cleared_for_restart() {
         let mut cfg = Config::default();
         cfg.queue.max_active_downloads = 1;
@@ -4478,6 +4961,92 @@ mod tests {
             );
         }
         assert_eq!(runtime.desired_download_hashes().await, vec![hash]);
+    }
+
+    #[tokio::test]
+    async fn reconcile_queue_force_clears_over_limit_active_engine() {
+        let mut cfg = Config::default();
+        cfg.queue.max_active_downloads = 1;
+        cfg.queue.auto_start = true;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let first_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "active-slot-one.bin",
+            b"active slot one payload",
+            8,
+            None,
+            false,
+        );
+        let second_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "active-slot-two.bin",
+            b"active slot two payload",
+            8,
+            None,
+            false,
+        );
+        let first_meta = swarmotter_core::meta::parse_torrent(&first_bytes).unwrap();
+        let second_meta = swarmotter_core::meta::parse_torrent(&second_bytes).unwrap();
+        let first_hash = first_meta.info_hash;
+        let second_hash = second_meta.info_hash;
+        let mut first_torrent = Torrent::new(first_meta, 1);
+        first_torrent.state = TorrentState::Downloading;
+        let mut second_torrent = Torrent::new(second_meta, 2);
+        second_torrent.state = TorrentState::Downloading;
+        {
+            let mut reg = runtime.registry.lock().await;
+            reg.add(first_torrent).unwrap();
+            reg.add(second_torrent).unwrap();
+        }
+        {
+            let mut queue = runtime.queue.lock().await;
+            queue.add(first_hash);
+            queue.add(second_hash);
+        }
+        {
+            let mut handles = runtime.engine_handles.lock().await;
+            handles.insert(
+                first_hash,
+                tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                }),
+            );
+            handles.insert(
+                second_hash,
+                tokio::spawn(async {
+                    std::future::pending::<()>().await;
+                }),
+            );
+        }
+
+        tokio::time::timeout(Duration::from_millis(100), runtime.reconcile_queue())
+            .await
+            .expect("queue reconciliation must not hang on over-limit active work");
+
+        assert!(runtime
+            .engine_handles
+            .lock()
+            .await
+            .contains_key(&first_hash));
+        assert!(!runtime
+            .engine_handles
+            .lock()
+            .await
+            .contains_key(&second_hash));
+        {
+            let reg = runtime.registry.lock().await;
+            assert_eq!(
+                reg.get(&first_hash).unwrap().state,
+                TorrentState::Downloading
+            );
+            assert_eq!(reg.get(&second_hash).unwrap().state, TorrentState::Queued);
+        }
+        assert_eq!(runtime.active_download_hashes().await, vec![first_hash]);
+
+        runtime.force_stop_engine(&first_hash).await;
     }
 
     #[tokio::test]
@@ -5086,6 +5655,12 @@ mod tests {
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         runtime.engine_cmds.lock().await.insert(hash, tx);
+        runtime.engine_handles.lock().await.insert(
+            hash,
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+        );
 
         runtime.refresh_autopilot_decisions(true).await;
 
@@ -5102,6 +5677,7 @@ mod tests {
             decision.action.unwrap().kind,
             AutopilotActionKind::ExpandDiscovery
         ));
+        runtime.force_stop_engine(&hash).await;
     }
 
     #[tokio::test]
@@ -5609,6 +6185,7 @@ mod tests {
             .update_settings(swarmotter_api::state::SettingsPatch {
                 queue: Some(swarmotter_core::queue::QueueLimits {
                     max_active_downloads: 50,
+                    max_active_metadata_fetches: 100,
                     max_active_seeds: 5,
                     auto_start: true,
                 }),
@@ -5744,6 +6321,76 @@ mod tests {
         assert_eq!(removed.len(), REMOVE_COUNT);
         assert!(runtime.registry.lock().await.torrents.is_empty());
         assert!(runtime.queue.lock().await.order.is_empty());
+        assert!(runtime.engine_handles.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bulk_remove_clears_ten_thousand_torrents_and_runtime_indexes() {
+        const REMOVE_COUNT: usize = 10_000;
+
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let placeholder_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "managed placeholder",
+            b"managed placeholder payload",
+            8,
+            None,
+            false,
+        );
+        let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
+        let hashes = (0..REMOVE_COUNT)
+            .map(|idx| InfoHash::from_bytes(scale_hash_bytes(idx as u32)))
+            .collect::<Vec<_>>();
+
+        {
+            let mut reg = runtime.registry.lock().await;
+            for (idx, hash) in hashes.iter().copied().enumerate() {
+                let mut torrent = Torrent::new(placeholder_meta.clone(), (idx + 1) as u64);
+                torrent.magnet_info_hash = Some(hash);
+                reg.add(torrent).unwrap();
+            }
+        }
+        runtime.queue.lock().await.add_many(hashes.iter().copied());
+        runtime.rate_samples.lock().await.insert(
+            hashes[0],
+            RateSample {
+                downloaded: 1,
+                uploaded: 0,
+                rate_down: 1,
+                rate_up: 0,
+                last_download_at: Some(Instant::now()),
+                last_upload_at: None,
+                no_download_since: None,
+                at: Instant::now(),
+                peak_rate_down: 1,
+                peak_rate_up: 0,
+            },
+        );
+        runtime
+            .engine_retry_after
+            .lock()
+            .await
+            .insert(hashes[1], Instant::now() + ENGINE_INCOMPLETE_RETRY_DELAY);
+
+        let removed = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.remove_torrents(hashes.clone(), false),
+        )
+        .await
+        .expect("bulk remove should be bounded for 10,000 records")
+        .unwrap();
+
+        assert_eq!(removed.len(), REMOVE_COUNT);
+        assert!(runtime.registry.lock().await.torrents.is_empty());
+        assert!(runtime.queue.lock().await.order.is_empty());
+        assert!(runtime.queue.lock().await.bypass.is_empty());
+        assert!(runtime.rate_samples.lock().await.is_empty());
+        assert!(runtime.engine_retry_after.lock().await.is_empty());
         assert!(runtime.engine_handles.lock().await.is_empty());
     }
 

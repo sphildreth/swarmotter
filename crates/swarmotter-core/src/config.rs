@@ -559,6 +559,7 @@ global_ratio_limit = 1.5
         assert_eq!(cfg.bandwidth.global_download, 1024);
         assert_eq!(cfg.bandwidth.global_upload, 0);
         assert_eq!(cfg.queue.max_active_downloads, 2);
+        assert_eq!(cfg.queue.max_active_metadata_fetches, 100);
         assert_eq!(cfg.queue.max_active_seeds, 5);
         assert!(cfg.queue.auto_start);
         assert_eq!(cfg.seeding.global_ratio_limit, Some(1.5));

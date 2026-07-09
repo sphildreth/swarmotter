@@ -39,6 +39,11 @@ ADR-0009 and ADR-0010.
   libraries should use `GET /api/v1/torrents/query` for explicit filtering,
   sorting, pagination, counts, and grouping without changing the legacy
   response shape; see ADR-0036.
+- `GET /api/v1/stats` includes scheduler diagnostics for large libraries:
+  configured active caps, requested and granted download/metadata slots,
+  running engine counts, retry-backoff counts, peer-worker budget, and
+  saturation booleans. These fields are additive to the `/api/v1` stats shape;
+  see ADR-0042.
 - Storage add-time preflight is part of `/api/v1` compatibility: when
   configured reserves are not met on the target storage root, add requests reject
   before data write.

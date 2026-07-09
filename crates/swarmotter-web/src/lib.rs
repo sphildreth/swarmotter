@@ -724,6 +724,7 @@ mod tests {
             "cfg-bandwidth-max-peers-per-torrent",
             "cfg-bandwidth-alt-enabled",
             "cfg-queue-max-active-downloads",
+            "cfg-queue-max-active-metadata-fetches",
             "cfg-queue-max-active-seeds",
             "cfg-queue-auto-start",
             "cfg-seeding-global-ratio-limit",
@@ -762,6 +763,7 @@ mod tests {
             "enabled: settingsField(\"cfg-compat-qbittorrent-enabled\").checked,",
             "minimum_free_space_bytes: settingsInteger(\"cfg-storage-minimum-free-space-bytes\", 0),",
             "minimum_free_space_percent: settingsInteger(\"cfg-storage-minimum-free-space-percent\", 0),",
+            "max_active_metadata_fetches: settingsInteger(\"cfg-queue-max-active-metadata-fetches\"),",
             "function renderWatchFolderEditors(",
             "function collectWatchFolderEditors(",
             "method: \"PUT\"",
@@ -799,6 +801,26 @@ mod tests {
                 "Settings editor still contains old raw/partial config surface {old_surface}"
             );
         }
+    }
+
+    #[test]
+    fn web_ui_queue_metadata_fetch_limit_is_wired() {
+        assert!(
+            INDEX_HTML.contains("id=\"cfg-queue-max-active-metadata-fetches\""),
+            "Queue settings editor is missing max_active_metadata_fetches field id"
+        );
+        assert!(
+            INDEX_HTML.contains("<span>Max active metadata fetches</span>"),
+            "Queue settings editor is missing max_active_metadata_fetches label"
+        );
+        assert!(
+            APP_JS.contains("setSettingsValue(\"cfg-queue-max-active-metadata-fetches\", queue.max_active_metadata_fetches)"),
+            "Queue settings editor is missing max_active_metadata_fetches load wiring"
+        );
+        assert!(
+            APP_JS.contains("max_active_metadata_fetches: settingsInteger(\"cfg-queue-max-active-metadata-fetches\"),"),
+            "Queue settings editor is missing max_active_metadata_fetches save wiring"
+        );
     }
 
     #[test]

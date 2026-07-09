@@ -52,6 +52,34 @@ pub struct GlobalStats {
     pub total_uploaded: u64,
     pub free_space: Option<u64>,
     pub uptime_seconds: u64,
+    #[serde(default)]
+    pub scheduler: SchedulerDiagnostics,
+}
+
+/// Global resource scheduler diagnostics for large-library operation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SchedulerDiagnostics {
+    pub managed_torrents: usize,
+    pub queued_torrents: usize,
+    pub running_engines: usize,
+    pub running_downloads: usize,
+    pub running_metadata_fetches: usize,
+    pub requested_downloads: usize,
+    pub requested_metadata_fetches: usize,
+    pub granted_downloads: usize,
+    pub granted_metadata_fetches: usize,
+    pub retry_backoff_torrents: usize,
+    pub active_download_limit: usize,
+    pub active_metadata_fetch_limit: usize,
+    pub active_seed_limit: usize,
+    pub peer_worker_global_limit: usize,
+    pub peer_worker_per_torrent_limit: usize,
+    pub effective_peer_worker_limit: usize,
+    pub peer_worker_budget: usize,
+    pub active_peer_workers: usize,
+    pub download_slots_saturated: bool,
+    pub metadata_fetch_slots_saturated: bool,
+    pub peer_worker_budget_saturated: bool,
 }
 
 /// Live peer scheduling diagnostics for understanding why discovered peers

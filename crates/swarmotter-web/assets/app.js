@@ -1812,6 +1812,7 @@ function renderSettingsEditor(cfg) {
   setSettingsChecked("cfg-bandwidth-alt-enabled", bandwidth.alt_enabled);
 
   setSettingsValue("cfg-queue-max-active-downloads", queue.max_active_downloads);
+  setSettingsValue("cfg-queue-max-active-metadata-fetches", queue.max_active_metadata_fetches);
   setSettingsValue("cfg-queue-max-active-seeds", queue.max_active_seeds);
   setSettingsChecked("cfg-queue-auto-start", queue.auto_start);
 
@@ -1916,6 +1917,7 @@ function collectSettingsConfig() {
     },
     queue: {
       max_active_downloads: settingsInteger("cfg-queue-max-active-downloads"),
+      max_active_metadata_fetches: settingsInteger("cfg-queue-max-active-metadata-fetches"),
       max_active_seeds: settingsInteger("cfg-queue-max-active-seeds"),
       auto_start: settingsField("cfg-queue-auto-start").checked,
     },

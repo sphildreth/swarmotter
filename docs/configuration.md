@@ -324,6 +324,7 @@ or network namespace.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `max_active_downloads` | `5` | Simultaneous active downloads, `0` means unlimited. |
+| `max_active_metadata_fetches` | `100` | Simultaneous active magnet metadata fetches, `0` means unlimited. Does not consume download/seed active slots. |
 | `max_active_seeds` | `5` | Simultaneous active seeds, `0` means unlimited. |
 | `auto_start` | `true` | Starts newly added torrents automatically. |
 

@@ -51,6 +51,7 @@ max_peers_per_torrent = 0
 
 [queue]
 max_active_downloads = 5
+max_active_metadata_fetches = 100
 max_active_seeds = 5
 auto_start = true
 
