@@ -65,6 +65,8 @@ const MAGNET_METADATA_NO_PEERS_RETRY_MESSAGE: &str =
     "magnet metadata fetch: no peers discovered; will retry";
 const STALE_ACTIVE_RECOVERY_MESSAGE: &str =
     "active torrent had no running engine; queued for lifecycle recovery";
+const STALE_INACTIVE_ENGINE_RECOVERY_MESSAGE: &str =
+    "queued torrent had stale engine bookkeeping; queued for lifecycle recovery";
 
 #[derive(Clone)]
 pub struct DaemonRuntime {
@@ -652,10 +654,12 @@ impl DaemonRuntime {
     }
 
     async fn reconcile_queue(&self) {
+        let inactive_recovered = self.sweep_inactive_engine_handles("queue_reconcile").await;
         let stale_recovered = self.sweep_stale_active_torrents("queue_reconcile").await;
         let desired = self.desired_download_hashes().await;
         let current = self.active_download_hashes().await;
         tracing::debug!(
+            inactive_recovered,
             stale_recovered,
             desired_downloads = desired.len(),
             current_downloads = current.len(),
@@ -725,6 +729,46 @@ impl DaemonRuntime {
             );
         }
         recovered.len()
+    }
+
+    async fn sweep_inactive_engine_handles(&self, reason: &'static str) -> usize {
+        let running: Vec<InfoHash> = self.engine_handles.lock().await.keys().copied().collect();
+        let stale: Vec<(InfoHash, Option<TorrentState>)> = {
+            let reg = self.registry.lock().await;
+            running
+                .into_iter()
+                .filter_map(|hash| match reg.get(&hash) {
+                    Some(t)
+                        if matches!(
+                            t.state,
+                            TorrentState::Downloading | TorrentState::DownloadingMetadata
+                        ) =>
+                    {
+                        None
+                    }
+                    Some(t) => Some((hash, Some(t.state))),
+                    None => Some((hash, None)),
+                })
+                .collect()
+        };
+
+        for (hash, state) in &stale {
+            tracing::warn!(
+                info_hash = %hash,
+                reason,
+                state = ?state,
+                "stale inactive engine bookkeeping cleared"
+            );
+            self.force_stop_engine(hash).await;
+            if matches!(state, Some(TorrentState::Queued)) {
+                let mut reg = self.registry.lock().await;
+                if let Some(t) = reg.get_mut(hash) {
+                    t.error = Some(STALE_INACTIVE_ENGINE_RECOVERY_MESSAGE.into());
+                }
+            }
+        }
+
+        stale.len()
     }
 
     async fn schedule_reconcile_queue(&self, reason: &'static str) {
@@ -1901,7 +1945,7 @@ impl DaemonRuntime {
         if !self.engine_handles.lock().await.contains_key(&hash) {
             return false;
         }
-        self.stop_engine(&hash).await;
+        self.force_stop_engine(&hash).await;
         {
             let mut reg = self.registry.lock().await;
             let Some(t) = reg.get_mut(&hash) else {
@@ -2041,8 +2085,8 @@ impl DaemonRuntime {
             .await;
         let probe = OsInterfaceProbe;
         *self.network_health.lock().await = net::evaluate(&cfg.network, &probe);
-        self.reconcile_queue().await;
         self.apply_peer_worker_limits().await;
+        self.schedule_reconcile_queue("runtime_config").await;
         self.sweep_selfish_completed_torrents_best_effort("runtime_config")
             .await;
         self.reconcile_seeders().await;
@@ -3460,9 +3504,6 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn torrent_autopilot_decision(&self, hash: &InfoHash) -> Option<AutopilotDecision> {
-        if let Some(decision) = self.autopilot_decisions.lock().await.get(hash).cloned() {
-            return Some(decision);
-        }
         let torrent = self.registry.lock().await.get(hash).cloned()?;
         let cfg = self.config.lock().await.clone();
         let network = self.network_health.lock().await.clone();
@@ -3482,7 +3523,12 @@ impl DaemonOps for DaemonRuntime {
             Instant::now(),
             &network,
         );
-        Some(AutopilotAnalyzer::new().analyze(&input, mode))
+        let decision = AutopilotAnalyzer::new().analyze(&input, mode);
+        self.autopilot_decisions
+            .lock()
+            .await
+            .insert(*hash, decision.clone());
+        Some(decision)
     }
 
     async fn set_torrent_autopilot_mode_override(
@@ -4372,6 +4418,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_torrent_with_stale_engine_handle_is_cleared_for_restart() {
+        let mut cfg = Config::default();
+        cfg.queue.max_active_downloads = 1;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "stale-queued-handle.bin",
+            b"stale queued handle payload",
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = meta.info_hash;
+        runtime
+            .registry
+            .lock()
+            .await
+            .add(Torrent::new(meta, 1))
+            .unwrap();
+        runtime.queue.lock().await.add(hash);
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        runtime.engine_cmds.lock().await.insert(hash, tx);
+        runtime.engine_handles.lock().await.insert(
+            hash,
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+        );
+        runtime
+            .engine_states
+            .lock()
+            .await
+            .insert(hash, Arc::new(Mutex::new(EngineState::default())));
+
+        let recovered = tokio::time::timeout(
+            Duration::from_millis(100),
+            runtime.sweep_inactive_engine_handles("test"),
+        )
+        .await
+        .expect("stale queued handles should be force-cleared promptly");
+
+        assert_eq!(recovered, 1);
+        assert!(!runtime.engine_handles.lock().await.contains_key(&hash));
+        assert!(!runtime.engine_cmds.lock().await.contains_key(&hash));
+        assert!(!runtime.engine_states.lock().await.contains_key(&hash));
+        {
+            let reg = runtime.registry.lock().await;
+            let torrent = reg.get(&hash).unwrap();
+            assert_eq!(torrent.state, TorrentState::Queued);
+            assert_eq!(
+                torrent.error.as_deref(),
+                Some(STALE_INACTIVE_ENGINE_RECOVERY_MESSAGE)
+            );
+        }
+        assert_eq!(runtime.desired_download_hashes().await, vec![hash]);
+    }
+
+    #[tokio::test]
+    async fn large_queue_recovery_keeps_configured_active_slots_startable() {
+        assert_large_queue_recovery_keeps_configured_active_slots_startable(100).await;
+    }
+
+    #[tokio::test]
+    async fn thousand_torrent_queue_recovery_keeps_configured_active_slots_startable() {
+        assert_large_queue_recovery_keeps_configured_active_slots_startable(1_000).await;
+    }
+
+    async fn assert_large_queue_recovery_keeps_configured_active_slots_startable(
+        total_torrents: usize,
+    ) {
+        assert!(total_torrents >= 50);
+        let mut cfg = Config::default();
+        cfg.queue.max_active_downloads = 50;
+        cfg.queue.auto_start = true;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let mut hashes = Vec::new();
+        {
+            let mut reg = runtime.registry.lock().await;
+            let mut queue = runtime.queue.lock().await;
+            for idx in 0..total_torrents {
+                let name = format!("large-queue-{idx}.bin");
+                let payload = format!("large queue payload {idx}");
+                let bytes = swarmotter_core::meta::build_single_file_torrent(
+                    &name,
+                    payload.as_bytes(),
+                    8,
+                    None,
+                    false,
+                );
+                let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+                let hash = meta.info_hash;
+                let mut torrent = Torrent::new(meta, (idx + 1) as u64);
+                if idx < 18 {
+                    torrent.state = TorrentState::Downloading;
+                }
+                reg.add(torrent).unwrap();
+                queue.add(hash);
+                hashes.push(hash);
+            }
+        }
+
+        {
+            let mut handles = runtime.engine_handles.lock().await;
+            for hash in hashes.iter().take(18) {
+                handles.insert(
+                    *hash,
+                    tokio::spawn(async {
+                        std::future::pending::<()>().await;
+                    }),
+                );
+            }
+            for hash in hashes.iter().skip(18).take(32) {
+                handles.insert(
+                    *hash,
+                    tokio::spawn(async {
+                        std::future::pending::<()>().await;
+                    }),
+                );
+            }
+        }
+
+        assert_eq!(runtime.active_download_hashes().await.len(), 18);
+        let recovered = runtime.sweep_inactive_engine_handles("test").await;
+        assert_eq!(recovered, 32);
+
+        let desired = runtime.desired_download_hashes().await;
+        assert_eq!(desired.len(), 50);
+        assert_eq!(
+            desired
+                .iter()
+                .filter(|hash| hashes[..18].contains(hash))
+                .count(),
+            18
+        );
+        let running = runtime.engine_handles.lock().await;
+        let blocked_startable = desired
+            .iter()
+            .filter(|hash| !hashes[..18].contains(hash) && running.contains_key(hash))
+            .count();
+        assert_eq!(
+            blocked_startable, 0,
+            "queued torrents selected to fill the configured active slots must not retain stale handles that make start_engine skip them"
+        );
+        drop(running);
+
+        for hash in hashes.iter().take(18) {
+            runtime.force_stop_engine(hash).await;
+        }
+    }
+
+    #[tokio::test]
     async fn engine_task_finished_clears_restart_blocking_runtime_bookkeeping() {
         let cfg = Config::default();
         let health = NetworkHealth::blocked(
@@ -4733,6 +4940,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn torrent_autopilot_decision_recomputes_stale_cached_snapshot() {
+        let mut cfg = Config::default();
+        cfg.autopilot.mode = AutopilotMode::Observe;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "autopilot-current.bin",
+            b"autopilot current payload",
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = meta.info_hash;
+        let mut torrent = Torrent::new(meta.clone(), 1);
+        torrent.state = TorrentState::Downloading;
+        runtime.registry.lock().await.add(torrent).unwrap();
+        let stale = AutopilotAnalyzer::new().analyze(
+            &AutopilotInput {
+                state: TorrentState::Queued,
+                ..Default::default()
+            },
+            AutopilotMode::Observe,
+        );
+        runtime.autopilot_decisions.lock().await.insert(hash, stale);
+        runtime.engine_states.lock().await.insert(
+            hash,
+            Arc::new(Mutex::new(EngineState {
+                piece_count: meta.piece_count(),
+                total_length: meta.total_length,
+                active_peers: 2,
+                peers: vec![
+                    swarmotter_core::peer::PeerAddr::from_socket_addr(
+                        "127.0.0.1:6881".parse().unwrap(),
+                    ),
+                    swarmotter_core::peer::PeerAddr::from_socket_addr(
+                        "127.0.0.1:6882".parse().unwrap(),
+                    ),
+                ],
+                peer_scheduler: PeerSchedulerDiagnostics {
+                    discovered_peers: 2,
+                    eligible_peers: 2,
+                    peer_worker_limit: 8,
+                    parallel_workers_started: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })),
+        );
+
+        let decision = runtime.torrent_autopilot_decision(&hash).await.unwrap();
+
+        assert_eq!(decision.snapshot.state, TorrentState::Downloading);
+        assert_eq!(decision.snapshot.known_peers, 2);
+        assert_eq!(decision.snapshot.active_peer_workers, 2);
+        let cached = runtime
+            .autopilot_decisions
+            .lock()
+            .await
+            .get(&hash)
+            .cloned()
+            .unwrap();
+        assert_eq!(cached.snapshot.state, TorrentState::Downloading);
+    }
+
+    #[tokio::test]
     async fn torrent_autopilot_override_is_persisted_and_used() {
         let cfg = Config::default();
         let health = NetworkHealth::blocked(
@@ -4903,14 +5180,20 @@ mod tests {
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         runtime.engine_cmds.lock().await.insert(stalled_hash, tx);
-        runtime
-            .engine_handles
-            .lock()
-            .await
-            .insert(stalled_hash, tokio::spawn(async {}));
+        runtime.engine_handles.lock().await.insert(
+            stalled_hash,
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+        );
         runtime.queue_reconcile.lock().await.scheduled = true;
 
-        runtime.refresh_autopilot_decisions(true).await;
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            runtime.refresh_autopilot_decisions(true),
+        )
+        .await
+        .expect("autopilot queue-slot release should not wait on a noncooperative engine task");
 
         let decision = runtime
             .autopilot_decisions
@@ -5304,6 +5587,44 @@ mod tests {
             assert!(state.scheduled);
             assert!(state.dirty);
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_queue_limit_update_marks_scheduled_reconcile_dirty() {
+        let mut cfg = Config::default();
+        cfg.queue.max_active_downloads = 25;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        {
+            let mut state = runtime.queue_reconcile.lock().await;
+            state.scheduled = true;
+            state.dirty = false;
+        }
+
+        runtime
+            .update_settings(swarmotter_api::state::SettingsPatch {
+                queue: Some(swarmotter_core::queue::QueueLimits {
+                    max_active_downloads: 50,
+                    max_active_seeds: 5,
+                    auto_start: true,
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.config.lock().await.queue.max_active_downloads, 50);
+        assert_eq!(runtime.queue.lock().await.limits.max_active_downloads, 50);
+        let state = runtime.queue_reconcile.lock().await;
+        assert!(state.scheduled);
+        assert!(
+            state.dirty,
+            "runtime queue limit updates should schedule queue reconciliation instead of awaiting engine startup inline"
+        );
     }
 
     #[tokio::test]
