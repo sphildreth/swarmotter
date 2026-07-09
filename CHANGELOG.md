@@ -7,7 +7,7 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
-## [1.2.0] - [2026-07-09] [UNREALEASED]
+## [1.2.0] - [2026-07-09]
 
 ### Added
 
