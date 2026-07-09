@@ -94,6 +94,29 @@ feature completion and acceptance criteria, not by time estimates.
   generated lawful local payload reports a non-zero health score and at
   least one bar, computed from the live engine state.
 
+### Scale tests
+
+- Queue data-structure tests cover 10,000-entry add/remove/reorder behavior.
+- Daemon lifecycle tests cover 1,000- and 10,000-record stale-active recovery,
+  metadata retry backoff, desired active cap enforcement, and bulk removal.
+- API integration tests cover 1,000-torrent rapid add, bulk add, and
+  query/filter/group behavior with generated lawful magnets.
+- Ignored opt-in scale tests cover larger synthetic flows:
+  `ignored_thousand_mixed_state_torrents_keep_scheduler_bounds` validates a
+  1,200-record daemon library across queued, checking, downloading metadata,
+  downloading, seeding, paused, completed, and error states while asserting
+  scheduler request/grant bounds.
+  `ignored_scale_harness_add_query_retry_remove_reset_2000_torrents` validates
+  a 2,000-torrent API add/query/recheck/reannounce/remove/reset flow using
+  generated lawful torrent files.
+
+Run ignored scale tests explicitly when validating large-library behavior:
+
+```bash
+cargo test -p swarmotterd ignored_thousand_mixed_state_torrents_keep_scheduler_bounds -- --ignored
+cargo test -p swarmotter-api --test scale_harness -- --ignored
+```
+
 ## Test data
 
 Tests must use clearly lawful sources (generated local torrents, public-domain
@@ -102,7 +125,4 @@ See `content-policy.md`.
 
 ## TODO
 
-- Decide on integration test harness layout (e.g., `tests/` directories per
-  crate) as implementation begins.
-- Add local swarm fixture tooling.
 - Keep this document aligned with `requirements.md`.

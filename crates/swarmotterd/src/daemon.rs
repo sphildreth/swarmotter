@@ -4818,6 +4818,325 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "scale regression: mixed lifecycle states at 1k+ records"]
+    async fn ignored_thousand_mixed_state_torrents_keep_scheduler_bounds() {
+        const TOTAL_TORRENTS: usize = 1_200;
+        const MAX_ACTIVE_DOWNLOADS: usize = 32;
+        const MAX_ACTIVE_METADATA_FETCHES: usize = 24;
+        const LIVE_DOWNLOAD_COUNT: usize = 20;
+        const LIVE_METADATA_COUNT: usize = 16;
+        const STALE_DOWNLOAD_COUNT: usize = 40;
+        const STALE_METADATA_COUNT: usize = 44;
+        const QUEUED_DOWNLOAD_COUNT: usize = 260;
+        const QUEUED_METADATA_COUNT: usize = 220;
+        const BACKOFF_METADATA_COUNT: usize = 150;
+        const COMPLETED_COUNT: usize = 120;
+        const PAUSED_COUNT: usize = 100;
+        const SEEDING_COUNT: usize = 60;
+        const CHECKING_COUNT: usize = 50;
+        const ERROR_COUNT: usize = 40;
+        const NETWORK_BLOCKED_COUNT: usize = 30;
+        const STORAGE_ERROR_COUNT: usize = 25;
+        const TRACKER_ERROR_COUNT: usize = 25;
+        const LIVE_METADATA_START: usize = LIVE_DOWNLOAD_COUNT;
+        const STALE_DOWNLOAD_START: usize = LIVE_METADATA_START + LIVE_METADATA_COUNT;
+        const STALE_METADATA_START: usize = STALE_DOWNLOAD_START + STALE_DOWNLOAD_COUNT;
+        const QUEUED_DOWNLOAD_START: usize = STALE_METADATA_START + STALE_METADATA_COUNT;
+        const QUEUED_METADATA_START: usize = QUEUED_DOWNLOAD_START + QUEUED_DOWNLOAD_COUNT;
+        const BACKOFF_METADATA_START: usize = QUEUED_METADATA_START + QUEUED_METADATA_COUNT;
+        const COMPLETED_START: usize = BACKOFF_METADATA_START + BACKOFF_METADATA_COUNT;
+        const PAUSED_START: usize = COMPLETED_START + COMPLETED_COUNT;
+        const SEEDING_START: usize = PAUSED_START + PAUSED_COUNT;
+        const CHECKING_START: usize = SEEDING_START + SEEDING_COUNT;
+        const ERROR_START: usize = CHECKING_START + CHECKING_COUNT;
+        const NETWORK_BLOCKED_START: usize = ERROR_START + ERROR_COUNT;
+        const STORAGE_ERROR_START: usize = NETWORK_BLOCKED_START + NETWORK_BLOCKED_COUNT;
+        const TRACKER_ERROR_START: usize = STORAGE_ERROR_START + STORAGE_ERROR_COUNT;
+
+        assert_eq!(TRACKER_ERROR_START + TRACKER_ERROR_COUNT, TOTAL_TORRENTS);
+
+        let mut cfg = Config::default();
+        cfg.queue.max_active_downloads = MAX_ACTIVE_DOWNLOADS;
+        cfg.queue.max_active_metadata_fetches = MAX_ACTIVE_METADATA_FETCHES;
+        cfg.queue.auto_start = true;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+
+        let placeholder_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "mixed-state placeholder",
+            b"placeholder payload",
+            8,
+            None,
+            false,
+        );
+        let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
+        let hashes = (0..TOTAL_TORRENTS)
+            .map(|idx| InfoHash::from_bytes(scale_hash_bytes(idx as u32)))
+            .collect::<Vec<_>>();
+        let backoff_start = Instant::now();
+
+        {
+            let mut reg = runtime.registry.lock().await;
+            for (idx, hash) in hashes.iter().copied().enumerate() {
+                let mut torrent = Torrent::new(placeholder_meta.clone(), (idx + 1) as u64);
+                torrent.magnet_info_hash = Some(hash);
+                if idx < LIVE_DOWNLOAD_COUNT {
+                    torrent.state = TorrentState::Downloading;
+                    torrent.needs_metadata = false;
+                } else if idx < LIVE_METADATA_START + LIVE_METADATA_COUNT {
+                    torrent.state = TorrentState::DownloadingMetadata;
+                    torrent.needs_metadata = true;
+                } else if idx < STALE_DOWNLOAD_START + STALE_DOWNLOAD_COUNT {
+                    torrent.state = TorrentState::Downloading;
+                    torrent.needs_metadata = false;
+                } else if idx < STALE_METADATA_START + STALE_METADATA_COUNT {
+                    torrent.state = TorrentState::DownloadingMetadata;
+                    torrent.needs_metadata = true;
+                } else if idx < QUEUED_DOWNLOAD_START + QUEUED_DOWNLOAD_COUNT {
+                    torrent.state = TorrentState::Queued;
+                    torrent.needs_metadata = false;
+                } else if idx < QUEUED_METADATA_START + QUEUED_METADATA_COUNT {
+                    torrent.state = TorrentState::Queued;
+                    torrent.needs_metadata = true;
+                } else if idx < BACKOFF_METADATA_START + BACKOFF_METADATA_COUNT {
+                    torrent.state = TorrentState::Queued;
+                    torrent.needs_metadata = true;
+                } else if idx < COMPLETED_START + COMPLETED_COUNT {
+                    torrent.state = TorrentState::Completed;
+                    torrent.date_completed = Some((idx + 1) as u64);
+                    torrent.needs_metadata = false;
+                } else if idx < PAUSED_START + PAUSED_COUNT {
+                    torrent.state = TorrentState::Paused;
+                    torrent.needs_metadata = false;
+                } else if idx < SEEDING_START + SEEDING_COUNT {
+                    torrent.state = TorrentState::Seeding;
+                    torrent.needs_metadata = false;
+                } else if idx < CHECKING_START + CHECKING_COUNT {
+                    torrent.state = TorrentState::Checking;
+                    torrent.needs_metadata = false;
+                } else {
+                    torrent.state = if idx < ERROR_START + ERROR_COUNT {
+                        TorrentState::Error
+                    } else if idx < NETWORK_BLOCKED_START + NETWORK_BLOCKED_COUNT {
+                        TorrentState::NetworkBlocked
+                    } else if idx < STORAGE_ERROR_START + STORAGE_ERROR_COUNT {
+                        TorrentState::StorageError
+                    } else {
+                        TorrentState::TrackerError
+                    };
+                    torrent.needs_metadata = false;
+                    torrent.error = Some("mixed-state scale fixture error".to_string());
+                }
+                reg.add(torrent).unwrap();
+            }
+        }
+
+        runtime.queue.lock().await.add_many(hashes.iter().copied());
+        {
+            let mut handles = runtime.engine_handles.lock().await;
+            for hash in hashes.iter().take(LIVE_DOWNLOAD_COUNT).chain(
+                hashes
+                    .iter()
+                    .skip(LIVE_METADATA_START)
+                    .take(LIVE_METADATA_COUNT),
+            ) {
+                handles.insert(
+                    *hash,
+                    tokio::spawn(async {
+                        std::future::pending::<()>().await;
+                    }),
+                );
+            }
+        }
+        {
+            let mut retry_after = runtime.engine_retry_after.lock().await;
+            for hash in hashes
+                .iter()
+                .skip(BACKOFF_METADATA_START)
+                .take(BACKOFF_METADATA_COUNT)
+            {
+                retry_after.insert(*hash, backoff_start + Duration::from_secs(60));
+            }
+        }
+
+        let reg = runtime.registry.lock().await;
+        assert_eq!(reg.torrents.len(), TOTAL_TORRENTS);
+        assert_eq!(
+            reg.torrents
+                .values()
+                .filter(|torrent| torrent.state == TorrentState::Queued)
+                .count(),
+            QUEUED_DOWNLOAD_COUNT + QUEUED_METADATA_COUNT + BACKOFF_METADATA_COUNT
+        );
+        assert_eq!(
+            reg.torrents
+                .values()
+                .filter(|torrent| torrent.state == TorrentState::DownloadingMetadata)
+                .count(),
+            LIVE_METADATA_COUNT + STALE_METADATA_COUNT
+        );
+        assert_eq!(
+            reg.torrents
+                .values()
+                .filter(|torrent| torrent.state == TorrentState::Downloading)
+                .count(),
+            LIVE_DOWNLOAD_COUNT + STALE_DOWNLOAD_COUNT
+        );
+        assert_eq!(
+            reg.torrents
+                .values()
+                .filter(|torrent| torrent.state == TorrentState::Completed)
+                .count(),
+            COMPLETED_COUNT
+        );
+        assert_eq!(
+            reg.torrents
+                .values()
+                .filter(|torrent| torrent.state == TorrentState::Paused)
+                .count(),
+            PAUSED_COUNT
+        );
+        assert_eq!(
+            reg.torrents
+                .values()
+                .filter(|torrent| torrent.state == TorrentState::Seeding)
+                .count(),
+            SEEDING_COUNT
+        );
+        assert_eq!(
+            reg.torrents
+                .values()
+                .filter(|torrent| torrent.state == TorrentState::Checking)
+                .count(),
+            CHECKING_COUNT
+        );
+        assert_eq!(
+            reg.torrents
+                .values()
+                .filter(|torrent| torrent.state == TorrentState::Error)
+                .count(),
+            ERROR_COUNT
+        );
+        assert_eq!(
+            reg.torrents
+                .values()
+                .filter(|torrent| torrent.state == TorrentState::NetworkBlocked)
+                .count(),
+            NETWORK_BLOCKED_COUNT
+        );
+        assert_eq!(
+            reg.torrents
+                .values()
+                .filter(|torrent| torrent.state == TorrentState::StorageError)
+                .count(),
+            STORAGE_ERROR_COUNT
+        );
+        assert_eq!(
+            reg.torrents
+                .values()
+                .filter(|torrent| torrent.state == TorrentState::TrackerError)
+                .count(),
+            TRACKER_ERROR_COUNT
+        );
+        drop(reg);
+
+        let stale_recovered = runtime.sweep_stale_active_torrents("scale_test").await;
+        assert_eq!(stale_recovered, STALE_DOWNLOAD_COUNT + STALE_METADATA_COUNT);
+
+        let desired =
+            tokio::time::timeout(Duration::from_secs(5), runtime.desired_download_hashes())
+                .await
+                .expect("mixed-state scheduler planning should remain bounded for 1,200 records");
+        assert_eq!(
+            desired.len(),
+            MAX_ACTIVE_DOWNLOADS + MAX_ACTIVE_METADATA_FETCHES
+        );
+        let desired_backoff_hashes = hashes
+            .iter()
+            .skip(BACKOFF_METADATA_START)
+            .take(BACKOFF_METADATA_COUNT)
+            .copied()
+            .collect::<Vec<_>>();
+        assert!(desired
+            .iter()
+            .all(|hash| !desired_backoff_hashes.contains(hash)));
+        {
+            let reg = runtime.registry.lock().await;
+            assert_eq!(
+                desired
+                    .iter()
+                    .filter(|hash| reg.get(hash).is_some_and(|torrent| torrent.needs_metadata))
+                    .count(),
+                MAX_ACTIVE_METADATA_FETCHES
+            );
+        }
+
+        let stats = runtime.global_stats().await;
+        assert_eq!(
+            stats.scheduler.requested_downloads,
+            LIVE_DOWNLOAD_COUNT + STALE_DOWNLOAD_COUNT + QUEUED_DOWNLOAD_COUNT
+        );
+        assert_eq!(
+            stats.scheduler.requested_metadata_fetches,
+            LIVE_METADATA_COUNT + STALE_METADATA_COUNT + QUEUED_METADATA_COUNT
+        );
+        assert_eq!(stats.scheduler.granted_downloads, MAX_ACTIVE_DOWNLOADS);
+        assert_eq!(
+            stats.scheduler.granted_metadata_fetches,
+            MAX_ACTIVE_METADATA_FETCHES
+        );
+        assert_eq!(
+            stats.scheduler.retry_backoff_torrents,
+            BACKOFF_METADATA_COUNT
+        );
+        assert_eq!(
+            stats.scheduler.queued_torrents,
+            QUEUED_DOWNLOAD_COUNT
+                + QUEUED_METADATA_COUNT
+                + BACKOFF_METADATA_COUNT
+                + STALE_DOWNLOAD_COUNT
+                + STALE_METADATA_COUNT
+        );
+        assert_eq!(
+            stats.scheduler.running_engines,
+            LIVE_DOWNLOAD_COUNT + LIVE_METADATA_COUNT
+        );
+        assert_eq!(stats.scheduler.running_downloads, LIVE_DOWNLOAD_COUNT);
+        assert_eq!(
+            stats.scheduler.running_metadata_fetches,
+            LIVE_METADATA_COUNT
+        );
+        assert_eq!(stats.scheduler.active_download_limit, MAX_ACTIVE_DOWNLOADS);
+        assert_eq!(
+            stats.scheduler.active_metadata_fetch_limit,
+            MAX_ACTIVE_METADATA_FETCHES
+        );
+        assert_eq!(
+            runtime.active_download_hashes().await.len(),
+            LIVE_DOWNLOAD_COUNT + LIVE_METADATA_COUNT
+        );
+        assert_eq!(
+            runtime.engine_retry_after.lock().await.len(),
+            BACKOFF_METADATA_COUNT
+        );
+        assert!(stats.scheduler.download_slots_saturated);
+        assert!(stats.scheduler.metadata_fetch_slots_saturated);
+
+        for hash in hashes.iter().take(LIVE_DOWNLOAD_COUNT).chain(
+            hashes
+                .iter()
+                .skip(LIVE_METADATA_START)
+                .take(LIVE_METADATA_COUNT),
+        ) {
+            runtime.force_stop_engine(hash).await;
+        }
+    }
+
+    #[tokio::test]
     async fn metadata_fetch_limit_is_separate_from_download_slot_limit() {
         let mut cfg = Config::default();
         cfg.queue.max_active_downloads = 2;

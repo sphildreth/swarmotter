@@ -22,6 +22,10 @@ date or duration estimates.
 - **Large-library API coverage:** API integration tests now cover 1,000-torrent
   rapid add, bulk add, and query/filter/group behavior using generated lawful
   magnets.
+- **Scale validation harnesses:** ignored opt-in tests now cover a 1,200-record
+  mixed-state daemon scheduler library across all torrent states and a
+  2,000-torrent API add/query/recheck/reannounce/remove/reset flow using
+  generated lawful torrent files.
 
 ### Fixed
 

@@ -45,3 +45,8 @@ torrent on each tick.
 Add generated local-torrent benchmarks or ignored scale tests for adding,
 querying, reconciling, retrying, removing, and resetting thousands of torrents.
 Benchmarks must use generated lawful content and local fixtures only.
+
+Implemented scale coverage includes ignored opt-in tests for a 1,200-record
+mixed-state daemon scheduler library and a 2,000-torrent API add/query/retry/
+remove/reset flow. These tests remain outside the default suite and are run
+explicitly during large-library validation.
