@@ -28,6 +28,12 @@
   UI, complete API, and fail-closed VPN/NIC traffic containment.
 </p>
 
+<p align="center">
+  <a href="assets/screenshots/v1.2.0/output.gif" title="Click for Screenshots">
+    <img src="assets/screenshots/v1.2.0/output.png" alt="Static screenshot of the SwarmOtter Web UI torrent table" width="50%" title="Click for Screenshots">
+  </a>
+</p>
+
 ---
 
 ## What SwarmOtter Is
