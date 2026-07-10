@@ -148,6 +148,11 @@ impl DhtRunner {
         let _socket_guard = self.socket_lock.lock().await;
         let target = NodeId::from_bytes(*info_hash.as_bytes());
         let mut hints = self.lookup_family_hints(target).await;
+        if hints.is_empty() && !self.bootstrap.is_empty() {
+            for addr in &self.bootstrap {
+                add_family_hint(&mut hints, *addr);
+            }
+        }
         let mut result = DhtLookupResult::default();
         let mut seen_peers: HashSet<PeerAddr> = HashSet::new();
         let mut attempted_families: HashSet<DhtAddressFamily> = HashSet::new();
@@ -259,12 +264,12 @@ impl DhtRunner {
                 if !queried.insert(addr) {
                     continue;
                 }
+                result.queried_nodes += 1;
                 let txn = unique_transaction_id(&transactions);
                 let q = build_get_peers(txn, self.self_id, info_hash);
                 if socket.send_to(addr, &q).await.is_err() {
                     continue;
                 }
-                result.queried_nodes += 1;
                 transactions.insert(txn, addr);
             }
 
@@ -478,8 +483,106 @@ mod utp_transport_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use swarmotter_core::net::binder::LoopbackBinder;
     use swarmotter_core::peer::PeerAddr;
+
+    use swarmotter_core::error::CoreError;
+
+    struct CountingBootstrapUdpSocket {
+        send_count: Arc<AtomicUsize>,
+        last_target: Arc<Mutex<Option<SocketAddr>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl swarmotter_core::net::ContainedUdpSocket for CountingBootstrapUdpSocket {
+        async fn send_to(&self, addr: SocketAddr, _data: &[u8]) -> Result<()> {
+            self.send_count.fetch_add(1, Ordering::SeqCst);
+            let mut last_target = self
+                .last_target
+                .lock()
+                .map_err(|_| CoreError::Internal("failed to record bootstrap target".into()))?;
+            *last_target = Some(addr);
+            Err(CoreError::Internal(
+                "bootstrap query intentionally not sent".into(),
+            ))
+        }
+
+        async fn recv_from(&self, _buf: &mut [u8]) -> Result<(SocketAddr, usize)> {
+            Err(CoreError::Internal("no response".into()))
+        }
+
+        fn local_addr(&self) -> Result<SocketAddr> {
+            Ok(SocketAddr::from(([127, 0, 0, 1], 0)))
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingBootstrapBinder {
+        send_count: Arc<AtomicUsize>,
+        last_target: Arc<Mutex<Option<SocketAddr>>>,
+    }
+
+    impl CountingBootstrapBinder {
+        fn new() -> Self {
+            Self {
+                send_count: Arc::new(AtomicUsize::new(0)),
+                last_target: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl swarmotter_core::net::NetworkBinder for CountingBootstrapBinder {
+        async fn connect_peer(&self, _addr: SocketAddr) -> Result<tokio::net::TcpStream> {
+            Err(CoreError::Internal("unsupported in test binder".into()))
+        }
+
+        async fn http_get(&self, _url: &str) -> Result<swarmotter_core::net::HttpResponse> {
+            Err(CoreError::Internal("unsupported in test binder".into()))
+        }
+
+        async fn http_get_range(
+            &self,
+            _url: &str,
+            _start: u64,
+            _end_exclusive: u64,
+        ) -> Result<swarmotter_core::net::HttpResponse> {
+            Err(CoreError::Internal("unsupported in test binder".into()))
+        }
+
+        async fn resolve_host(&self, _host: &str, _port: u16) -> Result<SocketAddr> {
+            Err(CoreError::Internal("unsupported in test binder".into()))
+        }
+
+        async fn udp_socket(&self) -> Result<Box<dyn swarmotter_core::net::ContainedUdpSocket>> {
+            Ok(Box::new(CountingBootstrapUdpSocket {
+                send_count: self.send_count.clone(),
+                last_target: self.last_target.clone(),
+            }))
+        }
+
+        async fn udp_socket_on(
+            &self,
+            _remote: Option<SocketAddr>,
+            _local_port: u16,
+        ) -> Result<Box<dyn swarmotter_core::net::ContainedUdpSocket>> {
+            self.udp_socket().await
+        }
+
+        async fn bind_peer_listener(
+            &self,
+            _port: u16,
+        ) -> Result<Box<dyn swarmotter_core::net::PeerListener>> {
+            Err(CoreError::Internal("unsupported in test binder".into()))
+        }
+
+        fn traffic_allowed(&self) -> bool {
+            true
+        }
+    }
 
     fn write_bstr(out: &mut Vec<u8>, bytes: &[u8]) {
         out.extend_from_slice(bytes.len().to_string().as_bytes());
@@ -687,5 +790,30 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let count = rt.block_on(runner.node_count());
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn dht_get_peers_queries_bootstrap_on_empty_routing_table() {
+        let binder = CountingBootstrapBinder::new();
+        let bootstrap_addr = "127.0.0.1:6881".parse().unwrap();
+        let runner = DhtRunner::new(
+            NodeId::random(),
+            Arc::new(binder.clone()),
+            vec![bootstrap_addr],
+            0,
+        );
+        let result = runner
+            .get_peers_with_stats(InfoHash::from_bytes([0xaa; 20]), 1)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.queried_nodes, 1,
+            "expected a bootstrap query attempt"
+        );
+        assert_eq!(binder.send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(*binder.last_target.lock().unwrap(), Some(bootstrap_addr));
+        assert_eq!(result.responding_nodes, 0);
+        assert!(result.peers.is_empty());
     }
 }

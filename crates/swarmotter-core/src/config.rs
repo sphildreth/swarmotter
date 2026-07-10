@@ -214,7 +214,7 @@ impl Default for TorrentConfig {
 pub struct DhtConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_dht_bootstrap_nodes")]
     pub bootstrap_nodes: Vec<String>,
     #[serde(default = "default_dht_port")]
     pub port: u16,
@@ -224,15 +224,19 @@ fn default_dht_port() -> u16 {
     51413
 }
 
+fn default_dht_bootstrap_nodes() -> Vec<String> {
+    vec![
+        "dht.transmissionbt.com:6881".into(),
+        "router.bittorrent.com:6881".into(),
+        "router.utorrent.com:6881".into(),
+    ]
+}
+
 impl Default for DhtConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            bootstrap_nodes: vec![
-                "dht.transmissionbt.com:6881".into(),
-                "router.bittorrent.com:6881".into(),
-                "router.utorrent.com:6881".into(),
-            ],
+            bootstrap_nodes: default_dht_bootstrap_nodes(),
             port: default_dht_port(),
         }
     }
@@ -775,6 +779,18 @@ max_request_body_bytes = 0
 port = 0
 "#;
         assert!(Config::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn dht_partial_config_uses_default_bootstrap_nodes() {
+        let cfg = Config::from_toml_str(
+            r#"
+[dht]
+port = 55145
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.dht.bootstrap_nodes, default_dht_bootstrap_nodes());
     }
 
     #[test]

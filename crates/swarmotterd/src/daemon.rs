@@ -815,6 +815,10 @@ impl DaemonRuntime {
     }
 
     async fn desired_download_hashes(&self) -> Vec<InfoHash> {
+        self.desired_download_hashes_excluding(None).await
+    }
+
+    async fn desired_download_hashes_excluding(&self, excluded: Option<InfoHash>) -> Vec<InfoHash> {
         let cfg = self.config.read().await.clone();
         let retry_after = self.engine_retry_after.read().await.clone();
         let mut queue = self.queue.lock().await;
@@ -838,6 +842,9 @@ impl DaemonRuntime {
         let mut active_metadata_fetches = 0usize;
         let bypass_set = queue.bypass.iter().copied().collect::<HashSet<_>>();
         for hash in queue.bypass.iter().chain(queue.order.iter()) {
+            if excluded.is_some_and(|excluded| &excluded == hash) {
+                continue;
+            }
             let download_slots_full = download_limit > 0 && active_downloads >= download_limit;
             let metadata_slots_full =
                 metadata_limit > 0 && active_metadata_fetches >= metadata_limit;
@@ -2473,6 +2480,17 @@ impl DaemonRuntime {
 
     async fn apply_autopilot_queue_release(&self, hash: InfoHash) -> bool {
         if !self.engine_handles.read().await.contains_key(&hash) {
+            return false;
+        }
+        if self
+            .desired_download_hashes_excluding(Some(hash))
+            .await
+            .is_empty()
+        {
+            tracing::debug!(
+                info_hash = %hash,
+                "autopilot queue-slot release skipped because no queued replacement is currently eligible"
+            );
             return false;
         }
         self.force_stop_engine(&hash).await;
@@ -6647,6 +6665,120 @@ mod tests {
             .get(&stalled_hash)
             .is_some_and(|retry_at| *retry_at > Instant::now()));
         assert_eq!(runtime.desired_download_hashes().await, vec![queued_hash]);
+    }
+
+    #[tokio::test]
+    async fn autopilot_act_mode_skips_queue_release_without_eligible_replacement() {
+        let mut cfg = Config::default();
+        cfg.autopilot.mode = AutopilotMode::Act;
+        cfg.queue.max_active_downloads = 1;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let stalled_bytes = swarmotter_core::meta::build_single_file_torrent(
+            "autopilot-stalled-alone.bin",
+            b"stalled payload",
+            8,
+            None,
+            false,
+        );
+        let stalled_meta = swarmotter_core::meta::parse_torrent(&stalled_bytes).unwrap();
+        let stalled_hash = stalled_meta.info_hash;
+        let mut stalled = Torrent::new(stalled_meta.clone(), 1);
+        stalled.state = TorrentState::Downloading;
+        runtime.registry.lock().await.add(stalled).unwrap();
+        {
+            let mut queue = runtime.queue.lock().await;
+            queue.add(stalled_hash);
+        }
+        let stalled_since = Instant::now() - Duration::from_secs(45);
+        runtime.engine_states.write().await.insert(
+            stalled_hash,
+            Arc::new(Mutex::new(EngineState {
+                piece_count: stalled_meta.piece_count(),
+                total_length: stalled_meta.total_length,
+                tracker_ok: false,
+                dht_discovery_ok: false,
+                pex_discovery_ok: false,
+                peer_scheduler: PeerSchedulerDiagnostics {
+                    peer_worker_limit: 1,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })),
+        );
+        runtime.rate_samples.write().await.insert(
+            stalled_hash,
+            RateSample {
+                downloaded: 0,
+                uploaded: 0,
+                rate_down: 0,
+                rate_up: 0,
+                last_download_at: None,
+                last_upload_at: None,
+                no_download_since: Some(stalled_since),
+                at: stalled_since,
+                peak_rate_down: 0,
+                peak_rate_up: 0,
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        runtime.engine_cmds.lock().await.insert(stalled_hash, tx);
+        runtime.engine_handles.write().await.insert(
+            stalled_hash,
+            tokio::spawn(async {
+                std::future::pending::<()>().await;
+            }),
+        );
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            runtime.refresh_autopilot_decisions(true),
+        )
+        .await
+        .expect("autopilot queue-slot release should skip without a replacement candidate");
+
+        let decision = runtime
+            .autopilot_decisions
+            .read()
+            .await
+            .get(&stalled_hash)
+            .cloned()
+            .unwrap();
+        assert!(decision
+            .snapshot
+            .causes
+            .contains(&swarmotter_core::models::stats::SlowCause::NoRecentProgress));
+        assert!(matches!(
+            decision.action.unwrap().kind,
+            AutopilotActionKind::ReleaseQueueSlot
+        ));
+        assert_eq!(
+            runtime
+                .registry
+                .lock()
+                .await
+                .get(&stalled_hash)
+                .unwrap()
+                .state,
+            TorrentState::Downloading
+        );
+        assert_eq!(runtime.queue.lock().await.position(&stalled_hash), Some(1));
+        assert!(runtime
+            .engine_handles
+            .read()
+            .await
+            .contains_key(&stalled_hash));
+        assert!(runtime
+            .engine_retry_after
+            .read()
+            .await
+            .get(&stalled_hash)
+            .is_none());
+        assert_eq!(runtime.desired_download_hashes().await, vec![stalled_hash]);
     }
 
     #[tokio::test]

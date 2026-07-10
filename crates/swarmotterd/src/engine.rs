@@ -609,10 +609,15 @@ impl TorrentEngine {
                     .download_from_peer(&peer_addr, &storage, &mut have, &mut discovered)
                     .await
                 {
-                    Ok(progressed) => {
+                    Ok((progressed, session_reason)) => {
                         if progressed {
                             made_progress = true;
                         } else {
+                            tracing::debug!(
+                                peer = %peer_addr.socket_addr(),
+                                reason = session_reason,
+                                "serial peer session produced no progress; backing off"
+                            );
                             backoff_peer(&mut peer_backoff, peer_addr.socket_addr());
                         }
                     }
@@ -785,12 +790,12 @@ impl TorrentEngine {
         storage: &StorageIo,
         have: &mut PieceBitfield,
         discovered: &mut Vec<PeerAddr>,
-    ) -> Result<bool> {
+    ) -> Result<(bool, &'static str)> {
         if !self.binder.traffic_allowed() {
-            return Ok(false);
+            return Ok((false, "transport_blocked"));
         }
         if !self.peer_allowed(peer_addr) {
-            return Ok(false);
+            return Ok((false, "peer_rejected_by_policy"));
         }
         let (mut reader, mut write_half, transport) = connect_peer_wire_with_transport(
             self.binder.clone(),
@@ -853,6 +858,7 @@ impl TorrentEngine {
         let mut made_progress = false;
         let piece_count = self.meta.piece_count();
         let mut remote_pex_id: Option<u8> = None;
+        let mut no_progress_reason: Option<&'static str> = None;
 
         // Drive a small download loop: pick a missing piece the peer has,
         // request its blocks, assemble, verify, write.
@@ -860,14 +866,16 @@ impl TorrentEngine {
 
         loop {
             if Instant::now() > deadline {
+                no_progress_reason = Some("deadline_exceeded");
                 break;
             }
             if have.count(piece_count) == piece_count {
+                no_progress_reason = Some("torrent_complete");
                 break;
             }
 
             // If unchoked and we have a candidate piece, request blocks.
-            if !peer_choking {
+            if !peer_choking && peer_bf.is_some() {
                 if let Some(piece_index) = self.pick_piece(peer_bf.as_ref(), have) {
                     let plen = self.piece_length(piece_index) as u32;
                     let reqs = block_requests(plen);
@@ -894,13 +902,24 @@ impl TorrentEngine {
                     while received_blocks < reqs.len() {
                         let remaining = piece_deadline.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
+                            no_progress_reason = Some("piece_download_timeout");
                             break;
                         }
                         let msg = match timeout(remaining, reader.read_message()).await {
                             Ok(Ok(Some(m))) => m,
-                            Ok(Ok(None)) => break,
-                            Ok(Err(_)) => break,
-                            Err(_) => break,
+                            Ok(Ok(None)) => {
+                                no_progress_reason =
+                                    Some("peer_closed_connection_during_piece_download");
+                                break;
+                            }
+                            Ok(Err(_)) => {
+                                no_progress_reason = Some("peer_message_read_error");
+                                break;
+                            }
+                            Err(_) => {
+                                no_progress_reason = Some("piece_download_timeout");
+                                break;
+                            }
                         };
                         match msg {
                             Message::Piece {
@@ -935,6 +954,7 @@ impl TorrentEngine {
                             }
                             Message::Choke => {
                                 peer_choking = true;
+                                no_progress_reason = Some("peer_choked_us");
                                 record_peer_choked(&self.state, *peer_addr).await;
                                 break;
                             }
@@ -1002,11 +1022,15 @@ impl TorrentEngine {
                             tracing::warn!(piece = piece_index, "piece hash mismatch; rejecting");
                             record_peer_hash_failure(&self.state, *peer_addr).await;
                             // Bad hash: do not mark; try a different piece.
+                            no_progress_reason = Some("piece_hash_mismatch");
                         }
+                    } else if no_progress_reason.is_none() {
+                        no_progress_reason = Some("piece_download_incomplete");
                     }
                     continue;
                 } else {
                     // No missing piece this peer has; not interesting.
+                    no_progress_reason = Some("peer_has_no_missing_pieces");
                     peer::write_message(&mut write_half, &Message::NotInterested).await?;
                     break;
                 }
@@ -1015,7 +1039,18 @@ impl TorrentEngine {
             // Wait for unchoke / bitfield / have.
             let msg = match timeout(Duration::from_secs(15), reader.read_message()).await {
                 Ok(Ok(Some(m))) => m,
-                _ => break,
+                Ok(Ok(None)) => {
+                    no_progress_reason = Some("peer_closed_connection");
+                    break;
+                }
+                Ok(Err(_)) => {
+                    no_progress_reason = Some("peer_message_read_error");
+                    break;
+                }
+                Err(_) => {
+                    no_progress_reason = Some("state_wait_timeout");
+                    break;
+                }
             };
             match msg {
                 Message::Unchoke => {
@@ -1023,6 +1058,7 @@ impl TorrentEngine {
                     record_peer_unchoked(&self.state, *peer_addr).await;
                 }
                 Message::Choke => {
+                    no_progress_reason = Some("peer_choked_us");
                     peer_choking = true;
                     record_peer_choked(&self.state, *peer_addr).await;
                 }
@@ -1080,7 +1116,17 @@ impl TorrentEngine {
             }
         }
 
-        Ok(made_progress)
+        if made_progress {
+            return Ok((true, "progressed"));
+        }
+        let no_progress_reason =
+            no_progress_reason.unwrap_or("session_ended_without_terminal_reason");
+        tracing::debug!(
+            peer = %peer_addr.socket_addr(),
+            reason = no_progress_reason,
+            "serial peer session ended without progress"
+        );
+        Ok((false, no_progress_reason))
     }
 
     /// Concurrent endgame download: request the remaining pieces' blocks from
@@ -1273,9 +1319,14 @@ impl TorrentEngine {
                         any_progress = true;
                     }
                     Ok((peer_addr, Ok(PeerSessionOutcome::NoProgress))) => {
+                        tracing::debug!(
+                            peer = %peer_addr.socket_addr(),
+                            "parallel peer session ended without progress"
+                        );
                         backoff_peer(peer_backoff, peer_addr.socket_addr());
                     }
                     Ok((_, Ok(PeerSessionOutcome::NoWorkAvailable))) => {
+                        tracing::debug!("parallel peer session had no immediate in-session work");
                         // This peer had useful pieces, but all currently useful work
                         // was already reserved by other workers. Do not penalize it.
                     }
@@ -2034,7 +2085,7 @@ struct PeerCandidateCounts {
 }
 
 fn peer_allowed_by_config(peer: &PeerAddr, allow_ipv6: bool) -> bool {
-    allow_ipv6 || !peer.ip.is_ipv6()
+    peer.port != 0 && (allow_ipv6 || !peer.ip.is_ipv6())
 }
 
 fn classify_peer_candidates(
@@ -3505,8 +3556,20 @@ async fn parallel_peer_session(
     candidate_count: usize,
 ) -> Result<PeerSessionOutcome> {
     if !binder.traffic_allowed() {
+        let reason = "transport_blocked";
+        tracing::debug!(
+            peer = %peer_addr.socket_addr(),
+            reason = reason,
+            "parallel peer session skipped (no traffic allowed)"
+        );
+        tracing::trace!(
+            peer = %peer_addr.socket_addr(),
+            reason = reason,
+            "parallel peer session skipped before transport negotiation"
+        );
         return Ok(PeerSessionOutcome::NoProgress);
     }
+    let mut no_progress_reason: &'static str = "session_in_progress";
 
     let (mut reader, mut write_half, transport) = connect_peer_wire_with_transport(
         binder,
@@ -3518,7 +3581,11 @@ async fn parallel_peer_session(
         encryption_mode,
     )
     .await?;
-    tracing::debug!(peer = %peer_addr.socket_addr(), transport = transport.as_str(), "parallel peer connected");
+    tracing::debug!(
+        peer = %peer_addr.socket_addr(),
+        transport = transport.as_str(),
+        "parallel peer connected"
+    );
     record_peer_connected(&state, peer_addr).await;
 
     let piece_count = meta.piece_count();
@@ -3563,6 +3630,7 @@ async fn parallel_peer_session(
 
     loop {
         if Instant::now() > deadline {
+            no_progress_reason = "deadline_exceeded";
             break;
         }
         let complete = {
@@ -3570,247 +3638,302 @@ async fn parallel_peer_session(
             work.have.count(piece_count) == piece_count
         };
         if complete {
+            no_progress_reason = "torrent_complete";
             break;
         }
 
         if !peer_choking {
-            let Some(peer_bf_snapshot) = peer_bf.clone() else {
-                break;
-            };
-            let mut downloads: HashMap<usize, ParallelPieceDownload> = HashMap::new();
-            let mut global_in_flight = 0usize;
-            let mut session_error = None;
-            if let Err(e) = fill_parallel_piece_window(
-                &mut write_half,
-                &mut downloads,
-                &mut global_in_flight,
-                &shared,
-                &peer_bf_snapshot,
-                peer_addr.socket_addr(),
-                &meta,
-                piece_count,
-                request_window.desired_in_flight(),
-                candidate_count,
-            )
-            .await
-            {
-                session_error = Some(e);
-            }
-            if downloads.is_empty() {
-                let has_missing = shared
-                    .lock()
-                    .await
-                    .peer_has_missing_piece(&peer_bf_snapshot, piece_count);
-                if has_missing {
-                    no_work_available = true;
-                } else if let Err(e) =
-                    peer::write_message(&mut write_half, &Message::NotInterested).await
+            if let Some(peer_bf_snapshot) = peer_bf.clone() {
+                let mut downloads: HashMap<usize, ParallelPieceDownload> = HashMap::new();
+                let mut global_in_flight = 0usize;
+                let mut session_error = None;
+                if let Err(e) = fill_parallel_piece_window(
+                    &mut write_half,
+                    &mut downloads,
+                    &mut global_in_flight,
+                    &shared,
+                    &peer_bf_snapshot,
+                    peer_addr.socket_addr(),
+                    &meta,
+                    piece_count,
+                    request_window.desired_in_flight(),
+                    candidate_count,
+                )
+                .await
                 {
+                    no_progress_reason = "fill_window_failed";
                     session_error = Some(e);
+                }
+                if downloads.is_empty() {
+                    let has_missing = shared
+                        .lock()
+                        .await
+                        .peer_has_missing_piece(&peer_bf_snapshot, piece_count);
+                    if has_missing {
+                        no_progress_reason = "peer_has_no_assignable_work";
+                        no_work_available = true;
+                    } else if let Err(e) =
+                        peer::write_message(&mut write_half, &Message::NotInterested).await
+                    {
+                        no_progress_reason = "send_not_interested_failed";
+                        session_error = Some(e);
+                    }
+                    if let Some(e) = session_error {
+                        shared.lock().await.remove_peer(peer_socket, piece_count);
+                        return Err(e);
+                    }
+                    break;
+                }
+
+                let mut last_block_at = Instant::now();
+                let mut received_any = false;
+                while !downloads.is_empty() {
+                    let remaining = (last_block_at + Duration::from_secs(20))
+                        .saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        no_progress_reason = "piece_window_timeout";
+                        break;
+                    }
+                    let msg = match timeout(remaining, reader.read_message()).await {
+                        Ok(Ok(Some(m))) => {
+                            no_progress_reason = "awaiting_piece_or_control_message";
+                            m
+                        }
+                        Ok(Ok(None)) => {
+                            no_progress_reason = "peer_closed_connection_during_piece_window";
+                            break;
+                        }
+                        Ok(Err(_)) => {
+                            no_progress_reason = "peer_message_read_error";
+                            break;
+                        }
+                        Err(_) => {
+                            no_progress_reason = "piece_window_idle_timeout";
+                            break;
+                        }
+                    };
+                    match msg {
+                        Message::Piece {
+                            piece,
+                            offset,
+                            block,
+                        } => {
+                            let piece_index = piece as usize;
+                            let mut complete_data = None;
+                            if let Some(download) = downloads.get_mut(&piece_index) {
+                                match download.record_block(offset, &block, &mut global_in_flight) {
+                                    Ok(Some(complete)) => {
+                                        record_peer_block(&state, peer_addr, block.len() as u64)
+                                            .await;
+                                        let now = Instant::now();
+                                        request_window.record_block(block.len() as u64, now);
+                                        last_block_at = now;
+                                        received_any = true;
+                                        no_progress_reason = "piece_downloaded_some_blocks";
+                                        if complete {
+                                            no_progress_reason =
+                                                "piece_download_complete_data_ready";
+                                            complete_data =
+                                                Some(download.assembler.data().to_vec());
+                                        } else if let Err(e) = download
+                                            .send_more(
+                                                &mut write_half,
+                                                &mut global_in_flight,
+                                                request_window.desired_in_flight(),
+                                            )
+                                            .await
+                                        {
+                                            no_progress_reason = "request_refill_failed";
+                                            session_error = Some(e);
+                                            break;
+                                        } else {
+                                            write_half.flush().await.ok();
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        no_progress_reason = "record_block_failed";
+                                        session_error = Some(e);
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(data) = complete_data {
+                                downloads.remove(&piece_index);
+                                if swarmotter_core::storage::verify_piece(&meta, piece_index, &data)
+                                {
+                                    limiter
+                                        .acquire(RateDirection::Download, data.len() as u64)
+                                        .await;
+                                    if let Err(e) = storage.write_piece(piece_index, &data).await {
+                                        shared.lock().await.release_piece(piece_index);
+                                        no_progress_reason = "storage_write_piece_failed";
+                                        session_error = Some(e);
+                                        break;
+                                    }
+                                    let have_snapshot = {
+                                        let mut work = shared.lock().await;
+                                        if !work.have.has(piece_index) {
+                                            work.have.set(piece_index);
+                                            progressed = true;
+                                            made_progress
+                                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                        work.release_piece(piece_index);
+                                        work.have.clone()
+                                    };
+                                    update_progress_state(&state, &meta, &have_snapshot).await;
+                                    if let Err(e) = peer::write_message(
+                                        &mut write_half,
+                                        &Message::Have {
+                                            piece: piece_index as u32,
+                                        },
+                                    )
+                                    .await
+                                    {
+                                        no_progress_reason = "send_have_failed";
+                                        session_error = Some(e);
+                                        break;
+                                    }
+                                    if let Err(e) = fill_parallel_piece_window(
+                                        &mut write_half,
+                                        &mut downloads,
+                                        &mut global_in_flight,
+                                        &shared,
+                                        peer_bf.as_ref().unwrap_or(&peer_bf_snapshot),
+                                        peer_addr.socket_addr(),
+                                        &meta,
+                                        piece_count,
+                                        request_window.desired_in_flight(),
+                                        candidate_count,
+                                    )
+                                    .await
+                                    {
+                                        no_progress_reason = "fill_window_failed";
+                                        session_error = Some(e);
+                                        break;
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        piece = piece_index,
+                                        "piece hash mismatch; rejecting"
+                                    );
+                                    record_peer_hash_failure(&state, peer_addr).await;
+                                    no_progress_reason = "piece_hash_mismatch";
+                                    shared.lock().await.release_piece(piece_index);
+                                }
+                            }
+                        }
+                        Message::Choke => {
+                            no_progress_reason = "peer_choked_us";
+                            peer_choking = true;
+                            record_peer_choked(&state, peer_addr).await;
+                            break;
+                        }
+                        Message::Unchoke => {
+                            no_progress_reason = "peer_unchoked_us";
+                            peer_choking = false;
+                            record_peer_unchoked(&state, peer_addr).await;
+                        }
+                        Message::Have { piece } => {
+                            no_progress_reason = "peer_sent_have";
+                            apply_peer_have(&mut peer_bf, piece_count, piece);
+                            shared
+                                .lock()
+                                .await
+                                .note_peer_have(peer_socket, piece, piece_count);
+                            if let Some(bf) = &peer_bf {
+                                let have = shared.lock().await.have.clone();
+                                record_peer_availability(&state, peer_addr, bf, &have, piece_count)
+                                    .await;
+                            }
+                        }
+                        Message::Bitfield { bits } => {
+                            no_progress_reason = "peer_sent_bitfield";
+                            let bf = Bitfield::from_bytes(bits, piece_count);
+                            shared
+                                .lock()
+                                .await
+                                .note_peer_bitfield(peer_socket, &bf, piece_count);
+                            let have = shared.lock().await.have.clone();
+                            record_peer_availability(&state, peer_addr, &bf, &have, piece_count)
+                                .await;
+                            peer_bf = Some(bf);
+                        }
+                        Message::Extended { id, payload } => {
+                            no_progress_reason = "parallel_pex_message";
+                            handle_parallel_pex_message(
+                                id,
+                                &payload,
+                                pex_enabled,
+                                &mut remote_pex_id,
+                                allow_ipv6,
+                                pex_max_peers,
+                                &pex_peers,
+                                &state,
+                                &mut request_window,
+                            )
+                            .await;
+                        }
+                        Message::Keepalive
+                        | Message::Interested
+                        | Message::NotInterested
+                        | Message::Request { .. }
+                        | Message::Cancel { .. }
+                        | Message::Unknown { .. } => {}
+                    }
+                }
+
+                for piece_index in downloads.keys().copied().collect::<Vec<_>>() {
+                    shared.lock().await.release_piece(piece_index);
                 }
                 if let Some(e) = session_error {
                     shared.lock().await.remove_peer(peer_socket, piece_count);
                     return Err(e);
                 }
-                break;
-            }
-
-            let mut last_block_at = Instant::now();
-            let mut received_any = false;
-            while !downloads.is_empty() {
-                let remaining = (last_block_at + Duration::from_secs(20))
-                    .saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
+                if !downloads.is_empty() {
+                    no_progress_reason = "piece_window_not_drained";
+                    record_peer_timeout(&state, peer_addr).await;
+                }
+                if !received_any {
+                    no_progress_reason = "no_blocks_received_in_window";
                     break;
                 }
-                let msg = match timeout(remaining, reader.read_message()).await {
-                    Ok(Ok(Some(m))) => m,
-                    _ => break,
-                };
-                match msg {
-                    Message::Piece {
-                        piece,
-                        offset,
-                        block,
-                    } => {
-                        let piece_index = piece as usize;
-                        let mut complete_data = None;
-                        if let Some(download) = downloads.get_mut(&piece_index) {
-                            match download.record_block(offset, &block, &mut global_in_flight) {
-                                Ok(Some(complete)) => {
-                                    record_peer_block(&state, peer_addr, block.len() as u64).await;
-                                    let now = Instant::now();
-                                    request_window.record_block(block.len() as u64, now);
-                                    last_block_at = now;
-                                    received_any = true;
-                                    if complete {
-                                        complete_data = Some(download.assembler.data().to_vec());
-                                    } else if let Err(e) = download
-                                        .send_more(
-                                            &mut write_half,
-                                            &mut global_in_flight,
-                                            request_window.desired_in_flight(),
-                                        )
-                                        .await
-                                    {
-                                        session_error = Some(e);
-                                        break;
-                                    } else {
-                                        write_half.flush().await.ok();
-                                    }
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    session_error = Some(e);
-                                    break;
-                                }
-                            }
-                        }
-                        if let Some(data) = complete_data {
-                            downloads.remove(&piece_index);
-                            if swarmotter_core::storage::verify_piece(&meta, piece_index, &data) {
-                                limiter
-                                    .acquire(RateDirection::Download, data.len() as u64)
-                                    .await;
-                                if let Err(e) = storage.write_piece(piece_index, &data).await {
-                                    shared.lock().await.release_piece(piece_index);
-                                    session_error = Some(e);
-                                    break;
-                                }
-                                let have_snapshot = {
-                                    let mut work = shared.lock().await;
-                                    if !work.have.has(piece_index) {
-                                        work.have.set(piece_index);
-                                        progressed = true;
-                                        made_progress
-                                            .store(true, std::sync::atomic::Ordering::Relaxed);
-                                    }
-                                    work.release_piece(piece_index);
-                                    work.have.clone()
-                                };
-                                update_progress_state(&state, &meta, &have_snapshot).await;
-                                if let Err(e) = peer::write_message(
-                                    &mut write_half,
-                                    &Message::Have {
-                                        piece: piece_index as u32,
-                                    },
-                                )
-                                .await
-                                {
-                                    session_error = Some(e);
-                                    break;
-                                }
-                                if let Err(e) = fill_parallel_piece_window(
-                                    &mut write_half,
-                                    &mut downloads,
-                                    &mut global_in_flight,
-                                    &shared,
-                                    peer_bf.as_ref().unwrap_or(&peer_bf_snapshot),
-                                    peer_addr.socket_addr(),
-                                    &meta,
-                                    piece_count,
-                                    request_window.desired_in_flight(),
-                                    candidate_count,
-                                )
-                                .await
-                                {
-                                    session_error = Some(e);
-                                    break;
-                                }
-                            } else {
-                                tracing::warn!(
-                                    piece = piece_index,
-                                    "piece hash mismatch; rejecting"
-                                );
-                                record_peer_hash_failure(&state, peer_addr).await;
-                                shared.lock().await.release_piece(piece_index);
-                            }
-                        }
-                    }
-                    Message::Choke => {
-                        peer_choking = true;
-                        record_peer_choked(&state, peer_addr).await;
-                        break;
-                    }
-                    Message::Unchoke => {
-                        peer_choking = false;
-                        record_peer_unchoked(&state, peer_addr).await;
-                    }
-                    Message::Have { piece } => {
-                        apply_peer_have(&mut peer_bf, piece_count, piece);
-                        shared
-                            .lock()
-                            .await
-                            .note_peer_have(peer_socket, piece, piece_count);
-                        if let Some(bf) = &peer_bf {
-                            let have = shared.lock().await.have.clone();
-                            record_peer_availability(&state, peer_addr, bf, &have, piece_count)
-                                .await;
-                        }
-                    }
-                    Message::Bitfield { bits } => {
-                        let bf = Bitfield::from_bytes(bits, piece_count);
-                        shared
-                            .lock()
-                            .await
-                            .note_peer_bitfield(peer_socket, &bf, piece_count);
-                        let have = shared.lock().await.have.clone();
-                        record_peer_availability(&state, peer_addr, &bf, &have, piece_count).await;
-                        peer_bf = Some(bf);
-                    }
-                    Message::Extended { id, payload } => {
-                        handle_parallel_pex_message(
-                            id,
-                            &payload,
-                            pex_enabled,
-                            &mut remote_pex_id,
-                            allow_ipv6,
-                            pex_max_peers,
-                            &pex_peers,
-                            &state,
-                            &mut request_window,
-                        )
-                        .await;
-                    }
-                    Message::Keepalive
-                    | Message::Interested
-                    | Message::NotInterested
-                    | Message::Request { .. }
-                    | Message::Cancel { .. }
-                    | Message::Unknown { .. } => {}
-                }
+                continue;
             }
-
-            for piece_index in downloads.keys().copied().collect::<Vec<_>>() {
-                shared.lock().await.release_piece(piece_index);
-            }
-            if let Some(e) = session_error {
-                shared.lock().await.remove_peer(peer_socket, piece_count);
-                return Err(e);
-            }
-            if !downloads.is_empty() {
-                record_peer_timeout(&state, peer_addr).await;
-            }
-            if !received_any {
-                break;
-            }
-            continue;
         }
 
         let msg = match timeout(Duration::from_secs(15), reader.read_message()).await {
-            Ok(Ok(Some(m))) => m,
-            _ => break,
+            Ok(Ok(Some(m))) => {
+                no_progress_reason = "awaiting_state_transition";
+                m
+            }
+            Ok(Ok(None)) => {
+                no_progress_reason = "peer_closed_connection_waiting_state";
+                break;
+            }
+            Ok(Err(_)) => {
+                no_progress_reason = "peer_message_read_error";
+                break;
+            }
+            Err(_) => {
+                no_progress_reason = "state_wait_timeout";
+                break;
+            }
         };
         match msg {
             Message::Unchoke => {
+                no_progress_reason = "peer_unchoked_us";
                 peer_choking = false;
                 record_peer_unchoked(&state, peer_addr).await;
             }
             Message::Choke => {
+                no_progress_reason = "peer_choked_us";
                 peer_choking = true;
                 record_peer_choked(&state, peer_addr).await;
             }
             Message::Bitfield { bits } => {
+                no_progress_reason = "peer_sent_bitfield";
                 let bf = Bitfield::from_bytes(bits, piece_count);
                 shared
                     .lock()
@@ -3821,6 +3944,7 @@ async fn parallel_peer_session(
                 peer_bf = Some(bf);
             }
             Message::Have { piece } => {
+                no_progress_reason = "peer_sent_have";
                 apply_peer_have(&mut peer_bf, piece_count, piece);
                 shared
                     .lock()
@@ -3832,6 +3956,7 @@ async fn parallel_peer_session(
                 }
             }
             Message::Extended { id, payload } => {
+                no_progress_reason = "parallel_pex_message";
                 handle_parallel_pex_message(
                     id,
                     &payload,
@@ -3856,6 +3981,13 @@ async fn parallel_peer_session(
     }
 
     shared.lock().await.remove_peer(peer_socket, piece_count);
+    if no_progress_reason == "session_in_progress" {
+        no_progress_reason = if no_work_available {
+            "no_work_available"
+        } else {
+            "session_ended_without_terminal_reason"
+        };
+    }
     let outcome = if progressed {
         PeerSessionOutcome::Progressed
     } else if no_work_available {
@@ -3863,6 +3995,23 @@ async fn parallel_peer_session(
     } else {
         PeerSessionOutcome::NoProgress
     };
+    match outcome {
+        PeerSessionOutcome::Progressed => {}
+        PeerSessionOutcome::NoWorkAvailable => {
+            tracing::debug!(
+                peer = %peer_addr.socket_addr(),
+                reason = no_progress_reason,
+                "parallel peer session had no immediate in-session work"
+            );
+        }
+        PeerSessionOutcome::NoProgress => {
+            tracing::debug!(
+                peer = %peer_addr.socket_addr(),
+                reason = no_progress_reason,
+                "parallel peer session ended without progress"
+            );
+        }
+    }
     Ok(outcome)
 }
 
@@ -4536,6 +4685,7 @@ mod tests {
         assert!(engine.peer_allowed(&PeerAddr::from_socket_addr(
             "127.0.0.1:6881".parse().unwrap()
         )));
+        assert!(!engine.peer_allowed(&PeerAddr::from_socket_addr("127.0.0.1:0".parse().unwrap())));
         assert!(!engine.peer_allowed(&PeerAddr::from_socket_addr("[::1]:6881".parse().unwrap())));
     }
 

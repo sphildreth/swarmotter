@@ -7,6 +7,32 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [1.2.2] - [2026-07-10]
+
+### Fixed
+
+- **Live public-swarm Linux torrent throughput:** normal torrent announces now
+  collect every concurrent tracker response instead of returning after the
+  first peer-bearing tracker, partial `[dht]` TOML config keeps the default
+  bootstrap nodes, empty-table DHT lookups actively query bootstrap families,
+  and invalid port-zero peer candidates are filtered before scheduling. Strict
+  contained networking no longer reports `traffic_allowed = false` merely
+  because another peer worker is reading binder config; the fail-closed socket
+  guard remains the authoritative gate before any torrent traffic is opened.
+  Peer sessions also keep reading when an unchoke arrives before bitfield/have
+  availability, allowing standards-compliant peers to advertise pieces before
+  requests are selected. On the local strict-`br0` Ubuntu legal torrent test,
+  the daemon completed the 6.52 GB ISO and recorded a 222.52 MiB/s peak sample
+  with a 134.68 MiB/s smoothed download rate.
+- **Autopilot queue release with no replacement:** `ReleaseQueueSlot` now
+  skips demoting a stalled active torrent when no other queued download is
+  currently eligible to consume the released slot, keeping single-torrent
+  legal download tests active for continued discovery and retry.
+- **Peer failure diagnostics:** serial and parallel peer sessions now emit
+  structured no-progress reasons for closed connections, state waits, missing
+  useful work, hash failures, and timeout paths, making live swarm stalls
+  actionable from daemon logs.
+
 ## [1.2.1] - [2026-07-09]
 
 ### Fixed
@@ -80,8 +106,6 @@ date or duration estimates.
   --release -p swarmotter-core` writes N small synthetic .torrent files
   and matching payloads, with an optional HTTP tracker URL, for local
   swarm testing without contacting public trackers.
-
-## [Unreleased]
 
 ## [1.2.0] - [2026-07-09]
 

@@ -13,12 +13,12 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use swarmotter_core::error::{CoreError, Result};
@@ -103,20 +103,27 @@ where
 /// A real `NetworkBinder` that binds torrent sockets to the configured
 /// source address and fails closed in strict mode.
 pub struct ContainedBinder {
-    config: Arc<Mutex<NetworkConfig>>,
+    config: Arc<RwLock<NetworkConfig>>,
     probe: Arc<dyn InterfaceProbe + Send + Sync>,
 }
 
 impl ContainedBinder {
     pub fn new(config: NetworkConfig, probe: Arc<dyn InterfaceProbe + Send + Sync>) -> Self {
         Self {
-            config: Arc::new(Mutex::new(config)),
+            config: Arc::new(RwLock::new(config)),
             probe,
         }
     }
 
+    fn config_snapshot(&self) -> Result<NetworkConfig> {
+        self.config
+            .read()
+            .map(|cfg| cfg.clone())
+            .map_err(|_| CoreError::Internal("network binder config lock poisoned".into()))
+    }
+
     async fn guard(&self) -> Result<()> {
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config_snapshot()?;
         if cfg.mode == NetworkContainmentMode::Disabled {
             return Ok(());
         }
@@ -189,7 +196,9 @@ impl ContainedBinder {
     /// affected; new connections honor the updated config.
     #[allow(dead_code)]
     pub async fn update_config(&self, config: NetworkConfig) {
-        *self.config.lock().await = config;
+        if let Ok(mut cfg) = self.config.write() {
+            *cfg = config;
+        }
     }
 }
 
@@ -197,7 +206,7 @@ impl ContainedBinder {
 impl NetworkBinder for ContainedBinder {
     async fn connect_peer(&self, addr: SocketAddr) -> Result<tokio::net::TcpStream> {
         self.guard().await?;
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config_snapshot()?;
         ensure_family_enforced(&cfg, addr)?;
         let socket = tokio::net::TcpSocket::new_v4_or_v6_for(addr)?;
         bind_socket_to_interface(&socket, cfg.required_interface.as_deref())?;
@@ -238,7 +247,7 @@ impl NetworkBinder for ContainedBinder {
         if let Ok(ip) = host.parse() {
             return Ok(SocketAddr::new(ip, port));
         }
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config_snapshot()?;
         if cfg.mode == NetworkContainmentMode::Strict
             && cfg.fail_closed
             && cfg.required_network_namespace.is_none()
@@ -264,7 +273,7 @@ impl NetworkBinder for ContainedBinder {
         remote: Option<SocketAddr>,
     ) -> Result<Box<dyn ContainedUdpSocket>> {
         self.guard().await?;
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config_snapshot()?;
         if let Some(remote) = remote {
             ensure_family_enforced(&cfg, remote)?;
         }
@@ -279,7 +288,7 @@ impl NetworkBinder for ContainedBinder {
         local_port: u16,
     ) -> Result<Box<dyn ContainedUdpSocket>> {
         self.guard().await?;
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config_snapshot()?;
         if let Some(remote) = remote {
             ensure_family_enforced(&cfg, remote)?;
         }
@@ -291,7 +300,7 @@ impl NetworkBinder for ContainedBinder {
 
     async fn bind_peer_listener(&self, port: u16) -> Result<Box<dyn PeerListener>> {
         self.guard().await?;
-        let cfg = self.config.lock().await.clone();
+        let cfg = self.config_snapshot()?;
         let iface = cfg.required_interface.as_deref();
         let v4_addr = cfg
             .required_source_ipv4
@@ -334,8 +343,7 @@ impl NetworkBinder for ContainedBinder {
         // Synchronous check: evaluate against a snapshot. For strictness we
         // re-evaluate; the async guard is the authoritative gate before any
         // socket is opened.
-        let Ok(cfg) = self.config.try_lock() else {
-            // If locked (in-flight reconfig), be conservative.
+        let Ok(cfg) = self.config.read() else {
             return false;
         };
         if cfg.mode == NetworkContainmentMode::Disabled {
@@ -627,7 +635,7 @@ fn bind_socket_to_interface<S>(_socket: &S, iface: Option<&str>) -> Result<()> {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use swarmotter_core::net::{InterfaceInfo, InterfaceProbe};
+    use swarmotter_core::net::{InterfaceInfo, InterfaceProbe, NetworkBinder};
 
     struct FakeProbe {
         dns_ok: bool,
@@ -693,6 +701,28 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.is_network_blocked());
+    }
+
+    #[test]
+    fn traffic_allowed_uses_shared_config_reads() {
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            required_source_ipv4: Some("127.0.0.1".into()),
+            fail_closed: true,
+            validate_dns: false,
+            ..Default::default()
+        };
+        let binder = ContainedBinder::new(
+            cfg,
+            Arc::new(FakeProbe {
+                dns_ok: false,
+                source_ok: true,
+                namespace_ok: false,
+            }),
+        );
+
+        let _read_guard = binder.config.read().unwrap();
+        assert!(binder.traffic_allowed());
     }
 
     #[tokio::test]
