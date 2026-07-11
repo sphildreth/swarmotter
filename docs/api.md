@@ -45,8 +45,12 @@ X-SwarmOtter-Auth: <token>
 ```
 
 Startup validation rejects authenticated mode unless `api.auth_token` is set.
-It also rejects an unauthenticated listener outside loopback.
 `GET /api/v1/settings` never returns the token value.
+
+When `api.require_auth = false`, API and Web UI requests do not require a token,
+including on a configured LAN listener. Every client that can reach such a
+listener can control SwarmOtter, so authenticated mode is strongly recommended
+unless the reachable network is the intended trust boundary.
 
 Browser requests to `/api/v1` must be same-origin: `Origin` must match `Host`,
 and Fetch Metadata marked as cross-site or same-site is rejected. This includes

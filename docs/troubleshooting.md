@@ -171,12 +171,20 @@ X-SwarmOtter-Auth: <token>
 
 The Web UI uses the same API routes as external clients.
 
+If a trusted-LAN deployment should not require a token, set
+`api.require_auth = false` in the mounted TOML configuration, or set
+`SWARMOTTER_API_REQUIRE_AUTH=false` for the Compose deployment. Non-loopback
+listeners log a warning because every reachable client can then control
+SwarmOtter.
+
 ## Update helper health check reports connection resets
 
 If `deploy/update-swarmotter.sh` reports repeated `curl: (56) Recv failure:
-Connection reset by peer` while checking `http://127.0.0.1:9091/health`, first
-verify whether the daemon is healthy inside the shared Gluetun network
-namespace:
+Connection reset by peer` while checking `http://127.0.0.1:9091/health`, inspect
+the service status and recent logs printed by the updater. Current release
+images are also configuration-checked before the healthy stack is replaced.
+To distinguish a daemon failure from host port filtering, verify whether the
+daemon is healthy inside the shared Gluetun network namespace:
 
 ```bash
 docker compose --env-file .env -f compose.yml exec swarmotter \

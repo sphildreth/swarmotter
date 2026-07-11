@@ -224,7 +224,7 @@ mode = "act"  # optional; defaults to act
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `bind_address` | `"127.0.0.1:9091"` | Address for the Web UI and API control plane. |
-| `require_auth` | `false` | Requires API/Web UI token auth. It must be true for non-loopback bind addresses. |
+| `require_auth` | `false` | Requires API/Web UI token auth. Strongly recommended for non-loopback listeners. |
 | `auth_token` | unset | Required when `require_auth = true`. |
 | `max_request_body_bytes` | `16777216` | Maximum API request body size, including `.torrent` uploads. |
 

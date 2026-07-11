@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR-0049](0049-configured-unauthenticated-lan-control-plane.md)
 
 ## Context
 

@@ -19,9 +19,9 @@ ADR-0009 and ADR-0010.
 - Suitable for scripts, browser integrations, and the built-in Web UI.
 - The Web UI uses the same API as external automation; it does not have a
   privileged internal channel.
-- Browser requests are same-origin and unauthenticated listeners are loopback
-  only; non-browser clients remain compatible without browser Origin headers.
-  See ADR-0044.
+- Browser requests are same-origin in both authentication modes; configured
+  unauthenticated LAN listeners trust their network boundary, and non-browser
+  clients remain compatible without browser Origin headers. See ADR-0049.
 
 ## Compatibility contract
 

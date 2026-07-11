@@ -22,7 +22,7 @@ FROM debian:bookworm-slim AS runtime-base
 
 ARG SWARMOTTER_BUILD_COMMIT=unknown
 ARG SWARMOTTER_IMAGE_CREATED=unknown
-ARG SWARMOTTER_VERSION=1.3.0
+ARG SWARMOTTER_VERSION=1.3.1
 
 LABEL org.opencontainers.image.title="SwarmOtter" \
       org.opencontainers.image.description="SwarmOtter BitTorrent daemon and web UI" \
@@ -31,7 +31,8 @@ LABEL org.opencontainers.image.title="SwarmOtter" \
       org.opencontainers.image.revision="${SWARMOTTER_BUILD_COMMIT}" \
       org.opencontainers.image.source="https://github.com/sphildreth/swarmotter" \
       org.opencontainers.image.url="https://github.com/sphildreth/swarmotter" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.licenses="Apache-2.0" \
+      io.swarmotter.config-check="true"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl iproute2 \

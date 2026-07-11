@@ -291,10 +291,13 @@ the matching `ghcr.io/sphildreth/swarmotter:vX.Y.Z` image. If the running
 container already has that version label, the helper exits without backing up,
 pulling, or restarting. Otherwise, it backs up Compose environment files,
 SwarmOtter configuration, SwarmOtter state, and Gluetun state into
-`~/swarmotter-backups`, updates `SWARMOTTER_IMAGE`, recreates the Compose stack
-so Docker attaches networks before Gluetun installs VPN routes, validates the
-health endpoint, image labels, and contained egress from the SwarmOtter
-container, and keeps a local rollback image tag.
+`~/swarmotter-backups`, updates `SWARMOTTER_IMAGE`, and asks supported target
+images to validate the mounted configuration before stopping the healthy
+stack. It then recreates the Compose stack so Docker attaches networks before
+Gluetun installs VPN routes, validates the health endpoint, image labels, and
+contained egress from the SwarmOtter container, and keeps a local rollback
+image tag. Failed validation also prints service status and recent container
+logs before rollback.
 
 Pass an explicit image or tag only when pinning a specific release or
 performing a rollback:
@@ -343,6 +346,12 @@ utp_enabled = true
 utp_prefer_tcp = true
 encryption_mode = "preferred"
 ```
+
+For a LAN that is deliberately the control-plane trust boundary, set
+`SWARMOTTER_API_REQUIRE_AUTH=false` in `.env` and leave
+`SWARMOTTER_API_TOKEN` empty. The Web UI then uses the same-origin API without a
+token prompt. Every client that can reach port `9091` can control SwarmOtter,
+so keep authentication enabled on any network that is not fully trusted.
 
 The service user needs write access to both storage directories. Incomplete
 torrents write to `incomplete_dir`; verified completed data is moved into

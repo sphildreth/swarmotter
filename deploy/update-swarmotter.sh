@@ -21,6 +21,7 @@ SERVICE_NAME="${SWARMOTTER_COMPOSE_SERVICE:-swarmotter}"
 CONTAINER_NAME="${SWARMOTTER_CONTAINER_NAME:-swarmotter}"
 ROLLBACK_ON_FAILURE="${SWARMOTTER_ROLLBACK_ON_FAILURE:-1}"
 SKIP_EGRESS_CHECK="${SWARMOTTER_SKIP_EGRESS_CHECK:-0}"
+PREFLIGHT_CONFIG_PATH="${SWARMOTTER_PREFLIGHT_CONFIG_PATH:-/etc/swarmotter/swarmotter.toml}"
 
 DOCKER=(docker)
 rollback_tag=""
@@ -64,6 +65,7 @@ Environment overrides:
   SWARMOTTER_ROLLBACK_ON_FAILURE=0
   SWARMOTTER_SKIP_EGRESS_CHECK=1
   SWARMOTTER_CONTAINER_HEALTH_URL
+  SWARMOTTER_PREFLIGHT_CONFIG_PATH
 EOF
 }
 
@@ -457,6 +459,27 @@ recreate_stack() {
     compose up -d
 }
 
+preflight_target_image() {
+    local supported
+
+    supported="$(docker_cmd image inspect -f '{{ index .Config.Labels "io.swarmotter.config-check" }}' "$TARGET_IMAGE" 2>/dev/null || true)"
+    if [[ "$supported" != "true" ]]; then
+        log "Target image does not advertise config preflight support; skipping"
+        return
+    fi
+
+    log "Validating mounted configuration with target image"
+    compose run --rm --no-deps "$SERVICE_NAME" \
+        --config "$PREFLIGHT_CONFIG_PATH" --check-config
+}
+
+show_service_diagnostics() {
+    log "SwarmOtter service status:"
+    compose ps "$SERVICE_NAME" || true
+    log "Recent SwarmOtter container logs:"
+    compose logs --no-color --tail 100 "$SERVICE_NAME" || true
+}
+
 validate_health() {
     local port
     local url
@@ -478,6 +501,7 @@ validate_health() {
         fi
     done
 
+    show_service_diagnostics
     log "Host health check failed; checking health inside the SwarmOtter network namespace: $container_url"
     if compose exec -T "$SERVICE_NAME" curl --max-time 5 -fsS "$container_url" >/dev/null; then
         die "health passes inside the SwarmOtter container but not through the host-published port. For Gluetun deployments, set FIREWALL_INPUT_PORTS=9091 in the Gluetun environment file."
@@ -489,8 +513,11 @@ validate_health() {
 validate_container() {
     local running configured_image version revision
 
-    running="$(docker_cmd inspect -f '{{.State.Running}}' "$CONTAINER_NAME")"
-    [[ "$running" == "true" ]] || die "$CONTAINER_NAME is not running"
+    running="$(docker_cmd inspect -f '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null || true)"
+    if [[ "$running" != "true" ]]; then
+        show_service_diagnostics
+        die "$CONTAINER_NAME is not running"
+    fi
 
     configured_image="$(docker_cmd inspect -f '{{.Config.Image}}' "$CONTAINER_NAME")"
     [[ "$configured_image" == "$TARGET_IMAGE" ]] || die "$CONTAINER_NAME uses $configured_image, expected $TARGET_IMAGE"
@@ -573,6 +600,7 @@ main() {
 
     log "Pulling target image"
     compose pull "$SERVICE_NAME"
+    preflight_target_image
 
     log "Restarting the Compose stack so Docker attaches networks before VPN routes are installed"
     updated_service=1

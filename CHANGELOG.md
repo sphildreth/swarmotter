@@ -7,6 +7,22 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [1.3.1] - [2026-07-12]
+
+### Fixed
+
+- **Configured LAN Web UI access:** restored `api.require_auth = false` as a
+  valid setting on non-loopback listeners, allowing the same-origin Web UI to
+  use its API without a token prompt. Such listeners now emit a prominent
+  exposure warning while retaining browser Origin/Host and Fetch Metadata
+  checks. Authenticated remote access remains the recommended default. See
+  [ADR-0049](design/adr/0049-configured-unauthenticated-lan-control-plane.md).
+- **Upgrade configuration safety:** environment overrides are now applied
+  before final file validation, and release images expose a config-only startup
+  check. The Compose updater runs that check against the mounted configuration
+  before replacing a healthy stack and prints service status and recent logs
+  when post-update validation fails.
+
 ## [1.3.0] - [2026-07-11]
 
 ### Added
