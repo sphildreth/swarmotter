@@ -23,7 +23,7 @@ pub struct TorrentSettings {
 }
 
 /// An in-memory torrent record.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Torrent {
     pub meta: TorrentMeta,
     pub state: TorrentState,

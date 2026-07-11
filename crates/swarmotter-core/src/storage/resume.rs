@@ -85,9 +85,35 @@ pub struct FastResume {
     pub bytes_completed: u64,
     pub total_length: u64,
     pub priorities: Vec<FilePriority>,
+    /// Per-file wanted state. Missing in older resume files, where callers
+    /// should treat an empty list as "all wanted" for compatibility.
+    #[serde(default)]
+    pub wanted: Vec<bool>,
+    /// File metadata captured after the last verified write. A missing stamp
+    /// forces a safe recheck, preserving compatibility with older resumes.
+    #[serde(default)]
+    pub file_stamps: Vec<ResumeFileStamp>,
     pub download_dir: Option<String>,
     pub date_added: u64,
     pub date_completed: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeFileStamp {
+    pub exists: bool,
+    pub length: u64,
+    pub modified_unix_nanos: Option<u64>,
+    /// Unix filesystem identity and change timestamp. These catch same-size
+    /// edits whose modification time was preserved or rounded by the
+    /// filesystem. Missing fields in older resume data force a safe recheck.
+    #[serde(default)]
+    pub device: Option<u64>,
+    #[serde(default)]
+    pub inode: Option<u64>,
+    #[serde(default)]
+    pub changed_unix_seconds: Option<i64>,
+    #[serde(default)]
+    pub changed_subsec_nanos: Option<i64>,
 }
 
 impl FastResume {
@@ -143,6 +169,8 @@ mod tests {
             bytes_completed: 1000,
             total_length: 1000,
             priorities: vec![FilePriority::Normal; 2],
+            wanted: vec![true, false],
+            file_stamps: Vec::new(),
             download_dir: Some("/data".into()),
             date_added: 1,
             date_completed: Some(2),
@@ -152,5 +180,27 @@ mod tests {
         assert_eq!(back.info_hash, resume.info_hash);
         assert_eq!(back.piece_count, 10);
         assert_eq!(back.priorities.len(), 2);
+        assert_eq!(back.wanted, vec![true, false]);
+    }
+
+    #[test]
+    fn legacy_resume_defaults_wanted_state() {
+        let json = r#"{
+            "info_hash":"0000000000000000000000000000000000000000",
+            "name":"test",
+            "piece_bitfield":"00",
+            "piece_count":1,
+            "downloaded":0,
+            "uploaded":0,
+            "bytes_completed":0,
+            "total_length":1,
+            "priorities":["normal"],
+            "download_dir":null,
+            "date_added":1,
+            "date_completed":null
+        }"#;
+
+        let resume = FastResume::parse_json(json).unwrap();
+        assert!(resume.wanted.is_empty());
     }
 }

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 /// Seeding policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SeedingPolicy {
     /// Global ratio limit (uploaded/downloaded). `None` = seed forever.
     #[serde(default = "default_global_ratio_limit")]

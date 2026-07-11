@@ -36,6 +36,9 @@ persistence and does not expose sensitive auth tokens in API responses.
     - and whether a write reached disk.
 - Include the auth-token preservation and restart metadata in the API contract for settings
   replacement responses.
+- Supported package and container deployments give the daemon a private,
+  writable configuration directory. Containers mount the directory rather than
+  the individual file so atomic rename remains available.
 
 ## Consequences
 
@@ -45,6 +48,8 @@ persistence and does not expose sensitive auth tokens in API responses.
   commit.
 - Restart-required behavior is explicit and machine-readable, so the UI can prompt for restart.
 - Sensitive token material remains protected even during full configuration exchange.
+- Deployment umasks keep token-bearing atomic replacements private to the
+  service account.
 
 ## Related Documents
 

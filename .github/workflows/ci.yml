@@ -29,11 +29,27 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --all --all-features
+      - name: Validate Web UI JavaScript
+        run: |
+          node --check crates/swarmotter-web/assets/theme-bootstrap.js
+          node --check crates/swarmotter-web/assets/app.js
+      - name: Validate deployment manifests
+        run: |
+          cp deploy/gluetun.env.example deploy/gluetun.env
+          docker compose --env-file deploy/.env.example -f deploy/compose.yml config >/dev/null
+
+  rust-1-88-check:
+    name: Rust 1.88 check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Check locked workspace at the minimum Rust version
+        run: cargo check --locked --workspace --all-targets --all-features
 
   docs-site:
-    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
-    needs: build-test
+    needs: [build-test, rust-1-88-check]
     permissions:
       contents: read
     steps:
@@ -81,7 +97,7 @@ jobs:
   container-image:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
-    needs: build-test
+    needs: [build-test, rust-1-88-check]
     permissions:
       contents: read
       packages: write

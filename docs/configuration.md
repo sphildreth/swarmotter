@@ -35,6 +35,42 @@ SwarmOtter exposes two update modes:
 
 The `PUT /api/v1/settings` response reports which fields were applied live, which
 fields require restart, and whether the write was persisted.
+Supported package and Compose deployments provide a private writable config
+directory. If persistence is unavailable, the Web UI can fall back to PATCH for
+only bandwidth, queue, seeding, and autopilot settings.
+
+Network containment, peer listen port, IP-family policy, uTP policy, peer
+encryption mode, and DHT changes are applied live by stopping the complete old
+data-plane task set and rebuilding eligible tasks with fresh binders. API
+listener/body-limit and logging destination changes are reported as requiring a
+process restart.
+
+Changing a global storage root is rejected when an existing torrent still
+depends on the old root. Assign explicit locations with move-data before
+changing `storage.download_dir`; complete or remove incomplete payloads before
+changing `storage.incomplete_dir`. This prevents a settings update from making
+existing payload data appear missing.
+
+Unknown top-level or nested TOML fields are rejected. This prevents a misspelled
+containment or security setting from silently falling back to a default.
+
+## Durable daemon state
+
+Torrent records, queue order, labels, file choices, and per-torrent controls
+are stored separately from configuration in a versioned state file. Select its
+path with `--state-file PATH` or `SWARMOTTER_STATE_FILE=PATH`.
+
+Without an explicit path, the daemon uses the first available location:
+
+1. The systemd `STATE_DIRECTORY`, as `state.json`.
+2. `/var/lib/swarmotter/state.json` when that directory exists.
+3. `$XDG_STATE_HOME/swarmotter/state.json`.
+4. `$HOME/.local/state/swarmotter/state.json`.
+5. `./swarmotter-state.json`.
+
+The state file is atomically replaced and mode `0600` on Unix. Corrupt or
+unsupported state stops startup with an explicit error instead of presenting
+an empty library. Restored completed torrents are rechecked before seeding.
 
 ## Common configuration: bind torrents to `br0`
 
@@ -44,6 +80,8 @@ SLAAC, or router advertisements.
 ```toml
 [api]
 bind_address = "0.0.0.0:9091"
+require_auth = true
+auth_token = "replace-with-a-long-random-token"
 
 [storage]
 download_dir = "/mnt/incoming/swarmotter/downloads"
@@ -186,7 +224,7 @@ mode = "act"  # optional; defaults to act
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `bind_address` | `"127.0.0.1:9091"` | Address for the Web UI and API control plane. |
-| `require_auth` | `false` | Requires API/Web UI token auth when true. |
+| `require_auth` | `false` | Requires API/Web UI token auth. It must be true for non-loopback bind addresses. |
 | `auth_token` | unset | Required when `require_auth = true`. |
 | `max_request_body_bytes` | `16777216` | Maximum API request body size, including `.torrent` uploads. |
 
@@ -288,7 +326,9 @@ sized up front.
 | `validate_dns` | `false` | Reports `dns_not_constrained` in network health when DNS cannot be proven constrained. Hostname resolution is still fail-closed unless DNS is constrained or a network namespace is used. |
 
 Strict mode requires at least one enforceable path: interface, source address,
-or network namespace.
+or network namespace. On Linux, route and DNS path validation invoke
+`ip route get`; direct and tarball installs must provide the `ip` utility from
+the distribution's `iproute2` or `iproute` package.
 
 ### `[autopilot]`
 
@@ -304,7 +344,7 @@ or network namespace.
 | `allow_ipv6` | `true` | Enables IPv6 peers when network containment also allows IPv6; when false, IPv6 peers are filtered before connecting. |
 | `utp_enabled` | `true` | Enables uTP peer transport through contained UDP sockets. |
 | `utp_prefer_tcp` | `true` | Tries TCP first, with uTP fallback. |
-| `encryption_mode` | `preferred` | TCP MSE/PE peer wire mode. `disabled` permits plaintext handshakes. `preferred` enables MSE/PE with plaintext fallback for TCP attempts while preserving the configured TCP/uTP preference. `required` refuses plaintext and requires encrypted TCP stream negotiation. Changing this setting is reported as restart-required for already-running torrent tasks. |
+| `encryption_mode` | `preferred` | TCP MSE/PE peer wire mode. `disabled` permits plaintext handshakes. `preferred` enables MSE/PE with plaintext fallback for TCP attempts while preserving the configured TCP/uTP preference. `required` refuses plaintext and requires encrypted TCP stream negotiation. Changing this setting rebuilds active data-plane tasks before it is reported as applied. |
 | `selfish` | `false` | Removes a torrent after verified completion and does not seed it; already-completed managed records are also removed on runtime reconciliation while preserving downloaded data. |
 
 ### `[bandwidth]`

@@ -208,6 +208,9 @@ async fn require_api_auth(
     next: Next,
 ) -> Response {
     let cfg = state.daemon.get_config().await;
+    if let Some(response) = reject_unsafe_browser_request(&req, &cfg) {
+        return response;
+    }
     if !cfg.api.require_auth {
         return next.run(req).await;
     }
@@ -221,6 +224,91 @@ async fn require_api_auth(
         return next.run(req).await;
     }
     auth_error(StatusCode::UNAUTHORIZED, "missing or invalid API token")
+}
+
+fn reject_unsafe_browser_request(
+    req: &Request<Body>,
+    cfg: &swarmotter_core::config::Config,
+) -> Option<Response> {
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    let fetch_site = req
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok());
+    let browser_request = origin.is_some() || fetch_site.is_some();
+
+    if matches!(fetch_site, Some("cross-site" | "same-site")) {
+        return Some(browser_security_error(
+            "cross_origin_forbidden",
+            "cross-origin browser requests are not allowed",
+        ));
+    }
+
+    if let Some(origin) = origin {
+        let origin_authority = origin
+            .parse::<axum::http::Uri>()
+            .ok()
+            .and_then(|uri| uri.authority().cloned());
+        let request_authority = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<axum::http::uri::Authority>().ok());
+        let same_authority = origin_authority
+            .as_ref()
+            .zip(request_authority.as_ref())
+            .is_some_and(|(origin, request)| authority_matches(origin, request));
+        if !same_authority {
+            return Some(browser_security_error(
+                "cross_origin_forbidden",
+                "browser Origin must match the request Host",
+            ));
+        }
+    }
+
+    if browser_request && !cfg.api.require_auth {
+        let loopback_host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<axum::http::uri::Authority>().ok())
+            .is_some_and(|authority| is_loopback_host(authority.host()));
+        if !loopback_host {
+            return Some(browser_security_error(
+                "host_forbidden",
+                "unauthenticated browser access requires a loopback Host",
+            ));
+        }
+    }
+
+    None
+}
+
+fn authority_matches(
+    left: &axum::http::uri::Authority,
+    right: &axum::http::uri::Authority,
+) -> bool {
+    left.host()
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case(right.host().trim_end_matches('.'))
+        && left.port_u16() == right.port_u16()
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let ip_literal = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    ip_literal
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
 }
 
 pub(crate) fn request_has_token(req: &Request<Body>, expected: &str) -> bool {
@@ -255,6 +343,15 @@ fn auth_error(status: StatusCode, message: &str) -> Response {
         status,
         [(header::CONTENT_TYPE, "application/json")],
         envelope::error_to_json("unauthorized", message),
+    )
+        .into_response()
+}
+
+fn browser_security_error(code: &str, message: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        [(header::CONTENT_TYPE, "application/json")],
+        envelope::error_to_json(code, message),
     )
         .into_response()
 }

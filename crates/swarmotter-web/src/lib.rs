@@ -14,7 +14,8 @@
 
 use axum::{
     body::Body,
-    http::{header, StatusCode},
+    http::{header, HeaderValue, Request as HttpRequest, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::get,
     Router,
@@ -22,6 +23,7 @@ use axum::{
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_JS: &str = include_str!("../assets/app.js");
+const THEME_BOOTSTRAP_JS: &str = include_str!("../assets/theme-bootstrap.js");
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 const TABULATOR_JS: &str = include_str!("../assets/vendor/tabulator/tabulator.min.js");
 const TABULATOR_CSS: &str = include_str!("../assets/vendor/tabulator/tabulator_midnight.min.css");
@@ -50,6 +52,7 @@ pub fn web_router() -> Router {
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
+        .route("/theme-bootstrap.js", get(theme_bootstrap_js))
         .route("/style.css", get(style_css))
         .route("/vendor/tabulator/tabulator.min.js", get(tabulator_js))
         .route(
@@ -69,6 +72,7 @@ pub fn web_router() -> Router {
         .route("/mstile-150x150.png", get(mstile_150))
         .route("/site.webmanifest", get(site_webmanifest))
         .route("/swarmotter-icon-64x64.png", get(header_logo))
+        .layer(middleware::from_fn(add_security_headers))
 }
 
 async fn index() -> Response {
@@ -84,6 +88,38 @@ async fn app_js() -> Response {
         APP_JS,
     )
         .into_response()
+}
+
+async fn theme_bootstrap_js() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        THEME_BOOTSTRAP_JS,
+    )
+        .into_response()
+}
+
+async fn add_security_headers(request: HttpRequest<Body>, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    response
 }
 
 async fn style_css() -> Response {
@@ -188,6 +224,7 @@ mod tests {
     fn assets_are_nonempty() {
         assert!(!INDEX_HTML.is_empty());
         assert!(!APP_JS.is_empty());
+        assert!(!THEME_BOOTSTRAP_JS.is_empty());
         assert!(!STYLE_CSS.is_empty());
         assert!(!TABULATOR_JS.is_empty());
         assert!(!TABULATOR_CSS.is_empty());
@@ -486,12 +523,20 @@ mod tests {
             "class=\"icon-button theme-toggle\"",
             "theme-icon-sun",
             "theme-icon-moon",
-            "swarmotter.theme",
-            "document.documentElement.dataset.theme = theme;",
+            "src=\"/theme-bootstrap.js\"",
         ] {
             assert!(
                 INDEX_HTML.contains(needle),
                 "Web UI is missing theme toggle markup {needle}"
+            );
+        }
+        for needle in [
+            "swarmotter.theme",
+            "document.documentElement.dataset.theme = theme;",
+        ] {
+            assert!(
+                THEME_BOOTSTRAP_JS.contains(needle),
+                "Theme bootstrap script is missing {needle}"
             );
         }
         for needle in [
@@ -608,6 +653,10 @@ mod tests {
             "doctor-summary",
             "doctor-application",
             "doctor-checks",
+            "details-controls",
+            "details-activity",
+            "tracker-add-url",
+            "remove-torrent-dialog",
         ] {
             assert!(
                 INDEX_HTML.contains(&format!("id=\"{}\"", id)),
@@ -633,6 +682,101 @@ mod tests {
                 "Web UI is missing markup marker {needle}"
             );
         }
+    }
+
+    #[test]
+    fn web_ui_exposes_required_torrent_operations() {
+        for id in [
+            "details-start-btn",
+            "details-stop-btn",
+            "details-reannounce-btn",
+            "details-queue-top-btn",
+            "details-queue-up-btn",
+            "details-queue-down-btn",
+            "details-queue-bottom-btn",
+            "details-move-path",
+            "details-labels",
+            "details-download-limit",
+            "details-upload-limit",
+            "details-limits-btn",
+            "tracker-add-btn",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{}\"", id)),
+                "Web UI is missing required operation control {id}"
+            );
+        }
+        for needle in [
+            "function runDetailsCommand(",
+            "\"/queue/move-top\"",
+            "\"/queue/move-bottom\"",
+            "\"/reannounce\"",
+            "\"/move\"",
+            "\"/labels\"",
+            "\"/limits\"",
+            "/trackers/edit",
+            "/files/${fi}/rename",
+            "function renderDetailsActivity(",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "Web UI operation wiring is missing {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_removal_has_explicit_cancel_keep_and_delete_choices() {
+        for value in ["cancel", "keep", "delete"] {
+            assert!(
+                INDEX_HTML.contains(&format!("value=\"{}\"", value)),
+                "Removal dialog is missing {value} choice"
+            );
+        }
+        assert!(APP_JS.contains("const removal = await chooseTorrentRemoval(name);"));
+        assert!(APP_JS.contains("if (removal === \"cancel\") return;"));
+        assert!(!APP_JS.contains("Remove torrent? Delete data too?"));
+    }
+
+    #[test]
+    fn web_ui_scopes_removal_observation_to_the_active_query() {
+        for needle in [
+            "let lastTorrentObservationKey = null;",
+            "observeTorrentRemovals(torrents, queryParams, query);",
+            "const observesCompleteLibrary = !torrentQueryState.q",
+            "if (!observesCompleteLibrary)",
+            "if (observationKey !== lastTorrentObservationKey)",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "Removal observation is missing {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_rejects_stale_torrent_detail_responses() {
+        for needle in [
+            "function detailsRequestIsCurrent(hash)",
+            "function beginDetailsLoad()",
+            "if (!detailsRequestIsCurrent(hash)) return;",
+            "#details-controls\").classList.add(\"hidden\")",
+            "const hash = currentHash;",
+            "button.dataset.pendingHash = hash;",
+            "if (button.dataset.pendingHash === hash)",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "Torrent detail stale-response protection is missing {needle}"
+            );
+        }
+        assert!(
+            APP_JS
+                .matches("if (!detailsRequestIsCurrent(hash)) return;")
+                .count()
+                >= 6,
+            "Every asynchronous torrent detail renderer must reject stale responses"
+        );
     }
 
     #[test]
@@ -767,6 +911,10 @@ mod tests {
             "function renderWatchFolderEditors(",
             "function collectWatchFolderEditors(",
             "method: \"PUT\"",
+            "async function replaceSettingsWithRuntimeFallback(",
+            "method: \"PATCH\"",
+            "error?.status !== 500",
+            "Runtime settings applied",
             "api(\"/reset\"",
             "Reset all downloads?",
             "let resetError = null;",
@@ -919,6 +1067,10 @@ mod tests {
                 "application/javascript; charset=utf-8",
             ),
             (
+                "/theme-bootstrap.js",
+                "application/javascript; charset=utf-8",
+            ),
+            (
                 "/vendor/tabulator/tabulator_midnight.min.css",
                 "text/css; charset=utf-8",
             ),
@@ -940,5 +1092,32 @@ mod tests {
                 content_type
             );
         }
+    }
+
+    #[tokio::test]
+    async fn web_assets_set_browser_security_headers() {
+        let response = web_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request is valid"),
+            )
+            .await
+            .expect("route responds");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.contains("frame-ancestors 'none'")));
+        assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
     }
 }

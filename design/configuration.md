@@ -23,10 +23,14 @@ updates use two API paths:
 - Defaults should be safe and operator-friendly.
 - Strict network containment must require an enforceable data-plane path.
 - API auth must require a non-empty token when enabled.
+- API auth must be enabled whenever the control-plane listener is not loopback
+  (ADR-0044).
 - `GET /api/v1/settings` must redact `api.auth_token`.
 - Full config replacement must preserve the existing auth token when the
   request omits it.
 - Runtime updates must report fields that require restart.
+- Unknown top-level and nested fields must be rejected rather than silently
+  ignored.
 - Environment overrides must pass through the same validation as file config.
 - Transport option changes are release-facing compatibility decisions.
 
@@ -55,8 +59,10 @@ peer-wire negotiation:
   fallback when allowed; TCP/uTP ordering still follows `torrent.utp_prefer_tcp`.
 - `required`: refuse plaintext and require encrypted stream negotiation.
 
-Changing this mode is restart-required for already-running torrent tasks because
-engines and seeders capture the peer-wire policy at task startup.
+Changing this mode stops and rebuilds the complete torrent data plane before
+the replacement is reported as applied. Engines, tracker sidecars, DHT work,
+the shared listener, and accepted sessions created under the previous policy
+are awaited before eligible tasks start with the new policy (ADR-0047).
 
 This phase is TCP-only; no uTP encryption and no per-profile/per-torrent override
 surface is included yet.

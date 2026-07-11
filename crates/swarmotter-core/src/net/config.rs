@@ -7,7 +7,8 @@ use crate::models::network::NetworkContainmentMode;
 use serde::{Deserialize, Serialize};
 
 /// Network containment configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     #[serde(default = "default_network_mode")]
     pub mode: NetworkContainmentMode,

@@ -1279,6 +1279,128 @@ async fn api_auth_blocks_v1_without_token_and_accepts_bearer() {
 }
 
 #[tokio::test]
+async fn native_api_rejects_cross_origin_browser_mutations() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/reset")
+                .header("host", "127.0.0.1:9091")
+                .header("origin", "https://malicious.example")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/reset")
+                .header("host", "malicious.example")
+                .header("origin", "http://malicious.example")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn native_api_allows_same_origin_browser_and_non_browser_clients() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents")
+                .header("host", "127.0.0.1:9091")
+                .header("origin", "http://127.0.0.1:9091")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents")
+                .header("host", "[::1]:9091")
+                .header("origin", "http://[::1]:9091")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn native_api_accepts_authenticated_same_origin_reverse_proxy_requests() {
+    let mut cfg = Config::default();
+    cfg.api.require_auth = true;
+    cfg.api.auth_token = Some("test-token".into());
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents")
+                .header("host", "swarmotter.example")
+                .header("origin", "https://swarmotter.example")
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/ws")
+                .header("host", "swarmotter.example")
+                .header("origin", "https://malicious.example")
+                .header("authorization", "Bearer test-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn transmission_rpc_is_disabled_by_default() {
     let state = fake_daemon::fake_state();
     let app = swarmotter_api::app_router(state);

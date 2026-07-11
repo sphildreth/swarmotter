@@ -11,6 +11,13 @@ description: |-
 vendor: SwarmOtter
 homepage: https://github.com/sphildreth/swarmotter
 license: Apache-2.0
+overrides:
+  deb:
+    depends:
+      - iproute2
+  rpm:
+    depends:
+      - iproute
 scripts:
   preinstall: deploy/package/preinstall.sh
   postinstall: deploy/package/postinstall.sh
@@ -22,13 +29,19 @@ contents:
       mode: 0755
       owner: root
       group: root
+  - dst: /etc/swarmotter
+    type: dir
+    file_info:
+      mode: 0700
+      owner: swarmotter
+      group: swarmotter
   - src: config/swarmotter.toml.example
     dst: /etc/swarmotter/swarmotter.toml
     type: config|noreplace
     file_info:
-      mode: 0644
-      owner: root
-      group: root
+      mode: 0600
+      owner: swarmotter
+      group: swarmotter
   - src: deploy/swarmotterd.service
     dst: /usr/lib/systemd/system/swarmotterd.service
     file_info:

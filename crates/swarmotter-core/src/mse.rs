@@ -193,7 +193,34 @@ where
 }
 
 /// Accept MSE/PE on an inbound TCP peer stream for a known torrent info hash.
-pub async fn accept<S>(mut stream: S, info_hash: InfoHash) -> Result<MseStream<S>>
+pub async fn accept<S>(stream: S, info_hash: InfoHash) -> Result<MseStream<S>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (_, stream) = accept_matching(stream, &[info_hash]).await?;
+    Ok(stream)
+}
+
+/// Accept MSE/PE on an inbound stream and identify which registered torrent
+/// the initiator selected. This is used by a process-wide peer listener: the
+/// MSE stream key is the first point at which an encrypted inbound connection
+/// identifies its torrent.
+pub async fn accept_any<S>(stream: S, info_hashes: &[InfoHash]) -> Result<(InfoHash, MseStream<S>)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if info_hashes.is_empty() {
+        return Err(CoreError::Internal(
+            "cannot accept MSE without a registered torrent".into(),
+        ));
+    }
+    accept_matching(stream, info_hashes).await
+}
+
+async fn accept_matching<S>(
+    mut stream: S,
+    info_hashes: &[InfoHash],
+) -> Result<(InfoHash, MseStream<S>)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -211,15 +238,14 @@ where
 
     let mut req2 = [0u8; HASH_LEN];
     stream.read_exact(&mut req2).await?;
-    let expected_req2 = xor20(
-        sha1_concat(&[b"req2", info_hash.as_bytes()]),
-        sha1_concat(&[b"req3", &secret_bytes]),
-    );
-    if req2 != expected_req2 {
-        return Err(CoreError::Internal(
-            "MSE stream key did not match torrent info hash".into(),
-        ));
-    }
+    let req3 = sha1_concat(&[b"req3", &secret_bytes]);
+    let info_hash = info_hashes
+        .iter()
+        .copied()
+        .find(|candidate| req2 == xor20(sha1_concat(&[b"req2", candidate.as_bytes()]), req3))
+        .ok_or_else(|| {
+            CoreError::Internal("MSE stream key did not match a registered torrent".into())
+        })?;
 
     let mut incoming = Rc4Cipher::new(&derive_key(b"keyA", &secret_bytes, info_hash.as_bytes()));
     let mut outgoing = Rc4Cipher::new(&derive_key(b"keyB", &secret_bytes, info_hash.as_bytes()));
@@ -238,11 +264,9 @@ where
     stream.write_all(&response).await?;
     stream.flush().await.ok();
 
-    Ok(MseStream::new(
-        stream,
-        incoming,
-        outgoing,
-        initiator.initial_data,
+    Ok((
+        info_hash,
+        MseStream::new(stream, incoming, outgoing, initiator.initial_data),
     ))
 }
 
@@ -633,5 +657,21 @@ mod tests {
         server.flush().await.unwrap();
         client.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"pong");
+    }
+
+    #[tokio::test]
+    async fn mse_accept_any_routes_by_stream_key() {
+        let (client_io, server_io) = tokio::io::duplex(8192);
+        let first = InfoHash::from_bytes([0x11; 20]);
+        let selected = InfoHash::from_bytes([0x22; 20]);
+        let server = tokio::spawn(async move { accept_any(server_io, &[first, selected]).await });
+        let mut client = connect(client_io, selected).await.unwrap();
+        let (identified, mut server) = server.await.unwrap().unwrap();
+        assert_eq!(identified, selected);
+        client.write_all(b"routed").await.unwrap();
+        client.flush().await.unwrap();
+        let mut got = [0u8; 6];
+        server.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"routed");
     }
 }

@@ -384,7 +384,10 @@ backup_paths() {
     local gluetun_env_path
 
     gluetun_env_file="$(read_env_value GLUETUN_ENV_FILE gluetun.env)"
-    swarmotter_config="$(read_env_value SWARMOTTER_CONFIG /srv/swarmotter/config/swarmotter.toml)"
+    swarmotter_config="$(read_env_value SWARMOTTER_CONFIG_DIR "")"
+    if [[ -z "$swarmotter_config" ]]; then
+        swarmotter_config="$(read_env_value SWARMOTTER_CONFIG /srv/swarmotter/config/swarmotter.toml)"
+    fi
     swarmotter_state="$(read_env_value SWARMOTTER_STATE /srv/swarmotter/state)"
     gluetun_state="$(read_env_value GLUETUN_STATE_DIR /srv/swarmotter/gluetun)"
     gluetun_env_path="$(resolve_path "$gluetun_env_file")"

@@ -7,7 +7,8 @@
 # --- Control plane (API + Web UI) ---
 [api]
 bind_address = "127.0.0.1:9091"
-# Set require_auth = true and auth_token to enable API authentication.
+# Authentication may be disabled only while bind_address is loopback. Set
+# require_auth = true and auth_token before binding to a LAN or proxy listener.
 require_auth = false
 # auth_token = "change-me"
 # Maximum API request body size in bytes.

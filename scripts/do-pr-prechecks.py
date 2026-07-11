@@ -3,13 +3,17 @@
 
 """Run the local checks that should pass before opening a SwarmOtter PR.
 
-The default command set mirrors the GitHub Actions `build-test` job that runs on
+The default command set mirrors the required GitHub Actions checks that run on
 pull requests:
 
   - cargo fmt --all -- --check
   - cargo check --workspace --all-targets --all-features
   - cargo clippy --workspace --all-targets --all-features -- -D warnings
   - cargo test --all --all-features
+  - node --check for both Web UI scripts
+  - docker compose config for the supported deployment manifest
+  - cargo +1.88.0 check --locked --workspace --all-targets --all-features
+  - mdbook build
 
 The script uses Rich for progress feedback. Install it with:
 
@@ -54,6 +58,11 @@ PR_CHECKS = (
     "cargo check --workspace --all-targets --all-features",
     "cargo clippy --workspace --all-targets --all-features -- -D warnings",
     "cargo test --all --all-features",
+    "node --check crates/swarmotter-web/assets/theme-bootstrap.js",
+    "node --check crates/swarmotter-web/assets/app.js",
+    "GLUETUN_ENV_FILE=gluetun.env.example docker compose --env-file deploy/.env.example -f deploy/compose.yml config",
+    "cargo +1.88.0 check --locked --workspace --all-targets --all-features",
+    "mdbook build",
 )
 
 
@@ -62,6 +71,7 @@ class CheckStep:
     name: str
     command: list[str]
     note: str = ""
+    environment: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -84,6 +94,11 @@ def repo_root_from_script() -> Path:
 
 def command_text(command: Iterable[str]) -> str:
     return " ".join(command)
+
+
+def step_command_text(step: CheckStep) -> str:
+    environment = [f"{key}={value}" for key, value in step.environment]
+    return command_text([*environment, *step.command])
 
 
 def cargo_command(toolchain: str, args: list[str]) -> list[str]:
@@ -164,6 +179,62 @@ def build_steps(args: argparse.Namespace) -> list[CheckStep]:
         ]
     )
 
+    steps.extend(
+        [
+            CheckStep(
+                "Validate theme bootstrap JavaScript",
+                ["node", "--check", "crates/swarmotter-web/assets/theme-bootstrap.js"],
+                PR_CHECKS[4],
+            ),
+            CheckStep(
+                "Validate Web UI JavaScript",
+                ["node", "--check", "crates/swarmotter-web/assets/app.js"],
+                PR_CHECKS[5],
+            ),
+            CheckStep(
+                "Validate deployment manifest",
+                [
+                    "docker",
+                    "compose",
+                    "--env-file",
+                    "deploy/.env.example",
+                    "-f",
+                    "deploy/compose.yml",
+                    "config",
+                ],
+                PR_CHECKS[6],
+                (("GLUETUN_ENV_FILE", "gluetun.env.example"),),
+            ),
+        ]
+    )
+
+    if not args.no_install_minimum_rust:
+        steps.append(
+            CheckStep(
+                "Install minimum Rust toolchain",
+                [
+                    "rustup",
+                    "toolchain",
+                    "install",
+                    args.minimum_rust_toolchain,
+                    "--profile",
+                    "minimal",
+                ],
+                "GitHub Actions installs the minimum supported Rust toolchain.",
+            )
+        )
+
+    steps.append(
+        CheckStep(
+            "Minimum Rust version check",
+            cargo_command(
+                args.minimum_rust_toolchain,
+                ["check", "--locked", "--workspace", "--all-targets", "--all-features"],
+            ),
+            PR_CHECKS[7],
+        )
+    )
+
     if args.docs:
         mdbook_version = os.environ.get("DOCS_MDBOOK_VERSION", "0.5.0")
         mermaid_version = os.environ.get("DOCS_MDBOOK_MERMAID_VERSION", "0.17.0")
@@ -176,7 +247,7 @@ def build_steps(args: argparse.Namespace) -> list[CheckStep]:
                             args.toolchain,
                             ["install", "mdbook", "--version", mdbook_version, "--locked"],
                         ),
-                        "Main-branch/docs CI installs mdbook before building docs.",
+                        "Docs CI installs mdbook before building docs.",
                     ),
                     CheckStep(
                         "Install mdBook Mermaid",
@@ -190,7 +261,7 @@ def build_steps(args: argparse.Namespace) -> list[CheckStep]:
                                 "--locked",
                             ],
                         ),
-                        "Main-branch/docs CI installs mdbook-mermaid before building docs.",
+                        "Docs CI installs mdbook-mermaid before building docs.",
                     ),
                 ]
             )
@@ -198,7 +269,7 @@ def build_steps(args: argparse.Namespace) -> list[CheckStep]:
             CheckStep(
                 "Build mdBook",
                 ["mdbook", "build"],
-                "Optional: docs-site is skipped for pull_request but runs on main/workflow_dispatch.",
+                PR_CHECKS[8],
             )
         )
 
@@ -248,10 +319,12 @@ def run_step(
 ) -> StepResult:
     started = time.monotonic()
     tail: deque[str] = deque(maxlen=tail_lines)
+    step_env = env.copy()
+    step_env.update(step.environment)
     process = subprocess.Popen(
         step.command,
         cwd=cwd,
-        env=env,
+        env=step_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -273,7 +346,7 @@ def run_step(
 
 
 def print_failure(console: Console, result: StepResult) -> None:
-    command = command_text(result.step.command)
+    command = step_command_text(result.step)
     body = [
         f"[bold]Command:[/bold] {escape(command)}",
         f"[bold]Exit code:[/bold] {result.returncode}",
@@ -309,7 +382,7 @@ def print_summary(console: Console, results: list[StepResult]) -> None:
             result.step.name,
             status,
             f"{result.duration:.1f}s",
-            command_text(result.step.command),
+            step_command_text(result.step),
         )
     console.print(table)
 
@@ -341,14 +414,33 @@ def parse_args() -> argparse.Namespace:
         help="Do not ensure rustfmt/clippy are installed for the selected toolchain.",
     )
     parser.add_argument(
-        "--docs",
+        "--minimum-rust-toolchain",
+        default="1.88.0",
+        help="Minimum supported Rust toolchain used by the locked workspace check.",
+    )
+    parser.add_argument(
+        "--no-install-minimum-rust",
         action="store_true",
-        help="Also run the main/workflow_dispatch docs-site mdBook build.",
+        help="Do not ensure the minimum supported Rust toolchain is installed.",
+    )
+    docs_group = parser.add_mutually_exclusive_group()
+    docs_group.add_argument(
+        "--docs",
+        dest="docs",
+        action="store_true",
+        default=True,
+        help="Run the PR docs-site mdBook build (enabled by default).",
+    )
+    docs_group.add_argument(
+        "--no-docs",
+        dest="docs",
+        action="store_false",
+        help="Skip the required PR documentation build for a partial local check.",
     )
     parser.add_argument(
         "--install-doc-tools",
         action="store_true",
-        help="Install CI-pinned mdbook/mdbook-mermaid versions before --docs.",
+        help="Install CI-pinned mdbook/mdbook-mermaid versions before the docs build.",
     )
     parser.add_argument(
         "--docker",
@@ -395,7 +487,7 @@ def main() -> int:
     steps = build_steps(args)
     if args.list:
         for step in steps:
-            console.print(f"[bold]{step.name}[/bold]: {command_text(step.command)}")
+            console.print(f"[bold]{step.name}[/bold]: {step_command_text(step)}")
             if step.note:
                 console.print(f"  [dim]{step.note}[/dim]")
         return 0
@@ -411,7 +503,7 @@ def main() -> int:
                     "[bold]SwarmOtter PR prechecks[/bold]",
                     f"Repository: {repo_root}",
                     f"Toolchain: {args.toolchain}",
-                    "Default checks mirror .github/workflows/ci.yml build-test.",
+                    "Default checks mirror the required pull-request CI jobs.",
                 ]
             ),
             border_style="cyan",
@@ -452,7 +544,7 @@ def main() -> int:
                 continue
 
             progress.update(overall, description=f"Running {step.name}")
-            console.print(f"[cyan]▶ {step.name}[/cyan] [dim]{command_text(step.command)}[/dim]")
+            console.print(f"[cyan]▶ {step.name}[/cyan] [dim]{step_command_text(step)}[/dim]")
             result = run_step(
                 step,
                 cwd=repo_root,

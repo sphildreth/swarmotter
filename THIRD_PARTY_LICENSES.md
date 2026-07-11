@@ -67,6 +67,19 @@ foundational dependency stack rationale.
 | `assets/mermaid-init.js` | Bundled by mdbook-mermaid 0.17.0 | MPL-2.0 | Theme-aware Mermaid initialization script for mdBook |
 | `crates/swarmotter-web/assets/vendor/tabulator` | 6.5.0 | MIT | Vendored browser grid used by the Web UI torrent list for sorting, column filtering, and table refresh behavior |
 
+## Operating-system runtime dependencies
+
+| Component | Provisioning | License | Justification |
+|-----------|--------------|---------|---------------|
+| `iproute2` | Debian-family runtime package | GPL-2.0-only in Debian bookworm package metadata | Supplies the `ip route get` process used to validate strict Linux route and DNS paths. It is not linked into SwarmOtter or used to create torrent sockets. |
+| `iproute` | RPM-family runtime package | GPL-2.0-or-later AND NIST-PD in Fedora package metadata | Supplies the same `ip` utility for RPM installations without changing torrent socket ownership. |
+
+Native packages declare this dependency and the official container installs it
+from the base distribution. Distribution package metadata and notices remain
+the source of truth for the exact packaged version and component licenses.
+Release SBOM and native-package metadata are authoritative for transitive
+operating-system packages in a specific artifact.
+
 ## Network containment note
 
 None of the direct dependencies above create torrent data-plane network

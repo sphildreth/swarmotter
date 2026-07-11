@@ -61,6 +61,7 @@ let toastDisplayMs = loadToastDisplayMs();
 let currentTheme = loadThemePreference();
 let torrentsLoaded = false;
 let knownTorrents = new Map();
+let lastTorrentObservationKey = null;
 let expectedRemovedTorrents = new Map();
 let selectedTorrents = new Map();
 let visibleTorrents = [];
@@ -107,6 +108,11 @@ const EVENT_KINDS = [
 ];
 
 const TORRENT_ACTIONS = [
+  {
+    act: "details",
+    label: "Details",
+    icon: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></svg>`,
+  },
   {
     act: "pause",
     label: "Pause",
@@ -369,6 +375,7 @@ async function api(path, opts = {}) {
 
 // --- Navigation ---
 function openView(view, activeButton = null) {
+  currentHash = null;
   $$(".nav").forEach(b => b.classList.remove("active"));
   if (activeButton && activeButton.classList.contains("nav")) activeButton.classList.add("active");
   $$(".view").forEach(v => v.classList.add("hidden"));
@@ -479,7 +486,7 @@ async function refreshTorrents() {
       torrentQueryState.page = query.page_count;
       return refreshTorrents();
     }
-    observeTorrentRemovals(torrents);
+    observeTorrentRemovals(torrents, queryParams, query);
     syncSelectedTorrents(torrents);
     const rows = torrents.map(normalizeTorrentRow);
     ensureTorrentTable();
@@ -756,7 +763,7 @@ function torrentTableColumns() {
     {
       title: "Actions",
       field: "_actions",
-      width: 150,
+      width: 190,
       headerSort: false,
       resizable: false,
       formatter: () => renderTorrentActions(),
@@ -992,8 +999,31 @@ function applySavedTorrentQueryView() {
   applyTorrentQueryControls(torrentQueryState);
 }
 
-function observeTorrentRemovals(list) {
+function observeTorrentRemovals(list, observationKey, query) {
   const current = new Map((list || []).map(t => [t.info_hash, String(t.name || t.info_hash || "")]));
+  const total = finiteNumber(query?.total);
+  const filtered = finiteNumber(query?.filtered);
+  const observesCompleteLibrary = !torrentQueryState.q
+    && !torrentQueryState.state
+    && !torrentQueryState.health
+    && !torrentQueryState.performance
+    && clampTorrentPage(query?.page) === 1
+    && total !== null
+    && filtered === total
+    && current.size === total;
+  if (!observesCompleteLibrary) {
+    knownTorrents.clear();
+    lastTorrentObservationKey = null;
+    expectedRemovedTorrents.clear();
+    torrentsLoaded = false;
+    return;
+  }
+  if (observationKey !== lastTorrentObservationKey) {
+    knownTorrents = current;
+    lastTorrentObservationKey = observationKey;
+    torrentsLoaded = true;
+    return;
+  }
   if (torrentsLoaded) {
     for (const [hash, name] of knownTorrents.entries()) {
       if (current.has(hash)) continue;
@@ -1139,15 +1169,21 @@ async function removeSelectedTorrents() {
 
 async function handleTorrentAction(act, hash, name) {
   try {
+    if (act === "details") {
+      await openDetails(hash);
+      return;
+    }
     if (act === "pause") await api(`/torrents/${hash}/pause`, { method: "POST" });
     else if (act === "resume") await api(`/torrents/${hash}/resume`, { method: "POST" });
     else if (act === "recheck") await api(`/torrents/${hash}/recheck`, { method: "POST" });
     else if (act === "remove") {
-      if (confirm("Remove torrent? Delete data too?")) await api(`/torrents/${hash}?delete_data=true`, { method: "DELETE" });
-      else await api(`/torrents/${hash}`, { method: "DELETE" });
+      const removal = await chooseTorrentRemoval(name);
+      if (removal === "cancel") return;
+      const deleteData = removal === "delete";
+      await api(`/torrents/${hash}?delete_data=${deleteData}`, { method: "DELETE" });
       expectedRemovedTorrents.set(hash, name);
       selectedTorrents.delete(hash);
-      showToast("Torrent removed", name, "info");
+      showToast("Torrent removed", deleteData ? `${name}; downloaded data deleted` : `${name}; downloaded data kept`, "info");
     }
     refreshTorrents();
   } catch (e) {
@@ -1155,21 +1191,60 @@ async function handleTorrentAction(act, hash, name) {
   }
 }
 
+function chooseTorrentRemoval(name) {
+  const dialog = $("#remove-torrent-dialog");
+  const message = $("#remove-torrent-message");
+  if (!dialog || typeof dialog.showModal !== "function") {
+    if (!window.confirm(`Remove ${name} from SwarmOtter?`)) return Promise.resolve("cancel");
+    return Promise.resolve(window.confirm("Delete the downloaded data too? Choose Cancel to keep it.") ? "delete" : "keep");
+  }
+  message.textContent = `${name} can be removed while keeping its downloaded data, or removed with its downloaded data permanently deleted.`;
+  dialog.returnValue = "cancel";
+  return new Promise(resolve => {
+    dialog.addEventListener("close", () => resolve(dialog.returnValue || "cancel"), { once: true });
+    dialog.showModal();
+  });
+}
+
 // --- Details ---
+function detailsRequestIsCurrent(hash) {
+  const view = $("#view-details");
+  return currentHash === hash && view && !view.classList.contains("hidden");
+}
+
+function beginDetailsLoad() {
+  $("#details-title").textContent = "Loading torrent details";
+  $("#details-health").innerHTML = "";
+  $("#details-summary").innerHTML = "";
+  $("#details-autopilot").innerHTML = "";
+  $("#details-activity").innerHTML = `<h3>Activity</h3><p class="muted">Loading activity...</p>`;
+  $("#details-controls").classList.add("hidden");
+  $("#tracker-add-btn").disabled = true;
+  $("#tracker-add-url").value = "";
+  for (const selector of ["#files-table tbody", "#peers-table tbody", "#trackers-table tbody"]) {
+    $(selector).innerHTML = "";
+  }
+}
+
 async function openDetails(hash) {
   currentHash = hash;
   $$(".view").forEach(v => v.classList.add("hidden"));
   $("#view-details").classList.remove("hidden");
+  beginDetailsLoad();
   try {
-    const [t, decision, autopilotStatus, networkDiag] = await Promise.all([
+    const [t, stats, decision, autopilotStatus, networkDiag] = await Promise.all([
       api(`/torrents/${hash}`),
+      api(`/torrents/${hash}/stats`).catch(() => null),
       api(`/torrents/${hash}/autopilot`).catch(() => null),
       api("/autopilot/status").catch(() => null),
       api("/network/diagnostics").catch(() => null),
     ]);
+    if (!detailsRequestIsCurrent(hash)) return;
     $("#details-title").textContent = t.name;
     renderDetailsHealth(t.health);
     renderDetailsSummary(t);
+    renderDetailsControls(t);
+    renderDetailsActivity(stats || t);
     renderAutopilotDiagnostics({
       torrent: t,
       decision,
@@ -1177,12 +1252,16 @@ async function openDetails(hash) {
       networkDiagnostics: networkDiag,
     });
     bindAutopilotModeSelector(hash, t.autopilot_mode_override);
+    $("#details-controls").classList.remove("hidden");
+    $("#tracker-add-btn").disabled = false;
     loadFiles(hash);
     loadPeers(hash);
     loadTrackers(hash);
   } catch (e) {
+    if (!detailsRequestIsCurrent(hash)) return;
     $("#details-title").textContent = "Torrent details";
     renderDetailsHealth(null);
+    renderDetailsActivity(null);
     renderAutopilotDiagnostics({ torrent: null, decision: null, globalAutopilot: null, networkDiagnostics: null });
     $("#details-summary").innerHTML = "";
     showError("Open torrent details failed", e);
@@ -1267,8 +1346,40 @@ function renderDetailsSummary(t) {
       ["Rate up", fmtRate(t.rate_up)],
       ["Download cap", fmtBytes(t.download_limit || 0)],
       ["Upload cap", fmtBytes(t.upload_limit || 0)],
+      ["Queue position", fmtCount(t.queue_position)],
+      ["Labels", (t.labels || []).join(", ")],
     ])}
   `;
+}
+
+function renderDetailsControls(t) {
+  if (!t) return;
+  $("#details-move-path").value = t.download_dir || "";
+  $("#details-labels").value = (t.labels || []).join(", ");
+  $("#details-download-limit").value = String(finiteNumber(t.download_limit) ?? 0);
+  $("#details-upload-limit").value = String(finiteNumber(t.upload_limit) ?? 0);
+}
+
+function renderDetailsActivity(stats) {
+  const panel = $("#details-activity");
+  if (!panel) return;
+  if (!stats) {
+    panel.innerHTML = `<h3>Activity</h3><p class="muted">Activity data is unavailable.</p>`;
+    return;
+  }
+  panel.innerHTML = `
+    <h3>Activity</h3>
+    ${renderKv([
+      ["State", stats.state],
+      ["Progress", fmtPercentFromFraction(stats.progress, 1) || fmtProgress(stats.bytes_completed, stats.total_length)],
+      ["Downloaded", fmtBytes(stats.downloaded)],
+      ["Uploaded", fmtBytes(stats.uploaded)],
+      ["Download rate", fmtRate(stats.rate_down)],
+      ["Upload rate", fmtRate(stats.rate_up)],
+      ["Pieces", `${fmtCount(stats.pieces_have)} / ${fmtCount(stats.piece_count)}`],
+      ["Active / known peers", `${fmtCount(stats.active_peer_workers)} / ${fmtCount(stats.known_peers)}`],
+      ["Tracker", stats.tracker_message || (stats.tracker_ok ? "healthy" : "unavailable")],
+    ])}`;
 }
 
 function renderAutopilotDiagnostics({ torrent, decision, globalAutopilot, networkDiagnostics }) {
@@ -1376,6 +1487,7 @@ function networkHealthSummary(health, checks, containment) {
 function bindAutopilotModeSelector(hash) {
   const select = $("#details-autopilot-mode");
   if (!select) return;
+  select.disabled = autopilotModeUpdateInFlight;
   const setMode = async () => {
     const nextMode = select.value;
     await setAutopilotModeOverride(hash, nextMode);
@@ -1396,14 +1508,17 @@ async function setAutopilotModeOverride(hash, nextMode) {
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
     });
+    if (!detailsRequestIsCurrent(hash)) return;
     showToast("Autopilot mode saved", "Override updated for this torrent.", "success");
-    if (currentHash === hash) await openDetails(hash);
+    await openDetails(hash);
   } catch (e) {
     if (select) select.value = previous;
-    showError("Failed to update autopilot mode", e);
+    if (detailsRequestIsCurrent(hash)) showError("Failed to update autopilot mode", e);
   } finally {
     autopilotModeUpdateInFlight = false;
     if (select) select.disabled = false;
+    const activeSelect = $("#details-autopilot-mode");
+    if (activeSelect) activeSelect.disabled = false;
   }
 }
 
@@ -1463,11 +1578,12 @@ $$(".tab").forEach(btn => btn.addEventListener("click", () => {
 async function loadFiles(hash) {
   try {
     const files = await api(`/torrents/${hash}/files`);
+    if (!detailsRequestIsCurrent(hash)) return;
     const tbody = $("#files-table tbody");
     tbody.innerHTML = "";
     files.forEach(f => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${escapeHtml(f.path)}</td><td>${fmtBytes(f.length)}</td><td>${fmtBytes(f.bytes_completed)}</td><td><select data-fi="${f.index}" class="prio"><option value="unwanted">Unwanted</option><option value="low">Low</option><option value="normal">Normal</option><option value="high">High</option></select></td><td><input type="checkbox" data-fi="${f.index}" class="want" ${f.wanted ? "checked" : ""}></td>`;
+      tr.innerHTML = `<td>${escapeHtml(f.path)}</td><td>${fmtBytes(f.length)}</td><td>${fmtBytes(f.bytes_completed)}</td><td><select data-fi="${f.index}" class="prio" aria-label="Priority for ${escapeHtml(f.path)}"><option value="unwanted">Unwanted</option><option value="low">Low</option><option value="normal">Normal</option><option value="high">High</option></select></td><td><input type="checkbox" data-fi="${f.index}" class="want" aria-label="Download ${escapeHtml(f.path)}" ${f.wanted ? "checked" : ""}></td><td><div class="file-rename-row"><input type="text" data-fi="${f.index}" class="rename-path" value="${escapeHtml(f.path)}" aria-label="New path for ${escapeHtml(f.path)}"><button type="button" data-fi="${f.index}" class="rename-file secondary">Rename</button></div></td>`;
       tbody.appendChild(tr);
     });
     $$("#files-table .prio").forEach(sel => {
@@ -1477,11 +1593,51 @@ async function loadFiles(hash) {
     $$("#files-table .prio").forEach(sel => sel.addEventListener("change", async () => {
       const fi = parseInt(sel.dataset.fi, 10);
       const priority = sel.value;
-      await api(`/torrents/${hash}/files/priority`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ file_indices: [fi], priority }) });
+      try {
+        await api(`/torrents/${hash}/files/priority`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ file_indices: [fi], priority }) });
+        if (!detailsRequestIsCurrent(hash)) return;
+        showToast("File priority saved", "", "success");
+      } catch (e) {
+        if (!detailsRequestIsCurrent(hash)) return;
+        showError("File priority failed", e);
+        await loadFiles(hash);
+      }
     }));
     $$("#files-table .want").forEach(cb => cb.addEventListener("change", async () => {
       const fi = parseInt(cb.dataset.fi, 10);
-      await api(`/torrents/${hash}/files/wanted`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ file_indices: [fi], wanted: cb.checked }) });
+      try {
+        await api(`/torrents/${hash}/files/wanted`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ file_indices: [fi], wanted: cb.checked }) });
+        if (!detailsRequestIsCurrent(hash)) return;
+        showToast("File selection saved", "", "success");
+      } catch (e) {
+        if (!detailsRequestIsCurrent(hash)) return;
+        showError("File selection failed", e);
+        await loadFiles(hash);
+      }
+    }));
+    $$("#files-table .rename-file").forEach(button => button.addEventListener("click", async () => {
+      const fi = parseInt(button.dataset.fi, 10);
+      const input = $(`#files-table .rename-path[data-fi="${fi}"]`);
+      const newPath = input?.value.trim() || "";
+      if (!newPath) {
+        showToast("Enter a new file path", "", "warning");
+        return;
+      }
+      button.disabled = true;
+      try {
+        await api(`/torrents/${hash}/files/${fi}/rename`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ new_path: newPath }),
+        });
+        if (!detailsRequestIsCurrent(hash)) return;
+        showToast("File renamed", newPath, "success");
+        await loadFiles(hash);
+      } catch (e) {
+        if (detailsRequestIsCurrent(hash)) showError("File rename failed", e);
+      } finally {
+        button.disabled = false;
+      }
     }));
   } catch (e) { log("files error: " + e.message); }
 }
@@ -1489,6 +1645,7 @@ async function loadFiles(hash) {
 async function loadPeers(hash) {
   try {
     const peers = await api(`/torrents/${hash}/peers`) || [];
+    if (!detailsRequestIsCurrent(hash)) return;
     const tbody = $("#peers-table tbody");
     tbody.innerHTML = "";
     peers.forEach(p => {
@@ -1502,22 +1659,136 @@ async function loadPeers(hash) {
 async function loadTrackers(hash) {
   try {
     const trackers = await api(`/torrents/${hash}/trackers`) || [];
+    if (!detailsRequestIsCurrent(hash)) return;
     const tbody = $("#trackers-table tbody");
     tbody.innerHTML = "";
     trackers.forEach(t => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${escapeHtml(t.url)}</td><td>${fmtCount(t.tier)}</td><td>${escapeHtml(t.status)}</td><td>${fmtCount(t.seeders)}</td><td>${fmtCount(t.leechers)}</td>`;
+      tr.innerHTML = `<td>${escapeHtml(t.url)}</td><td>${fmtCount(t.tier)}</td><td>${escapeHtml(t.status)}</td><td>${fmtCount(t.seeders)}</td><td>${fmtCount(t.leechers)}</td><td><div class="tracker-edit-row"><input type="url" class="tracker-edit-url" value="${escapeHtml(t.url)}" aria-label="Edit tracker ${escapeHtml(t.url)}"><button type="button" class="tracker-save secondary" data-url="${escapeHtml(t.url)}">Save</button><button type="button" class="tracker-remove danger" data-url="${escapeHtml(t.url)}">Remove</button></div></td>`;
       tbody.appendChild(tr);
     });
+    $$("#trackers-table .tracker-save").forEach(button => button.addEventListener("click", async () => {
+      const oldUrl = button.dataset.url;
+      const newUrl = button.closest(".tracker-edit-row")?.querySelector(".tracker-edit-url")?.value.trim() || "";
+      if (!newUrl || newUrl === oldUrl) return;
+      try {
+        await api(`/torrents/${hash}/trackers/edit`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ old_url: oldUrl, new_url: newUrl }),
+        });
+        if (!detailsRequestIsCurrent(hash)) return;
+        showToast("Tracker updated", newUrl, "success");
+        await loadTrackers(hash);
+      } catch (e) {
+        if (detailsRequestIsCurrent(hash)) showError("Tracker update failed", e);
+      }
+    }));
+    $$("#trackers-table .tracker-remove").forEach(button => button.addEventListener("click", async () => {
+      const url = button.dataset.url;
+      if (!window.confirm(`Remove tracker ${url}?`)) return;
+      try {
+        await api(`/torrents/${hash}/trackers/${encodeURIComponent(url)}`, { method: "DELETE" });
+        if (!detailsRequestIsCurrent(hash)) return;
+        showToast("Tracker removed", url, "success");
+        await loadTrackers(hash);
+      } catch (e) {
+        if (detailsRequestIsCurrent(hash)) showError("Tracker removal failed", e);
+      }
+    }));
   } catch (e) { log("trackers error: " + e.message); }
 }
 
+$("#tracker-add-btn").addEventListener("click", async () => {
+  const hash = currentHash;
+  const url = $("#tracker-add-url").value.trim();
+  if (!hash || !url) {
+    showToast("Enter a tracker URL", "", "warning");
+    return;
+  }
+  try {
+    await api(`/torrents/${hash}/trackers`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    if (!detailsRequestIsCurrent(hash)) return;
+    $("#tracker-add-url").value = "";
+    showToast("Tracker added", url, "success");
+    await loadTrackers(hash);
+  } catch (e) {
+    if (detailsRequestIsCurrent(hash)) showError("Tracker add failed", e);
+  }
+});
+
 $("#back-btn").addEventListener("click", () => {
+  currentHash = null;
   $$(".view").forEach(v => v.classList.add("hidden"));
   $("#view-torrents").classList.remove("hidden");
   $$(".nav").forEach(b => b.classList.remove("active"));
   $$(".nav")[0].classList.add("active");
   refreshTorrents();
+});
+
+async function runDetailsCommand(button, suffix, title, body = null) {
+  if (!currentHash) return;
+  const hash = currentHash;
+  button.dataset.pendingHash = hash;
+  button.disabled = true;
+  try {
+    const options = { method: "POST" };
+    if (body !== null) {
+      options.headers = { "content-type": "application/json" };
+      options.body = JSON.stringify(body);
+    }
+    await api(`/torrents/${hash}${suffix}`, options);
+    if (!detailsRequestIsCurrent(hash)) return;
+    showToast(title, "", "success");
+    await openDetails(hash);
+    refreshTorrents();
+  } catch (e) {
+    if (detailsRequestIsCurrent(hash)) showError(`${title} failed`, e);
+  } finally {
+    if (button.dataset.pendingHash === hash) {
+      delete button.dataset.pendingHash;
+      button.disabled = false;
+    }
+  }
+}
+
+[
+  ["details-start-btn", "/start", "Torrent started"],
+  ["details-stop-btn", "/stop", "Torrent stopped"],
+  ["details-reannounce-btn", "/reannounce", "Reannounce requested"],
+  ["details-queue-top-btn", "/queue/move-top", "Moved to queue top"],
+  ["details-queue-up-btn", "/queue/move-up", "Moved up in queue"],
+  ["details-queue-down-btn", "/queue/move-down", "Moved down in queue"],
+  ["details-queue-bottom-btn", "/queue/move-bottom", "Moved to queue bottom"],
+].forEach(([id, path, title]) => {
+  $("#" + id).addEventListener("click", event => runDetailsCommand(event.currentTarget, path, title));
+});
+
+$("#details-move-btn").addEventListener("click", event => {
+  const path = $("#details-move-path").value.trim();
+  if (!path) {
+    showToast("Enter a destination path", "", "warning");
+    return;
+  }
+  runDetailsCommand(event.currentTarget, "/move", "Torrent data moved", { path });
+});
+
+$("#details-labels-btn").addEventListener("click", event => {
+  const labels = $("#details-labels").value.split(",").map(label => label.trim()).filter(Boolean);
+  runDetailsCommand(event.currentTarget, "/labels", "Torrent labels saved", { labels });
+});
+
+$("#details-limits-btn").addEventListener("click", event => {
+  const downloadLimit = Math.max(0, Math.trunc(finiteNumber($("#details-download-limit").value) ?? 0));
+  const uploadLimit = Math.max(0, Math.trunc(finiteNumber($("#details-upload-limit").value) ?? 0));
+  runDetailsCommand(event.currentTarget, "/limits", "Torrent limits saved", {
+    download_limit: downloadLimit,
+    upload_limit: uploadLimit,
+  });
 });
 
 // --- Add ---
@@ -1536,7 +1807,7 @@ $("#add-magnet-btn").addEventListener("click", async () => {
     button.setAttribute("aria-busy", "true");
     showToast("Adding magnet", "", "info");
     const dir = $("#magnet-dir").value.trim();
-    const body = { magnet };
+    const body = { magnet, paused: $("#magnet-paused").checked };
     if (dir) body.download_dir = dir;
     const h = await api("/torrents/magnet", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     showToast("Torrent added", h, "success");
@@ -1561,15 +1832,15 @@ $("#add-file-btn").addEventListener("click", async () => {
   try {
     const file = $("#torrent-file").files[0];
     if (!file) { showToast("Choose a .torrent file", "", "warning"); return; }
-    const h = await uploadTorrentFile(file);
+    const h = await uploadTorrentFile(file, $("#file-paused").checked);
     showToast("Torrent added", h, "success");
     refreshTorrents();
   } catch (e) { showError("Upload failed", e); }
 });
 
-async function uploadTorrentFile(file) {
+async function uploadTorrentFile(file, paused = false) {
   const buf = await file.arrayBuffer();
-  return api("/torrents/file", {
+  return api(`/torrents/file?paused=${paused}`, {
     method: "POST",
     headers: { "content-type": "application/octet-stream" },
     body: buf
@@ -1996,6 +2267,30 @@ function collectWatchFolderEditors() {
   }));
 }
 
+async function replaceSettingsWithRuntimeFallback(nextConfig) {
+  try {
+    const result = await api("/settings", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(nextConfig),
+    });
+    return { result, persistenceError: null };
+  } catch (error) {
+    if (error?.status !== 500) throw error;
+    await api("/settings", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        bandwidth: nextConfig.bandwidth,
+        queue: nextConfig.queue,
+        seeding: nextConfig.seeding,
+        autopilot: nextConfig.autopilot,
+      }),
+    });
+    return { result: null, persistenceError: error };
+  }
+}
+
 function watchInput(row, field) {
   return row.querySelector(`[data-watch-field="${field}"]`);
 }
@@ -2018,16 +2313,18 @@ $("#settings-editor").addEventListener("submit", async (event) => {
   const status = $("#settings-save-status");
   try {
     const nextConfig = collectSettingsConfig();
-    const result = await api("/settings", {
-      method: "PUT",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(nextConfig),
-    });
-    if (nextConfig.api.auth_token) saveApiToken(nextConfig.api.auth_token);
-    fullConfigSnapshot = result.config;
-    renderSettingsEditor(result.config);
-    renderConfigSaveStatus(result);
-    showToast("Configuration saved", result.restart_required ? "Restart required for some fields" : "", "success");
+    const { result, persistenceError } = await replaceSettingsWithRuntimeFallback(nextConfig);
+    if (persistenceError) {
+      await refreshSettings();
+      renderRuntimeSettingsFallbackStatus(persistenceError);
+      showToast("Runtime settings applied", "Full configuration was not persisted; non-runtime fields were not changed.", "warning");
+    } else {
+      if (nextConfig.api.auth_token) saveApiToken(nextConfig.api.auth_token);
+      fullConfigSnapshot = result.config;
+      renderSettingsEditor(result.config);
+      renderConfigSaveStatus(result);
+      showToast("Configuration saved", result.restart_required ? "Restart required for some fields" : "", "success");
+    }
     await refreshDoctorBadge();
   } catch (e) {
     if (status) {
@@ -2064,6 +2361,7 @@ $("#reset-downloads-btn").addEventListener("click", async () => {
   try {
     currentHash = null;
     knownTorrents.clear();
+    lastTorrentObservationKey = null;
     expectedRemovedTorrents.clear();
     selectedTorrents.clear();
     torrentsLoaded = false;
@@ -2135,6 +2433,18 @@ function renderConfigSaveStatus(result) {
       ["Restart fields", (result.restart_required_fields || []).join(", ")],
       ["Runtime fields applied", (result.applied_runtime_fields || []).join(", ")],
     ])}`;
+}
+
+function renderRuntimeSettingsFallbackStatus(error) {
+  $("#settings-save-status").innerHTML = `
+    <h3>Save status</h3>
+    ${renderCheckList([{
+      id: "runtime_only",
+      label: "Runtime-only fallback",
+      level: "warning",
+      detail: `Bandwidth, queue, seeding, and autopilot settings were applied in memory. Full persistence failed: ${error.message || error}`,
+      remediation: "Make the configured file writable by the SwarmOtter service before changing other settings.",
+    }])}`;
 }
 
 // --- Watch ---

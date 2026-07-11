@@ -98,12 +98,21 @@ async fn run_one_transaction(
 ) -> Result<AnnounceResponse> {
     let connect_txn = random_txn_id();
     let connect = encode_connect(connect_txn);
-    let buf = send_recv(socket, addr, &connect, 16).await?;
+    let buf = send_recv(socket, addr, &connect, ACTION_CONNECT, connect_txn, 16).await?;
     let conn_id = decode_connect(&buf, connect_txn)?;
 
-    let announce_req = encode_announce(req, conn_id);
-    let buf = send_recv(socket, addr, &announce_req, 2048).await?;
-    decode_announce(&buf)
+    let announce_txn = random_txn_id();
+    let announce_req = encode_announce(req, conn_id, announce_txn);
+    let buf = send_recv(
+        socket,
+        addr,
+        &announce_req,
+        ACTION_ANNOUNCE,
+        announce_txn,
+        2048,
+    )
+    .await?;
+    decode_announce(&buf, announce_txn)
 }
 
 /// Encode a BEP 15 connect request (16 bytes).
@@ -143,8 +152,7 @@ fn decode_connect(buf: &[u8], expected_txn: u32) -> Result<u64> {
 }
 
 /// Encode a BEP 15 announce request (98 bytes).
-fn encode_announce(req: &AnnounceRequest, connection_id: u64) -> Vec<u8> {
-    let txn = random_txn_id();
+fn encode_announce(req: &AnnounceRequest, connection_id: u64, txn: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(98);
     out.extend_from_slice(&connection_id.to_be_bytes());
     out.extend_from_slice(&ACTION_ANNOUNCE.to_be_bytes());
@@ -168,11 +176,17 @@ fn encode_announce(req: &AnnounceRequest, connection_id: u64) -> Vec<u8> {
 
 /// Decode an announce response. Validates the action and parses interval,
 /// seeders/leechers, and compact IPv4 peers.
-fn decode_announce(buf: &[u8]) -> Result<AnnounceResponse> {
+fn decode_announce(buf: &[u8], expected_txn: u32) -> Result<AnnounceResponse> {
     if buf.len() < 8 {
         return Err(CoreError::Parse("udp announce response too short".into()));
     }
     let action = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+    let txn = u32::from_be_bytes(buf[4..8].try_into().unwrap());
+    if txn != expected_txn {
+        return Err(CoreError::Parse(
+            "udp announce response transaction id mismatch".into(),
+        ));
+    }
     if action == ACTION_ERROR {
         let msg = String::from_utf8_lossy(&buf[8..]).to_string();
         return Ok(AnnounceResponse {
@@ -235,18 +249,43 @@ async fn send_recv(
     socket: &dyn ContainedUdpSocket,
     addr: SocketAddr,
     payload: &[u8],
+    expected_action: u32,
+    expected_txn: u32,
     max_read: usize,
 ) -> Result<Vec<u8>> {
     socket.send_to(addr, payload).await?;
     let mut buf = vec![0u8; max_read];
-    let (_from, n) = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        socket.recv_from(&mut buf),
-    )
-    .await
-    .map_err(|_| CoreError::Internal("udp tracker response timed out".into()))??;
-    buf.truncate(n);
-    Ok(buf)
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(CoreError::Internal("udp tracker response timed out".into()));
+        }
+        let (from, n) = tokio::time::timeout(remaining, socket.recv_from(&mut buf))
+            .await
+            .map_err(|_| CoreError::Internal("udp tracker response timed out".into()))??;
+        if from != addr || n < 8 {
+            continue;
+        }
+        let action = u32::from_be_bytes(
+            buf[0..4]
+                .try_into()
+                .map_err(|_| CoreError::Parse("udp tracker response action truncated".into()))?,
+        );
+        let txn = u32::from_be_bytes(buf[4..8].try_into().map_err(|_| {
+            CoreError::Parse("udp tracker response transaction id truncated".into())
+        })?);
+        if txn != expected_txn {
+            continue;
+        }
+        if action != expected_action && action != ACTION_ERROR {
+            return Err(CoreError::Parse(format!(
+                "udp tracker response unexpected action {action}"
+            )));
+        }
+        buf.truncate(n);
+        return Ok(buf);
+    }
 }
 
 fn random_txn_id() -> u32 {
@@ -264,7 +303,42 @@ fn random_txn_id() -> u32 {
 mod tests {
     use super::*;
     use crate::hash::InfoHash;
-    use std::sync::Arc;
+    use async_trait::async_trait;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    struct ScriptedUdpSocket {
+        replies: Mutex<VecDeque<(SocketAddr, Vec<u8>)>>,
+        sends: Mutex<Vec<(SocketAddr, Vec<u8>)>>,
+    }
+
+    #[async_trait]
+    impl ContainedUdpSocket for ScriptedUdpSocket {
+        async fn send_to(&self, addr: SocketAddr, data: &[u8]) -> Result<()> {
+            self.sends.lock().unwrap().push((addr, data.to_vec()));
+            Ok(())
+        }
+
+        async fn recv_from(&self, buf: &mut [u8]) -> Result<(SocketAddr, usize)> {
+            let (source, response) = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| CoreError::Internal("scripted UDP replies exhausted".into()))?;
+            if response.len() > buf.len() {
+                return Err(CoreError::Internal(
+                    "scripted UDP response exceeds receive buffer".into(),
+                ));
+            }
+            buf[..response.len()].copy_from_slice(&response);
+            Ok((source, response.len()))
+        }
+
+        fn local_addr(&self) -> Result<SocketAddr> {
+            Ok("127.0.0.1:40000".parse().unwrap())
+        }
+    }
 
     fn req() -> AnnounceRequest {
         AnnounceRequest {
@@ -323,7 +397,7 @@ mod tests {
 
     #[test]
     fn encode_announce_is_98_bytes() {
-        let enc = encode_announce(&req(), 0x0102030405060708);
+        let enc = encode_announce(&req(), 0x0102030405060708, 0x11223344);
         assert_eq!(enc.len(), 98);
         assert_eq!(
             u64::from_be_bytes(enc[0..8].try_into().unwrap()),
@@ -332,6 +406,10 @@ mod tests {
         assert_eq!(
             u32::from_be_bytes(enc[8..12].try_into().unwrap()),
             ACTION_ANNOUNCE
+        );
+        assert_eq!(
+            u32::from_be_bytes(enc[12..16].try_into().unwrap()),
+            0x11223344
         );
         assert_eq!(&enc[16..36], req().info_hash.as_bytes());
         assert_eq!(&enc[36..56], &req().peer_id);
@@ -360,7 +438,7 @@ mod tests {
         buf.extend_from_slice(&[192, 168, 1, 1, 0x1A, 0xE1]);
         // peer 10.0.0.2:6882
         buf.extend_from_slice(&[10, 0, 0, 2, 0x1A, 0xE2]);
-        let resp = decode_announce(&buf).unwrap();
+        let resp = decode_announce(&buf, 1).unwrap();
         assert_eq!(resp.interval, 1800);
         assert_eq!(resp.seeders, 3);
         assert_eq!(resp.leechers, 2);
@@ -376,7 +454,7 @@ mod tests {
         buf.extend_from_slice(&ACTION_ERROR.to_be_bytes());
         buf.extend_from_slice(&9u32.to_be_bytes());
         buf.extend_from_slice(b"tracker overloaded");
-        let resp = decode_announce(&buf).unwrap();
+        let resp = decode_announce(&buf, 9).unwrap();
         assert!(resp.failure_reason.is_some());
         assert!(resp.failure_reason.unwrap().contains("tracker overloaded"));
         assert!(resp.peers.is_empty());
@@ -386,7 +464,58 @@ mod tests {
     fn decode_announce_rejects_wrong_action() {
         let mut buf = vec![0u8; 20];
         buf[0..4].copy_from_slice(&ACTION_CONNECT.to_be_bytes());
-        assert!(decode_announce(&buf).is_err());
+        buf[4..8].copy_from_slice(&7u32.to_be_bytes());
+        assert!(decode_announce(&buf, 7).is_err());
+    }
+
+    #[test]
+    fn decode_announce_rejects_wrong_transaction() {
+        let mut buf = vec![0u8; 20];
+        buf[0..4].copy_from_slice(&ACTION_ANNOUNCE.to_be_bytes());
+        buf[4..8].copy_from_slice(&7u32.to_be_bytes());
+        assert!(decode_announce(&buf, 8).is_err());
+    }
+
+    #[tokio::test]
+    async fn send_recv_ignores_wrong_source_and_transaction() {
+        const EXPECTED_TXN: u32 = 0x11223344;
+        let tracker_addr: SocketAddr = "127.0.0.1:6969".parse().unwrap();
+        let wrong_source: SocketAddr = "127.0.0.1:6970".parse().unwrap();
+        let response = |transaction_id: u32| {
+            let mut response = Vec::with_capacity(8);
+            response.extend_from_slice(&ACTION_CONNECT.to_be_bytes());
+            response.extend_from_slice(&transaction_id.to_be_bytes());
+            response
+        };
+        let socket = ScriptedUdpSocket {
+            replies: Mutex::new(VecDeque::from([
+                (wrong_source, response(EXPECTED_TXN)),
+                (tracker_addr, response(EXPECTED_TXN.wrapping_add(1))),
+                (tracker_addr, response(EXPECTED_TXN)),
+            ])),
+            sends: Mutex::new(Vec::new()),
+        };
+
+        let response = send_recv(
+            &socket,
+            tracker_addr,
+            b"request",
+            ACTION_CONNECT,
+            EXPECTED_TXN,
+            16,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            u32::from_be_bytes(response[4..8].try_into().unwrap()),
+            EXPECTED_TXN
+        );
+        assert!(socket.replies.lock().unwrap().is_empty());
+        assert_eq!(
+            socket.sends.lock().unwrap().as_slice(),
+            &[(tracker_addr, b"request".to_vec())]
+        );
     }
 
     #[tokio::test]

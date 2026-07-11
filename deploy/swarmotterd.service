@@ -15,7 +15,11 @@ ExecStart=/usr/bin/swarmotterd --config /etc/swarmotter/swarmotter.toml
 
 # Persistent state and download directories.
 StateDirectory=swarmotter
-ReadWritePaths=/var/lib/swarmotter /data/downloads /data/incomplete
+ReadWritePaths=/etc/swarmotter /var/lib/swarmotter /data/downloads /data/incomplete
+UMask=0077
+
+# Large libraries need enough descriptors for peer sockets and open files.
+LimitNOFILE=65536
 
 # Hardening.
 NoNewPrivileges=true

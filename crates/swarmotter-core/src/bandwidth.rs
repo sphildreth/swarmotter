@@ -17,6 +17,7 @@ const REFILL_TIME_MASK: u64 = !REFILL_IN_PROGRESS;
 
 /// Bandwidth limits.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct BandwidthLimits {
     /// Bytes/sec global download (0 = unlimited).
     #[serde(default)]

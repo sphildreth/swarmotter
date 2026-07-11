@@ -81,31 +81,32 @@ pub struct TrackerInfo {
     pub last_announce: Option<u64>,
 }
 
-/// Build announce-list tiers from a flat tracker list, putting primary first.
+/// Build effective BEP 12 tracker tiers. `announce-list` takes precedence over
+/// the legacy single `announce` URL when it is present.
 pub fn build_tiers(
     announce: Option<&str>,
     announce_list: Option<&[Vec<String>]>,
 ) -> Vec<TrackerTier> {
-    let mut out = Vec::new();
-    let mut idx = 0usize;
-    if let Some(a) = announce {
-        out.push(TrackerTier {
-            tier: idx,
-            url: a.to_string(),
-        });
-        idx += 1;
-    }
-    if let Some(list) = announce_list {
+    if let Some(list) = announce_list.filter(|list| !list.is_empty()) {
+        let mut out = Vec::new();
         for (i, tier) in list.iter().enumerate() {
             for url in tier {
                 out.push(TrackerTier {
-                    tier: idx + i,
+                    tier: i,
                     url: url.clone(),
                 });
             }
         }
+        return out;
     }
-    out
+    announce
+        .map(|url| {
+            vec![TrackerTier {
+                tier: 0,
+                url: url.to_string(),
+            }]
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -139,8 +140,9 @@ mod tests {
                 vec!["http://c/a".into(), "http://d/a".into()],
             ]),
         );
-        assert_eq!(tiers[0].url, "http://primary/a");
+        assert_eq!(tiers[0].url, "http://b/a");
         assert_eq!(tiers[0].tier, 0);
-        assert_eq!(tiers[3].url, "http://d/a");
+        assert_eq!(tiers[2].url, "http://d/a");
+        assert_eq!(tiers[2].tier, 1);
     }
 }

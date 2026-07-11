@@ -369,6 +369,79 @@ nav { display: flex; gap: 0.3rem; }
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   line-height: 1.35;
 }
+.details-command-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  margin-bottom: 0.8rem;
+}
+.details-control-grid {
+  display: grid;
+  grid-template-columns: minmax(14rem, 1fr) auto minmax(14rem, 1fr) auto;
+  gap: 0.65rem;
+  align-items: end;
+}
+.details-control-grid button {
+  min-height: 2.15rem;
+}
+.tracker-add-row {
+  display: flex;
+  align-items: end;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+.tracker-add-row label {
+  margin: 0;
+}
+.tracker-add-row input {
+  flex: 1 1 24rem;
+  min-width: 12rem;
+}
+.file-rename-row,
+.tracker-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 18rem;
+}
+.file-rename-row input,
+.tracker-edit-row input {
+  min-width: 12rem;
+  width: 100%;
+}
+dialog {
+  width: min(34rem, calc(100vw - 2rem));
+  padding: 0;
+  color: var(--fg);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+dialog::backdrop {
+  background: rgba(0, 0, 0, 0.7);
+}
+.confirm-dialog {
+  padding: 1rem;
+}
+.confirm-dialog h2 {
+  margin-top: 0;
+}
+.confirm-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+@media (max-width: 720px) {
+  .details-control-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .tracker-add-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
 button.secondary {
   background: transparent;
   color: var(--fg);

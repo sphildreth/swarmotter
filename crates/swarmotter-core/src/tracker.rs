@@ -270,14 +270,16 @@ pub fn parse_compact_ipv6(bytes: &[u8]) -> Vec<PeerAddr> {
 
 /// Build announce-list tiers preserving order from a torrent's tracker list.
 pub fn announce_tiers(announce: Option<&str>, announce_list: &[Vec<String>]) -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    if let Some(a) = announce {
-        out.push(vec![a.to_string()]);
+    if !announce_list.is_empty() {
+        return announce_list
+            .iter()
+            .filter(|tier| !tier.is_empty())
+            .cloned()
+            .collect();
     }
-    for tier in announce_list {
-        out.push(tier.clone());
-    }
-    out
+    announce
+        .map(|url| vec![vec![url.to_string()]])
+        .unwrap_or_default()
 }
 
 /// Issue an announce to a single HTTP tracker URL through the network
@@ -412,13 +414,20 @@ mod tests {
     }
 
     #[test]
-    fn announce_tiers_order() {
+    fn announce_list_tiers_take_precedence_over_announce() {
         let tiers = announce_tiers(
             Some("http://primary/a"),
             &[vec!["http://b/a".into(), "http://c/a".into()]],
         );
-        assert_eq!(tiers[0], vec!["http://primary/a"]);
-        assert_eq!(tiers[1], vec!["http://b/a", "http://c/a"]);
+        assert_eq!(tiers, vec![vec!["http://b/a", "http://c/a"]]);
+    }
+
+    #[test]
+    fn announce_is_used_when_announce_list_is_absent() {
+        assert_eq!(
+            announce_tiers(Some("http://primary/a"), &[]),
+            vec![vec!["http://primary/a"]]
+        );
     }
 
     #[test]

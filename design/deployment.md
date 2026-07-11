@@ -17,6 +17,10 @@ SwarmOtter supports these deployment surfaces:
 - `deploy/compose.yml` for Docker Compose homelab deployments.
 - Reverse proxy deployments in front of the API/Web UI control plane.
 
+Source builds require Rust 1.88 or newer. CI checks the locked workspace at
+that compiler floor while release artifacts use the separately pinned release
+builder described in ADR-0032.
+
 ## Design constraints
 
 - The API/Web UI control plane is independent from the torrent data plane.
@@ -41,6 +45,11 @@ The release-facing container contract includes:
   `/var/lib/swarmotter`.
 - Config path: `/etc/swarmotter/swarmotter.toml`.
 - Healthcheck: `GET http://127.0.0.1:9091/health`.
+- Runtime identity: UID/GID `10001` (`swarmotter`).
+- Bind-mounted config directories must be writable by UID/GID `10001` and kept
+  private so atomic settings replacement preserves credential confidentiality.
+- Standalone containers and Compose set `nofile` to `65536` for peer, tracker,
+  and storage handles.
 
 Changes to this contract are release-facing and should be handled through
 `VERSIONING_GUIDE.md`.
@@ -61,7 +70,13 @@ The native packages install `/usr/bin/swarmotterd`,
 `/etc/swarmotter/swarmotter.toml`, and the systemd unit at
 `/usr/lib/systemd/system/swarmotterd.service`. Package scripts create the
 `swarmotter` service account and reload systemd metadata but do not start the
-daemon automatically.
+daemon automatically. Debian packages depend on `iproute2`, RPM packages
+depend on `iproute`, and the container runtime installs `iproute2`; each
+release surface therefore supplies the `ip route get` command required by
+strict route and DNS validation.
+The configuration directory is private and writable by the service account so
+validated Web UI/API settings replacement can use atomic rename. The packaged
+systemd unit and Compose service also set the documented file-descriptor limit.
 
 Release automation builds the Linux binaries inside a Debian bookworm Rust
 container with Rust target builds and uses those prebuilt binaries for release

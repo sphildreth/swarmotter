@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 
 /// Queue limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueueLimits {
     /// Max simultaneously downloading torrents (0 = unlimited).
     #[serde(default = "default_max_active_downloads")]

@@ -19,6 +19,8 @@ feature completion and acceptance criteria, not by time estimates.
 - Torrent parsing.
 - Info hash handling.
 - Tracker tier handling.
+- UDP tracker source, action, and transaction correlation.
+- uTP header, connection-ID, extension-chain, and SACK handling.
 - Piece selection.
 - Piece verification.
 - Queue behavior.
@@ -36,6 +38,9 @@ feature completion and acceptance criteria, not by time estimates.
 - Add magnet through API.
 - Add torrent file through API.
 - Upload torrent file through Web UI/API path.
+- Reject cross-origin native API mutations and WebSocket handshakes while
+  preserving same-origin browser requests and non-browser API clients.
+- Validate Web UI static security headers and required operation wiring.
 - Import torrent from watch folder.
 - Pause/resume/remove lifecycle.
 - Recheck lifecycle.
@@ -45,6 +50,8 @@ feature completion and acceptance criteria, not by time estimates.
 - File priority behavior.
 - Queue behavior.
 - Settings behavior.
+- Concurrent atomic configuration replacement.
+- Durable torrent and queue restoration after daemon reconstruction.
 - WebSocket/SSE event delivery.
 - Per-torrent health serialization: `TorrentSummary` and the torrent detail
   endpoint both include a `health` object with score, bars, label, and
@@ -65,11 +72,13 @@ feature completion and acceptance criteria, not by time estimates.
 ### Storage tests
 
 - Fast resume.
+- Same-size changed-file detection and corrupt-resume quarantine.
 - Forced recheck.
 - Interrupted write recovery.
 - Missing file detection.
 - Partial download behavior.
 - File selection behavior.
+- Cross-torrent storage path collision rejection.
 - Move complete behavior.
 - Rename path behavior.
 
@@ -79,8 +88,9 @@ feature completion and acceptance criteria, not by time estimates.
 - Tracker-based peer discovery (UDP/BEP 15, compact peers): covered
 - Download completion: covered (generated payload, in-process seed peer)
 - Direct-peer (PEX/DHT-style) discovery: covered (directly-supplied seed)
-- Seeding/upload behavior: covered (inbound `Seeder` serves a completed
-  download to a fresh leecher through the contained listener)
+- Seeding/upload behavior: covered (the shared inbound `SeederHub` routes
+  multiple completed torrents through one contained listener and owns accepted
+  sessions until completion or cancellation)
 - Daemon-driven download through `DaemonOps`: covered
 - Magnet metadata fetch: covered (BEP 9 ut_metadata, info-hash verified)
 - DHT-based peer discovery: covered (local KRPC `get_peers` fixture)

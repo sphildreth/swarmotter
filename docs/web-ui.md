@@ -11,9 +11,12 @@ Change the listener with:
 ```toml
 [api]
 bind_address = "0.0.0.0:9091"
+require_auth = true
+auth_token = "replace-with-a-long-random-token"
 ```
 
-When binding outside localhost, enable API authentication.
+Authentication is required when binding outside localhost. Browser requests
+must also be same-origin; reverse proxies must preserve the public `Host`.
 
 ## Add torrents
 
@@ -36,7 +39,10 @@ The app refreshes the torrent list after successful upload.
 The Peers column shows active peer workers / known peers from the torrent
 summary response. The main UI area uses the available browser width so wide
 tables can show operational details without being capped to a narrow centered
-column. Per-row torrent actions are icon buttons with accessible labels.
+column. Per-row torrent actions are icon buttons with accessible labels. The
+Details action opens keyboard-accessible lifecycle, queue, move, label,
+bandwidth-limit, file-rename, and tracker-edit controls. Removing one torrent
+offers separate Cancel, keep-data, and delete-data choices.
 
 The torrent list is an interactive table. Click a column header to sort by
 that column, and click it again to reverse the direction. Header filters can
@@ -118,7 +124,10 @@ keeps the per-torrent override control.
 
 The Settings screen uses a two-panel layout: section navigation on the left and
 the selected settings group on the right. Save, reload, and reset controls sit
-in the Settings header. Saving still submits the full configuration snapshot.
+in the Settings header. Saving submits the full configuration snapshot. If an
+operator intentionally makes the config path read-only, a failed persistence
+attempt falls back only to the live-safe bandwidth, queue, seeding, and
+autopilot PATCH; the UI reports that other changes were not applied.
 
 The details page renders a compact "why is this slow?" report with these fields:
 
@@ -137,8 +146,9 @@ continue to honor the fail-closed containment model.
 
 Transient operation feedback is shown as toast notifications instead of inline
 status text. This includes torrent add/upload results, user-initiated torrent
-removal, removals observed from automatic completion policy, bandwidth setting
-saves, and watch-folder scan results.
+removal, external removals observed while the complete unfiltered library is
+visible, bandwidth setting saves, and watch-folder scan results. Filtered or
+paginated result changes are never treated as proof that a torrent was removed.
 
 Toasts display for 5 seconds by default. The display time is a browser-local UI
 preference that can be changed in Settings > Notifications.
@@ -181,3 +191,5 @@ The daemon serves the Web UI favicon set and app manifest from the embedded
 graphics assets. The header uses the SwarmOtter icon next to the app name and
 includes a light/dark theme icon. The Web UI defaults to dark mode and stores
 the selected theme in browser `localStorage` under `swarmotter.theme`.
+Web assets use a self-only content security policy and cannot be framed by
+another site.

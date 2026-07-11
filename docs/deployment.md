@@ -8,22 +8,28 @@ Build the daemon:
 cargo build --release
 ```
 
-Install a config:
+Install a private config for a foreground run:
 
 ```bash
-sudo install -d /etc/swarmotter /var/lib/swarmotter
-sudo install -m 0644 config/swarmotter.toml.example /etc/swarmotter/swarmotter.toml
+install -d -m 0700 "$HOME/.config/swarmotter"
+install -m 0600 config/swarmotter.toml.example "$HOME/.config/swarmotter/swarmotter.toml"
 ```
 
-Edit `/etc/swarmotter/swarmotter.toml`, then run:
+Edit `$HOME/.config/swarmotter/swarmotter.toml`, then run:
 
 ```bash
-./target/release/swarmotterd --config /etc/swarmotter/swarmotter.toml
+umask 077
+./target/release/swarmotterd --config "$HOME/.config/swarmotter/swarmotter.toml"
 ```
 
 Logs are written to stderr and to the configured daemon log file. With default
 logging, the per-user file is `~/.local/state/swarmotter/swarmotterd.log`
 unless `XDG_STATE_HOME` is set.
+
+Strict route and DNS validation use the Linux `ip route get` command. Direct
+and tarball installations must provide the `ip` utility through `iproute2` on
+Debian/Ubuntu or `iproute` on Fedora/RHEL-family systems. The official
+container image and native packages include or declare this dependency.
 
 ## Release Artifacts
 
@@ -44,7 +50,13 @@ packages install:
 - `/var/lib/swarmotter`, `/data/downloads`, and `/data/incomplete`
 
 Package installation creates the `swarmotter` service account and reloads
-systemd metadata. It does not start the daemon automatically. Review
+systemd metadata. It also installs the distribution package that supplies the
+Linux `ip` utility used by strict route validation. The package keeps
+`/etc/swarmotter` mode `0700` and the config mode `0600`, both owned by the
+service account. This lets validated Web UI settings updates use atomic
+replacement without exposing the API token to other local users.
+
+Package installation does not start the daemon automatically. Review
 `/etc/swarmotter/swarmotter.toml`, make sure the configured containment path
 exists, then enable the service:
 
@@ -60,7 +72,9 @@ An example unit is provided in:
 deploy/swarmotterd.service
 ```
 
-Install it:
+Install it after installing the daemon binary, private service-owned config,
+service account, and storage directories (the native packages perform those
+steps):
 
 ```bash
 sudo install -m 0644 deploy/swarmotterd.service /etc/systemd/system/swarmotterd.service
@@ -68,8 +82,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now swarmotterd
 ```
 
-Make sure the service user can read the config and write the storage
-directories.
+Make sure the service user owns the private config directory and can write the
+storage directories.
 
 ## File descriptor requirements
 
@@ -90,7 +104,7 @@ which is insufficient.
 
 ### Configuring file descriptor limits
 
-**For systemd services**, add to the service unit:
+The packaged systemd unit already includes:
 
 ```ini
 [Service]
@@ -104,13 +118,13 @@ swarmotter soft nofile 65536
 swarmotter hard nofile 65536
 ```
 
-**For Docker containers**, use the `--ulimit` flag:
+**For standalone Docker containers**, use the `--ulimit` flag:
 
 ```bash
 docker run --ulimit nofile=65536:65536 ...
 ```
 
-Or in `compose.yml`:
+The provided `compose.yml` includes the equivalent setting:
 
 ```yaml
 services:
@@ -135,12 +149,13 @@ The production container image is published to:
 ghcr.io/sphildreth/swarmotter
 ```
 
-The repository workflow builds pull requests without publishing and publishes a
-multi-architecture image on successful pushes to `main`. Main builds are tagged
-as `main` and `sha-<shortsha>`. Version-tag releases publish `linux/amd64` and
-`linux/arm64` images tagged as `vX.Y.Z`, `X.Y.Z`, `X.Y`, `X`, and `latest`.
-After the first GHCR publish, set the package visibility to public in GitHub
-Packages if anonymous homelab pulls are desired.
+Pull requests validate the Compose manifest but do not build or publish a
+container image. Successful pushes to `main` build and publish a
+multi-architecture image tagged as `main` and `sha-<shortsha>`. Version-tag
+releases publish `linux/amd64` and `linux/arm64` images tagged as `vX.Y.Z`,
+`X.Y.Z`, `X.Y`, `X`, and `latest`. After the first GHCR publish, set the
+package visibility to public in GitHub Packages if anonymous homelab pulls are
+desired.
 
 ### What is Gluetun?
 
@@ -204,13 +219,17 @@ traffic.
 Prepare host directories:
 
 ```bash
-sudo install -d -m 0755 /srv/swarmotter/config
+sudo install -d -m 0700 -o 10001 -g 10001 /srv/swarmotter/config
 sudo install -d -o 10001 -g 10001 /srv/swarmotter/state
 sudo install -d -o 10001 -g 10001 /srv/swarmotter/downloads
 sudo install -d -o 10001 -g 10001 /srv/swarmotter/incomplete
 sudo install -d /srv/swarmotter/gluetun
-sudo install -m 0644 config/swarmotter.container.toml.example /srv/swarmotter/config/swarmotter.toml
+sudo install -m 0600 -o 10001 -g 10001 config/swarmotter.container.toml.example /srv/swarmotter/config/swarmotter.toml
 ```
+
+`SWARMOTTER_CONFIG_DIR` in `.env` names this directory. Compose mounts the
+directory read/write so atomic settings replacement works; keep it mode `0700`
+and owned by container UID/GID `10001`.
 
 Create and edit the Compose environment file:
 
@@ -338,15 +357,29 @@ Container sketch:
 
 ```bash
 docker build -f deploy/Dockerfile -t swarmotter .
+
+sudo install -d -m 0700 -o 10001 -g 10001 /srv/swarmotter/config
+sudo install -d -o 10001 -g 10001 /srv/swarmotter/state
+sudo install -d -o 10001 -g 10001 /srv/swarmotter/downloads
+sudo install -d -o 10001 -g 10001 /srv/swarmotter/incomplete
+sudo install -m 0600 -o 10001 -g 10001 \
+  config/swarmotter.container.toml.example \
+  /srv/swarmotter/config/swarmotter.toml
+
 docker run -d --name swarmotter \
+  --ulimit nofile=65536:65536 \
   -p 9091:9091 \
   -e SWARMOTTER_API__AUTH_TOKEN="$(openssl rand -hex 32)" \
-  -v /data/downloads:/data/downloads \
-  -v /data/incomplete:/data/incomplete \
-  -v /var/lib/swarmotter:/var/lib/swarmotter \
-  -v /etc/swarmotter:/etc/swarmotter:ro \
+  -v /srv/swarmotter/downloads:/data/downloads \
+  -v /srv/swarmotter/incomplete:/data/incomplete \
+  -v /srv/swarmotter/state:/var/lib/swarmotter \
+  -v /srv/swarmotter/config:/etc/swarmotter \
   swarmotter
 ```
+
+The container runs as UID/GID `10001`. Keep the bind-mounted config directory
+owned by that account and mode `0700` so full settings replacement can create
+and atomically rename a mode-`0600` config file.
 
 Attach the container to the intended contained network instead of the default
 bridge when strict data-plane containment is required.
@@ -354,28 +387,45 @@ bridge when strict data-plane containment is required.
 ## Reverse proxy
 
 A reverse proxy may sit in front of the API/Web UI. Keep authentication enabled
-unless another trusted auth layer protects access.
+unless another trusted auth layer protects access. Terminate TLS at the proxy;
+the API token is a bearer credential and must not cross an untrusted network in
+plaintext. Preserve the public `Host` so same-origin browser validation works.
 
 ```nginx
 server {
     listen 80;
     server_name swarmotter.example;
 
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name swarmotter.example;
+
+    ssl_certificate /etc/letsencrypt/live/swarmotter.example/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/swarmotter.example/privkey.pem;
+
     location / {
         proxy_pass http://127.0.0.1:9091;
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Real-IP $remote_addr;
     }
 
     location /api/v1/ws {
         proxy_pass http://127.0.0.1:9091;
         proxy_http_version 1.1;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
     }
 
     location /api/v1/events {
         proxy_pass http://127.0.0.1:9091;
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Proto $scheme;
         proxy_buffering off;
         proxy_read_timeout 1h;
     }

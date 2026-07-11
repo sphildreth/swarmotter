@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub api: ApiConfig,
@@ -47,6 +48,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CompatibilityConfig {
     #[serde(default)]
     pub transmission: TransmissionCompatibilityConfig,
@@ -55,6 +57,7 @@ pub struct CompatibilityConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TransmissionCompatibilityConfig {
     /// Enable the Transmission RPC compatibility adapter at `/transmission/rpc`.
     #[serde(default)]
@@ -62,6 +65,7 @@ pub struct TransmissionCompatibilityConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct QbittorrentCompatibilityConfig {
     /// Enable the qBittorrent-compatible Web API adapter at `/api/v2`.
     #[serde(default)]
@@ -69,6 +73,7 @@ pub struct QbittorrentCompatibilityConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApiConfig {
     #[serde(default = "default_api_bind")]
     pub bind_address: String,
@@ -102,6 +107,7 @@ impl Default for ApiConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     #[serde(default)]
     pub download_dir: Option<String>,
@@ -141,6 +147,7 @@ impl Default for StorageConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TorrentConfig {
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
@@ -210,7 +217,8 @@ impl Default for TorrentConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DhtConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -243,6 +251,7 @@ impl Default for DhtConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PexConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -261,6 +270,7 @@ impl Default for PexConfig {
 
 /// A watch folder configuration entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WatchFolderConfig {
     pub path: String,
     #[serde(default)]
@@ -289,6 +299,7 @@ pub enum StartBehavior {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -376,6 +387,16 @@ impl Config {
         if self.api.bind_address.is_empty() {
             return Err(CoreError::InvalidConfig(
                 "api.bind_address must not be empty".into(),
+            ));
+        }
+        let api_bind = self
+            .api
+            .bind_address
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| CoreError::InvalidConfig(format!("api.bind_address: {e}")))?;
+        if !self.api.require_auth && !api_bind.ip().is_loopback() {
+            return Err(CoreError::InvalidConfig(
+                "api.require_auth must be true when api.bind_address is not loopback".into(),
             ));
         }
         if self.api.require_auth
@@ -524,6 +545,8 @@ mode = "observe"
         let toml = r#"
 [api]
 bind_address = "0.0.0.0:9091"
+require_auth = true
+auth_token = "test-token"
 
 [storage]
 download_dir = "/mnt/incoming/swarmotter/downloads"
@@ -575,6 +598,8 @@ global_ratio_limit = 1.5
         let toml = r#"
 [api]
 bind_address = "0.0.0.0:9091"
+require_auth = true
+auth_token = "test-token"
 
 [storage]
 download_dir = "/data/downloads"
@@ -741,10 +766,33 @@ encryption_mode = "required"
                 "SWARMOTTER_API__BIND_ADDRESS".into(),
                 "0.0.0.0:12345".into(),
             ),
+            ("SWARMOTTER_API__REQUIRE_AUTH".into(), "true".into()),
+            ("SWARMOTTER_API__AUTH_TOKEN".into(), "test-token".into()),
         ];
         let cfg = cfg.apply_env_overrides(&env).unwrap();
         assert_eq!(cfg.torrent.listen_port, 60000);
         assert_eq!(cfg.api.bind_address, "0.0.0.0:12345");
+    }
+
+    #[test]
+    fn unauthenticated_api_must_remain_on_loopback() {
+        let err = Config::from_toml_str(
+            r#"
+[api]
+bind_address = "0.0.0.0:9091"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("api.require_auth"));
+
+        let cfg = Config::from_toml_str(
+            r#"
+[api]
+bind_address = "[::1]:9091"
+"#,
+        )
+        .unwrap();
+        assert!(!cfg.api.require_auth);
     }
 
     #[test]
@@ -832,5 +880,11 @@ mode = "disabled"
             cfg.network.required_source_ipv4.as_deref(),
             Some("10.8.0.2")
         );
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_and_nested_fields() {
+        assert!(Config::from_toml_str("bandwith = {}\n").is_err());
+        assert!(Config::from_toml_str("[network]\nvalidate_routes = true\n").is_err());
     }
 }

@@ -81,6 +81,10 @@ Common fail-closed conditions:
 - The required network namespace is unavailable.
 - Socket binding fails.
 
+Linux route and DNS path checks use `ip route get`. The official container and
+native packages provide the required utility; direct and tarball installs must
+install `iproute2` on Debian/Ubuntu or `iproute` on Fedora/RHEL-family systems.
+
 The API reports the current state at:
 
 ```text

@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::fs;
@@ -25,8 +26,10 @@ use tokio::sync::Mutex;
 use crate::error::{CoreError, Result};
 use crate::hash::InfoHash;
 use crate::meta::TorrentMeta;
-use crate::storage::resume::{FastResume, PieceBitfield};
+use crate::storage::resume::{FastResume, PieceBitfield, ResumeFileStamp};
 use crate::storage::{piece_file_ranges, verify_piece};
+
+static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Per-torrent storage handle performing real disk I/O.
 #[derive(Clone)]
@@ -34,6 +37,7 @@ pub struct StorageIo {
     meta: TorrentMeta,
     download_dir: PathBuf,
     file_handles: Arc<Mutex<HashMap<usize, CachedFileHandle>>>,
+    resume_write_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -42,12 +46,79 @@ struct CachedFileHandle {
     writable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveEntryKind {
+    Existing,
+    CreateEmpty,
+    Absent,
+}
+
+#[derive(Debug, Clone)]
+struct MovePlanEntry {
+    source: PathBuf,
+    destination: PathBuf,
+    kind: MoveEntryKind,
+}
+
+/// Filesystem paths owned by one torrent at a specific storage root.
+///
+/// Daemon registration can compare these snapshots before starting work so
+/// distinct info hashes never write or delete the same payload/resume paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoragePathOwnership {
+    pub info_hash: InfoHash,
+    pub base_dir: PathBuf,
+    pub payload_paths: Vec<PathBuf>,
+    pub resume_path: PathBuf,
+}
+
+impl StoragePathOwnership {
+    /// Whether two distinct torrents claim overlapping payload/resume paths.
+    ///
+    /// Ancestor/descendant claims also conflict: one torrent cannot own a
+    /// regular file at a path that another torrent needs as a directory.
+    pub fn conflicts_with(&self, other: &Self) -> bool {
+        if self.info_hash == other.info_hash {
+            return false;
+        }
+        let mut owned = self
+            .payload_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(std::iter::once(self.resume_path.as_path()));
+        let other_owned = other
+            .payload_paths
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(std::iter::once(other.resume_path.as_path()))
+            .collect::<Vec<_>>();
+        owned.any(|path| {
+            other_owned
+                .iter()
+                .any(|other_path| paths_overlap(path, other_path))
+        })
+    }
+
+    pub fn ensure_compatible_with(&self, other: &Self) -> Result<()> {
+        if self.conflicts_with(other) {
+            return Err(CoreError::Storage(format!(
+                "storage path ownership conflict between {} and {} under {}",
+                self.info_hash,
+                other.info_hash,
+                self.base_dir.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl StorageIo {
     pub fn new(meta: TorrentMeta, download_dir: impl Into<PathBuf>) -> Self {
         Self {
             meta,
             download_dir: download_dir.into(),
             file_handles: Arc::new(Mutex::new(HashMap::new())),
+            resume_write_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -59,6 +130,51 @@ impl StorageIo {
     /// Base directory containing this torrent's data.
     pub fn base_dir(&self) -> &Path {
         &self.download_dir
+    }
+
+    /// Describe every payload and resume path this torrent owns.
+    pub fn path_ownership(&self) -> Result<StoragePathOwnership> {
+        validate_path_component(&self.meta.name)?;
+        let mut payload_paths: Vec<PathBuf> = Vec::with_capacity(self.meta.files.len());
+        for index in 0..self.meta.files.len() {
+            let path = normalize_lexical_path(&self.file_path(index)?);
+            if let Some(existing) = payload_paths
+                .iter()
+                .find(|existing| paths_overlap(existing, &path))
+            {
+                return Err(CoreError::Storage(format!(
+                    "overlapping payload paths owned by torrent {}: {} and {}",
+                    self.meta.info_hash,
+                    existing.display(),
+                    path.display()
+                )));
+            }
+            payload_paths.push(path);
+        }
+        payload_paths.sort();
+        let resume_path = normalize_lexical_path(&self.resume_path());
+        if let Some(payload_path) = payload_paths
+            .iter()
+            .find(|payload_path| paths_overlap(payload_path, &resume_path))
+        {
+            return Err(CoreError::Storage(format!(
+                "payload path collides with fast-resume path for torrent {}: {} and {}",
+                self.meta.info_hash,
+                payload_path.display(),
+                resume_path.display()
+            )));
+        }
+        Ok(StoragePathOwnership {
+            info_hash: self.meta.info_hash,
+            base_dir: normalize_lexical_path(&self.download_dir),
+            payload_paths,
+            resume_path,
+        })
+    }
+
+    /// Whether both handles resolve to the same storage root.
+    pub fn shares_storage_root_with(&self, other: &Self) -> bool {
+        normalize_lexical_path(&self.download_dir) == normalize_lexical_path(&other.download_dir)
     }
 
     /// Sum the current on-disk payload file lengths, capped at each torrent
@@ -78,6 +194,60 @@ impl StorageIo {
             }
         }
         Ok(total.min(self.meta.total_length))
+    }
+
+    /// Capture file metadata used to invalidate fast-resume state after an
+    /// external same-size payload modification.
+    pub async fn resume_file_stamps(&self) -> Result<Vec<ResumeFileStamp>> {
+        self.flush_all_writable_handles().await?;
+        let mut stamps = Vec::with_capacity(self.meta.files.len());
+        for index in 0..self.meta.files.len() {
+            let path = self.file_path(index)?;
+            match fs::metadata(path).await {
+                Ok(metadata) => {
+                    let modified_unix_nanos = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64);
+                    #[cfg(unix)]
+                    let (device, inode, changed_unix_seconds, changed_subsec_nanos) = {
+                        use std::os::unix::fs::MetadataExt as _;
+                        (
+                            Some(metadata.dev()),
+                            Some(metadata.ino()),
+                            Some(metadata.ctime()),
+                            Some(metadata.ctime_nsec()),
+                        )
+                    };
+                    #[cfg(not(unix))]
+                    let (device, inode, changed_unix_seconds, changed_subsec_nanos) =
+                        (None, None, None, None);
+                    stamps.push(ResumeFileStamp {
+                        exists: true,
+                        length: metadata.len(),
+                        modified_unix_nanos,
+                        device,
+                        inode,
+                        changed_unix_seconds,
+                        changed_subsec_nanos,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    stamps.push(ResumeFileStamp {
+                        exists: false,
+                        length: 0,
+                        modified_unix_nanos: None,
+                        device: None,
+                        inode: None,
+                        changed_unix_seconds: None,
+                        changed_subsec_nanos: None,
+                    });
+                }
+                Err(error) => return Err(CoreError::from(error)),
+            }
+        }
+        Ok(stamps)
     }
 
     /// Resolve the absolute path for a file index.
@@ -116,12 +286,25 @@ impl StorageIo {
     /// a just-started torrent has claimed its incomplete path while preserving
     /// the `preallocate = false` behavior.
     pub async fn ensure_active_layout(&self) -> Result<()> {
+        self.ensure_active_layout_for_files(&vec![true; self.meta.files.len()])
+            .await
+    }
+
+    /// Create only the selected portion of the visible active layout. Piece
+    /// writes may still create an adjacent unselected file when a selected
+    /// piece crosses a file boundary, which is required to verify that piece.
+    pub async fn ensure_active_layout_for_files(&self, selected: &[bool]) -> Result<()> {
+        self.validate_file_selection(selected)?;
         self.ensure_dirs().await?;
         if self.meta.files.is_empty() {
             return Ok(());
         }
-        self.ensure_file_dirs(0).await?;
-        if !self.meta.is_multi_file {
+        for (index, wanted) in selected.iter().copied().enumerate() {
+            if wanted {
+                self.ensure_file_dirs(index).await?;
+            }
+        }
+        if !self.meta.is_multi_file && selected[0] {
             let path = self.file_path(0)?;
             fs::OpenOptions::new()
                 .create(true)
@@ -137,8 +320,20 @@ impl StorageIo {
     /// Preallocate (truncate to full length) all files so random writes land at
     /// the right offsets. Uses sparse truncation by default.
     pub async fn preallocate(&self) -> Result<()> {
+        self.preallocate_files(&vec![true; self.meta.files.len()])
+            .await
+    }
+
+    /// Preallocate only selected files. This prevents an unwanted large file
+    /// from consuming disk merely because another file in the torrent was
+    /// selected.
+    pub async fn preallocate_files(&self, selected: &[bool]) -> Result<()> {
+        self.validate_file_selection(selected)?;
         self.ensure_dirs().await?;
-        for (i, _f) in self.meta.files.iter().enumerate() {
+        for (i, wanted) in selected.iter().copied().enumerate() {
+            if !wanted {
+                continue;
+            }
             self.ensure_file_dirs(i).await?;
             let path = self.file_path(i)?;
             let file = fs::OpenOptions::new()
@@ -154,19 +349,24 @@ impl StorageIo {
         Ok(())
     }
 
+    fn validate_file_selection(&self, selected: &[bool]) -> Result<()> {
+        if selected.len() != self.meta.files.len() {
+            return Err(CoreError::Storage(format!(
+                "file selection length {} does not match torrent file count {}",
+                selected.len(),
+                self.meta.files.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// Write a block (a sub-range of a piece) to disk at the correct file
     /// offset(s), crossing file boundaries as needed.
     ///
     /// `piece_index` is the piece, `offset` is the byte offset within that
     /// piece, and `block` is the block bytes.
     pub async fn write_block(&self, piece_index: usize, offset: u64, block: &[u8]) -> Result<()> {
-        let Some((piece_start, _piece_end)) = self.meta.piece_byte_range(piece_index as u64) else {
-            return Err(CoreError::Storage(format!(
-                "piece {piece_index} out of range"
-            )));
-        };
-        let abs_start = piece_start + offset;
-        let abs_end = abs_start + block.len() as u64;
+        let (abs_start, abs_end) = self.checked_piece_range(piece_index, offset, block.len())?;
         self.write_file_slices(abs_start, abs_end, block).await
     }
 
@@ -207,7 +407,30 @@ impl StorageIo {
     }
 
     async fn write_file_slices(&self, abs_start: u64, abs_end: u64, data: &[u8]) -> Result<()> {
-        let slices = byte_ranges_to_file_slices(&self.meta, abs_start, abs_end);
+        let range_len = abs_end.checked_sub(abs_start).ok_or_else(|| {
+            CoreError::Storage(format!(
+                "invalid storage write range {abs_start}..{abs_end}"
+            ))
+        })?;
+        let data_len = u64::try_from(data.len())
+            .map_err(|_| CoreError::Storage("storage write length exceeds u64".into()))?;
+        if abs_end > self.meta.total_length || range_len != data_len {
+            return Err(CoreError::Storage(format!(
+                "storage write range {abs_start}..{abs_end} does not match {data_len} bytes within torrent length {}",
+                self.meta.total_length
+            )));
+        }
+        let slices = byte_ranges_to_file_slices(&self.meta, abs_start, abs_end)?;
+        let mapped_len = slices.iter().try_fold(0u64, |total, slice| {
+            total
+                .checked_add(slice.length)
+                .ok_or_else(|| CoreError::Storage("mapped storage write length overflow".into()))
+        })?;
+        if mapped_len != data_len {
+            return Err(CoreError::Storage(format!(
+                "storage write mapped {mapped_len} of {data_len} bytes"
+            )));
+        }
         let mut data_off = 0usize;
         for slice in slices {
             self.ensure_file_dirs(slice.file_index).await?;
@@ -230,6 +453,15 @@ impl StorageIo {
     }
 
     fn checked_piece_write_range(
+        &self,
+        piece_index: usize,
+        offset: u64,
+        data_len: usize,
+    ) -> Result<(u64, u64)> {
+        self.checked_piece_range(piece_index, offset, data_len)
+    }
+
+    fn checked_piece_range(
         &self,
         piece_index: usize,
         offset: u64,
@@ -272,7 +504,7 @@ impl StorageIo {
                 "piece {piece_index} out of range"
             )));
         };
-        let slices = byte_ranges_to_file_slices(&self.meta, start, end);
+        let slices = byte_ranges_to_file_slices(&self.meta, start, end)?;
         self.flush_writable_file_slices(&slices).await?;
         let mut out = Vec::with_capacity((end - start) as usize);
         for slice in slices {
@@ -296,14 +528,8 @@ impl StorageIo {
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>> {
-        let Some((piece_start, _)) = self.meta.piece_byte_range(piece_index as u64) else {
-            return Err(CoreError::Storage(format!(
-                "piece {piece_index} out of range"
-            )));
-        };
-        let abs_start = piece_start + offset;
-        let abs_end = abs_start + length as u64;
-        let slices = byte_ranges_to_file_slices(&self.meta, abs_start, abs_end);
+        let (abs_start, abs_end) = self.checked_piece_range(piece_index, offset, length)?;
+        let slices = byte_ranges_to_file_slices(&self.meta, abs_start, abs_end)?;
         self.flush_writable_file_slices(&slices).await?;
         let mut out = Vec::with_capacity(length);
         for slice in slices {
@@ -315,6 +541,12 @@ impl StorageIo {
             let mut buf = vec![0u8; slice.length as usize];
             file.read_exact(&mut buf).await.map_err(CoreError::from)?;
             out.extend_from_slice(&buf);
+        }
+        if out.len() != length {
+            return Err(CoreError::Storage(format!(
+                "storage read returned {} of {length} requested bytes",
+                out.len()
+            )));
         }
         Ok(out)
     }
@@ -422,45 +654,116 @@ impl StorageIo {
 
     /// Persist fast-resume metadata next to active torrent data.
     pub async fn save_resume(&self, resume: &FastResume) -> Result<PathBuf> {
-        let path = self.resume_path();
+        let _write_guard = self.resume_write_lock.lock().await;
+        let path = self.checked_resume_path()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await.map_err(CoreError::from)?;
         }
         let json = resume
             .serialize_json()
             .map_err(|e| CoreError::Storage(format!("resume serialize: {e}")))?;
-        fs::write(&path, json.as_bytes())
-            .await
-            .map_err(CoreError::from)?;
+        let temporary = temporary_sibling_path(&path, "tmp")?;
+        let write_result: Result<()> = async {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .await
+                .map_err(CoreError::from)?;
+            file.write_all(json.as_bytes())
+                .await
+                .map_err(CoreError::from)?;
+            file.flush().await.map_err(CoreError::from)?;
+            file.sync_all().await.map_err(CoreError::from)?;
+            drop(file);
+            fs::rename(&temporary, &path)
+                .await
+                .map_err(CoreError::from)?;
+            sync_parent_directory(&path).await
+        }
+        .await;
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary).await;
+            return Err(error);
+        }
         Ok(path)
     }
 
     /// Load fast-resume metadata for this torrent, validating the info hash
     /// matches. Returns `None` if no resume file exists.
     pub async fn load_resume(&self, expected_hash: &InfoHash) -> Result<Option<FastResume>> {
-        let path = self.resume_path();
-        if !path.exists() {
-            return Ok(None);
-        }
-        let bytes = fs::read(&path).await.map_err(CoreError::from)?;
-        let s = std::str::from_utf8(&bytes)
-            .map_err(|e| CoreError::Storage(format!("resume not utf8: {e}")))?;
-        let resume = FastResume::parse_json(s)
-            .map_err(|e| CoreError::Storage(format!("resume parse: {e}")))?;
+        let _write_guard = self.resume_write_lock.lock().await;
+        let path = self.checked_resume_path()?;
+        let bytes = match fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(CoreError::from(error)),
+        };
+        let s = match std::str::from_utf8(&bytes) {
+            Ok(s) => s,
+            Err(error) => {
+                self.quarantine_corrupt_resume(&path, &format!("resume not utf8: {error}"))
+                    .await;
+                return Ok(None);
+            }
+        };
+        let resume = match FastResume::parse_json(s) {
+            Ok(resume) => resume,
+            Err(error) => {
+                self.quarantine_corrupt_resume(&path, &format!("resume parse: {error}"))
+                    .await;
+                return Ok(None);
+            }
+        };
         if &resume.info_hash != expected_hash {
             return Err(CoreError::Storage(format!(
                 "resume info hash mismatch: expected {}, found {}",
                 expected_hash, resume.info_hash
             )));
         }
-        if resume.piece_count != self.meta.piece_count() {
-            return Err(CoreError::Storage(format!(
-                "resume piece_count {} != meta {}",
-                resume.piece_count,
-                self.meta.piece_count()
-            )));
+        let expected_bitfield_bytes = resume.piece_count.div_ceil(8);
+        let piece_count_matches = resume.piece_count == self.meta.piece_count();
+        let verified_bytes = piece_count_matches.then(|| {
+            (0..self.meta.piece_count())
+                .filter(|&index| resume.piece_bitfield.has(index))
+                .filter_map(|index| self.meta.piece_byte_range(index as u64))
+                .map(|(start, end)| end - start)
+                .sum::<u64>()
+        });
+        let structurally_inconsistent = resume.name != self.meta.name
+            || !piece_count_matches
+            || resume.total_length != self.meta.total_length
+            || resume.piece_bitfield.as_bytes().len() != expected_bitfield_bytes
+            || resume.bytes_completed > resume.total_length
+            || verified_bytes != Some(resume.bytes_completed)
+            || (!resume.wanted.is_empty() && resume.wanted.len() != self.meta.files.len())
+            || (!resume.file_stamps.is_empty()
+                && resume.file_stamps.len() != self.meta.files.len());
+        if structurally_inconsistent {
+            self.quarantine_corrupt_resume(&path, "resume fields are structurally inconsistent")
+                .await;
+            return Ok(None);
         }
         Ok(Some(resume))
+    }
+
+    async fn quarantine_corrupt_resume(&self, path: &Path, reason: &str) {
+        let quarantine = match temporary_sibling_path(path, "corrupt") {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(path = %path.display(), error = %error, %reason, "invalid fast resume could not be quarantined");
+                return;
+            }
+        };
+        match fs::rename(path, &quarantine).await {
+            Ok(()) => {
+                let _ = sync_parent_directory(path).await;
+                tracing::warn!(path = %path.display(), quarantine = %quarantine.display(), %reason, "invalid fast resume quarantined; storage recheck required");
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), error = %error, %reason, "invalid fast resume ignored; storage recheck required");
+            }
+        }
     }
 
     /// Path of the fast-resume file for this torrent.
@@ -469,66 +772,129 @@ impl StorageIo {
             .join(format!("{}.swarmotter.resume", self.meta.name))
     }
 
-    /// Remove fast-resume metadata for this torrent, if present.
-    pub async fn remove_resume(&self) -> Result<()> {
-        let _ = fs::remove_file(self.resume_path()).await;
-        Ok(())
+    fn checked_resume_path(&self) -> Result<PathBuf> {
+        validate_path_component(&self.meta.name)?;
+        Ok(self.resume_path())
     }
 
-    /// Move verified torrent data from this storage root to another root,
+    /// Remove fast-resume metadata for this torrent, if present.
+    pub async fn remove_resume(&self) -> Result<()> {
+        let _write_guard = self.resume_write_lock.lock().await;
+        let path = self.checked_resume_path()?;
+        match fs::remove_file(&path).await {
+            Ok(()) => sync_parent_directory(&path).await,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(CoreError::Storage(format!(
+                "failed to remove resume {}: {error}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Move torrent data from this storage root to another root,
     /// preserving torrent-relative paths. The destination must not already
     /// contain the torrent's files; refusing to overwrite avoids clobbering
     /// user data when a path is misconfigured.
     pub async fn move_to(&self, destination_dir: impl Into<PathBuf>) -> Result<Self> {
         let destination = Self::new(self.meta.clone(), destination_dir);
-        if self.download_dir == destination.download_dir {
+        if self.shares_storage_root_with(&destination) {
             return Ok(destination);
         }
         self.flush_all_writable_handles().await?;
         self.clear_file_handles().await;
-
-        for (index, file) in self.meta.files.iter().enumerate() {
-            let src = self.file_path(index)?;
-            let dst = destination.file_path(index)?;
-            if src == dst {
-                continue;
-            }
-            if path_exists(&dst).await? {
-                return Err(CoreError::Storage(format!(
-                    "destination file already exists while moving completed data: {}",
-                    dst.display()
-                )));
-            }
-            if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent).await.map_err(CoreError::from)?;
-            }
-            if path_exists(&src).await? {
-                rename_or_copy(&src, &dst).await?;
-                cleanup_empty_parents(src.parent(), &self.download_dir).await;
-            } else if file.length == 0 {
-                fs::File::create(&dst).await.map_err(CoreError::from)?;
-            } else {
-                return Err(CoreError::Storage(format!(
-                    "source file missing while moving completed data: {}",
-                    src.display()
-                )));
+        let plan = self.build_move_plan(&destination).await?;
+        self.remove_resume().await?;
+        execute_move_plan(&plan, &destination.download_dir).await?;
+        for entry in &plan {
+            if entry.kind == MoveEntryKind::Existing {
+                cleanup_empty_parents(entry.source.parent(), &self.download_dir).await;
             }
         }
-
-        self.remove_resume().await?;
         Ok(destination)
+    }
+
+    async fn build_move_plan(&self, destination: &Self) -> Result<Vec<MovePlanEntry>> {
+        self.path_ownership()?;
+        destination.path_ownership()?;
+        if path_lexists(&destination.checked_resume_path()?).await? {
+            return Err(CoreError::Storage(format!(
+                "destination resume file already exists while moving torrent data: {}",
+                destination.resume_path().display()
+            )));
+        }
+
+        let mut plan = Vec::with_capacity(self.meta.files.len());
+        for (index, expected) in self.meta.files.iter().enumerate() {
+            let source = self.file_path(index)?;
+            let target = destination.file_path(index)?;
+            if normalize_lexical_path(&source) == normalize_lexical_path(&target) {
+                continue;
+            }
+            if path_lexists(&target).await? {
+                return Err(CoreError::Storage(format!(
+                    "destination file already exists while moving torrent data: {}",
+                    target.display()
+                )));
+            }
+            let kind = match fs::symlink_metadata(&source).await {
+                Ok(metadata) if metadata.is_file() && metadata.len() <= expected.length => {
+                    MoveEntryKind::Existing
+                }
+                Ok(metadata) if !metadata.is_file() => {
+                    return Err(CoreError::Storage(format!(
+                        "source payload path is not a file: {}",
+                        source.display()
+                    )));
+                }
+                Ok(metadata) => {
+                    return Err(CoreError::Storage(format!(
+                        "source file length {} exceeds expected {} while moving torrent data: {}",
+                        metadata.len(),
+                        expected.length,
+                        source.display()
+                    )));
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound && expected.length == 0 =>
+                {
+                    MoveEntryKind::CreateEmpty
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => MoveEntryKind::Absent,
+                Err(error) => return Err(CoreError::from(error)),
+            };
+            plan.push(MovePlanEntry {
+                source,
+                destination: target,
+                kind,
+            });
+        }
+        Ok(plan)
     }
 
     /// Remove all torrent data files and the resume file.
     pub async fn remove_all(&self) -> Result<()> {
         self.flush_all_writable_handles().await?;
         self.clear_file_handles().await;
+        let mut failures = Vec::new();
         for i in 0..self.meta.files.len() {
             let p = self.file_path(i)?;
-            let _ = fs::remove_file(&p).await;
-            cleanup_empty_parents(p.parent(), &self.download_dir).await;
+            match fs::remove_file(&p).await {
+                Ok(()) => cleanup_empty_parents(p.parent(), &self.download_dir).await,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    cleanup_empty_parents(p.parent(), &self.download_dir).await;
+                }
+                Err(error) => failures.push(format!("{}: {error}", p.display())),
+            }
         }
-        self.remove_resume().await?;
+        if let Err(error) = self.remove_resume().await {
+            failures.push(error.to_string());
+        }
+        if !failures.is_empty() {
+            return Err(CoreError::Storage(format!(
+                "failed to remove all torrent data: {}",
+                failures.join("; ")
+            )));
+        }
         Ok(())
     }
 }
@@ -544,11 +910,23 @@ struct FileSliceRange {
 /// Map an absolute byte range `[start, end)` within the torrent to the file
 /// slices it covers. This is the storage equivalent of
 /// [`crate::storage::piece_file_ranges`] generalized to arbitrary ranges.
-fn byte_ranges_to_file_slices(meta: &TorrentMeta, start: u64, end: u64) -> Vec<FileSliceRange> {
+fn byte_ranges_to_file_slices(
+    meta: &TorrentMeta,
+    start: u64,
+    end: u64,
+) -> Result<Vec<FileSliceRange>> {
+    if start > end || end > meta.total_length {
+        return Err(CoreError::Storage(format!(
+            "byte range {start}..{end} is outside torrent length {}",
+            meta.total_length
+        )));
+    }
     let mut out = Vec::new();
     let mut offset = 0u64;
     for (i, file) in meta.files.iter().enumerate() {
-        let file_end = offset + file.length;
+        let file_end = offset.checked_add(file.length).ok_or_else(|| {
+            CoreError::Storage(format!("file layout overflows at file index {i}"))
+        })?;
         if file_end > start && offset < end {
             let slice_start = offset.max(start) - offset;
             let slice_end = file_end.min(end) - offset;
@@ -560,7 +938,7 @@ fn byte_ranges_to_file_slices(meta: &TorrentMeta, start: u64, end: u64) -> Vec<F
         }
         offset = file_end;
     }
-    out
+    Ok(out)
 }
 
 /// Join a base directory with a file's path components, guarding against path
@@ -598,29 +976,271 @@ fn validate_path_component(value: &str) -> Result<()> {
     Ok(())
 }
 
-async fn path_exists(path: &Path) -> Result<bool> {
-    match fs::metadata(path).await {
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    use std::ffi::OsStr;
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let can_pop = normalized
+                    .file_name()
+                    .is_some_and(|name| name != OsStr::new(".."));
+                if can_pop {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push("..");
+                }
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(value) => normalized.push(value),
+        }
+    }
+    normalized
+}
+
+fn temporary_sibling_path(path: &Path, kind: &str) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| CoreError::Storage(format!("path has no file name: {}", path.display())))?;
+    let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut temporary_name = file_name.to_os_string();
+    temporary_name.push(format!(".{kind}-{}-{sequence}", std::process::id()));
+    Ok(path.with_file_name(temporary_name))
+}
+
+#[cfg(unix)]
+async fn sync_parent_directory(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let directory = fs::File::open(parent).await.map_err(CoreError::from)?;
+    directory.sync_all().await.map_err(CoreError::from)
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+async fn path_lexists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path).await {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(CoreError::from(e)),
     }
 }
 
-async fn rename_or_copy(src: &Path, dst: &Path) -> Result<()> {
-    match fs::rename(src, dst).await {
-        Ok(()) => Ok(()),
-        Err(rename_err) => match fs::copy(src, dst).await {
-            Ok(_) => {
-                fs::remove_file(src).await.map_err(CoreError::from)?;
-                Ok(())
+async fn execute_move_plan(plan: &[MovePlanEntry], target_root: &Path) -> Result<()> {
+    let mut completed = Vec::with_capacity(plan.len());
+    for entry in plan {
+        if entry.kind == MoveEntryKind::Absent {
+            for (path, role) in [
+                (&entry.source, "source"),
+                (&entry.destination, "destination"),
+            ] {
+                if let Err(error) = ensure_move_path_absent(path, role).await {
+                    return rollback_move_plan(&completed, target_root, error).await;
+                }
             }
-            Err(copy_err) => Err(CoreError::Storage(format!(
-                "failed to move {} to {}: rename failed ({rename_err}); copy fallback failed ({copy_err})",
-                src.display(),
-                dst.display()
-            ))),
-        },
+            continue;
+        }
+        if entry.kind == MoveEntryKind::CreateEmpty {
+            if let Err(error) = ensure_move_path_absent(&entry.source, "source").await {
+                return rollback_move_plan(&completed, target_root, error).await;
+            }
+        }
+        if let Some(parent) = entry.destination.parent() {
+            if let Err(error) = fs::create_dir_all(parent).await {
+                return rollback_move_plan(&completed, target_root, CoreError::from(error)).await;
+            }
+        }
+        let result = match entry.kind {
+            MoveEntryKind::Existing => move_file_exclusive(&entry.source, &entry.destination).await,
+            MoveEntryKind::CreateEmpty => create_empty_file_exclusive(&entry.destination).await,
+            MoveEntryKind::Absent => unreachable!("absent entries are handled before mutation"),
+        };
+        if let Err(error) = result {
+            return rollback_move_plan(&completed, target_root, error).await;
+        }
+        completed.push(entry.clone());
+        if let Err(error) = sync_move_entry_parents(entry).await {
+            return rollback_move_plan(&completed, target_root, error).await;
+        }
     }
+    Ok(())
+}
+
+async fn ensure_move_path_absent(path: &Path, role: &str) -> Result<()> {
+    if path_lexists(path).await? {
+        return Err(CoreError::Storage(format!(
+            "{role} file appeared after move preflight: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn rollback_move_plan(
+    completed: &[MovePlanEntry],
+    target_root: &Path,
+    original: CoreError,
+) -> Result<()> {
+    let mut rollback_failures = Vec::new();
+    for entry in completed.iter().rev() {
+        let result = match entry.kind {
+            MoveEntryKind::Existing => move_file_exclusive(&entry.destination, &entry.source).await,
+            MoveEntryKind::CreateEmpty => match fs::remove_file(&entry.destination).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(CoreError::from(error)),
+            },
+            MoveEntryKind::Absent => Ok(()),
+        };
+        let result = match result {
+            Ok(()) => sync_move_entry_parents(entry).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            rollback_failures.push(format!(
+                "{} -> {}: {error}",
+                entry.destination.display(),
+                entry.source.display()
+            ));
+        }
+        cleanup_empty_parents(entry.destination.parent(), target_root).await;
+    }
+    if rollback_failures.is_empty() {
+        Err(original)
+    } else {
+        Err(CoreError::Storage(format!(
+            "{original}; move rollback also failed: {}",
+            rollback_failures.join("; ")
+        )))
+    }
+}
+
+async fn move_file_exclusive(source: &Path, destination: &Path) -> Result<()> {
+    if path_lexists(destination).await? {
+        return Err(CoreError::Storage(format!(
+            "destination file already exists: {}",
+            destination.display()
+        )));
+    }
+
+    match fs::hard_link(source, destination).await {
+        Ok(()) => {
+            if let Err(error) = fs::remove_file(source).await {
+                let cleanup = fs::remove_file(destination).await;
+                return Err(CoreError::Storage(format!(
+                    "failed to remove source {} after linking to {}: {error}{}",
+                    source.display(),
+                    destination.display(),
+                    cleanup
+                        .err()
+                        .map(|cleanup| format!("; destination cleanup failed: {cleanup}"))
+                        .unwrap_or_default()
+                )));
+            }
+            Ok(())
+        }
+        Err(link_error) => copy_file_exclusive(source, destination, &link_error).await,
+    }
+}
+
+async fn copy_file_exclusive(
+    source_path: &Path,
+    destination_path: &Path,
+    link_error: &std::io::Error,
+) -> Result<()> {
+    let mut source = fs::File::open(source_path).await.map_err(CoreError::from)?;
+    let source_metadata = source.metadata().await.map_err(CoreError::from)?;
+    let mut destination = match fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(destination_path)
+        .await
+    {
+        Ok(file) => file,
+        Err(error) => {
+            return Err(CoreError::Storage(format!(
+                "failed to move {} to {}: link failed ({link_error}); exclusive copy create failed ({error})",
+                source_path.display(),
+                destination_path.display()
+            )));
+        }
+    };
+
+    let copy_result: Result<()> = async {
+        let copied = tokio::io::copy(&mut source, &mut destination)
+            .await
+            .map_err(CoreError::from)?;
+        if copied != source_metadata.len() {
+            return Err(CoreError::Storage(format!(
+                "copied {copied} of {} bytes from {}",
+                source_metadata.len(),
+                source_path.display()
+            )));
+        }
+        destination.flush().await.map_err(CoreError::from)?;
+        fs::set_permissions(destination_path, source_metadata.permissions())
+            .await
+            .map_err(CoreError::from)?;
+        destination.sync_all().await.map_err(CoreError::from)?;
+        Ok(())
+    }
+    .await;
+    drop(destination);
+    if let Err(error) = copy_result {
+        let _ = fs::remove_file(destination_path).await;
+        return Err(error);
+    }
+    if let Err(error) = fs::remove_file(source_path).await {
+        let cleanup = fs::remove_file(destination_path).await;
+        return Err(CoreError::Storage(format!(
+            "copied {} to {} but failed to remove source: {error}{}",
+            source_path.display(),
+            destination_path.display(),
+            cleanup
+                .err()
+                .map(|cleanup| format!("; destination cleanup failed: {cleanup}"))
+                .unwrap_or_default()
+        )));
+    }
+    Ok(())
+}
+
+async fn create_empty_file_exclusive(path: &Path) -> Result<()> {
+    let file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .await
+        .map_err(CoreError::from)?;
+    file.sync_all().await.map_err(CoreError::from)
+}
+
+async fn sync_move_entry_parents(entry: &MovePlanEntry) -> Result<()> {
+    match entry.kind {
+        MoveEntryKind::Existing => {
+            sync_parent_directory(&entry.source).await?;
+            if entry.source.parent() != entry.destination.parent() {
+                sync_parent_directory(&entry.destination).await?;
+            }
+        }
+        MoveEntryKind::CreateEmpty => {
+            sync_parent_directory(&entry.destination).await?;
+        }
+        MoveEntryKind::Absent => {}
+    }
+    Ok(())
 }
 
 async fn cleanup_empty_parents(parent: Option<&Path>, stop_at: &Path) {
@@ -656,6 +1276,45 @@ pub fn build_resume(
     priorities: &[crate::models::torrent::FilePriority],
     piece_byte_lengths: &[u64],
 ) -> FastResume {
+    let wanted = priorities
+        .iter()
+        .map(|priority| *priority != crate::models::torrent::FilePriority::Unwanted)
+        .collect::<Vec<_>>();
+    build_resume_with_wanted(
+        info_hash,
+        name,
+        bitfield,
+        piece_count,
+        downloaded,
+        uploaded,
+        total_length,
+        download_dir,
+        date_added,
+        date_completed,
+        priorities,
+        &wanted,
+        piece_byte_lengths,
+    )
+}
+
+/// Build a [`FastResume`] while preserving explicit wanted state separately
+/// from scheduling priority.
+#[allow(clippy::too_many_arguments)]
+pub fn build_resume_with_wanted(
+    info_hash: InfoHash,
+    name: String,
+    bitfield: PieceBitfield,
+    piece_count: usize,
+    downloaded: u64,
+    uploaded: u64,
+    total_length: u64,
+    download_dir: Option<String>,
+    date_added: u64,
+    date_completed: Option<u64>,
+    priorities: &[crate::models::torrent::FilePriority],
+    wanted: &[bool],
+    piece_byte_lengths: &[u64],
+) -> FastResume {
     let bytes_completed = (0..piece_count)
         .filter(|&i| bitfield.has(i))
         .map(|i| *piece_byte_lengths.get(i).unwrap_or(&0))
@@ -670,6 +1329,8 @@ pub fn build_resume(
         bytes_completed,
         total_length,
         priorities: priorities.to_vec(),
+        wanted: wanted.to_vec(),
+        file_stamps: Vec::new(),
         download_dir,
         date_added,
         date_completed,
@@ -758,6 +1419,46 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_stamps_detect_same_size_edits_with_restored_mtime() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::MetadataExt as _;
+
+        let original = b"abcdefgh";
+        let replacement = b"ABCDEFGH";
+        let bytes = build_single_file_torrent("stamp.bin", original, 8, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("resume-stamp-ctime");
+        let store = StorageIo::new(meta, dir.clone());
+        let path = store.file_path(0).unwrap();
+        tokio::fs::write(&path, original).await.unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let before = store.resume_file_stamps().await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tokio::fs::write(&path, replacement).await.unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: metadata.atime(),
+                tv_nsec: metadata.atime_nsec(),
+            },
+            libc::timespec {
+                tv_sec: metadata.mtime(),
+                tv_nsec: metadata.mtime_nsec(),
+            },
+        ];
+        let path_c = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::utimensat(libc::AT_FDCWD, path_c.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(result, 0);
+
+        let after = store.resume_file_stamps().await.unwrap();
+        assert_eq!(before[0].modified_unix_nanos, after[0].modified_unix_nanos);
+        assert_ne!(before, after);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[tokio::test]
     async fn storage_reuses_file_handles_for_repeated_block_io() {
         let content = b"0123456789abcdef";
@@ -805,6 +1506,8 @@ mod tests {
         store.write_piece(0, &content[..16]).await.unwrap();
         store.write_piece(1, &content[16..]).await.unwrap();
 
+        assert_eq!(store.read_piece(0).await.unwrap(), &content[..16]);
+        assert_eq!(store.read_piece(1).await.unwrap(), &content[16..]);
         assert_eq!(std::fs::read(store.file_path(0).unwrap()).unwrap(), content);
         assert!(store.verify_piece_on_disk(0).await.unwrap());
         assert!(store.verify_piece_on_disk(1).await.unwrap());
@@ -907,6 +1610,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remove_all_reports_payload_deletion_failures() {
+        let bytes = build_single_file_torrent("blocked.bin", b"01234567", 8, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("remove-all-error");
+        let store = StorageIo::new(meta, dir.clone());
+        let payload = store.file_path(0).unwrap();
+        fs::create_dir_all(&payload).await.unwrap();
+
+        let error = store.remove_all().await.unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to remove all torrent data"));
+        assert!(error.to_string().contains(&payload.display().to_string()));
+        assert!(payload.is_dir());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn write_piece_range_preserves_multi_file_boundaries() {
         let files = vec![
             (vec!["a.txt".into()], 5u64),
@@ -923,6 +1645,9 @@ mod tests {
         store.write_piece_range(1, 0, b"owor").await.unwrap();
         store.write_piece(2, b"ld!!").await.unwrap();
 
+        assert_eq!(store.read_piece(0).await.unwrap(), b"hell");
+        assert_eq!(store.read_piece(1).await.unwrap(), b"owor");
+        assert_eq!(store.read_piece(2).await.unwrap(), b"ld!!");
         let a = std::fs::read(dir.join("dir").join("a.txt")).unwrap();
         assert_eq!(&a, b"hello");
         let b = std::fs::read(dir.join("dir").join("sub").join("b.bin")).unwrap();
@@ -959,7 +1684,7 @@ mod tests {
         let mut bf = PieceBitfield::new(4);
         bf.set(0);
         bf.set(1);
-        let resume = build_resume(
+        let resume = build_resume_with_wanted(
             meta.info_hash,
             meta.name.clone(),
             bf,
@@ -971,6 +1696,7 @@ mod tests {
             1,
             None,
             &[crate::models::torrent::FilePriority::Normal],
+            &[false],
             &[8u64; 4],
         );
         store.save_resume(&resume).await.unwrap();
@@ -979,6 +1705,37 @@ mod tests {
         assert_eq!(loaded.piece_count, meta.piece_count());
         assert!(loaded.piece_bitfield.has(0));
         assert!(loaded.piece_bitfield.has(1));
+        assert_eq!(loaded.wanted, vec![false]);
+        assert!(!std::fs::read_dir(&dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn corrupt_resume_is_quarantined_for_safe_recheck() {
+        let bytes = build_single_file_torrent("corrupt.bin", b"01234567", 8, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("resume-corrupt");
+        let store = StorageIo::new(meta.clone(), dir.clone());
+        fs::write(store.resume_path(), b"{not valid json")
+            .await
+            .unwrap();
+
+        assert!(store.load_resume(&meta.info_hash).await.unwrap().is_none());
+        assert!(!store.resume_path().exists());
+        let prefix = "corrupt.bin.swarmotter.resume.corrupt-";
+        assert!(std::fs::read_dir(&dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(prefix)
+        }));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1052,6 +1809,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn block_io_rejects_ranges_outside_the_piece() {
+        let content = b"0123456789abcdeflast";
+        let bytes = build_single_file_torrent("range.bin", content, 16, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("block-range");
+        let store = StorageIo::new(meta, dir.clone());
+        store.preallocate().await.unwrap();
+
+        assert!(store.write_block(0, 15, b"xx").await.is_err());
+        assert!(store.write_block(1, 4, b"x").await.is_err());
+        assert!(store.write_block(2, 0, b"x").await.is_err());
+        assert!(store.read_block(0, 15, 2).await.is_err());
+        assert!(store.read_block(1, 4, 1).await.is_err());
+        assert!(store.checked_piece_range(0, 1, usize::MAX).is_err());
+        assert_eq!(store.read_block(1, 4, 0).await.unwrap(), Vec::<u8>::new());
+        assert_eq!(store.read_piece(0).await.unwrap(), vec![0u8; 16]);
+        assert_eq!(store.read_piece(1).await.unwrap(), vec![0u8; 4]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
     async fn move_to_moves_data_and_removes_active_resume() {
         let content = b"0123456789abcdef";
         let bytes = build_single_file_torrent("move.bin", content, 8, None, false);
@@ -1121,6 +1899,290 @@ mod tests {
         );
         std::fs::remove_dir_all(&active).ok();
         std::fs::remove_dir_all(&complete).ok();
+    }
+
+    #[tokio::test]
+    async fn move_to_preserves_short_sparse_files_and_absent_files() {
+        let files = vec![
+            (vec!["partial.bin".into()], 8u64),
+            (vec!["sub".into(), "unwanted.bin".into()], 8u64),
+        ];
+        let contents: Vec<&[u8]> = vec![b"partial!", b"unwanted"];
+        let bytes = build_multi_file_torrent("sparse", &files, &contents, 4, None);
+        let meta = parse_torrent(&bytes).unwrap();
+        let active = unique_dir("move-sparse-active");
+        let complete = unique_dir("move-sparse-complete");
+        let store = StorageIo::new(meta.clone(), active.clone());
+        let partial_path = store.file_path(0).unwrap();
+        fs::create_dir_all(partial_path.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(&partial_path, b"par").await.unwrap();
+        assert!(!store.file_path(1).unwrap().exists());
+
+        let moved = store.move_to(complete.clone()).await.unwrap();
+
+        assert!(!partial_path.exists());
+        assert_eq!(std::fs::read(moved.file_path(0).unwrap()).unwrap(), b"par");
+        assert_eq!(
+            std::fs::metadata(moved.file_path(0).unwrap())
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(!moved.file_path(1).unwrap().exists());
+        std::fs::remove_dir_all(&active).ok();
+        std::fs::remove_dir_all(&complete).ok();
+    }
+
+    #[tokio::test]
+    async fn move_to_allows_an_entirely_absent_payload_without_claiming_destination_files() {
+        let bytes = build_single_file_torrent("not-started.bin", b"not started", 4, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let active = unique_dir("move-absent-active");
+        let complete = unique_dir("move-absent-complete");
+        let store = StorageIo::new(meta, active.clone());
+
+        let moved = store.move_to(complete.clone()).await.unwrap();
+
+        assert!(!store.file_path(0).unwrap().exists());
+        assert!(!moved.file_path(0).unwrap().exists());
+        std::fs::remove_dir_all(&active).ok();
+        std::fs::remove_dir_all(&complete).ok();
+    }
+
+    #[tokio::test]
+    async fn move_to_rejects_destination_collision_for_an_absent_source() {
+        let bytes = build_single_file_torrent("absent.bin", b"expected bytes", 4, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let active = unique_dir("move-absent-collision-active");
+        let complete = unique_dir("move-absent-collision-complete");
+        let store = StorageIo::new(meta.clone(), active.clone());
+        let destination = StorageIo::new(meta, complete.clone());
+        fs::write(destination.file_path(0).unwrap(), b"existing")
+            .await
+            .unwrap();
+
+        assert!(store.move_to(complete.clone()).await.is_err());
+        assert_eq!(
+            std::fs::read(destination.file_path(0).unwrap()).unwrap(),
+            b"existing"
+        );
+        assert!(!store.file_path(0).unwrap().exists());
+        std::fs::remove_dir_all(&active).ok();
+        std::fs::remove_dir_all(&complete).ok();
+    }
+
+    #[tokio::test]
+    async fn move_to_preflights_every_destination_before_mutating_sources() {
+        let files = vec![
+            (vec!["a.txt".into()], 5u64),
+            (vec!["sub".into(), "b.bin".into()], 7u64),
+        ];
+        let contents: Vec<&[u8]> = vec![b"hello", b"world!!"];
+        let bytes = build_multi_file_torrent("dir", &files, &contents, 4, None);
+        let meta = parse_torrent(&bytes).unwrap();
+        let active = unique_dir("move-collision-active");
+        let complete = unique_dir("move-collision-complete");
+        let store = StorageIo::new(meta.clone(), active.clone());
+        store.preallocate().await.unwrap();
+        store.write_block(0, 0, b"hell").await.unwrap();
+        store.write_block(1, 0, b"owor").await.unwrap();
+        store.write_block(2, 0, b"ld!!").await.unwrap();
+        let resume = build_resume(
+            meta.info_hash,
+            meta.name.clone(),
+            PieceBitfield::new(meta.piece_count()),
+            meta.piece_count(),
+            0,
+            0,
+            meta.total_length,
+            Some(active.display().to_string()),
+            1,
+            None,
+            &[crate::models::torrent::FilePriority::Normal; 2],
+            &[4u64; 3],
+        );
+        store.save_resume(&resume).await.unwrap();
+
+        let destination = StorageIo::new(meta, complete.clone());
+        let collision = destination.file_path(1).unwrap();
+        fs::create_dir_all(collision.parent().unwrap())
+            .await
+            .unwrap();
+        fs::write(&collision, b"occupied").await.unwrap();
+
+        assert!(store.move_to(complete.clone()).await.is_err());
+        assert_eq!(
+            std::fs::read(store.file_path(0).unwrap()).unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            std::fs::read(store.file_path(1).unwrap()).unwrap(),
+            b"world!!"
+        );
+        assert!(!destination.file_path(0).unwrap().exists());
+        assert_eq!(std::fs::read(collision).unwrap(), b"occupied");
+        assert!(store.resume_path().exists());
+        std::fs::remove_dir_all(&active).ok();
+        std::fs::remove_dir_all(&complete).ok();
+    }
+
+    #[tokio::test]
+    async fn move_plan_rolls_back_completed_entries_after_later_failure() {
+        let active = unique_dir("move-rollback-active");
+        let complete = unique_dir("move-rollback-complete");
+        let source_one = active.join("one.bin");
+        let source_two = active.join("two.bin");
+        let destination_one = complete.join("one.bin");
+        let blocker = complete.join("blocker");
+        let destination_two = blocker.join("two.bin");
+        fs::write(&source_one, b"one").await.unwrap();
+        fs::write(&source_two, b"two").await.unwrap();
+        fs::write(&blocker, b"not a directory").await.unwrap();
+        let plan = vec![
+            MovePlanEntry {
+                source: source_one.clone(),
+                destination: destination_one.clone(),
+                kind: MoveEntryKind::Existing,
+            },
+            MovePlanEntry {
+                source: source_two.clone(),
+                destination: destination_two.clone(),
+                kind: MoveEntryKind::Existing,
+            },
+        ];
+
+        assert!(execute_move_plan(&plan, &complete).await.is_err());
+        assert_eq!(std::fs::read(source_one).unwrap(), b"one");
+        assert_eq!(std::fs::read(source_two).unwrap(), b"two");
+        assert!(!destination_one.exists());
+        assert_eq!(std::fs::read(blocker).unwrap(), b"not a directory");
+        std::fs::remove_dir_all(&active).ok();
+        std::fs::remove_dir_all(&complete).ok();
+    }
+
+    #[tokio::test]
+    async fn move_plan_rolls_back_when_an_absent_source_appears() {
+        let active = unique_dir("move-absent-race-active");
+        let complete = unique_dir("move-absent-race-complete");
+        let source_one = active.join("one.bin");
+        let appeared_source = active.join("appeared.bin");
+        let destination_one = complete.join("one.bin");
+        let absent_destination = complete.join("appeared.bin");
+        fs::write(&source_one, b"one").await.unwrap();
+        fs::write(&appeared_source, b"appeared after preflight")
+            .await
+            .unwrap();
+        let plan = vec![
+            MovePlanEntry {
+                source: source_one.clone(),
+                destination: destination_one.clone(),
+                kind: MoveEntryKind::Existing,
+            },
+            MovePlanEntry {
+                source: appeared_source.clone(),
+                destination: absent_destination.clone(),
+                kind: MoveEntryKind::Absent,
+            },
+        ];
+
+        assert!(execute_move_plan(&plan, &complete).await.is_err());
+        assert_eq!(std::fs::read(source_one).unwrap(), b"one");
+        assert_eq!(
+            std::fs::read(appeared_source).unwrap(),
+            b"appeared after preflight"
+        );
+        assert!(!destination_one.exists());
+        assert!(!absent_destination.exists());
+        std::fs::remove_dir_all(&active).ok();
+        std::fs::remove_dir_all(&complete).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn move_parent_sync_errors_are_returned() {
+        let root = unique_dir("move-sync-error");
+        let entry = MovePlanEntry {
+            source: root.join("missing-parent").join("source.bin"),
+            destination: root.join("destination.bin"),
+            kind: MoveEntryKind::Existing,
+        };
+
+        assert!(sync_move_entry_parents(&entry).await.is_err());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn path_ownership_detects_collisions_and_normalizes_roots() {
+        let bytes = build_single_file_torrent("same.bin", b"01234567", 8, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let root = unique_dir("path-ownership");
+        let first = StorageIo::new(meta.clone(), root.clone());
+        let mut other_meta = meta.clone();
+        other_meta.info_hash = InfoHash::from_bytes([9u8; 20]);
+        let second = StorageIo::new(other_meta, root.join("child").join(".."));
+
+        assert!(first.shares_storage_root_with(&second));
+        let first_ownership = first.path_ownership().unwrap();
+        let second_ownership = second.path_ownership().unwrap();
+        assert!(first_ownership.conflicts_with(&second_ownership));
+        assert!(first_ownership
+            .ensure_compatible_with(&second_ownership)
+            .is_err());
+
+        let elsewhere = StorageIo::new(meta, root.join("elsewhere"));
+        assert!(!first_ownership.conflicts_with(&elsewhere.path_ownership().unwrap()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn path_ownership_rejects_file_directory_prefix_collisions() {
+        assert!(paths_overlap(
+            Path::new("/data/file"),
+            Path::new("/data/file/child")
+        ));
+        let meta = TorrentMeta {
+            info_hash: InfoHash::from_bytes([8u8; 20]),
+            name: "root".into(),
+            piece_length: 16,
+            pieces: vec![[0u8; 20]],
+            files: vec![
+                MetaFile {
+                    path: vec!["root".into(), "file".into()],
+                    length: 1,
+                },
+                MetaFile {
+                    path: vec!["root".into(), "file".into(), "child".into()],
+                    length: 1,
+                },
+            ],
+            total_length: 2,
+            private: false,
+            announce: None,
+            announce_list: vec![],
+            webseeds: vec![],
+            comment: None,
+            created_by: None,
+            creation_date: None,
+            is_multi_file: true,
+        };
+        let store = StorageIo::new(meta, std::env::temp_dir());
+        assert!(store.path_ownership().is_err());
+    }
+
+    #[test]
+    fn path_ownership_rejects_payload_collision_with_its_resume_file() {
+        let bytes = build_single_file_torrent("payload.bin", b"01234567", 8, None, false);
+        let mut meta = parse_torrent(&bytes).unwrap();
+        meta.files[0].path = vec!["payload.bin.swarmotter.resume".into()];
+        let store = StorageIo::new(meta, std::env::temp_dir());
+
+        let error = store.path_ownership().unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("payload path collides with fast-resume path"));
     }
 
     #[test]

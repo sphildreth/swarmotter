@@ -18,8 +18,10 @@
 //! ADR-0012 (peer protocol architecture) / ADR-0013 (task/runtime model).
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,6 +37,7 @@ use swarmotter_core::hash::InfoHash;
 use swarmotter_core::meta::TorrentMeta;
 use swarmotter_core::models::peer::EnginePeerHealth;
 use swarmotter_core::models::stats::PeerSchedulerDiagnostics;
+use swarmotter_core::models::torrent::FilePriority;
 use swarmotter_core::models::tracker::TrackerStatus;
 use swarmotter_core::net::NetworkBinder;
 use swarmotter_core::peer::{
@@ -56,13 +59,87 @@ const NORMAL_PEER_SESSION_DEADLINE: Duration = Duration::from_secs(180);
 const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DHT_DISCOVERY_ROUNDS: usize = 6;
 const TRACKER_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(8);
-const TRACKER_ANNOUNCE_EARLY_RETURN_GRACE: Duration = Duration::from_millis(250);
 const MAGNET_METADATA_RETRY_PAUSE: Duration = Duration::from_secs(2);
 const MAGNET_METADATA_MAX_ROUNDS: u32 = 8;
 const WEBSEED_BATCH_PIECES: usize = 128;
 const WEBSEED_MAX_CONCURRENT_REQUESTS: usize = 32;
 const WEBSEED_MAX_MIRROR_ATTEMPTS: usize = 4;
 const WEBSEED_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone)]
+struct PieceSelection {
+    priorities: Arc<Vec<Option<i32>>>,
+    target_count: usize,
+}
+
+impl PieceSelection {
+    fn all(meta: &TorrentMeta) -> Self {
+        Self::all_count(meta.piece_count())
+    }
+
+    fn all_count(piece_count: usize) -> Self {
+        let priorities = vec![Some(FilePriority::Normal.weight()); piece_count];
+        Self {
+            target_count: priorities.len(),
+            priorities: Arc::new(priorities),
+        }
+    }
+
+    fn from_files(meta: &TorrentMeta, priorities: &[FilePriority], wanted: &[bool]) -> Self {
+        if priorities.len() != meta.files.len() || wanted.len() != meta.files.len() {
+            return Self::all(meta);
+        }
+        let priorities = (0..meta.piece_count())
+            .map(|piece| {
+                piece_file_ranges(meta, piece)
+                    .into_iter()
+                    .filter_map(|slice| {
+                        let priority = priorities[slice.file_index];
+                        (wanted[slice.file_index] && priority != FilePriority::Unwanted)
+                            .then_some(priority.weight())
+                    })
+                    .max()
+            })
+            .collect::<Vec<_>>();
+        let target_count = priorities
+            .iter()
+            .filter(|priority| priority.is_some())
+            .count();
+        Self {
+            priorities: Arc::new(priorities),
+            target_count,
+        }
+    }
+
+    fn includes(&self, piece: usize) -> bool {
+        self.priorities.get(piece).is_some_and(Option::is_some)
+    }
+
+    fn priority(&self, piece: usize) -> i32 {
+        self.priorities
+            .get(piece)
+            .and_then(|priority| *priority)
+            .unwrap_or(i32::MIN)
+    }
+
+    fn complete(&self, have: &PieceBitfield) -> bool {
+        if self.target_count == 0 {
+            return true;
+        }
+        self.priorities
+            .iter()
+            .enumerate()
+            .all(|(piece, priority)| priority.is_none() || have.has(piece))
+    }
+
+    fn remaining(&self, have: &PieceBitfield) -> usize {
+        self.priorities
+            .iter()
+            .enumerate()
+            .filter(|(piece, priority)| priority.is_some() && !have.has(*piece))
+            .count()
+    }
+}
 
 /// Magnet parameters for a torrent that still needs its metadata fetched
 /// (BEP 9). The placeholder `TorrentMeta` in the engine has a dummy info hash;
@@ -75,6 +152,9 @@ pub struct MagnetParams {
     pub trackers: Vec<String>,
 }
 
+pub type MetadataPreflight =
+    Arc<dyn Fn(TorrentMeta) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
+
 #[derive(Debug, Default)]
 struct TrackerAnnounceOutcome {
     peers: Vec<PeerAddr>,
@@ -82,6 +162,7 @@ struct TrackerAnnounceOutcome {
     message: Option<String>,
     failures: u32,
     tracker_results: HashMap<String, TrackerAnnounceSnapshot>,
+    interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +199,7 @@ pub struct EngineState {
     pub tracker_message: Option<String>,
     pub tracker_announces: HashMap<String, TrackerAnnounceSnapshot>,
     pub last_announce: Option<u64>,
+    pub tracker_interval_seconds: u64,
     pub peer_scheduler: PeerSchedulerDiagnostics,
     pub finished: bool,
     /// True when the engine stopped because the daemon explicitly requested
@@ -139,6 +221,9 @@ pub struct EngineState {
     pub last_valid_block: Option<std::time::Instant>,
     /// Timestamp of the latest DHT discovery result.
     pub dht_last_seen: Option<std::time::Instant>,
+    /// Timestamp of the latest DHT lookup attempt, including failures. This
+    /// prevents no-peer retry paths from bypassing the discovery cadence.
+    pub dht_last_lookup: Option<std::time::Instant>,
     /// Timestamp of the latest PEX discovery result.
     pub pex_last_seen: Option<std::time::Instant>,
     /// Timestamp of the latest successful tracker announce.
@@ -188,6 +273,7 @@ pub struct TorrentEngine {
     listen_port: u16,
     limiter: ShapedLimiter,
     magnet: Option<MagnetParams>,
+    metadata_preflight: Option<MetadataPreflight>,
     /// Optional DHT runner for trackerless peer discovery (disabled for
     /// private torrents).
     dht: Option<Arc<crate::dht::DhtRunner>>,
@@ -204,6 +290,9 @@ pub struct TorrentEngine {
     allow_ipv6: bool,
     pex_enabled: bool,
     pex_max_peers: usize,
+    file_priorities: Vec<FilePriority>,
+    wanted: Vec<bool>,
+    piece_selection: PieceSelection,
 }
 
 impl TorrentEngine {
@@ -248,6 +337,8 @@ impl TorrentEngine {
         limiter: RateLimiter,
         magnet: Option<MagnetParams>,
     ) -> Self {
+        let piece_selection = PieceSelection::all(&meta);
+        let file_count = meta.files.len();
         Self {
             meta,
             complete_dir: download_dir.clone(),
@@ -260,6 +351,7 @@ impl TorrentEngine {
             listen_port,
             limiter: ShapedLimiter::from_rate_limiter(limiter),
             magnet,
+            metadata_preflight: None,
             dht: None,
             utp_enabled: true,
             utp_prefer_tcp: true,
@@ -272,6 +364,9 @@ impl TorrentEngine {
             allow_ipv6: true,
             pex_enabled: true,
             pex_max_peers: 0,
+            file_priorities: vec![FilePriority::Normal; file_count],
+            wanted: vec![true; file_count],
+            piece_selection,
         }
     }
 
@@ -354,6 +449,21 @@ impl TorrentEngine {
         self
     }
 
+    pub fn with_file_selection(mut self, priorities: Vec<FilePriority>, wanted: Vec<bool>) -> Self {
+        self.file_priorities = priorities;
+        self.wanted = wanted;
+        self.piece_selection =
+            PieceSelection::from_files(&self.meta, &self.file_priorities, &self.wanted);
+        self
+    }
+
+    /// Validate and reserve resolved magnet metadata with the daemon before
+    /// any payload path is created.
+    pub fn with_metadata_preflight(mut self, preflight: MetadataPreflight) -> Self {
+        self.metadata_preflight = Some(preflight);
+        self
+    }
+
     fn set_peer_worker_limit(&self, max_peer_workers: usize) {
         let limit = if max_peer_workers == 0 {
             DEFAULT_PEER_WORKER_LIMIT
@@ -386,11 +496,22 @@ impl TorrentEngine {
             let info = self.fetch_magnet_metadata(&magnet).await?;
             let rebuilt =
                 crate::metadata::build_meta_from_info(&info, &magnet.name, &magnet.trackers)?;
+            if let Some(preflight) = &self.metadata_preflight {
+                preflight(rebuilt.clone()).await?;
+            }
             // Stash the real metadata so the daemon can update the record.
             self.state.lock().await.resolved_meta = Some(rebuilt.clone());
             // Replace the placeholder meta with the real one.
             self.meta = rebuilt;
         }
+        if self.file_priorities.len() != self.meta.files.len()
+            || self.wanted.len() != self.meta.files.len()
+        {
+            self.file_priorities = vec![FilePriority::Normal; self.meta.files.len()];
+            self.wanted = vec![true; self.meta.files.len()];
+        }
+        self.piece_selection =
+            PieceSelection::from_files(&self.meta, &self.file_priorities, &self.wanted);
 
         let piece_count = self.meta.piece_count();
         let total_length = self.meta.total_length;
@@ -414,27 +535,35 @@ impl TorrentEngine {
         let complete_storage = StorageIo::new(self.meta.clone(), self.complete_dir.clone());
         if self.download_dir != self.complete_dir {
             let complete_have = self.load_or_recheck(&complete_storage).await?;
-            if complete_have.count(piece_count) == piece_count {
+            if self.piece_selection.complete(&complete_have) {
                 self.update_progress(&complete_have).await;
-                self.finish_without_resume(&complete_storage).await?;
+                self.finish_selection(&complete_storage, &complete_have)
+                    .await?;
                 return Ok(self.state.lock().await.clone());
             }
         }
 
         let storage = StorageIo::new(self.meta.clone(), self.download_dir.clone());
+        let selected_files = self
+            .file_priorities
+            .iter()
+            .zip(&self.wanted)
+            .map(|(priority, wanted)| *wanted && *priority != FilePriority::Unwanted)
+            .collect::<Vec<_>>();
         if self.preallocate || !self.sparse {
-            storage.preallocate().await?;
+            storage.preallocate_files(&selected_files).await?;
         } else {
-            storage.ensure_active_layout().await?;
+            storage
+                .ensure_active_layout_for_files(&selected_files)
+                .await?;
         }
 
         // Load fast resume if present; otherwise recheck what's already on disk.
         let mut have = self.load_or_recheck(&storage).await?;
         self.update_progress(&have).await;
 
-        if have.count(piece_count) == piece_count {
-            let storage = self.complete_storage(&storage).await?;
-            self.finish_without_resume(&storage).await?;
+        if self.piece_selection.complete(&have) {
+            self.finish_selection(&storage, &have).await?;
             return Ok(self.state.lock().await.clone());
         }
 
@@ -455,7 +584,7 @@ impl TorrentEngine {
         // verify. Bounded by the configured per-torrent worker limit.
         let mut bad_peers: HashMap<SocketAddr, Instant> = HashMap::new();
         let mut peer_backoff: HashMap<SocketAddr, Instant> = HashMap::new();
-        let mut last_announce = Instant::now();
+        let mut last_discovery_refresh = Instant::now();
         let mut candidate_cursor: usize = 0;
         // Bounded consecutive no-peer rounds: if we never discover any peers
         // after a bounded number of announce attempts, give up gracefully
@@ -472,11 +601,11 @@ impl TorrentEngine {
                     break;
                 }
                 CommandOutcome::Reannounce => {
-                    let refreshed = self.refresh_discovery_peers().await;
+                    let refreshed = self.refresh_discovery_peers(true).await;
                     merge_unique_peers(&mut discovered, refreshed);
                     dedupe_peers(&mut discovered);
                     self.state.lock().await.peers = discovered.clone();
-                    last_announce = Instant::now();
+                    last_discovery_refresh = Instant::now();
                 }
                 CommandOutcome::RelaxPeerBackoff => {
                     peer_backoff.clear();
@@ -488,29 +617,28 @@ impl TorrentEngine {
             let max_concurrent = self.current_peer_worker_limit();
             self.sync_have_from_state(&mut have, piece_count).await;
 
-            if have.count(piece_count) == piece_count {
-                let storage = self.complete_storage(&storage).await?;
-                self.finish_without_resume(&storage).await?;
+            if self.piece_selection.complete(&have) {
+                self.finish_selection(&storage, &have).await?;
                 // Announce completion to trackers.
                 self.announce(AnnounceEvent::Completed).await;
                 break;
             }
 
             // Periodically re-announce to refresh peers.
-            if last_announce.elapsed() > PEER_REFRESH_INTERVAL {
-                let refreshed = self.refresh_discovery_peers().await;
+            if last_discovery_refresh.elapsed() > PEER_REFRESH_INTERVAL {
+                let refreshed = self.refresh_discovery_peers(false).await;
                 merge_unique_peers(&mut discovered, refreshed);
                 dedupe_peers(&mut discovered);
                 self.state.lock().await.peers = discovered.clone();
-                last_announce = Instant::now();
+                last_discovery_refresh = Instant::now();
             }
 
             let mut made_progress = self.run_webseed_round(&storage, &mut have).await;
-            if have.count(piece_count) == piece_count {
+            if self.piece_selection.complete(&have) {
                 continue;
             }
 
-            let remaining = piece_count - have.count(piece_count);
+            let remaining = self.piece_selection.remaining(&have);
             prune_peer_backoff(&mut bad_peers);
             prune_peer_backoff(&mut peer_backoff);
             let (mut eligible, candidate_counts) =
@@ -556,7 +684,7 @@ impl TorrentEngine {
                     let progressed = self
                         .run_endgame(&candidates, &storage, &mut have, &mut bad_peers)
                         .await;
-                    if progressed || have.count(piece_count) == piece_count {
+                    if progressed || self.piece_selection.complete(&have) {
                         continue;
                     }
                 }
@@ -602,7 +730,7 @@ impl TorrentEngine {
                 self.set_peer_scheduler_serial_active(true).await;
             }
             while let Some(peer_addr) = to_try.pop() {
-                if have.count(piece_count) == piece_count {
+                if self.piece_selection.complete(&have) {
                     break;
                 }
                 match self
@@ -639,7 +767,7 @@ impl TorrentEngine {
                 if no_usable_peer_candidates(&latest_counts) {
                     // No usable peers; back off briefly and retry announce.
                     self.sleep_or_stop(Duration::from_secs(2)).await;
-                    let refreshed = self.refresh_discovery_peers().await;
+                    let refreshed = self.refresh_discovery_peers(false).await;
                     merge_unique_peers(&mut discovered, refreshed);
                     dedupe_peers(&mut discovered);
                     self.state.lock().await.peers = discovered.clone();
@@ -713,12 +841,43 @@ impl TorrentEngine {
         state.peer_scheduler.serial_peer_active = false;
     }
 
-    async fn refresh_discovery_peers(&self) -> Vec<PeerAddr> {
-        let mut refreshed = self.announce(AnnounceEvent::Empty).await;
-        let dht_peers = self.discover_dht_peers().await;
-        merge_unique_peers(&mut refreshed, dht_peers);
+    async fn refresh_discovery_peers(&self, force: bool) -> Vec<PeerAddr> {
+        let mut refreshed = Vec::new();
+        if force || self.tracker_announce_due().await {
+            refreshed = self.announce(AnnounceEvent::Empty).await;
+        }
+        if force || self.dht_lookup_due().await {
+            merge_unique_peers(&mut refreshed, self.discover_dht_peers().await);
+        }
         dedupe_peers(&mut refreshed);
         refreshed
+    }
+
+    async fn tracker_announce_due(&self) -> bool {
+        if tracker::announce_tiers(self.meta.announce.as_deref(), &self.meta.announce_list)
+            .is_empty()
+        {
+            return false;
+        }
+        let state = self.state.lock().await;
+        let Some(last_announce) = state.last_announce else {
+            return true;
+        };
+        let interval = state
+            .tracker_interval_seconds
+            .max(PEER_REFRESH_INTERVAL.as_secs());
+        now_secs().saturating_sub(last_announce) >= interval
+    }
+
+    async fn dht_lookup_due(&self) -> bool {
+        if self.meta.is_private() || self.dht.is_none() {
+            return false;
+        }
+        self.state
+            .lock()
+            .await
+            .dht_last_lookup
+            .is_none_or(|last| last.elapsed() >= PEER_REFRESH_INTERVAL)
     }
 
     async fn discover_dht_peers(&self) -> Vec<PeerAddr> {
@@ -728,6 +887,7 @@ impl TorrentEngine {
         let Some(dht) = &self.dht else {
             return Vec::new();
         };
+        self.state.lock().await.dht_last_lookup = Some(Instant::now());
         let result = tokio::time::timeout(
             DHT_DISCOVERY_TIMEOUT,
             dht.get_peers_with_stats(self.meta.info_hash, DHT_DISCOVERY_ROUNDS),
@@ -869,7 +1029,7 @@ impl TorrentEngine {
                 no_progress_reason = Some("deadline_exceeded");
                 break;
             }
-            if have.count(piece_count) == piece_count {
+            if self.piece_selection.complete(have) {
                 no_progress_reason = Some("torrent_complete");
                 break;
             }
@@ -1151,11 +1311,11 @@ impl TorrentEngine {
         const ENDGAME_MAX_PEERS: usize = 4;
         const ENDGAME_STEP_DEADLINE: Duration = Duration::from_secs(30);
 
-        let piece_count = self.meta.piece_count();
         let shared_have = Arc::new(Mutex::new(have.clone()));
         let outstanding = Arc::new(Mutex::new(OutstandingRequests::new(ENDGAME_MAX_PEERS)));
         let made_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let download_dir = self.download_dir.clone();
+        let selection = self.piece_selection.clone();
 
         let peers: Vec<PeerAddr> = candidates.iter().take(ENDGAME_MAX_PEERS).copied().collect();
         let mut handles = AbortOnDropHandles::new();
@@ -1173,11 +1333,13 @@ impl TorrentEngine {
             let utp_enabled = self.utp_enabled;
             let utp_prefer_tcp = self.utp_prefer_tcp;
             let encryption_mode = self.encryption_mode;
+            let selection = selection.clone();
             handles.push(tokio::spawn(async move {
                 endgame_peer_session(
                     binder,
                     peer_addr,
                     meta,
+                    selection,
                     peer_id,
                     shared_have,
                     outstanding,
@@ -1220,7 +1382,7 @@ impl TorrentEngine {
         // Merge the shared have back into the local copy and persist progress.
         let merged = shared_have.lock().await.clone();
         let progressed = any_progress || made_progress.load(std::sync::atomic::Ordering::Relaxed);
-        let _still_endgame = is_endgame(piece_count - merged.count(piece_count));
+        let _still_endgame = is_endgame(self.piece_selection.remaining(&merged));
         if progressed {
             *have = merged.clone();
             self.update_progress(&merged).await;
@@ -1252,6 +1414,7 @@ impl TorrentEngine {
         let shared = Arc::new(Mutex::new(ParallelPieceState::new(
             have.clone(),
             self.meta.piece_count(),
+            self.piece_selection.clone(),
         )));
         let made_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pex_peers = Arc::new(Mutex::new(Vec::new()));
@@ -1345,7 +1508,7 @@ impl TorrentEngine {
 
             let complete = {
                 let work = shared.lock().await;
-                work.have.count(self.meta.piece_count()) == self.meta.piece_count()
+                work.selection.complete(&work.have)
             };
             if complete {
                 tasks.abort_all();
@@ -1363,7 +1526,7 @@ impl TorrentEngine {
             )
             .await;
             if Instant::now() >= next_discovery_refresh {
-                let refreshed = self.refresh_discovery_peers().await;
+                let refreshed = self.refresh_discovery_peers(false).await;
                 merge_parallel_candidate_iter(
                     &mut candidates,
                     &mut seen_candidates,
@@ -1444,10 +1607,11 @@ impl TorrentEngine {
         }
 
         let piece_count = self.meta.piece_count();
-        let missing: Vec<usize> = (0..piece_count)
-            .filter(|&piece| !have.has(piece))
-            .take(WEBSEED_BATCH_PIECES)
+        let mut missing: Vec<usize> = (0..piece_count)
+            .filter(|&piece| self.piece_selection.includes(piece) && !have.has(piece))
             .collect();
+        missing.sort_by_key(|piece| std::cmp::Reverse(self.piece_selection.priority(*piece)));
+        missing.truncate(WEBSEED_BATCH_PIECES);
         if missing.is_empty() {
             return false;
         }
@@ -1493,7 +1657,7 @@ impl TorrentEngine {
 
             let complete = {
                 let have = shared_have.lock().await;
-                have.count(piece_count) == piece_count
+                self.piece_selection.complete(&have)
             };
             if complete {
                 tasks.abort_all();
@@ -1530,7 +1694,9 @@ impl TorrentEngine {
     /// Pick a piece we don't have that the peer has.
     fn pick_piece(&self, peer_bf: Option<&Bitfield>, have: &PieceBitfield) -> Option<usize> {
         let peer_bf = peer_bf?;
-        (0..self.meta.piece_count()).find(|&i| peer_bf.has(i) && !have.has(i))
+        (0..self.meta.piece_count())
+            .filter(|&i| self.piece_selection.includes(i) && peer_bf.has(i) && !have.has(i))
+            .max_by_key(|&i| self.piece_selection.priority(i))
     }
     fn piece_length(&self, index: usize) -> u64 {
         if index + 1 == self.meta.piece_count() {
@@ -1542,11 +1708,8 @@ impl TorrentEngine {
 
     /// Announce to all HTTP/UDP trackers and return discovered peers.
     async fn announce(&self, event: AnnounceEvent) -> Vec<PeerAddr> {
-        let trackers: Vec<String> =
-            tracker::announce_tiers(self.meta.announce.as_deref(), &self.meta.announce_list)
-                .into_iter()
-                .flatten()
-                .collect();
+        let tiers =
+            tracker::announce_tiers(self.meta.announce.as_deref(), &self.meta.announce_list);
         let (uploaded, downloaded, left) = {
             let s = self.state.lock().await;
             (
@@ -1556,18 +1719,50 @@ impl TorrentEngine {
             )
         };
         let outcome = self
-            .announce_trackers(
+            .announce_tracker_tiers(
                 self.meta.info_hash,
-                trackers,
+                tiers,
                 uploaded,
                 downloaded,
                 left,
                 event,
-                true,
             )
             .await;
         self.record_tracker_announce_outcome(&outcome).await;
         outcome.peers
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn announce_tracker_tiers(
+        &self,
+        info_hash: InfoHash,
+        tiers: Vec<Vec<String>>,
+        uploaded: u64,
+        downloaded: u64,
+        left: u64,
+        event: AnnounceEvent,
+    ) -> TrackerAnnounceOutcome {
+        if tiers.is_empty() {
+            return TrackerAnnounceOutcome {
+                message: Some("no trackers configured".into()),
+                ..Default::default()
+            };
+        }
+        let mut aggregate = TrackerAnnounceOutcome::default();
+        'tiers: for tier in tiers {
+            for url in tier {
+                let outcome = self
+                    .announce_trackers(info_hash, vec![url], uploaded, downloaded, left, event)
+                    .await;
+                let succeeded = outcome.ok;
+                merge_tracker_outcome(&mut aggregate, outcome);
+                if succeeded {
+                    break 'tiers;
+                }
+            }
+        }
+        dedupe_peers(&mut aggregate.peers);
+        aggregate
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1579,7 +1774,6 @@ impl TorrentEngine {
         downloaded: u64,
         left: u64,
         event: AnnounceEvent,
-        return_after_first_peers: bool,
     ) -> TrackerAnnounceOutcome {
         if trackers.is_empty() {
             return TrackerAnnounceOutcome {
@@ -1632,58 +1826,11 @@ impl TorrentEngine {
             });
         }
 
-        let mut drain_late_results = false;
-        loop {
-            let joined = if return_after_first_peers && !outcome.peers.is_empty() {
-                match timeout(TRACKER_ANNOUNCE_EARLY_RETURN_GRACE, tasks.join_next()).await {
-                    Ok(joined) => joined,
-                    Err(_) => {
-                        drain_late_results = true;
-                        break;
-                    }
-                }
-            } else {
-                tasks.join_next().await
-            };
-            let Some(joined) = joined else {
-                break;
-            };
+        while let Some(joined) = tasks.join_next().await {
             record_tracker_joined_result(&mut outcome, joined, announce_at);
-        }
-        if drain_late_results {
-            self.spawn_late_tracker_result_collector(tasks, announce_at);
         }
         dedupe_peers(&mut outcome.peers);
         outcome
-    }
-
-    fn spawn_late_tracker_result_collector(
-        &self,
-        mut tasks: tokio::task::JoinSet<(String, Result<tracker::AnnounceResponse>)>,
-        announce_at: u64,
-    ) {
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            let mut outcome = TrackerAnnounceOutcome::default();
-            while let Some(joined) = tasks.join_next().await {
-                record_tracker_joined_result(&mut outcome, joined, announce_at);
-            }
-            if outcome.tracker_results.is_empty() && outcome.failures == 0 {
-                return;
-            }
-            let mut state = state.lock().await;
-            for (url, result) in &outcome.tracker_results {
-                state.tracker_announces.insert(url.clone(), result.clone());
-            }
-            if outcome.ok {
-                state.tracker_last_ok = Some(Instant::now());
-            }
-            if outcome.failures > 0 {
-                state.tracker_failures_recent = state
-                    .tracker_failures_recent
-                    .saturating_add(outcome.failures);
-            }
-        });
     }
 
     async fn record_tracker_announce_outcome(&self, outcome: &TrackerAnnounceOutcome) {
@@ -1691,6 +1838,9 @@ impl TorrentEngine {
         s.tracker_ok = outcome.ok;
         s.tracker_message = outcome.message.clone();
         s.last_announce = Some(now_secs());
+        if let Some(interval) = outcome.interval_seconds {
+            s.tracker_interval_seconds = interval;
+        }
         for (url, result) in &outcome.tracker_results {
             s.tracker_announces.insert(url.clone(), result.clone());
         }
@@ -1791,7 +1941,6 @@ impl TorrentEngine {
                     } else {
                         AnnounceEvent::Empty
                     },
-                    false,
                 )
                 .await;
             self.record_tracker_announce_outcome(&outcome).await;
@@ -1876,12 +2025,19 @@ impl TorrentEngine {
     async fn load_or_recheck(&self, storage: &StorageIo) -> Result<PieceBitfield> {
         if let Some(resume) = storage.load_resume(&self.meta.info_hash).await? {
             let payload_bytes = storage.payload_bytes_on_disk().await?;
-            if self.sparse && !self.preallocate && payload_bytes != resume.bytes_completed {
+            let current_stamps = storage.resume_file_stamps().await?;
+            let stamps_match = !resume.file_stamps.is_empty()
+                && resume.file_stamps.len() == current_stamps.len()
+                && resume.file_stamps == current_stamps;
+            let sparse_bytes_mismatch =
+                self.sparse && !self.preallocate && payload_bytes != resume.bytes_completed;
+            if sparse_bytes_mismatch || !stamps_match {
                 tracing::info!(
                     info_hash = %self.meta.info_hash,
                     payload_bytes,
                     resume_bytes_completed = resume.bytes_completed,
-                    "fast resume byte count differs from on-disk payload; rechecking storage"
+                    stamps_match,
+                    "fast resume does not match on-disk payload; rechecking storage"
                 );
                 storage.recheck().await
             } else {
@@ -1915,12 +2071,29 @@ impl TorrentEngine {
         Ok(())
     }
 
+    async fn finish_selection(&self, storage: &StorageIo, have: &PieceBitfield) -> Result<()> {
+        if have.count(self.meta.piece_count()) == self.meta.piece_count() {
+            let final_storage = if storage.base_dir() == self.complete_dir.as_path() {
+                storage.clone()
+            } else {
+                self.complete_storage(storage).await?
+            };
+            self.finish_without_resume(&final_storage).await
+        } else {
+            // A selected-file download is complete without claiming pieces
+            // that were intentionally skipped. Keep its resume metadata and
+            // active-root data so changing the selection can continue later.
+            self.mark_finished().await;
+            self.persist_resume(storage, have).await
+        }
+    }
+
     async fn persist_resume(&self, storage: &StorageIo, have: &PieceBitfield) -> Result<()> {
         let piece_byte_lengths: Vec<u64> = (0..self.meta.piece_count())
             .map(|i| self.piece_length(i))
             .collect();
         let s = self.state.lock().await;
-        let resume = swarmotter_core::storage::io::build_resume(
+        let mut resume = swarmotter_core::storage::io::build_resume_with_wanted(
             self.meta.info_hash,
             self.meta.name.clone(),
             have.clone(),
@@ -1931,10 +2104,12 @@ impl TorrentEngine {
             Some(storage.base_dir().display().to_string()),
             now_secs(),
             if s.finished { Some(now_secs()) } else { None },
-            &vec![swarmotter_core::models::torrent::FilePriority::Normal; self.meta.files.len()],
+            &self.file_priorities,
+            &self.wanted,
             &piece_byte_lengths,
         );
         drop(s);
+        resume.file_stamps = storage.resume_file_stamps().await?;
         storage.save_resume(&resume).await?;
         Ok(())
     }
@@ -1988,6 +2163,16 @@ fn record_tracker_joined_result(
 ) {
     match joined {
         Ok((url, Ok(resp))) => {
+            let effective_interval = resp
+                .interval
+                .max(resp.min_interval.unwrap_or(0))
+                .clamp(30, 86_400);
+            outcome.interval_seconds = Some(
+                outcome
+                    .interval_seconds
+                    .unwrap_or(0)
+                    .max(effective_interval),
+            );
             if let Some(fr) = resp.failure_reason {
                 let aggregate = format!("{url}: {fr}");
                 outcome.failures = outcome.failures.saturating_add(1);
@@ -2072,6 +2257,26 @@ fn record_tracker_joined_result(
                 outcome.message = Some(format!("tracker announce task failed: {e}"));
             }
         }
+    }
+}
+
+fn merge_tracker_outcome(
+    aggregate: &mut TrackerAnnounceOutcome,
+    mut outcome: TrackerAnnounceOutcome,
+) {
+    aggregate.ok |= outcome.ok;
+    aggregate.failures = aggregate.failures.saturating_add(outcome.failures);
+    aggregate.peers.append(&mut outcome.peers);
+    aggregate.tracker_results.extend(outcome.tracker_results);
+    if let Some(interval) = outcome.interval_seconds {
+        aggregate.interval_seconds = Some(
+            aggregate
+                .interval_seconds
+                .map_or(interval, |current| current.min(interval)),
+        );
+    }
+    if outcome.ok || aggregate.message.is_none() {
+        aggregate.message = outcome.message;
     }
 }
 
@@ -2863,6 +3068,7 @@ struct ParallelPieceState {
     reserved: HashSet<usize>,
     availability: Vec<u16>,
     peer_pieces: HashMap<SocketAddr, Bitfield>,
+    selection: PieceSelection,
 }
 
 /// Compute a stable shard offset in `[0, piece_count)` for a peer's
@@ -2899,12 +3105,13 @@ fn piece_shard(peer_addr: SocketAddr, piece_count: usize) -> usize {
 }
 
 impl ParallelPieceState {
-    fn new(have: PieceBitfield, piece_count: usize) -> Self {
+    fn new(have: PieceBitfield, piece_count: usize, selection: PieceSelection) -> Self {
         Self {
             have,
             reserved: HashSet::new(),
             availability: vec![0; piece_count],
             peer_pieces: HashMap::new(),
+            selection,
         }
     }
 
@@ -2967,14 +3174,24 @@ impl ParallelPieceState {
         let shard = piece_shard(peer_addr, piece_count);
         let piece = (0..piece_count)
             .map(|offset| (shard + offset) % piece_count)
-            .filter(|&i| peer_bf.has(i) && !self.have.has(i) && !self.reserved.contains(&i))
-            .min_by_key(|&i| self.availability.get(i).copied().unwrap_or(0).max(1))?;
+            .filter(|&i| {
+                self.selection.includes(i)
+                    && peer_bf.has(i)
+                    && !self.have.has(i)
+                    && !self.reserved.contains(&i)
+            })
+            .min_by_key(|&i| {
+                (
+                    std::cmp::Reverse(self.selection.priority(i)),
+                    self.availability.get(i).copied().unwrap_or(0).max(1),
+                )
+            })?;
         self.reserved.insert(piece);
         Some(piece)
     }
 
     fn peer_has_missing_piece(&self, peer_bf: &Bitfield, piece_count: usize) -> bool {
-        (0..piece_count).any(|i| peer_bf.has(i) && !self.have.has(i))
+        (0..piece_count).any(|i| self.selection.includes(i) && peer_bf.has(i) && !self.have.has(i))
     }
 
     fn release_piece(&mut self, piece: usize) {
@@ -2992,6 +3209,7 @@ async fn endgame_peer_session(
     binder: Arc<dyn NetworkBinder>,
     peer_addr: PeerAddr,
     meta: TorrentMeta,
+    selection: PieceSelection,
     peer_id: [u8; 20],
     shared_have: Arc<Mutex<PieceBitfield>>,
     outstanding: Arc<Mutex<swarmotter_core::endgame::OutstandingRequests>>,
@@ -3047,7 +3265,7 @@ async fn endgame_peer_session(
         // Already complete?
         let complete = {
             let have = shared_have.lock().await;
-            have.count(piece_count) == piece_count
+            selection.complete(&have)
         };
         if complete {
             break;
@@ -3062,7 +3280,9 @@ async fn endgame_peer_session(
                     Some(b) => b,
                     None => return Ok(progressed),
                 };
-                (0..piece_count).find(|&i| bf.has(i) && !have.has(i))
+                (0..piece_count)
+                    .filter(|&i| selection.includes(i) && bf.has(i) && !have.has(i))
+                    .max_by_key(|&i| selection.priority(i))
             };
             let Some(piece_index) = candidate else {
                 // Nothing this peer can give us right now.
@@ -3497,7 +3717,11 @@ where
         let work = shared.lock().await;
         let mut count = 0usize;
         for i in 0..piece_count {
-            if peer_bf.has(i) && !work.have.has(i) && !work.reserved.contains(&i) {
+            if work.selection.includes(i)
+                && peer_bf.has(i)
+                && !work.have.has(i)
+                && !work.reserved.contains(&i)
+            {
                 count += 1;
             }
         }
@@ -3635,7 +3859,7 @@ async fn parallel_peer_session(
         }
         let complete = {
             let work = shared.lock().await;
-            work.have.count(piece_count) == piece_count
+            work.selection.complete(&work.have)
         };
         if complete {
             no_progress_reason = "torrent_complete";
@@ -4086,7 +4310,7 @@ async fn update_progress_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use swarmotter_core::meta::build_single_file_torrent;
+    use swarmotter_core::meta::{build_multi_file_torrent, build_single_file_torrent};
 
     fn unique_dir(label: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -4100,6 +4324,39 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn piece_selection_skips_unwanted_files_and_completes_selected_set() {
+        let files = vec![(vec!["a.bin".into()], 4), (vec!["b.bin".into()], 4)];
+        let contents: Vec<&[u8]> = vec![b"aaaa", b"bbbb"];
+        let bytes = build_multi_file_torrent("selection", &files, &contents, 4, None);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let selection = PieceSelection::from_files(
+            &meta,
+            &[FilePriority::Normal, FilePriority::High],
+            &[false, true],
+        );
+        assert!(!selection.includes(0));
+        assert!(selection.includes(1));
+        let mut have = PieceBitfield::new(meta.piece_count());
+        assert!(!selection.complete(&have));
+        have.set(1);
+        assert!(selection.complete(&have));
+    }
+
+    #[test]
+    fn selected_file_includes_cross_file_boundary_piece() {
+        let files = vec![(vec!["a.bin".into()], 2), (vec!["b.bin".into()], 2)];
+        let contents: Vec<&[u8]> = vec![b"aa", b"bb"];
+        let bytes = build_multi_file_torrent("boundary", &files, &contents, 4, None);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let selection = PieceSelection::from_files(
+            &meta,
+            &[FilePriority::Normal, FilePriority::High],
+            &[false, true],
+        );
+        assert!(selection.includes(0));
     }
 
     #[test]
@@ -4170,6 +4427,38 @@ mod tests {
         );
         assert_eq!(engine.piece_length(0), 8);
         assert_eq!(engine.piece_length(1), 8);
+    }
+
+    #[tokio::test]
+    async fn tracker_refresh_respects_the_announced_interval() {
+        let bytes = build_single_file_torrent(
+            "tracker-interval.bin",
+            b"tracker interval payload",
+            8,
+            Some("http://127.0.0.1:1/announce"),
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let state = Arc::new(Mutex::new(EngineState {
+            last_announce: Some(now_secs()),
+            tracker_interval_seconds: 3_600,
+            ..EngineState::default()
+        }));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let engine = TorrentEngine::new(
+            meta,
+            PathBuf::from("/tmp"),
+            [0u8; 20],
+            Arc::new(swarmotter_core::net::binder::LoopbackBinder),
+            state.clone(),
+            rx,
+            vec![],
+            6881,
+        );
+
+        assert!(!engine.tracker_announce_due().await);
+        state.lock().await.last_announce = Some(now_secs().saturating_sub(3_601));
+        assert!(engine.tracker_announce_due().await);
     }
 
     #[test]
@@ -4395,7 +4684,7 @@ mod tests {
     #[test]
     fn parallel_piece_state_prefers_rarest_available_piece() {
         let have = PieceBitfield::new(3);
-        let mut state = ParallelPieceState::new(have, 3);
+        let mut state = ParallelPieceState::new(have, 3, PieceSelection::all_count(3));
         let peer_a: SocketAddr = "127.0.0.1:6001".parse().unwrap();
         let peer_b: SocketAddr = "127.0.0.2:6002".parse().unwrap();
 
@@ -4431,7 +4720,7 @@ mod tests {
         // that prevents one fast peer from monopolising all pieces when its
         // piece window is wider than the remaining piece count.
         let have = PieceBitfield::new(8);
-        let mut state = ParallelPieceState::new(have, 8);
+        let mut state = ParallelPieceState::new(have, 8, PieceSelection::all_count(8));
         let peer_a: SocketAddr = "127.0.0.1:7001".parse().unwrap();
         let peer_b: SocketAddr = "127.0.0.1:7002".parse().unwrap();
 
@@ -4594,6 +4883,56 @@ mod tests {
         assert!(!recovered.has(1));
         assert!(!recovered.has(2));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn same_size_external_payload_change_invalidates_fast_resume() {
+        let payload = b"abcdefgh";
+        let bytes = build_single_file_torrent("same-size.bin", payload, 8, None, false);
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("same-size-resume");
+        let storage = StorageIo::new(meta.clone(), dir.clone());
+        storage.write_piece(0, payload).await.unwrap();
+        let mut have = PieceBitfield::new(1);
+        have.set(0);
+        let mut resume = swarmotter_core::storage::io::build_resume(
+            meta.info_hash,
+            meta.name.clone(),
+            have,
+            1,
+            0,
+            0,
+            meta.total_length,
+            Some(dir.display().to_string()),
+            now_secs(),
+            None,
+            &[FilePriority::Normal],
+            &[8],
+        );
+        resume.file_stamps = storage.resume_file_stamps().await.unwrap();
+        storage.save_resume(&resume).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::fs::write(storage.file_path(0).unwrap(), b"XXXXXXXX")
+            .await
+            .unwrap();
+
+        let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let engine = TorrentEngine::new(
+            meta,
+            dir.clone(),
+            [0u8; 20],
+            binder,
+            state,
+            rx,
+            vec![],
+            6881,
+        )
+        .with_preallocate(false);
+        let recovered = engine.load_or_recheck(&storage).await.unwrap();
+        assert!(!recovered.has(0));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

@@ -50,6 +50,72 @@ pub struct MetaFile {
 }
 
 impl TorrentMeta {
+    /// Validate invariants that parsing normally establishes. Durable daemon
+    /// state calls this after deserialization so crafted or corrupted state
+    /// cannot bypass metainfo safety checks.
+    pub fn validate(&self) -> Result<()> {
+        if self.name.is_empty() {
+            return Err(CoreError::MalformedTorrent("empty torrent name".into()));
+        }
+        validate_path_component(&self.name, "torrent name")?;
+        if self.piece_length == 0 {
+            return Err(CoreError::MalformedTorrent(
+                "piece length must be greater than zero".into(),
+            ));
+        }
+        if self.files.is_empty() {
+            return Err(CoreError::MalformedTorrent(
+                "torrent must contain at least one file".into(),
+            ));
+        }
+        if !self.is_multi_file && self.files.len() != 1 {
+            return Err(CoreError::MalformedTorrent(
+                "single-file torrent must contain exactly one file".into(),
+            ));
+        }
+
+        let mut total = 0u64;
+        let mut paths = std::collections::HashSet::with_capacity(self.files.len());
+        for file in &self.files {
+            if file.path.is_empty() {
+                return Err(CoreError::MalformedTorrent("file with empty path".into()));
+            }
+            for component in &file.path {
+                validate_path_component(component, "file path component")?;
+            }
+            if !paths.insert(file.path.clone()) {
+                return Err(CoreError::MalformedTorrent(format!(
+                    "duplicate file path: {}",
+                    file.path.join("/")
+                )));
+            }
+            total = total.checked_add(file.length).ok_or_else(|| {
+                CoreError::MalformedTorrent("total file length exceeds u64".into())
+            })?;
+        }
+        if total != self.total_length {
+            return Err(CoreError::MalformedTorrent(format!(
+                "file lengths total {total} does not match recorded length {}",
+                self.total_length
+            )));
+        }
+        let expected_pieces_u64 = if total == 0 {
+            1
+        } else {
+            total.div_ceil(self.piece_length)
+        };
+        let expected_pieces = usize::try_from(expected_pieces_u64).map_err(|_| {
+            CoreError::MalformedTorrent("piece count exceeds platform limits".into())
+        })?;
+        if self.pieces.len() != expected_pieces {
+            return Err(CoreError::MalformedTorrent(format!(
+                "piece count {} does not match expected {expected_pieces}",
+                self.pieces.len()
+            )));
+        }
+        Ok(())
+    }
+
     /// Number of pieces.
     pub fn piece_count(&self) -> usize {
         self.pieces.len()
@@ -166,8 +232,8 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta> {
             // single-file: length is directly in the info dict.
             let length = length_v
                 .as_int()
-                .ok_or_else(|| CoreError::MalformedTorrent("'length' must be an integer".into()))?
-                as u64;
+                .ok_or_else(|| CoreError::MalformedTorrent("'length' must be an integer".into()))?;
+            let length = non_negative_length(length, "'length'")?;
             (
                 vec![MetaFile {
                     path: vec![name.clone()],
@@ -183,12 +249,13 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta> {
                 .ok_or_else(|| CoreError::MalformedTorrent("'files' must be a list".into()))?;
             let mut total = 0u64;
             let mut out = Vec::with_capacity(list.len());
+            let mut paths = std::collections::HashSet::with_capacity(list.len());
             for f in list {
                 let length = f
                     .get(b"length")
                     .and_then(Value::as_int)
-                    .ok_or_else(|| CoreError::MalformedTorrent("file missing length".into()))?
-                    as u64;
+                    .ok_or_else(|| CoreError::MalformedTorrent("file missing length".into()))?;
+                let length = non_negative_length(length, "file length")?;
                 let path_vals = f
                     .get(b"path")
                     .and_then(Value::as_list)
@@ -204,7 +271,15 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta> {
                 if path_vals.is_empty() {
                     return Err(CoreError::MalformedTorrent("file with empty path".into()));
                 }
-                total += length;
+                if !paths.insert(full_path.clone()) {
+                    return Err(CoreError::MalformedTorrent(format!(
+                        "duplicate file path: {}",
+                        full_path.join("/")
+                    )));
+                }
+                total = total.checked_add(length).ok_or_else(|| {
+                    CoreError::MalformedTorrent("total file length exceeds u64".into())
+                })?;
                 out.push(MetaFile {
                     path: full_path,
                     length,
@@ -218,11 +293,13 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta> {
         };
 
     // Validate piece count matches total length within one piece.
-    let expected_pieces = if total_length == 0 {
-        1
+    let expected_pieces_u64 = if total_length == 0 {
+        1u64
     } else {
-        total_length.div_ceil(piece_length) as usize
+        total_length.div_ceil(piece_length)
     };
+    let expected_pieces = usize::try_from(expected_pieces_u64)
+        .map_err(|_| CoreError::MalformedTorrent("piece count exceeds platform limits".into()))?;
     if pieces.len() != expected_pieces {
         return Err(CoreError::MalformedTorrent(format!(
             "piece count {} does not match expected {} for length {}",
@@ -287,6 +364,11 @@ fn get_int(dict: &[(Vec<u8>, Value)], key: &[u8]) -> Option<i64> {
     dict.iter()
         .find(|(k, _)| k == key)
         .and_then(|(_, v)| v.as_int())
+}
+
+fn non_negative_length(value: i64, field: &str) -> Result<u64> {
+    u64::try_from(value)
+        .map_err(|_| CoreError::MalformedTorrent(format!("{field} must not be negative")))
 }
 
 fn parse_url_list(dict: &[(Vec<u8>, Value)]) -> Vec<String> {
@@ -525,6 +607,30 @@ fn write_int(out: &mut Vec<u8>, n: u64) {
 mod tests {
     use super::*;
 
+    fn raw_single_file_torrent_with_length(length: i64) -> Vec<u8> {
+        let mut out = b"d4:infod6:lengthi".to_vec();
+        out.extend_from_slice(length.to_string().as_bytes());
+        out.extend_from_slice(b"e4:name1:f12:piece lengthi8e6:pieces20:");
+        out.extend_from_slice(&[0u8; 20]);
+        out.extend_from_slice(b"ee");
+        out
+    }
+
+    fn raw_multi_file_torrent_with_lengths(lengths: &[i64]) -> Vec<u8> {
+        let mut out = b"d4:infod5:filesl".to_vec();
+        for (index, length) in lengths.iter().enumerate() {
+            out.extend_from_slice(b"d6:lengthi");
+            out.extend_from_slice(length.to_string().as_bytes());
+            out.extend_from_slice(b"e4:pathl");
+            write_str(&mut out, format!("file-{index}").as_bytes());
+            out.extend_from_slice(b"ee");
+        }
+        out.extend_from_slice(b"e4:name3:dir12:piece lengthi8e6:pieces20:");
+        out.extend_from_slice(&[0u8; 20]);
+        out.extend_from_slice(b"ee");
+        out
+    }
+
     #[test]
     fn parses_single_file_torrent() {
         let content = b"hello swarmotter world data payload here";
@@ -605,6 +711,31 @@ mod tests {
     fn rejects_bad_torrent() {
         assert!(parse_torrent(b"not bencode").is_err());
         assert!(parse_torrent(b"d4:name3:fooe").is_err());
+    }
+
+    #[test]
+    fn rejects_negative_single_and_multi_file_lengths() {
+        let single = parse_torrent(&raw_single_file_torrent_with_length(-1)).unwrap_err();
+        assert!(single.to_string().contains("must not be negative"));
+
+        let multi = parse_torrent(&raw_multi_file_torrent_with_lengths(&[-1])).unwrap_err();
+        assert!(multi.to_string().contains("must not be negative"));
+    }
+
+    #[test]
+    fn rejects_total_file_length_overflow() {
+        let torrent = raw_multi_file_torrent_with_lengths(&[i64::MAX, i64::MAX, i64::MAX]);
+        let error = parse_torrent(&torrent).unwrap_err();
+        assert!(error.to_string().contains("total file length exceeds u64"));
+    }
+
+    #[test]
+    fn rejects_duplicate_multi_file_paths() {
+        let files = vec![(vec!["same.bin".into()], 1), (vec!["same.bin".into()], 1)];
+        let contents: Vec<&[u8]> = vec![b"a", b"b"];
+        let torrent = build_multi_file_torrent("dir", &files, &contents, 2, None);
+        let error = parse_torrent(&torrent).unwrap_err();
+        assert!(error.to_string().contains("duplicate file path"));
     }
 
     #[test]
@@ -698,6 +829,20 @@ mod tests {
             meta.webseeds,
             vec!["http://127.0.0.1/files/f", "https://webseed.example/data/f"]
         );
+    }
+
+    #[test]
+    fn deserialized_metadata_validation_rejects_broken_invariants() {
+        let bytes = build_single_file_torrent("state.bin", b"state payload", 8, None, false);
+        let mut meta = parse_torrent(&bytes).unwrap();
+        assert!(meta.validate().is_ok());
+
+        meta.total_length += 1;
+        assert!(meta.validate().is_err());
+
+        let mut meta = parse_torrent(&bytes).unwrap();
+        meta.files[0].path = vec!["..".into()];
+        assert!(meta.validate().is_err());
     }
 
     fn string_value(value: &[u8]) -> Vec<u8> {

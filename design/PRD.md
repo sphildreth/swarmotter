@@ -493,6 +493,8 @@ validate_dns = true
 
 [api]
 bind_address = "0.0.0.0:9091"
+require_auth = true
+auth_token = "replace-with-a-long-random-token"
 
 [torrent]
 listen_port = 51413

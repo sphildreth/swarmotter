@@ -14,6 +14,7 @@ mod metadata;
 mod netbinder;
 mod runtime;
 mod seeder;
+mod state_store;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,6 +33,10 @@ struct Args {
     /// Path to the configuration file.
     #[arg(short, long, env = "SWARMOTTER_CONFIG")]
     config: Option<PathBuf>,
+
+    /// Path to the durable torrent and queue state file.
+    #[arg(long, env = "SWARMOTTER_STATE_FILE")]
+    state_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -76,13 +81,16 @@ async fn main() -> Result<()> {
 
     let max_request_body_bytes = config.api.max_request_body_bytes;
     let broker = swarmotter_api::handlers::events::EventBroker::default();
-    let runtime = Arc::new(daemon::DaemonRuntime::with_paths_and_broker(
+    let state_file = args.state_file.clone().unwrap_or_else(default_state_file);
+    let runtime = Arc::new(daemon::DaemonRuntime::with_paths_broker_and_state(
         config.clone(),
         health,
         args.config.clone(),
         log_file,
+        Some(state_file.clone()),
         broker.clone(),
     ));
+    runtime.restore_persisted_state().await?;
 
     let state = Arc::new(AppState {
         daemon: runtime.clone(),
@@ -156,8 +164,28 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| swarmotter_core::error::CoreError::Internal(format!("server error: {e}")))?;
 
+    runtime.shutdown().await?;
     tracing::info!("swarmotterd stopped");
     Ok(())
+}
+
+fn default_state_file() -> PathBuf {
+    if let Some(directory) = std::env::var_os("STATE_DIRECTORY") {
+        if let Some(first) = std::env::split_paths(&directory).next() {
+            return first.join("state.json");
+        }
+    }
+    let packaged = PathBuf::from("/var/lib/swarmotter");
+    if packaged.is_dir() {
+        return packaged.join("state.json");
+    }
+    if let Some(directory) = std::env::var_os("XDG_STATE_HOME") {
+        return PathBuf::from(directory).join("swarmotter/state.json");
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home).join(".local/state/swarmotter/state.json");
+    }
+    PathBuf::from("swarmotter-state.json")
 }
 
 async fn shutdown_signal() {

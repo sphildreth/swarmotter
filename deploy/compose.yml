@@ -28,10 +28,14 @@ services:
     environment:
       SWARMOTTER_API__AUTH_TOKEN: ${SWARMOTTER_API_TOKEN:?set SWARMOTTER_API_TOKEN in deploy/.env}
     volumes:
-      - "${SWARMOTTER_CONFIG:-/srv/swarmotter/config/swarmotter.toml}:/etc/swarmotter/swarmotter.toml:ro"
+      - "${SWARMOTTER_CONFIG_DIR:-/srv/swarmotter/config}:/etc/swarmotter"
       - "${SWARMOTTER_DOWNLOADS:-/srv/swarmotter/downloads}:/data/downloads"
       - "${SWARMOTTER_INCOMPLETE:-/srv/swarmotter/incomplete}:/data/incomplete"
       - "${SWARMOTTER_STATE:-/srv/swarmotter/state}:/var/lib/swarmotter"
     security_opt:
       - no-new-privileges:true
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     restart: unless-stopped

@@ -80,14 +80,7 @@ curl -X POST http://127.0.0.1:9091/api/v1/torrents/file \
 ## LAN access
 
 To reach the Web UI from another machine on your LAN, bind the control plane to
-all IPv4 addresses:
-
-```toml
-[api]
-bind_address = "0.0.0.0:9091"
-```
-
-When exposing the API or Web UI off localhost, enable authentication:
+all IPv4 addresses and enable authentication:
 
 ```toml
 [api]

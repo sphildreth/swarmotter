@@ -17,14 +17,14 @@ pub use diagnostics::{
     check_storage_preflight, inspect_storage_root, required_free_space_bytes, StoragePreflight,
     StorageRootUsage,
 };
-pub use io::StorageIo;
+pub use io::{StorageIo, StoragePathOwnership};
 pub use layout::{FileLayout, FileSlice, StorageLayout};
 pub use resume::{FastResume, PieceBitfield};
 
 use crate::meta::TorrentMeta;
 
 /// A piece bitset tracking which pieces have been verified on disk.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PieceProgress {
     bitfield: PieceBitfield,
     pub total: usize,
@@ -55,6 +55,10 @@ impl PieceProgress {
 
     pub fn pieces_have(&self) -> usize {
         self.have_count
+    }
+
+    pub fn bitfield(&self) -> &PieceBitfield {
+        &self.bitfield
     }
 
     pub fn is_complete(&self) -> bool {

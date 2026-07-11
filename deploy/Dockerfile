@@ -22,7 +22,7 @@ FROM debian:bookworm-slim AS runtime-base
 
 ARG SWARMOTTER_BUILD_COMMIT=unknown
 ARG SWARMOTTER_IMAGE_CREATED=unknown
-ARG SWARMOTTER_VERSION=1.2.2
+ARG SWARMOTTER_VERSION=1.3.0
 
 LABEL org.opencontainers.image.title="SwarmOtter" \
       org.opencontainers.image.description="SwarmOtter BitTorrent daemon and web UI" \
@@ -34,19 +34,20 @@ LABEL org.opencontainers.image.title="SwarmOtter" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl iproute2 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 swarmotter \
     && useradd --system --uid 10001 --gid swarmotter --home-dir /var/lib/swarmotter --shell /usr/sbin/nologin swarmotter \
-    && install -d -o swarmotter -g swarmotter /etc/swarmotter /var/lib/swarmotter /data/downloads /data/incomplete
+    && install -d -m 0700 -o swarmotter -g swarmotter /etc/swarmotter \
+    && install -d -o swarmotter -g swarmotter /var/lib/swarmotter /data/downloads /data/incomplete
 
-COPY --chown=root:root config/swarmotter.container.toml.example /etc/swarmotter/swarmotter.toml
+COPY --chown=swarmotter:swarmotter --chmod=0600 config/swarmotter.container.toml.example /etc/swarmotter/swarmotter.toml
 
-VOLUME ["/data/downloads", "/data/incomplete", "/var/lib/swarmotter"]
+VOLUME ["/etc/swarmotter", "/data/downloads", "/data/incomplete", "/var/lib/swarmotter"]
 EXPOSE 9091
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl -fsS http://127.0.0.1:9091/health >/dev/null || exit 1
 USER swarmotter:swarmotter
-ENTRYPOINT ["/usr/local/bin/swarmotterd"]
+ENTRYPOINT ["/bin/sh", "-c", "umask 077; exec /usr/local/bin/swarmotterd \"$@\"", "swarmotter-entrypoint"]
 CMD ["--config", "/etc/swarmotter/swarmotter.toml"]
 
 FROM runtime-base AS runtime-prebuilt

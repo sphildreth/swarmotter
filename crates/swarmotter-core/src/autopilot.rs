@@ -37,6 +37,7 @@ pub enum AutopilotMode {
 /// Top-level autopilot settings exposed from config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct AutopilotConfig {
     #[serde(default)]
     pub mode: AutopilotMode,

@@ -246,9 +246,10 @@ UDP socket (see ADR-0020).
 
 - [x] Torrent list
 - [x] Add magnet / upload torrent
-- [x] Torrent details (files, peers, trackers)
-- [x] Queue controls
-- [x] Bandwidth controls
+- [x] Torrent details (activity, files, peers, trackers; file rename and tracker
+      add/edit/remove controls)
+- [x] Queue controls (start-now, stop, and move top/up/down/bottom in details)
+- [x] Bandwidth controls (global settings and per-torrent limits in details)
 - [x] Ratio/seeding controls (via settings)
 - [x] Settings
 - [x] Network/VPN health
@@ -329,8 +330,8 @@ data-plane capabilities are implemented.
 Platform-specific `InterfaceProbe` OS-level enumeration (getifaddrs) and DNS
 enforcement are abstracted; the abstraction enforces fail-closed correctly by
 surfacing `interface_missing`/`dns_not_constrained` in strict mode when the
-OS probe cannot confirm the path. The remaining `[~]` item below is an
-honest platform-coverage limitation, not a missing capability.
+OS probe cannot confirm the path. The platform-coverage limitation is
+documented below; no required capability remains marked in progress.
 
 ## Test Status
 
@@ -339,7 +340,12 @@ honest platform-coverage limitation, not a missing capability.
 | `cargo fmt --all -- --check` | pass |
 | `cargo check --workspace --all-targets --all-features` | pass |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass (no warnings) |
-| `cargo test --all --all-features` | pass (core 216 unit including webseed metadata/range/health tests + engine/daemon/seeder/dht/utp/endgame/bandwidth/metadata/tls/containment/api/web + 14 local swarm including webseed and active-download health + 4 daemon download) |
+| `cargo test --all --all-features` | pass (294 core unit tests, 51 API unit tests, 50 API integration tests, 25 Web tests, plus daemon and generated local-swarm suites) |
+| `cargo +1.88.0 check --locked --workspace --all-targets --all-features` | pass |
+| `node --check crates/swarmotter-web/assets/theme-bootstrap.js` | pass |
+| `node --check crates/swarmotter-web/assets/app.js` | pass |
+| `docker compose --env-file deploy/.env.example -f deploy/compose.yml config` | pass with `GLUETUN_ENV_FILE=gluetun.env.example` |
+| `mdbook build` | pass |
 | local swarm download (HTTP tracker + direct peer) | pass |
 | local swarm download (UDP tracker, BEP 15) | pass |
 | local swarm seeding (inbound Seeder serves completed download) | pass |
@@ -375,6 +381,13 @@ honest platform-coverage limitation, not a missing capability.
 - ADR-0021: Selfish completion policy
 - ADR-0022: API auth and contained resolution hardening
 - ADR-0023: Interface-bound containment for dynamic addresses
+- ADR-0025: Runtime diagnostics and atomic configuration replacement
+- ADR-0032: Linux release artifact strategy
+- ADR-0044: Browser origin and loopback API security
+- ADR-0045: Versioned durable daemon state
+- ADR-0046: Shared inbound peer listener
+- ADR-0047: Transactional live data-plane reconfiguration
+- ADR-0048: File selection drives piece scheduling
 
 ## Notes
 
@@ -404,7 +417,6 @@ above.
   DNS mechanisms may still require a container / network namespace /
   VPN-routed path, or IP-literal peers/trackers, so the daemon can fail closed
   instead of using an unconstrained resolver.
-  so the daemon's DNS follows the contained route.
 - **Outbound upload-slot rotation (optimistic unchoke):** choking/unchoking
   (a required `v1.0.0` capability) is implemented and tested in both
   directions. The optional fairness algorithm that rotates an upload slot to

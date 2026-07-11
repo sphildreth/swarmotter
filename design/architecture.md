@@ -34,12 +34,15 @@ SwarmOtter is a Rust async daemon with these layers:
   that consumes the same API exposed to external automation (see ADR-0006).
   Assets are embedded at compile time.
 - **Daemon** (`swarmotterd`): owns torrent state, networking, disk I/O,
-  queueing, settings, and lifecycle. Implements `DaemonOps`, wires the API +
-  Web UI into a single `axum::serve`, runs the network health monitor and
-  watch-folder scanner, and spawns the live `TorrentEngine` task per active
-  torrent (`swarmotterd::engine`) plus an inbound `Seeder` listener
-  (`swarmotterd::seeder`) for serving verified pieces to inbound peers, both
-  reconciling real engine state into torrent summaries (see ADR-0016).
+  queueing, settings, durable registry state, and lifecycle. Implements
+  `DaemonOps`, wires the API + Web UI into a single `axum::serve`, runs the
+  network health monitor and watch-folder scanner, and spawns the live
+  `TorrentEngine` task per active torrent (`swarmotterd::engine`). A single
+  process-wide `SeederHub` (`swarmotterd::seeder`) owns the contained inbound
+  peer listener, routes plaintext and encrypted handshakes to registered
+  torrents, and owns every accepted peer session. Engine state is reconciled
+  into torrent summaries and a versioned state file preserves torrent and
+  queue state across restarts (see ADR-0016, ADR-0045, and ADR-0046).
 - **Per-torrent health** (`swarmotter-core::models::health`): a deterministic
   calculator that turns live engine state (piece availability, peer
   usefulness, throughput, recent stability, discovery) into a `TorrentHealth`
@@ -77,9 +80,24 @@ unavailable while the control plane stays available.
 1. A client (Web UI or external script) calls `/api/v1/...`.
 2. The handler parses the request and calls the `DaemonOps` implementation.
 3. The daemon mutates its torrent registry and enforces network containment.
-4. The daemon publishes events via the `EventBroker` to SSE/WebSocket
+4. Durable mutations atomically checkpoint the torrent registry and queue.
+5. The daemon publishes events via the `EventBroker` to SSE/WebSocket
    subscribers.
-5. The handler returns the standard `{ success, data, error }` envelope.
+6. The handler returns the standard `{ success, data, error }` envelope.
+
+## Runtime ownership and reconfiguration
+
+The daemon owns and awaits every torrent data-plane task: engines, tracker
+announce sidecars, DHT work, the shared inbound listener, and accepted inbound
+peer sessions. Network, listen-port, IP-family, uTP, encryption, or DHT changes
+stop the complete old task set before the new configuration is installed and
+eligible torrents are reconciled with fresh binders. This prevents a task from
+retaining an obsolete containment policy (ADR-0047).
+
+File wanted flags and priorities are converted into a shared piece-selection
+map used by peer, endgame, and webseed paths. Only a full verified piece set is
+promoted to completed storage. Partial and selected-file seeders advertise only
+their verified bitfield and read from active storage (ADR-0048).
 
 ## Constraints
 

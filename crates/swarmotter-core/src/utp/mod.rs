@@ -5,7 +5,7 @@
 //! This module implements a production-grade uTP transport:
 //!
 //! - Full uTP packet header encode/decode per BEP 29 (20-byte header: type +
-//!   extension, version, connection id, timestamps, window size, seq/ack).
+//!   version, extension, connection id, timestamps, window size, seq/ack).
 //! - Extension parsing and the Selective ACK (SACK) extension encode/decode.
 //! - The full connection lifecycle: SYN/STATE/DATA/FIN/RESET, connection-id
 //!   assignment and validation, duplicate/out-of-order handling, in-order
@@ -30,7 +30,7 @@ pub mod sack;
 pub mod stream;
 
 pub use congestion::{CongestionState, Ledbat};
-pub use header::{now_micros, UtpHeader, UtpType, UTP_VERSION};
+pub use header::{now_micros, UtpExtension, UtpHeader, UtpType, UTP_VERSION};
 pub use sack::Sack;
 pub use stream::{connect_peer_stream, PeerDuplex, PeerTransport, UtpStream};
 
@@ -116,6 +116,8 @@ pub struct UtpConnection {
     /// Our advertised receive window (bytes), updated as the read buffer
     /// fills/drains.
     recv_window: u32,
+    /// Receive window most recently advertised by the peer.
+    peer_window: u32,
     /// In-order delivered-but-unread bytes (the readable byte stream).
     recv_buf: VecDeque<u8>,
     /// Out-of-order received bytes held for SACK-driven reassembly, keyed by
@@ -170,18 +172,16 @@ impl UtpConnection {
     pub async fn connect(binder: &dyn crate::net::NetworkBinder, peer: SocketAddr) -> Result<Self> {
         let socket: std::sync::Arc<dyn crate::net::ContainedUdpSocket> =
             binder.udp_socket_for(Some(peer)).await?.into();
-        let send_conn_id: u16 = rand_conn_id();
-        // Per BEP 29: the SYN carries the *receive* connection id the sender
-        // wants the responder to use (= send_conn_id + 1), and the responder
-        // replies with send_conn_id as its own send id.
-        let syn_recv_id = send_conn_id.wrapping_add(1);
+        // Per BEP 29, the SYN and responder-to-initiator packets use the random
+        // connection id. Initiator-to-responder DATA/STATE/FIN use id + 1.
+        let syn_conn_id: u16 = rand_conn_id();
         let seq = 1u16;
         let now_ts = now_micros();
         let syn = UtpHeader {
             typ: UtpType::Syn,
             version: UTP_VERSION,
             extension: 0,
-            connection_id: syn_recv_id,
+            connection_id: syn_conn_id,
             timestamp_micros: now_ts,
             timestamp_delta_micros: 0,
             window_size: RECV_WINDOW_DEFAULT,
@@ -191,7 +191,7 @@ impl UtpConnection {
         socket.send_to(peer, &syn.encode(&[])).await?;
 
         // Wait for the responder's STATE (ack of our SYN). It uses
-        // connection_id = our send_conn_id (the responder's send id).
+        // connection_id = the SYN id.
         let mut buf = vec![0u8; 2048];
         let (from, n) =
             match tokio::time::timeout(Duration::from_secs(10), socket.recv_from(&mut buf)).await {
@@ -207,7 +207,7 @@ impl UtpConnection {
                 "uTP connect: reply from wrong peer".into(),
             ));
         }
-        let (state, _payload) = UtpHeader::decode(&buf[..n])?;
+        let (state, _extensions, _payload) = UtpHeader::decode_with_extensions(&buf[..n])?;
         if state.typ != UtpType::State {
             return Err(CoreError::Internal(format!(
                 "uTP connect: expected STATE, got {:?}",
@@ -219,13 +219,13 @@ impl UtpConnection {
                 "uTP connect: SYN-ACK did not ack our SYN".into(),
             ));
         }
-        if state.connection_id != send_conn_id {
+        if state.connection_id != syn_conn_id {
             return Err(CoreError::Internal(
                 "uTP connect: SYN-ACK connection id mismatch".into(),
             ));
         }
-        // The responder's send connection id is our recv connection id.
-        let recv_conn_id = send_conn_id.wrapping_add(1);
+        let send_conn_id = syn_conn_id.wrapping_add(1);
+        let recv_conn_id = syn_conn_id;
 
         let c = Self {
             peer,
@@ -235,6 +235,7 @@ impl UtpConnection {
             seq_next: seq.wrapping_add(1),
             ack_number: state.seq_number,
             recv_window: RECV_WINDOW_DEFAULT,
+            peer_window: state.window_size,
             recv_buf: VecDeque::new(),
             ooo: Vec::new(),
             send_buf: VecDeque::new(),
@@ -256,9 +257,8 @@ impl UtpConnection {
     /// replies with a STATE ack and returns a ready connection.
     ///
     /// The socket must be a binder-provided contained UDP socket. The SYN's
-    /// connection id becomes the responder's send connection id; the
-    /// responder sends its data with connection_id = syn_conn_id + 1 and
-    /// expects the initiator's data with connection_id = syn_conn_id.
+    /// connection id becomes the responder's send connection id; the responder
+    /// expects initiator packets with `syn.connection_id + 1`.
     pub async fn accept_from_syn(
         socket: std::sync::Arc<dyn crate::net::ContainedUdpSocket>,
         peer: SocketAddr,
@@ -267,13 +267,10 @@ impl UtpConnection {
         if syn.typ != UtpType::Syn {
             return Err(CoreError::Internal("accept_from_syn: not a SYN".into()));
         }
-        // Per BEP 29: the SYN carries the *receive* connection id the
-        // initiator wants us to use when sending to it (= initiator send id +
-        // 1). Our send id is that value; the initiator's send id is one less,
-        // and that is the connection id we put on our outbound packets (which
-        // the initiator matches against its recv id).
+        // Per BEP 29, responder-to-initiator packets retain the SYN id, while
+        // initiator-to-responder packets use SYN id + 1.
         let send_conn_id = syn.connection_id;
-        let recv_conn_id = syn.connection_id.wrapping_sub(1);
+        let recv_conn_id = syn.connection_id.wrapping_add(1);
         let seq = 1u16;
         let now_ts = now_micros();
         // Echo the initiator's timestamp and compute a delta.
@@ -282,9 +279,7 @@ impl UtpConnection {
             typ: UtpType::State,
             version: UTP_VERSION,
             extension: 0,
-            // Send with the initiator's send id, which the initiator matches
-            // against its recv id.
-            connection_id: recv_conn_id,
+            connection_id: send_conn_id,
             timestamp_micros: now_ts,
             timestamp_delta_micros: delta,
             window_size: RECV_WINDOW_DEFAULT,
@@ -301,6 +296,7 @@ impl UtpConnection {
             seq_next: seq.wrapping_add(1),
             ack_number: syn.seq_number,
             recv_window: RECV_WINDOW_DEFAULT,
+            peer_window: syn.window_size,
             recv_buf: VecDeque::new(),
             ooo: Vec::new(),
             send_buf: VecDeque::new(),
@@ -363,8 +359,7 @@ impl UtpConnection {
         for slot in out.iter_mut().take(n) {
             *slot = self.recv_buf.pop_front().unwrap();
         }
-        self.recv_window =
-            (RECV_WINDOW_DEFAULT as usize).saturating_add(self.recv_buf.len()) as u32;
+        self.update_recv_window();
         Ok(n)
     }
 
@@ -432,12 +427,20 @@ impl UtpConnection {
                 if n == 0 {
                     return Ok(true);
                 }
-                let (header, payload) = match UtpHeader::decode(&buf[..n]) {
-                    Ok(p) => p,
-                    Err(_) => return Ok(true), // ignore malformed
+                let (header, extensions, payload) =
+                    match UtpHeader::decode_with_extensions(&buf[..n]) {
+                        Ok(p) => p,
+                        Err(_) => return Ok(true), // ignore malformed
+                    };
+                let sack = match sack_from_extensions(&extensions) {
+                    Ok(sack) => sack,
+                    Err(_) => return Ok(true), // ignore malformed extension data
                 };
                 self.last_recv = Instant::now();
-                match self.handle_packet(header, payload.to_vec()).await? {
+                match self
+                    .handle_packet(header, payload.to_vec(), sack.as_ref())
+                    .await?
+                {
                     RecvOutcome::Closed => {
                         // Peer FIN received. If we already sent our FIN, we close.
                         if self.local_fin_sent && self.fin_transmitted {
@@ -460,12 +463,18 @@ impl UtpConnection {
     }
 
     /// Validate and process one inbound packet.
-    async fn handle_packet(&mut self, header: UtpHeader, payload: Vec<u8>) -> Result<RecvOutcome> {
+    async fn handle_packet(
+        &mut self,
+        header: UtpHeader,
+        payload: Vec<u8>,
+        sack: Option<&Sack>,
+    ) -> Result<RecvOutcome> {
         // Connection id validation: inbound packets must carry our recv
         // connection id (the id we assigned to the peer's send side).
         if header.connection_id != self.recv_conn_id && header.typ != UtpType::Reset {
             return Ok(RecvOutcome::Duplicate);
         }
+        self.peer_window = header.window_size;
 
         // Measure one-way delay from the peer's timestamp echo (LEDBAT).
         let now_ts = now_micros();
@@ -478,14 +487,14 @@ impl UtpConnection {
         match header.typ {
             UtpType::Data => {
                 // Update ack of previously-sent data.
-                self.ack_in_flight(header.ack_number, &payload, header.extension);
+                self.ack_in_flight(header.ack_number, sack);
                 let outcome = self.handle_data(header.seq_number, payload);
                 self.cwnd.on_ack(header.ack_number);
                 Ok(outcome)
             }
             UtpType::State => {
                 // Pure ACK: advance in-flight bookkeeping with any SACK.
-                self.ack_in_flight(header.ack_number, &[], header.extension);
+                self.ack_in_flight(header.ack_number, sack);
                 self.cwnd.on_ack(header.ack_number);
                 Ok(RecvOutcome::Delivered)
             }
@@ -515,20 +524,28 @@ impl UtpConnection {
     fn handle_data(&mut self, seq: u16, payload: Vec<u8>) -> RecvOutcome {
         let expected = self.ack_number.wrapping_add(1);
         if seq == expected {
+            if payload.len() > self.recv_window as usize {
+                return RecvOutcome::Duplicate;
+            }
             // In-order: deliver and drain any contiguous out-of-order tail.
             self.recv_buf.extend(&payload);
             self.ack_number = seq;
             self.drain_ooo();
+            self.update_recv_window();
             RecvOutcome::Delivered
         } else if seq.wrapping_sub(self.ack_number.wrapping_add(1)) == 0 {
             RecvOutcome::Duplicate
         } else {
             // Out of order: hold if it is ahead and not already held.
             let already = self.ooo.iter().any(|(s, _)| *s == seq);
-            if !already && seq.wrapping_sub(self.ack_number) > 0 {
+            if !already
+                && seq_is_ahead(seq, self.ack_number)
+                && payload.len() <= self.recv_window as usize
+            {
                 self.ooo.push((seq, payload));
                 self.ooo
                     .sort_by_key(|(s, _)| s.wrapping_sub(self.ack_number));
+                self.update_recv_window();
             }
             RecvOutcome::Duplicate
         }
@@ -547,34 +564,27 @@ impl UtpConnection {
                 break;
             }
         }
+        self.update_recv_window();
     }
 
     /// Advance the in-flight queue given an ack number and an optional SACK
     /// extension. Removes acked (cumulatively-acked) packets and clears
     /// selectively-acked ones from retransmit consideration.
-    fn ack_in_flight(&mut self, ack: u16, _payload: &[u8], extension: u8) {
-        // Cumulative ack: drop everything at or before `ack` (wrapping).
-        let mut kept = Vec::with_capacity(self.in_flight.len());
-        for p in self.in_flight.drain(..) {
-            if !seq_at_or_before(p.seq, ack) {
-                kept.push(p);
-            }
-        }
-        self.in_flight = kept;
+    fn ack_in_flight(&mut self, ack: u16, sack: Option<&Sack>) {
+        self.in_flight.retain(|packet| {
+            !seq_at_or_before(packet.seq, ack) && !sack_acks_sequence(sack, ack, packet.seq)
+        });
+    }
 
-        // SACK extension (id 1): the peer selectively acks ranges beyond the
-        // cumulative ack. We can't free those from the queue (they may be
-        // needed for cumulative-ack progress), but we mark them as delivered
-        // so retransmit logic treats them as acked.
-        if extension == EXT_SACK {
-            // The SACK bitmap follows the header; we already consumed the
-            // extension byte via `header.extension` (single extension only is
-            // carried in the type/extension nibble). A full SACK is encoded as
-            // a trailing extension block; for our in-process peer we rely on
-            // the cumulative ack + the held out-of-order reassembly, which is
-            // sufficient for correctness. Marking is handled in try_send.
-            let _ = _payload;
-        }
+    fn update_recv_window(&mut self) {
+        let buffered = self
+            .ooo
+            .iter()
+            .fold(self.recv_buf.len(), |total, (_, payload)| {
+                total.saturating_add(payload.len())
+            });
+        self.recv_window =
+            RECV_WINDOW_DEFAULT.saturating_sub(buffered.min(u32::MAX as usize) as u32);
     }
 
     /// Send new DATA packets from the send buffer, bounded by the congestion
@@ -583,14 +593,14 @@ impl UtpConnection {
         if self.local_fin_sent && self.send_buf.is_empty() && self.in_flight.is_empty() {
             return Ok(());
         }
-        let cwnd = self.cwnd.window_bytes();
+        let send_window = self.cwnd.window_bytes().min(self.peer_window as usize);
         let mut in_flight_bytes = self.queued_in_flight_bytes();
         while !self.send_buf.is_empty() {
-            let allowed = cwnd.saturating_sub(in_flight_bytes);
-            if allowed < MAX_PAYLOAD.min(self.send_buf.len()) {
+            let allowed = send_window.saturating_sub(in_flight_bytes);
+            let n = MAX_PAYLOAD.min(self.send_buf.len()).min(allowed);
+            if n == 0 {
                 break;
             }
-            let n = MAX_PAYLOAD.min(self.send_buf.len());
             let payload: Vec<u8> = self.send_buf.drain(..n).collect();
             let seq = self.seq_next;
             self.seq_next = self.seq_next.wrapping_add(1);
@@ -607,9 +617,9 @@ impl UtpConnection {
                 seq_number: seq,
                 ack_number: self.ack_number,
             };
-            self.socket
-                .send_to(self.peer, &header.encode(&payload))
-                .await?;
+            let extensions = self.ack_extensions();
+            let packet = header.encode_with_extensions(&extensions, &payload)?;
+            self.socket.send_to(self.peer, &packet).await?;
             in_flight_bytes += payload.len();
             self.in_flight.push(InFlight::new(seq, payload, now_ts));
         }
@@ -634,9 +644,8 @@ impl UtpConnection {
                     seq_number: p.seq,
                     ack_number: self.ack_number,
                 };
-                self.socket
-                    .send_to(self.peer, &header.encode(&p.payload))
-                    .await?;
+                let packet = header.encode(&p.payload);
+                self.socket.send_to(self.peer, &packet).await?;
                 p.sent_at = now;
                 p.ts_micros = now_ts;
                 p.transmissions = p.transmissions.saturating_add(1);
@@ -674,7 +683,9 @@ impl UtpConnection {
             seq_number: self.seq_next,
             ack_number: self.ack_number,
         };
-        self.socket.send_to(self.peer, &header.encode(&[])).await?;
+        let extensions = self.ack_extensions();
+        let packet = header.encode_with_extensions(&extensions, &[])?;
+        self.socket.send_to(self.peer, &packet).await?;
         Ok(())
     }
 
@@ -694,8 +705,19 @@ impl UtpConnection {
             seq_number: seq,
             ack_number: self.ack_number,
         };
-        self.socket.send_to(self.peer, &header.encode(&[])).await?;
+        let extensions = self.ack_extensions();
+        let packet = header.encode_with_extensions(&extensions, &[])?;
+        self.socket.send_to(self.peer, &packet).await?;
         Ok(())
+    }
+
+    fn ack_extensions(&self) -> Vec<UtpExtension> {
+        let sack = Sack::from_held(self.ack_number, &self.ooo);
+        if sack.is_empty() {
+            Vec::new()
+        } else {
+            vec![UtpExtension::new(EXT_SACK, sack.encode_data())]
+        }
     }
 
     /// Total bytes currently in-flight (sent but not cumulatively acked).
@@ -710,6 +732,27 @@ impl UtpConnection {
 /// internet RTTs. Keep this bounded, but large enough for public Linux ISO
 /// swarms to maintain useful in-flight data over higher-latency paths.
 const RECV_WINDOW_DEFAULT: u32 = 4 * 1024 * 1024;
+
+fn sack_from_extensions(extensions: &[UtpExtension]) -> Result<Option<Sack>> {
+    extensions
+        .iter()
+        .find(|extension| extension.kind == EXT_SACK)
+        .map(|extension| Sack::parse_data(&extension.data))
+        .transpose()
+}
+
+fn sack_acks_sequence(sack: Option<&Sack>, ack: u16, sequence: u16) -> bool {
+    let Some(sack) = sack else {
+        return false;
+    };
+    let offset = sequence.wrapping_sub(ack);
+    sack.offsets().contains(&offset)
+}
+
+fn seq_is_ahead(sequence: u16, reference: u16) -> bool {
+    let distance = sequence.wrapping_sub(reference);
+    distance != 0 && distance < 0x8000
+}
 
 /// Wrapping comparison: is `s` at or before `ack` in u16 sequence space?
 fn seq_at_or_before(s: u16, ack: u16) -> bool {
@@ -743,6 +786,35 @@ mod tests {
         assert!(seq_at_or_before(4, 5));
         assert!(seq_at_or_before(u16::MAX, 1));
         assert!(!seq_at_or_before(6, 5));
+    }
+
+    #[test]
+    fn bep29_connection_id_directions_are_distinct() {
+        let syn_connection_id = 0x1234u16;
+        let initiator_send = syn_connection_id.wrapping_add(1);
+        let initiator_recv = syn_connection_id;
+        let responder_send = syn_connection_id;
+        let responder_recv = syn_connection_id.wrapping_add(1);
+
+        assert_eq!(initiator_send, responder_recv);
+        assert_eq!(initiator_recv, responder_send);
+    }
+
+    #[test]
+    fn sack_marks_only_selected_packets_beyond_cumulative_ack() {
+        let sack = Sack::parse_data(&[0b0000_0101, 0, 0, 0]).unwrap();
+        assert!(sack_acks_sequence(Some(&sack), 100, 102));
+        assert!(!sack_acks_sequence(Some(&sack), 100, 103));
+        assert!(sack_acks_sequence(Some(&sack), 100, 104));
+        assert!(!sack_acks_sequence(Some(&sack), 100, 101));
+    }
+
+    #[test]
+    fn sequence_ahead_check_handles_wraparound() {
+        assert!(seq_is_ahead(0, u16::MAX));
+        assert!(seq_is_ahead(10, 5));
+        assert!(!seq_is_ahead(5, 10));
+        assert!(!seq_is_ahead(5, 5));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

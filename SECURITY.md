@@ -2,9 +2,9 @@
 
 ## Supported Versions
 
-SwarmOtter has not released `v1.0.0` yet. Security fixes are applied to the
-`main` branch during development. Once `v1.0.0` is released, supported
-versions will be listed here.
+Security fixes are applied to the latest `1.2.x` release line and the `main`
+branch. Older minor release lines should be upgraded before reporting an issue
+that is already fixed in the current release.
 
 ## Reporting a Vulnerability
 

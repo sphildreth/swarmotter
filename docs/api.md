@@ -27,6 +27,8 @@ Errors use the same envelope:
 HTTP status codes reflect the error class:
 
 - `400`: bad input.
+- `401`: missing or invalid API authentication.
+- `403`: browser origin, Fetch Metadata, or Host validation failed.
 - `404`: not found.
 - `409`: duplicate.
 - `503`: network or containment blocked.
@@ -43,7 +45,13 @@ X-SwarmOtter-Auth: <token>
 ```
 
 Startup validation rejects authenticated mode unless `api.auth_token` is set.
+It also rejects an unauthenticated listener outside loopback.
 `GET /api/v1/settings` never returns the token value.
+
+Browser requests to `/api/v1` must be same-origin: `Origin` must match `Host`,
+and Fetch Metadata marked as cross-site or same-site is rejected. This includes
+WebSocket handshakes. CLI and automation clients that do not send browser origin
+metadata are unaffected. Authenticated reverse proxies must preserve `Host`.
 
 API request bodies are capped by `api.max_request_body_bytes`; this applies to
 JSON requests and raw `.torrent` uploads. The root `/health` alias remains a

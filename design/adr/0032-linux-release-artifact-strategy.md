@@ -38,9 +38,21 @@ and stages those same prebuilt binaries through the `runtime-prebuilt`
 Dockerfile target, so release image publication does not compile Rust inside
 emulated Docker builds.
 
+Source builds declare Rust 1.88 as the minimum supported compiler. CI checks
+the locked workspace with Rust 1.88 in addition to the stable-toolchain quality
+gate; release builders may use a newer pinned compiler while preserving this
+source compatibility floor.
+
 The packages install the daemon, default configuration, systemd unit, service
 account, and standard state/download directories, but they do not start the
-daemon automatically.
+daemon automatically. Debian packages depend on `iproute2`, RPM packages
+depend on `iproute`, and the container runtime includes `iproute2`, ensuring
+the `ip route get` probe used by strict route and DNS validation is available
+on supported release surfaces.
+
+The configuration directory and file are owned by the `swarmotter` service
+account with private permissions. This permits the accepted atomic settings
+replacement flow while keeping API tokens unreadable by other local accounts.
 
 Windows and macOS native packages are not supported release artifacts.
 Operators on those hosts should use the Linux container image through their
@@ -56,7 +68,9 @@ hosts.
 Release tags now have a durable artifact contract: native Linux packages,
 tarballs, checksums, and semver-tagged container images. Changes to installed
 paths, package behavior, image tag strategy, or the supported release build
-targets are release-facing compatibility changes.
+targets are release-facing compatibility changes. Raising the minimum supported
+Rust version likewise requires explicit compatibility review and aligned CI and
+operator documentation.
 
 ## Related Documents
 

@@ -7,6 +7,79 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [1.3.0] - [2026-07-11]
+
+### Added
+
+- **Durable daemon library state:** torrent records, queue order, file choices,
+  labels, trackers, and per-torrent controls now survive restart in a versioned,
+  crash-safe state file. Restore rejects malformed invariants and colliding
+  storage ownership, and completed payloads are fully rechecked before restored
+  torrents can seed. See [ADR-0045](design/adr/0045-versioned-durable-daemon-state.md).
+- **Shared inbound peer listener:** one contained listener now routes plaintext
+  and MSE/PE handshakes for every registered torrent, owns bounded accepted
+  sessions, and cancels them with the listener. Multiple torrents can seed on
+  the configured port without bind collisions. See
+  [ADR-0046](design/adr/0046-shared-inbound-peer-listener.md).
+- **Operational file selection:** wanted flags and file priorities now drive
+  serial, parallel, endgame, and webseed piece scheduling. Move-data and
+  rename-path operations update storage transactionally, and path ownership
+  prevents two torrents from sharing a payload location. See
+  [ADR-0048](design/adr/0048-file-selection-drives-piece-scheduling.md).
+- **Complete Web UI operations:** torrent details now expose lifecycle,
+  reannounce, queue movement, move-data, labels, per-torrent bandwidth,
+  file rename/priority, and tracker editing controls alongside an activity
+  view. Add flows can start paused, controls have explicit accessible labels,
+  and settings can apply runtime-supported sections when persistent config
+  replacement is unavailable.
+- **Release runtime prerequisites:** official container and native package
+  artifacts now provide the Linux `ip` utility required by strict route and
+  DNS validation, and packaged systemd/Compose deployments raise the file
+  descriptor limit for concurrent peer, tracker, and storage handles.
+
+### Changed
+
+- **Live data-plane configuration:** containment, listen-port, IP-family, uTP,
+  peer-encryption, and DHT replacements now stop and await the complete old
+  task set before rebuilding with fresh binders. Engine construction shares
+  the transition lock, and uTP streams own and cancel their connection drivers.
+  Configuration writes are serialized, atomically replaced, and reject unknown
+  fields. See
+  [ADR-0047](design/adr/0047-transactional-live-data-plane-reconfiguration.md).
+- **Tracker scheduling and validation:** announce behavior now preserves
+  BEP 12 fallback tiers, uses one successful tracker at a time, honors bounded
+  tracker-provided intervals independently from DHT refresh, and validates UDP
+  tracker response source, action, and transaction identifiers.
+- **Private writable configuration:** packaged and Compose deployments use a
+  service-owned, mode-`0700` configuration directory with a mode-`0600`
+  config file so validated settings replacement remains atomic without
+  exposing API credentials.
+- **Minimum Rust version:** source builds now require Rust 1.88, with a locked
+  workspace check at that compiler floor in CI.
+- **Browser control-plane security:** unauthenticated API listeners are
+  restricted to loopback, browser mutation and WebSocket requests enforce
+  same-origin Host checks, and Web assets ship with content security,
+  anti-framing, MIME-sniffing, and referrer-policy headers. See
+  [ADR-0044](design/adr/0044-browser-origin-and-loopback-api-security.md).
+
+### Fixed
+
+- **Peer protocol interoperability:** uTP now uses BEP 29 header semantics,
+  connection-ID transitions, extension chains, and selective acknowledgments;
+  inbound peer messages and storage block requests are bounded before
+  allocation or disk access.
+- **Storage and resume correctness:** metainfo rejects negative and overflowing
+  integers and duplicate file paths, fast resume detects same-size payload
+  changes and quarantines corrupt records, completed rechecks use the completed
+  storage root, move/rename rolls back when durable-state persistence fails,
+  and delete failures are returned instead of silently discarding registry
+  state.
+- **Torrent removal choices:** Web UI removal now distinguishes cancel,
+  remove while keeping payload data, and remove while deleting payload data.
+- **Filtered-list notifications:** the Web UI infers external removals only
+  while observing the complete, unfiltered library, preventing filtered,
+  paginated, or state-transitioned torrents from being reported as removed.
+
 ## [1.2.2] - [2026-07-10]
 
 ### Fixed

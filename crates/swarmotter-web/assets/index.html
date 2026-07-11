@@ -4,20 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SwarmOtter</title>
-  <script>
-    (function() {
-      const storageKey = "swarmotter.theme";
-      const fallbackTheme = "dark";
-      let theme = fallbackTheme;
-      try {
-        const saved = window.localStorage.getItem(storageKey);
-        if (saved === "light" || saved === "dark") theme = saved;
-      } catch {
-        theme = fallbackTheme;
-      }
-      document.documentElement.dataset.theme = theme;
-    })();
-  </script>
+  <script src="/theme-bootstrap.js"></script>
   <link rel="icon" href="/favicon.ico" sizes="any">
   <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
@@ -69,7 +56,8 @@
     <!-- Torrents view -->
     <section id="view-torrents" class="view">
       <div class="toolbar">
-        <input id="search" type="search" placeholder="Filter torrents...">
+        <label for="search" class="sr-only">Filter torrents</label>
+        <input id="search" type="search" placeholder="Filter torrents..." aria-label="Filter torrents">
         <button id="clear-torrent-filters-btn" type="button" class="secondary" disabled>Clear Filters</button>
         <div class="bulk-actions" aria-label="Torrent selection actions">
           <button id="select-all-torrents-btn" type="button" class="secondary">Select All</button>
@@ -149,13 +137,18 @@
       <h2>Add Torrent</h2>
       <div class="card">
         <h3>Add Magnet</h3>
+        <label for="magnet-input">Magnet link</label>
         <textarea id="magnet-input" rows="3" placeholder="magnet:?xt=urn:btih:..."></textarea>
-        <input id="magnet-dir" type="text" placeholder="Download directory (optional)">
+        <label for="magnet-dir">Download directory (optional)</label>
+        <input id="magnet-dir" type="text">
+        <label class="settings-check"><input id="magnet-paused" type="checkbox"><span>Add paused</span></label>
         <button id="add-magnet-btn">Add Magnet</button>
       </div>
       <div class="card">
         <h3>Upload .torrent</h3>
+        <label for="torrent-file">Torrent file</label>
         <input id="torrent-file" type="file" accept=".torrent">
+        <label class="settings-check"><input id="file-paused" type="checkbox"><span>Add paused</span></label>
         <button id="add-file-btn">Upload</button>
       </div>
     </section>
@@ -166,20 +159,50 @@
       <h2 id="details-title"></h2>
       <div id="details-health" class="card"></div>
       <div id="details-summary" class="card"></div>
+      <div id="details-controls" class="card">
+        <h3>Torrent controls</h3>
+        <div class="details-command-row" aria-label="Torrent lifecycle controls">
+          <button id="details-start-btn" type="button">Start Now</button>
+          <button id="details-stop-btn" type="button" class="secondary">Stop</button>
+          <button id="details-reannounce-btn" type="button" class="secondary">Reannounce</button>
+          <button id="details-queue-top-btn" type="button" class="secondary">Queue Top</button>
+          <button id="details-queue-up-btn" type="button" class="secondary">Queue Up</button>
+          <button id="details-queue-down-btn" type="button" class="secondary">Queue Down</button>
+          <button id="details-queue-bottom-btn" type="button" class="secondary">Queue Bottom</button>
+        </div>
+        <div class="details-control-grid">
+          <label class="settings-field"><span>Move data to</span><input id="details-move-path" type="text"></label>
+          <button id="details-move-btn" type="button">Move Data</button>
+          <label class="settings-field"><span>Labels (comma-separated)</span><input id="details-labels" type="text"></label>
+          <button id="details-labels-btn" type="button">Save Labels</button>
+          <label class="settings-field"><span>Download limit B/s (0 = unlimited)</span><input id="details-download-limit" type="number" min="0" step="1"></label>
+          <label class="settings-field"><span>Upload limit B/s (0 = unlimited)</span><input id="details-upload-limit" type="number" min="0" step="1"></label>
+          <button id="details-limits-btn" type="button">Save Limits</button>
+        </div>
+      </div>
       <div id="details-autopilot" class="card"></div>
       <div class="tabs">
-        <button data-tab="files" class="tab active">Files</button>
+        <button data-tab="activity" class="tab active">Activity</button>
+        <button data-tab="files" class="tab">Files</button>
         <button data-tab="peers" class="tab">Peers</button>
         <button data-tab="trackers" class="tab">Trackers</button>
       </div>
-      <div id="tab-files" class="tab-pane">
-        <table id="files-table"><thead><tr><th>Path</th><th>Size</th><th>Done</th><th>Priority</th><th>Wanted</th></tr></thead><tbody></tbody></table>
+      <div id="tab-activity" class="tab-pane">
+        <div id="details-activity" class="card"></div>
+      </div>
+      <div id="tab-files" class="tab-pane hidden">
+        <table id="files-table"><thead><tr><th>Path</th><th>Size</th><th>Done</th><th>Priority</th><th>Wanted</th><th>Rename</th></tr></thead><tbody></tbody></table>
       </div>
       <div id="tab-peers" class="tab-pane hidden">
         <table id="peers-table"><thead><tr><th>Address</th><th>Client</th><th>Progress</th><th>Down</th><th>Up</th></tr></thead><tbody></tbody></table>
       </div>
       <div id="tab-trackers" class="tab-pane hidden">
-        <table id="trackers-table"><thead><tr><th>URL</th><th>Tier</th><th>Status</th><th>Seeders</th><th>Leechers</th></tr></thead><tbody></tbody></table>
+        <div class="tracker-add-row">
+          <label for="tracker-add-url">Tracker URL</label>
+          <input id="tracker-add-url" type="url" placeholder="https://tracker.example/announce">
+          <button id="tracker-add-btn" type="button">Add Tracker</button>
+        </div>
+        <table id="trackers-table"><thead><tr><th>URL</th><th>Tier</th><th>Status</th><th>Seeders</th><th>Leechers</th><th>Actions</th></tr></thead><tbody></tbody></table>
       </div>
     </section>
 
@@ -237,7 +260,7 @@
             <button type="button" class="settings-nav-item" data-settings-target="pex">PEX</button>
             <button type="button" class="settings-nav-item" data-settings-target="watch">Watch folders</button>
             <button type="button" class="settings-nav-item" data-settings-target="logging">Logging</button>
-            <button type="button" class="settings-nav-item" data-settings-target="interface">Interface</button>
+            <button type="button" class="settings-nav-item" data-settings-target="interface">Notifications</button>
           </nav>
 
           <div class="settings-detail">
@@ -398,7 +421,7 @@
         </div>
 
         <div id="settings-interface" class="card settings-panel" data-settings-panel="interface" tabindex="-1" hidden>
-          <h3>Interface</h3>
+          <h3>Notifications</h3>
           <div class="settings-form-grid">
             <label class="settings-field"><span>Toast display seconds</span><input id="toast-seconds" type="number" min="1" max="60" step="1"></label>
             <button id="save-toast-btn" type="button">Save Notifications</button>
@@ -468,6 +491,18 @@
       </div>
     </section>
   </main>
+
+  <dialog id="remove-torrent-dialog" aria-labelledby="remove-torrent-title">
+    <form method="dialog" class="confirm-dialog">
+      <h2 id="remove-torrent-title">Remove torrent</h2>
+      <p id="remove-torrent-message"></p>
+      <div class="confirm-dialog-actions">
+        <button type="submit" value="cancel" class="secondary" autofocus>Cancel</button>
+        <button type="submit" value="keep">Remove, Keep Data</button>
+        <button type="submit" value="delete" class="danger">Remove and Delete Data</button>
+      </div>
+    </form>
+  </dialog>
 
   <script src="/vendor/tabulator/tabulator.min.js"></script>
   <script src="/app.js"></script>

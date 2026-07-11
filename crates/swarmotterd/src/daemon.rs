@@ -10,8 +10,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -55,7 +56,7 @@ use swarmotter_core::watch;
 
 use crate::engine::{EngineCommand, EngineState, TorrentEngine};
 use crate::netbinder::ContainedBinder;
-use crate::seeder::Seeder;
+use crate::seeder::{SeedRegistration, SeedRegistry, SeederHub};
 
 const PEER_DIAGNOSTIC_RECENT_WINDOW: Duration = Duration::from_secs(30);
 const QUEUE_RECONCILE_DEBOUNCE: Duration = Duration::from_millis(25);
@@ -71,6 +72,7 @@ const STALE_ACTIVE_RECOVERY_MESSAGE: &str =
     "active torrent had no running engine; queued for lifecycle recovery";
 const STALE_INACTIVE_ENGINE_RECOVERY_MESSAGE: &str =
     "queued torrent had stale engine bookkeeping; queued for lifecycle recovery";
+static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub struct DaemonRuntime {
@@ -79,12 +81,26 @@ pub struct DaemonRuntime {
     pub network_health: Arc<RwLock<NetworkHealth>>,
     pub watch_imports: Arc<Mutex<Vec<watch::ImportResult>>>,
     config_path: Option<PathBuf>,
+    config_write_lock: Arc<Mutex<()>>,
+    /// Serializes engine construction with data-plane configuration swaps.
+    /// The guard spans binder creation and task bookkeeping so no task can be
+    /// born under a policy that is being replaced.
+    data_plane_transition_lock: Arc<Mutex<()>>,
     log_file_path: Option<PathBuf>,
+    state_path: Option<PathBuf>,
+    state_write_lock: Arc<Mutex<()>>,
+    storage_ownership_lock: Arc<Mutex<()>>,
     engine_states: Arc<RwLock<HashMap<InfoHash, Arc<Mutex<EngineState>>>>>,
     engine_cmds: Arc<Mutex<HashMap<InfoHash, tokio::sync::mpsc::Sender<EngineCommand>>>>,
     engine_handles: Arc<RwLock<HashMap<InfoHash, JoinHandle<()>>>>,
     seeder_shutdowns: Arc<Mutex<HashMap<InfoHash, tokio::sync::watch::Sender<bool>>>>,
+    seeder_registry: SeedRegistry,
+    seeder_listener_shutdown: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
+    seeder_listener_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Per-torrent tracker announce sidecars. The TCP listener itself is
+    /// process-wide and stored in `seeder_listener_handle`.
     seeder_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
+    inbound_session_limit: Arc<AtomicUsize>,
     global_limiter: swarmotter_core::bandwidth::RateLimiter,
     engine_limiters: Arc<RwLock<HashMap<InfoHash, swarmotter_core::bandwidth::RateLimiter>>>,
     rate_samples: Arc<RwLock<HashMap<InfoHash, RateSample>>>,
@@ -163,6 +179,8 @@ struct EngineStartSnapshot {
     magnet_info_hash: Option<InfoHash>,
     magnet_name: Option<String>,
     magnet_trackers: Vec<String>,
+    priorities: Vec<FilePriority>,
+    wanted: Vec<bool>,
 }
 
 impl EngineStartSnapshot {
@@ -176,6 +194,8 @@ impl EngineStartSnapshot {
             magnet_info_hash: torrent.magnet_info_hash,
             magnet_name: torrent.magnet_name.clone(),
             magnet_trackers: torrent.magnet_trackers.clone(),
+            priorities: torrent.priorities.clone(),
+            wanted: torrent.wanted.clone(),
         }
     }
 
@@ -335,10 +355,33 @@ impl DaemonRuntime {
         log_file_path: Option<PathBuf>,
         event_broker: EventBroker,
     ) -> Self {
+        Self::with_paths_broker_and_state(
+            config,
+            startup_health,
+            config_path,
+            log_file_path,
+            None,
+            event_broker,
+        )
+    }
+
+    pub fn with_paths_broker_and_state(
+        config: Config,
+        startup_health: NetworkHealth,
+        config_path: Option<PathBuf>,
+        log_file_path: Option<PathBuf>,
+        state_path: Option<PathBuf>,
+        event_broker: EventBroker,
+    ) -> Self {
         let global_limiter = swarmotter_core::bandwidth::RateLimiter::new(
             config.bandwidth.effective_download(),
             config.bandwidth.effective_upload(),
         );
+        let inbound_session_limit = if config.bandwidth.max_peers == 0 {
+            crate::engine::DEFAULT_PEER_WORKER_LIMIT
+        } else {
+            config.bandwidth.max_peers
+        };
         Self {
             registry: Arc::new(Mutex::new(TorrentRegistry::default())),
             queue: Arc::new(Mutex::new(QueueState::new(config.queue.clone()))),
@@ -346,12 +389,21 @@ impl DaemonRuntime {
             network_health: Arc::new(RwLock::new(startup_health)),
             watch_imports: Arc::new(Mutex::new(Vec::new())),
             config_path,
+            config_write_lock: Arc::new(Mutex::new(())),
+            data_plane_transition_lock: Arc::new(Mutex::new(())),
             log_file_path,
+            state_path,
+            state_write_lock: Arc::new(Mutex::new(())),
+            storage_ownership_lock: Arc::new(Mutex::new(())),
             engine_states: Arc::new(RwLock::new(HashMap::new())),
             engine_cmds: Arc::new(Mutex::new(HashMap::new())),
             engine_handles: Arc::new(RwLock::new(HashMap::new())),
             seeder_shutdowns: Arc::new(Mutex::new(HashMap::new())),
+            seeder_registry: SeedRegistry::default(),
+            seeder_listener_shutdown: Arc::new(Mutex::new(None)),
+            seeder_listener_handle: Arc::new(Mutex::new(None)),
             seeder_handles: Arc::new(Mutex::new(HashMap::new())),
+            inbound_session_limit: Arc::new(AtomicUsize::new(inbound_session_limit.max(1))),
             global_limiter,
             engine_limiters: Arc::new(RwLock::new(HashMap::new())),
             rate_samples: Arc::new(RwLock::new(HashMap::new())),
@@ -362,6 +414,223 @@ impl DaemonRuntime {
             queue_reconcile: Arc::new(Mutex::new(QueueReconcileState::default())),
             event_broker,
         }
+    }
+
+    pub async fn restore_persisted_state(&self) -> Result<usize> {
+        let Some(path) = self.state_path.clone() else {
+            return Ok(0);
+        };
+        let Some(mut stored) = tokio::task::spawn_blocking(move || crate::state_store::load(&path))
+            .await
+            .map_err(|error| CoreError::Storage(format!("load daemon state task: {error}")))??
+        else {
+            return Ok(0);
+        };
+        let traffic_allowed = self.network_health.read().await.traffic_allowed;
+        let mut restored = TorrentRegistry::default();
+        for mut torrent in stored.torrents.drain(..) {
+            torrent.meta.validate().map_err(|error| {
+                CoreError::Storage(format!(
+                    "invalid metadata for restored torrent {}: {error}",
+                    torrent.info_hash()
+                ))
+            })?;
+            if torrent.files.len() != torrent.meta.files.len()
+                || torrent.priorities.len() != torrent.meta.files.len()
+                || torrent.wanted.len() != torrent.meta.files.len()
+            {
+                return Err(CoreError::Storage(format!(
+                    "daemon state for {} has inconsistent file settings",
+                    torrent.info_hash()
+                )));
+            }
+            if torrent.needs_metadata != torrent.magnet_info_hash.is_some() {
+                return Err(CoreError::Storage(format!(
+                    "daemon state for {} has inconsistent magnet identity",
+                    torrent.info_hash()
+                )));
+            }
+            let piece_count = torrent.meta.piece_count();
+            let expected_bitfield_bytes = piece_count.div_ceil(8);
+            if torrent.progress.total != piece_count
+                || torrent.progress.bitfield().as_bytes().len() != expected_bitfield_bytes
+                || (piece_count..expected_bitfield_bytes.saturating_mul(8))
+                    .any(|index| torrent.progress.bitfield().has(index))
+            {
+                return Err(CoreError::Storage(format!(
+                    "daemon state for {} has inconsistent piece progress",
+                    torrent.info_hash()
+                )));
+            }
+            let restored_bitfield = torrent.progress.bitfield().clone();
+            torrent
+                .progress
+                .replace_from_bitfield(&restored_bitfield, piece_count);
+            let previous_files = std::mem::take(&mut torrent.files);
+            torrent.files = torrent
+                .meta
+                .files
+                .iter()
+                .enumerate()
+                .map(|(index, file)| {
+                    let bytes_completed = previous_files[index].bytes_completed;
+                    if bytes_completed > file.length {
+                        return Err(CoreError::Storage(format!(
+                            "daemon state for {} has file progress beyond file length",
+                            torrent.info_hash()
+                        )));
+                    }
+                    Ok(TorrentFile {
+                        index,
+                        path: file.path.join("/"),
+                        length: file.length,
+                        bytes_completed,
+                        priority: torrent.priorities[index],
+                        wanted: torrent.wanted[index],
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            torrent.rate_down = 0;
+            torrent.rate_up = 0;
+            torrent.active_peer_workers = 0;
+            torrent.known_peers = 0;
+            torrent.health = swarmotter_core::models::torrent::TorrentHealth::unknown();
+            torrent.state = match torrent.state {
+                TorrentState::Downloading
+                | TorrentState::DownloadingMetadata
+                | TorrentState::Checking => {
+                    if traffic_allowed {
+                        TorrentState::Queued
+                    } else {
+                        TorrentState::NetworkBlocked
+                    }
+                }
+                TorrentState::Seeding => TorrentState::Completed,
+                state => state,
+            };
+            let hash = torrent.info_hash();
+            restored.add(torrent).map_err(|_| {
+                CoreError::Storage(format!("duplicate torrent {hash} in daemon state"))
+            })?;
+        }
+
+        let config = self.config.read().await.clone();
+        validate_restored_storage_ownership(restored.torrents.values(), &config)?;
+
+        let known = restored.torrents.keys().copied().collect::<HashSet<_>>();
+        let stale_queue_entries = stored
+            .queue
+            .order
+            .iter()
+            .filter(|hash| !known.contains(hash))
+            .copied()
+            .collect::<Vec<_>>();
+        stored.queue.remove_many(stale_queue_entries);
+        stored.queue.add_many(known.iter().copied());
+        stored.queue.limits = self.config.read().await.queue.clone();
+        let count = restored.torrents.len();
+        *self.registry.lock().await = restored;
+        *self.queue.lock().await = stored.queue;
+        self.verify_restored_completed_torrents().await;
+        self.reconcile_queue().await;
+        self.reconcile_seeders().await;
+        self.persist_state().await?;
+        tracing::info!(count, path = %self.state_path.as_ref().unwrap().display(), "restored daemon state");
+        Ok(count)
+    }
+
+    async fn verify_restored_completed_torrents(&self) {
+        let torrents = self
+            .registry
+            .lock()
+            .await
+            .torrents
+            .values()
+            .filter(|torrent| torrent.state == TorrentState::Completed)
+            .cloned()
+            .collect::<Vec<_>>();
+        for torrent in torrents {
+            let hash = torrent.info_hash();
+            let complete_dir = self.resolve_download_dir(&torrent).await;
+            let storage_dir = if torrent.progress.is_complete() {
+                complete_dir
+            } else {
+                self.resolve_incomplete_dir(&complete_dir).await
+            };
+            let storage = swarmotter_core::storage::StorageIo::new(
+                torrent.meta.clone(),
+                PathBuf::from(storage_dir),
+            );
+            match storage.recheck().await {
+                Ok(bitfield) => {
+                    let selection_complete = torrent_selection_complete(&torrent, &bitfield);
+                    let traffic_allowed = self.network_health.read().await.traffic_allowed;
+                    if let Some(restored) = self.registry.lock().await.get_mut(&hash) {
+                        restored
+                            .progress
+                            .replace_from_bitfield(&bitfield, restored.meta.piece_count());
+                        if !selection_complete {
+                            restored.state = if traffic_allowed {
+                                TorrentState::Queued
+                            } else {
+                                TorrentState::NetworkBlocked
+                            };
+                            restored.error = Some(
+                                "restored payload failed verification; selected pieces queued for recovery"
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    if let Some(restored) = self.registry.lock().await.get_mut(&hash) {
+                        restored.state = TorrentState::StorageError;
+                        restored.error = Some(error.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    async fn persist_state(&self) -> Result<()> {
+        let Some(path) = self.state_path.clone() else {
+            return Ok(());
+        };
+        let _write_guard = self.state_write_lock.lock().await;
+        let torrents = self
+            .registry
+            .lock()
+            .await
+            .torrents
+            .values()
+            .cloned()
+            .collect();
+        let queue = self.queue.lock().await.clone();
+        let state = crate::state_store::DaemonState::new(torrents, queue);
+        tokio::task::spawn_blocking(move || crate::state_store::save(&path, &state))
+            .await
+            .map_err(|error| CoreError::Storage(format!("save daemon state task: {error}")))??;
+        Ok(())
+    }
+
+    async fn persist_state_best_effort(&self, reason: &'static str) {
+        if let Err(error) = self.persist_state().await {
+            tracing::error!(reason, %error, "failed to persist daemon state");
+        }
+    }
+
+    pub async fn shutdown(&self) -> Result<()> {
+        self.reconcile_engine_progress().await;
+        let hashes = self
+            .registry
+            .lock()
+            .await
+            .torrents
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        self.stop_all_torrent_tasks(&hashes).await;
+        self.persist_state().await
     }
 
     fn publish_event(&self, event: Event) {
@@ -421,6 +690,9 @@ impl DaemonRuntime {
             );
             return Err(e);
         }
+        let storage_ownership = self.storage_ownership_lock.lock().await;
+        self.ensure_storage_paths_available(&t.meta, t.download_dir.as_deref())
+            .await?;
         apply_network_state(&mut t, &self.network_health).await;
         let blocked = t.state == TorrentState::NetworkBlocked;
         let start_paused = options.paused && !blocked;
@@ -438,7 +710,13 @@ impl DaemonRuntime {
                 return Err(CoreError::DuplicateTorrent(hash.to_hex()));
             }
         }
+        drop(storage_ownership);
         self.queue.lock().await.add(hash);
+        if let Err(error) = self.persist_state().await {
+            self.registry.lock().await.remove(&hash);
+            self.queue.lock().await.remove_many([hash]);
+            return Err(error);
+        }
         if !blocked && !start_paused {
             self.schedule_reconcile_queue("torrent_file_added").await;
         }
@@ -478,7 +756,11 @@ impl DaemonRuntime {
             m.trackers.first().map(|s| s.as_str()),
             false,
         );
-        let parsed = meta::parse_torrent(&bytes)?;
+        let mut parsed = meta::parse_torrent(&bytes)?;
+        // Placeholder storage ownership must use the magnet's real identity.
+        // Otherwise two different magnets with the same display name produce
+        // the same synthetic metainfo hash and bypass conflict detection.
+        parsed.info_hash = hash;
         let mut t = Torrent::new(parsed, now());
         t.needs_metadata = true;
         t.magnet_info_hash = Some(hash);
@@ -499,6 +781,9 @@ impl DaemonRuntime {
             );
             return Err(e);
         }
+        let storage_ownership = self.storage_ownership_lock.lock().await;
+        self.ensure_storage_paths_available(&t.meta, t.download_dir.as_deref())
+            .await?;
         apply_network_state(&mut t, &self.network_health).await;
         let blocked = t.state == TorrentState::NetworkBlocked;
         let start_paused = options.paused && !blocked;
@@ -510,6 +795,7 @@ impl DaemonRuntime {
             reg.add(t)
                 .map_err(|_| CoreError::DuplicateTorrent(hash.to_hex()))?;
         }
+        drop(storage_ownership);
         tracing::info!(
             info_hash = %hash,
             network_blocked = blocked,
@@ -518,6 +804,11 @@ impl DaemonRuntime {
             "magnet added"
         );
         self.queue.lock().await.add(hash);
+        if let Err(error) = self.persist_state().await {
+            self.registry.lock().await.remove(&hash);
+            self.queue.lock().await.remove_many([hash]);
+            return Err(error);
+        }
         if !blocked && !start_paused {
             self.schedule_reconcile_queue("magnet_added").await;
         }
@@ -546,40 +837,21 @@ impl DaemonRuntime {
             }
         }
 
-        let removed = {
-            let mut reg = self.registry.lock().await;
+        let targets = {
+            let reg = self.registry.lock().await;
             unique_hashes
                 .into_iter()
-                .filter_map(|hash| reg.remove(&hash).map(|torrent| (hash, torrent)))
+                .filter_map(|hash| reg.get(&hash).cloned().map(|torrent| (hash, torrent)))
                 .collect::<Vec<_>>()
         };
-        if removed.is_empty() {
+        if targets.is_empty() {
             return Ok(Vec::new());
         }
-
-        {
-            let mut queue = self.queue.lock().await;
-            queue.remove_many(removed.iter().map(|(hash, _)| *hash));
-        }
-        {
-            let mut rate_samples = self.rate_samples.write().await;
-            for (hash, _) in &removed {
-                rate_samples.remove(hash);
-            }
-        }
-        {
-            let mut decisions = self.autopilot_decisions.write().await;
-            let mut last_actions = self.autopilot_last_action.write().await;
-            for (hash, _) in &removed {
-                decisions.remove(hash);
-                last_actions.remove(hash);
-            }
-        }
-        for (hash, _) in &removed {
+        for (hash, _) in &targets {
             self.force_stop_engine(hash).await;
         }
         if delete_data {
-            for (_, torrent) in &removed {
+            for (hash, torrent) in &targets {
                 let complete_dir = self.resolve_download_dir(torrent).await;
                 let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
                 let mut dirs = vec![active_dir, complete_dir];
@@ -589,12 +861,40 @@ impl DaemonRuntime {
                         torrent.meta.clone(),
                         std::path::PathBuf::from(&dir),
                     );
-                    let _ = storage.remove_all().await;
+                    if let Err(error) = storage.remove_all().await {
+                        if let Some(torrent) = self.registry.lock().await.get_mut(hash) {
+                            torrent.state = TorrentState::StorageError;
+                            torrent.error = Some(error.to_string());
+                        }
+                        self.persist_state_best_effort("remove_failed").await;
+                        return Err(error);
+                    }
                 }
             }
         }
+        {
+            let mut reg = self.registry.lock().await;
+            for (hash, _) in &targets {
+                reg.remove(hash);
+            }
+        }
+        self.queue
+            .lock()
+            .await
+            .remove_many(targets.iter().map(|(hash, _)| *hash));
+        {
+            let mut rate_samples = self.rate_samples.write().await;
+            let mut decisions = self.autopilot_decisions.write().await;
+            let mut last_actions = self.autopilot_last_action.write().await;
+            for (hash, _) in &targets {
+                rate_samples.remove(hash);
+                decisions.remove(hash);
+                last_actions.remove(hash);
+            }
+        }
+        self.persist_state().await?;
         self.reconcile_queue().await;
-        let removed_hashes = removed
+        let removed_hashes = targets
             .into_iter()
             .map(|(hash, _)| {
                 self.publish_event(torrent_removed_event(hash, delete_data));
@@ -640,6 +940,95 @@ impl DaemonRuntime {
         for dir in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
             swarmotter_core::storage::check_storage_preflight(&dir, &cfg.storage, total_length)?;
         }
+        Ok(())
+    }
+
+    async fn ensure_storage_paths_available(
+        &self,
+        meta: &meta::TorrentMeta,
+        download_dir: Option<&str>,
+    ) -> Result<()> {
+        self.ensure_storage_paths_available_except(meta, download_dir, None)
+            .await
+    }
+
+    async fn ensure_storage_paths_available_except(
+        &self,
+        meta: &meta::TorrentMeta,
+        download_dir: Option<&str>,
+        exclude: Option<InfoHash>,
+    ) -> Result<()> {
+        let cfg = self.config.read().await.clone();
+        let complete_dir = resolve_download_dir_from_config(download_dir, &cfg);
+        let active_dir = resolve_incomplete_dir_from_config(&complete_dir, &cfg);
+        let candidates = unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)])
+            .into_iter()
+            .map(|root| {
+                swarmotter_core::storage::StorageIo::new(meta.clone(), root).path_ownership()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let existing = self
+            .registry
+            .lock()
+            .await
+            .torrents
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for torrent in existing {
+            if exclude.is_some_and(|hash| torrent.info_hash() == hash) {
+                continue;
+            }
+            let complete_dir =
+                resolve_download_dir_from_config(torrent.download_dir.as_deref(), &cfg);
+            let active_dir = resolve_incomplete_dir_from_config(&complete_dir, &cfg);
+            for root in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
+                let ownership =
+                    swarmotter_core::storage::StorageIo::new(torrent.meta.clone(), root)
+                        .path_ownership()?;
+                for candidate in &candidates {
+                    candidate.ensure_compatible_with(&ownership)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn reserve_resolved_magnet_metadata(
+        &self,
+        hash: InfoHash,
+        resolved: meta::TorrentMeta,
+        download_dir: Option<String>,
+    ) -> Result<()> {
+        if resolved.info_hash != hash {
+            return Err(CoreError::MalformedTorrent(
+                "resolved magnet metadata info hash changed during preflight".into(),
+            ));
+        }
+        let _storage_ownership = self.storage_ownership_lock.lock().await;
+        self.ensure_storage_paths_available_except(&resolved, download_dir.as_deref(), Some(hash))
+            .await?;
+        let previous = {
+            let mut registry = self.registry.lock().await;
+            let torrent = registry
+                .get_mut(&hash)
+                .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+            let previous = torrent.clone();
+            let empty_state = EngineState {
+                piece_count: resolved.piece_count(),
+                total_length: resolved.total_length,
+                ..EngineState::default()
+            };
+            apply_resolved_metadata(torrent, &resolved, &empty_state);
+            previous
+        };
+        if let Err(error) = self.persist_state().await {
+            if let Some(torrent) = self.registry.lock().await.get_mut(&hash) {
+                *torrent = previous;
+            }
+            return Err(error);
+        }
+        self.publish_event(torrent_metadata_event(hash));
         Ok(())
     }
 
@@ -1195,6 +1584,7 @@ impl DaemonRuntime {
     /// Start the live engine task for a torrent (downloading). No-op if the
     /// torrent is paused, queued, or already running.
     pub async fn start_engine(&self, hash: InfoHash) {
+        let _data_plane_transition = self.data_plane_transition_lock.lock().await;
         let health = self.network_health.read().await.clone();
         if !health.traffic_allowed && health.mode != NetworkContainmentMode::Disabled {
             // Network blocked: do not start the engine; mark torrent.
@@ -1350,17 +1740,7 @@ impl DaemonRuntime {
         let state_for_summary = state.clone();
         let hash_for_task = hash;
         let registry = self.registry.clone();
-        // Clones needed by the engine task to perform selfish-mode removal
-        // on completion without needing `&self` (the task owns only these
-        // shared handles). Cheap `Arc` clones.
         let config = self.config.clone();
-        let engine_cmds_arc = self.engine_cmds.clone();
-        let engine_handles_arc = self.engine_handles.clone();
-        let engine_states_arc = self.engine_states.clone();
-        let engine_limiters_arc = self.engine_limiters.clone();
-        let seeder_shutdowns_arc = self.seeder_shutdowns.clone();
-        let seeder_handles_arc = self.seeder_handles.clone();
-        let event_broker = self.event_broker.clone();
         let runtime_for_task = self.clone();
         // DHT runner for trackerless peer discovery. Gated by config and
         // containment; the engine disables DHT for private torrents.
@@ -1384,13 +1764,34 @@ impl DaemonRuntime {
         .with_preallocate(preallocate)
         .with_sparse(sparse)
         .with_storage_reserve(minimum_free_space_bytes, minimum_free_space_percent)
+        .with_file_selection(snapshot.priorities.clone(), snapshot.wanted.clone())
         .with_peer_worker_limit(max_peer_workers)
         .with_allow_ipv6(allow_ipv6)
         .with_pex(pex_enabled, pex_max_peers);
+        if needs_metadata {
+            let runtime = self.clone();
+            let metadata_download_dir = snapshot.download_dir.clone();
+            engine = engine.with_metadata_preflight(Arc::new(move |resolved| {
+                let runtime = runtime.clone();
+                let metadata_download_dir = metadata_download_dir.clone();
+                Box::pin(async move {
+                    runtime
+                        .reserve_resolved_magnet_metadata(hash, resolved, metadata_download_dir)
+                        .await
+                })
+            }));
+        }
         if let Some(dht) = dht_runner {
             engine = engine.with_dht(dht);
         }
+        // Do not let the engine run until its handle and related bookkeeping
+        // are visible. Otherwise a fast failure can remove an empty slot and
+        // leave its completed JoinHandle inserted as stale state.
+        let (task_start_tx, task_start_rx) = tokio::sync::oneshot::channel();
         let handle = tokio::spawn(async move {
+            if task_start_rx.await.is_err() {
+                return;
+            }
             match engine.run().await {
                 Ok(final_state) => {
                     let finished = final_state.finished;
@@ -1452,18 +1853,9 @@ impl DaemonRuntime {
                     // downloaded data. This must run after the registry update
                     // above so final stats/name are captured before removal.
                     if finished && config.read().await.torrent.selfish {
-                        Self::selfish_remove_completed(
-                            hash_for_task,
-                            registry.clone(),
-                            engine_cmds_arc.clone(),
-                            engine_handles_arc.clone(),
-                            engine_states_arc.clone(),
-                            engine_limiters_arc.clone(),
-                            seeder_shutdowns_arc.clone(),
-                            seeder_handles_arc.clone(),
-                            event_broker.clone(),
-                        )
-                        .await;
+                        runtime_for_task
+                            .selfish_remove_completed(hash_for_task)
+                            .await;
                     } else if !finished && !stopped_by_command {
                         let queued = runtime_for_task
                             .queue_torrent_for_retry(
@@ -1512,14 +1904,36 @@ impl DaemonRuntime {
         // completion) through the contained listener. Skip for magnets until
         // metadata is resolved (the placeholder has no real pieces to serve).
         if !needs_metadata {
-            self.start_seeder(
-                hash,
-                meta.clone(),
-                active_dir.clone(),
-                complete_dir.clone(),
-                state.clone(),
-            )
-            .await;
+            if let Err(error) = self
+                .start_seeder(
+                    hash,
+                    meta.clone(),
+                    active_dir.clone(),
+                    complete_dir.clone(),
+                    state.clone(),
+                )
+                .await
+            {
+                tracing::warn!(info_hash = %hash, %error, "inbound seeding listener unavailable");
+            }
+        }
+
+        let should_run = self
+            .registry
+            .lock()
+            .await
+            .get(&hash)
+            .is_some_and(|torrent| {
+                matches!(
+                    torrent.state,
+                    TorrentState::Queued
+                        | TorrentState::Downloading
+                        | TorrentState::DownloadingMetadata
+                )
+            });
+        if !should_run {
+            self.force_stop_engine(&hash).await;
+            return;
         }
 
         // Mark the torrent as downloading.
@@ -1542,6 +1956,7 @@ impl DaemonRuntime {
             self.publish_torrent_event("torrent_changed", hash, state);
             self.publish_event(stats_updated_event());
         }
+        let _ = task_start_tx.send(());
     }
 
     async fn stop_engine(&self, hash: &InfoHash) {
@@ -1576,10 +1991,29 @@ impl DaemonRuntime {
         self.rate_samples.write().await.remove(hash);
     }
 
+    async fn restart_engine_for_settings(&self, hash: &InfoHash) {
+        self.stop_engine(hash).await;
+        {
+            let mut registry = self.registry.lock().await;
+            if let Some(torrent) = registry.get_mut(hash) {
+                torrent.state = TorrentState::Queued;
+                torrent.error = None;
+            } else {
+                return;
+            }
+        }
+        {
+            let mut queue = self.queue.lock().await;
+            queue.add(*hash);
+            queue.start_now(hash);
+        }
+        self.reconcile_queue().await;
+    }
+
     async fn stop_all_torrent_tasks(&self, registry_hashes: &[InfoHash]) {
         let mut hashes = registry_hashes.to_vec();
         hashes.extend(self.engine_handles.read().await.keys().copied());
-        hashes.extend(self.seeder_handles.lock().await.keys().copied());
+        hashes.extend(self.seeder_shutdowns.lock().await.keys().copied());
         hashes.sort();
         hashes.dedup();
         for hash in hashes {
@@ -1601,6 +2035,8 @@ impl DaemonRuntime {
         self.engine_handles.write().await.clear();
         self.engine_limiters.write().await.clear();
         self.seeder_shutdowns.lock().await.clear();
+        self.seeder_registry.clear().await;
+        self.stop_seeder_listener(false).await;
         self.seeder_handles.lock().await.clear();
         self.rate_samples.write().await.clear();
         self.engine_retry_after.write().await.clear();
@@ -1620,11 +2056,15 @@ impl DaemonRuntime {
         active_dir: String,
         complete_dir: String,
         state: Arc<Mutex<EngineState>>,
-    ) {
-        if self.seeder_handles.lock().await.contains_key(&hash) {
-            return;
+    ) -> Result<()> {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        {
+            let mut shutdowns = self.seeder_shutdowns.lock().await;
+            if shutdowns.contains_key(&hash) {
+                return Ok(());
+            }
+            shutdowns.insert(hash, shutdown_tx.clone());
         }
-        let binder = self.make_binder().await;
         let peer_id = make_peer_id();
         let listen_port = self.config.read().await.torrent.listen_port;
         // Per-torrent upload limit (0 = unlimited) plus the shared global cap.
@@ -1647,27 +2087,24 @@ impl DaemonRuntime {
                 std::path::PathBuf::from(&complete_dir),
             )))
         };
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let encryption_mode = self.config.read().await.torrent.encryption_mode;
-        let mut seeder = Seeder::with_limiter(
+        let registration = SeedRegistration::new(
             meta.clone(),
             storage,
+            complete_storage,
             state,
-            binder,
-            listen_port,
             peer_id,
-            shutdown_rx,
             limiter,
-        )
-        .with_encryption_mode(encryption_mode)
-        .with_global_limiter(Some(self.global_limiter.clone()));
-        if let Some(complete_storage) = complete_storage {
-            seeder = seeder.with_complete_storage(complete_storage);
+            Some(self.global_limiter.clone()),
+            shutdown_rx,
+        );
+        self.seeder_registry.register(registration).await;
+        if let Err(error) = self.ensure_seeder_listener().await {
+            if let Some(shutdown) = self.seeder_shutdowns.lock().await.remove(&hash) {
+                let _ = shutdown.send(true);
+            }
+            self.seeder_registry.unregister(&hash).await;
+            return Err(error);
         }
-        self.seeder_shutdowns
-            .lock()
-            .await
-            .insert(hash, shutdown_tx.clone());
         let announce_handle = self
             .spawn_seeder_announce(
                 hash,
@@ -1677,30 +2114,72 @@ impl DaemonRuntime {
                 shutdown_tx.subscribe(),
             )
             .await;
-        let hash_for_task = hash;
-        let shutdown_tx_for_task = shutdown_tx.clone();
-        let runtime_for_task = self.clone();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let handle = tokio::spawn(async move {
-            let _ = started_rx.await;
-            if let Err(e) = seeder.run().await {
-                tracing::debug!(info_hash = %hash_for_task, error = %e, "seeder task ended");
-            }
-            // Stop the tracker announce sidecar on every seeder exit path,
-            // including containment changes and listener errors.
-            let _ = shutdown_tx_for_task.send(true);
-            if let Some(handle) = announce_handle {
-                let _ = handle.await;
-            }
-            runtime_for_task.seeder_task_finished(hash_for_task).await;
-        });
-        self.seeder_handles.lock().await.insert(hash, handle);
-        let _ = started_tx.send(());
+        if let Some(handle) = announce_handle {
+            self.seeder_handles.lock().await.insert(hash, handle);
+        }
+        Ok(())
     }
 
-    async fn seeder_task_finished(&self, hash: InfoHash) {
-        self.seeder_shutdowns.lock().await.remove(&hash);
-        self.seeder_handles.lock().await.remove(&hash);
+    async fn ensure_seeder_listener(&self) -> Result<()> {
+        let mut handle_slot = self.seeder_listener_handle.lock().await;
+        if handle_slot
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return Ok(());
+        }
+        if let Some(finished) = handle_slot.take() {
+            let _ = finished.await;
+        }
+        let cfg = self.config.read().await.clone();
+        let binder = self.make_binder().await;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+        let hub = SeederHub::new(
+            self.seeder_registry.clone(),
+            binder,
+            cfg.torrent.listen_port,
+            cfg.torrent.encryption_mode,
+            shutdown_rx,
+            self.inbound_session_limit.load(Ordering::Relaxed),
+        )
+        .with_dynamic_session_limit(self.inbound_session_limit.clone())
+        .with_bound_addr(bound_tx);
+        *self.seeder_listener_shutdown.lock().await = Some(shutdown_tx);
+        *handle_slot = Some(tokio::spawn(async move {
+            if let Err(error) = hub.run().await {
+                tracing::warn!(%error, "shared seeding listener ended");
+            }
+        }));
+        match tokio::time::timeout(Duration::from_secs(5), bound_rx).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(_)) => {
+                drop(handle_slot);
+                self.stop_seeder_listener(true).await;
+                Err(CoreError::NetworkBlocked(
+                    "shared inbound peer listener failed to bind".into(),
+                ))
+            }
+            Err(_) => {
+                drop(handle_slot);
+                self.stop_seeder_listener(true).await;
+                Err(CoreError::NetworkBlocked(
+                    "shared inbound peer listener bind timed out".into(),
+                ))
+            }
+        }
+    }
+
+    async fn stop_seeder_listener(&self, force: bool) {
+        if let Some(shutdown) = self.seeder_listener_shutdown.lock().await.take() {
+            let _ = shutdown.send(true);
+        }
+        if let Some(handle) = self.seeder_listener_handle.lock().await.take() {
+            if force {
+                handle.abort();
+            }
+            let _ = handle.await;
+        }
     }
 
     /// Spawn an owned sidecar task that periodically announces the seeder to
@@ -1715,12 +2194,8 @@ impl DaemonRuntime {
         listen_port: u16,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Option<JoinHandle<()>> {
-        let trackers: Vec<String> =
-            tracker::announce_tiers(meta.announce.as_deref(), &meta.announce_list)
-                .into_iter()
-                .flatten()
-                .collect();
-        if trackers.is_empty() {
+        let tracker_tiers = tracker::announce_tiers(meta.announce.as_deref(), &meta.announce_list);
+        if tracker_tiers.is_empty() {
             return None;
         }
         let binder = self.make_binder().await;
@@ -1730,25 +2205,22 @@ impl DaemonRuntime {
             }
             // Initial announce: started event so trackers see the seeder
             // immediately rather than waiting for the first interval tick.
-            tokio::select! {
+            let mut announce_after = tokio::select! {
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         return;
                     }
+                    Duration::from_secs(300)
                 }
-                _ = Self::seeder_announce_once(
-                    &trackers,
+                interval = Self::seeder_announce_once(
+                    &tracker_tiers,
                     hash,
                     peer_id,
                     listen_port,
                     binder.as_ref(),
                     AnnounceEvent::Started,
-                ) => {}
-            }
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // Skip the immediate first tick because we already announced above.
-            interval.tick().await;
+                ) => Duration::from_secs(interval)
+            };
             loop {
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
@@ -1756,7 +2228,7 @@ impl DaemonRuntime {
                             // Best-effort stopped announce, bounded by the
                             // per-tracker announce timeout.
                             Self::seeder_announce_once(
-                                &trackers,
+                                &tracker_tiers,
                                 hash,
                                 peer_id,
                                 listen_port,
@@ -1767,9 +2239,9 @@ impl DaemonRuntime {
                             return;
                         }
                     }
-                    _ = interval.tick() => {
-                        Self::seeder_announce_once(
-                            &trackers,
+                    _ = tokio::time::sleep(announce_after) => {
+                        let interval = Self::seeder_announce_once(
+                            &tracker_tiers,
                             hash,
                             peer_id,
                             listen_port,
@@ -1777,6 +2249,7 @@ impl DaemonRuntime {
                             AnnounceEvent::Empty,
                         )
                         .await;
+                        announce_after = Duration::from_secs(interval);
                     }
                 }
             }
@@ -1787,9 +2260,13 @@ impl DaemonRuntime {
         if let Some(tx) = self.seeder_shutdowns.lock().await.remove(hash) {
             let _ = tx.send(true);
         }
+        self.seeder_registry.unregister(hash).await;
         let handle = self.seeder_handles.lock().await.remove(hash);
         if let Some(handle) = handle {
             let _ = handle.await;
+        }
+        if self.seeder_registry.is_empty().await {
+            self.stop_seeder_listener(false).await;
         }
     }
 
@@ -1797,66 +2274,95 @@ impl DaemonRuntime {
     /// and continues on failure. Times out aggressively so a slow or
     /// unreachable tracker cannot stall the announce loop.
     async fn seeder_announce_once(
-        trackers: &[String],
+        tracker_tiers: &[Vec<String>],
         hash: InfoHash,
         peer_id: [u8; 20],
         port: u16,
         binder: &dyn swarmotter_core::net::NetworkBinder,
         event: AnnounceEvent,
-    ) {
-        for url in trackers {
-            let req = AnnounceRequest {
-                tracker_url: url.clone(),
-                info_hash: hash,
-                peer_id,
-                port,
-                uploaded: 0,
-                downloaded: 0,
-                left: 0,
-                event,
-                numwant: Some(0),
-                compact: true,
-            };
-            let outcome = if url.starts_with("udp://") {
-                tokio::time::timeout(
-                    Duration::from_secs(10),
-                    udp_tracker::udp_announce(binder, &req),
-                )
-                .await
-            } else {
-                tokio::time::timeout(
-                    Duration::from_secs(10),
-                    tracker::http_announce(binder, &req),
-                )
-                .await
-            };
-            match outcome {
-                Ok(Ok(_)) => {
-                    tracing::info!(
-                        info_hash = %hash,
-                        tracker = %url,
-                        event = event.as_str(),
-                        "seeder announce ok"
-                    );
-                }
-                Ok(Err(e)) => {
-                    tracing::debug!(
-                        info_hash = %hash,
-                        tracker = %url,
-                        event = event.as_str(),
-                        error = %e,
-                        "seeder announce failed"
-                    );
-                }
-                Err(_) => {
-                    tracing::debug!(
-                        info_hash = %hash,
-                        tracker = %url,
-                        event = event.as_str(),
-                        "seeder announce timed out"
-                    );
+    ) -> u64 {
+        let mut interval_seconds = 0u64;
+        'tiers: for tier in tracker_tiers {
+            for url in tier {
+                let req = AnnounceRequest {
+                    tracker_url: url.clone(),
+                    info_hash: hash,
+                    peer_id,
+                    port,
+                    uploaded: 0,
+                    downloaded: 0,
+                    left: 0,
+                    event,
+                    numwant: Some(0),
+                    compact: true,
+                };
+                let outcome = if url.starts_with("udp://") {
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        udp_tracker::udp_announce(binder, &req),
+                    )
+                    .await
+                } else {
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        tracker::http_announce(binder, &req),
+                    )
+                    .await
+                };
+                let succeeded = match outcome {
+                    Ok(Ok(response)) if response.failure_reason.is_none() => {
+                        let interval = response
+                            .interval
+                            .max(response.min_interval.unwrap_or(0))
+                            .clamp(30, 86_400);
+                        interval_seconds = interval;
+                        tracing::info!(
+                            info_hash = %hash,
+                            tracker = %url,
+                            event = event.as_str(),
+                            "seeder announce ok"
+                        );
+                        true
+                    }
+                    Ok(Ok(response)) => {
+                        tracing::debug!(
+                            info_hash = %hash,
+                            tracker = %url,
+                            event = event.as_str(),
+                            error = %response.failure_reason.unwrap_or_else(|| "tracker failure".into()),
+                            "seeder announce failed"
+                        );
+                        false
+                    }
+                    Ok(Err(e)) => {
+                        tracing::debug!(
+                            info_hash = %hash,
+                            tracker = %url,
+                            event = event.as_str(),
+                            error = %e,
+                            "seeder announce failed"
+                        );
+                        false
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            info_hash = %hash,
+                            tracker = %url,
+                            event = event.as_str(),
+                            "seeder announce timed out"
+                        );
+                        false
+                    }
+                };
+                if succeeded {
+                    break 'tiers;
                 }
             }
+        }
+        if interval_seconds == 0 {
+            300
+        } else {
+            interval_seconds
         }
     }
 
@@ -1864,10 +2370,14 @@ impl DaemonRuntime {
         if let Some(tx) = self.seeder_shutdowns.lock().await.remove(hash) {
             let _ = tx.send(true);
         }
+        self.seeder_registry.unregister(hash).await;
         let handle = self.seeder_handles.lock().await.remove(hash);
         if let Some(handle) = handle {
             handle.abort();
             let _ = handle.await;
+        }
+        if self.seeder_registry.is_empty().await {
+            self.stop_seeder_listener(true).await;
         }
     }
 
@@ -1877,7 +2387,12 @@ impl DaemonRuntime {
         let seeding_limit = cfg.queue.max_active_seeds;
         let samples = self.rate_samples.read().await.clone();
         let running_seeders: Vec<InfoHash> =
-            self.seeder_handles.lock().await.keys().copied().collect();
+            self.seeder_shutdowns.lock().await.keys().copied().collect();
+        if !running_seeders.is_empty() {
+            if let Err(error) = self.ensure_seeder_listener().await {
+                tracing::warn!(%error, "shared inbound seeding listener unavailable");
+            }
+        }
 
         let completed: Vec<(
             InfoHash,
@@ -1938,7 +2453,7 @@ impl DaemonRuntime {
         }
 
         for hash in allowed {
-            if self.seeder_handles.lock().await.contains_key(&hash) {
+            if self.seeder_shutdowns.lock().await.contains_key(&hash) {
                 continue;
             }
             let Some((_, meta, ..)) = completed.iter().find(|(h, ..)| *h == hash).cloned() else {
@@ -1953,11 +2468,29 @@ impl DaemonRuntime {
             };
             let complete_dir = self.resolve_download_dir(&torrent_for_dir).await;
             let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
-            let Some(state) = self.engine_states.read().await.get(&hash).cloned() else {
-                continue;
+            let existing_state = self.engine_states.read().await.get(&hash).cloned();
+            let state = if let Some(state) = existing_state {
+                state
+            } else {
+                let pieces_have = torrent_for_dir.progress.bitfield().clone();
+                let state = Arc::new(Mutex::new(EngineState {
+                    piece_count: meta.piece_count(),
+                    total_length: meta.total_length,
+                    downloaded: torrent_for_dir.downloaded,
+                    uploaded: torrent_for_dir.uploaded,
+                    pieces_have,
+                    finished: true,
+                    ..EngineState::default()
+                }));
+                self.engine_states.write().await.insert(hash, state.clone());
+                state
             };
-            self.start_seeder(hash, meta, active_dir, complete_dir, state)
-                .await;
+            if let Err(error) = self
+                .start_seeder(hash, meta, active_dir, complete_dir, state)
+                .await
+            {
+                tracing::warn!(info_hash = %hash, %error, "inbound seeding listener unavailable");
+            }
         }
     }
 
@@ -2019,50 +2552,31 @@ impl DaemonRuntime {
     /// `delete_data = false`, but safe to call from within the engine task
     /// itself because it does NOT await the engine task's own join handle
     /// (that would deadlock); the already-returning task is simply detached.
-    ///
-    /// This is an associated function taking the shared `Arc<Mutex<...>>`
-    /// fields (rather than `&self`) precisely so the spawned engine task can
-    /// invoke it with its captured clones.
-    #[allow(clippy::too_many_arguments)]
-    async fn selfish_remove_completed(
-        hash: InfoHash,
-        registry: Arc<Mutex<TorrentRegistry>>,
-        engine_cmds: Arc<Mutex<HashMap<InfoHash, tokio::sync::mpsc::Sender<EngineCommand>>>>,
-        engine_handles: Arc<RwLock<HashMap<InfoHash, JoinHandle<()>>>>,
-        engine_states: Arc<RwLock<HashMap<InfoHash, Arc<Mutex<EngineState>>>>>,
-        engine_limiters: Arc<RwLock<HashMap<InfoHash, swarmotter_core::bandwidth::RateLimiter>>>,
-        seeder_shutdowns: Arc<Mutex<HashMap<InfoHash, tokio::sync::watch::Sender<bool>>>>,
-        seeder_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
-        event_broker: EventBroker,
-    ) {
-        let name = registry
+    async fn selfish_remove_completed(&self, hash: InfoHash) {
+        let name = self
+            .registry
             .lock()
             .await
             .get(&hash)
             .map(|t| t.name().to_string())
             .unwrap_or_default();
         // Stop the inbound seeder (a separate task; safe to await).
-        if let Some(tx) = seeder_shutdowns.lock().await.remove(&hash) {
-            let _ = tx.send(true);
-        }
-        let seeder_handle = seeder_handles.lock().await.remove(&hash);
-        if let Some(handle) = seeder_handle {
-            let _ = handle.await;
-        }
+        self.stop_seeder(&hash).await;
         // Clear live engine bookkeeping. We deliberately do NOT await the
         // engine join handle: it belongs to the engine task that is calling
         // this method, so awaiting it would deadlock. Dropping the detached
         // handle is safe because the task is already returning.
-        engine_cmds.lock().await.remove(&hash);
-        engine_states.write().await.remove(&hash);
-        engine_limiters.write().await.remove(&hash);
-        let engine_handle = engine_handles.write().await.remove(&hash);
+        self.engine_cmds.lock().await.remove(&hash);
+        self.engine_states.write().await.remove(&hash);
+        self.engine_limiters.write().await.remove(&hash);
+        let engine_handle = self.engine_handles.write().await.remove(&hash);
         if let Some(handle) = engine_handle {
             drop(handle);
         }
         // Remove the torrent record; downloaded data is preserved (no
         // delete-data behavior is invoked).
-        registry.lock().await.remove(&hash);
+        self.registry.lock().await.remove(&hash);
+        self.queue.lock().await.remove(&hash);
         tracing::info!(
             info_hash = %hash,
             name = %name,
@@ -2070,8 +2584,9 @@ impl DaemonRuntime {
             delete_data = false,
             "selfish mode removed completed torrent; downloaded data preserved"
         );
-        event_broker.publish(torrent_removed_event(hash, false));
-        event_broker.publish(stats_updated_event());
+        self.publish_event(torrent_removed_event(hash, false));
+        self.publish_event(stats_updated_event());
+        self.persist_state_best_effort("selfish_completion").await;
     }
 
     async fn make_binder(&self) -> Arc<dyn swarmotter_core::net::NetworkBinder> {
@@ -2126,6 +2641,16 @@ impl DaemonRuntime {
                         t.state = TorrentState::NetworkBlocked;
                         t.error = Some(health.detail.clone());
                     }
+                }
+                let seeding_hashes = self
+                    .seeder_shutdowns
+                    .lock()
+                    .await
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>();
+                for hash in seeding_hashes {
+                    self.force_stop_seeder(&hash).await;
                 }
             } else {
                 let mut reg = self.registry.lock().await;
@@ -2328,6 +2853,9 @@ impl DaemonRuntime {
         self.sweep_selfish_completed_torrents_best_effort("engine_progress")
             .await;
         self.reconcile_seeders().await;
+        if !snapshots.is_empty() {
+            self.persist_state_best_effort("engine_progress").await;
+        }
     }
 
     /// Periodically compute autopilot decisions from contained runtime
@@ -2613,6 +3141,8 @@ impl DaemonRuntime {
             );
             return Err(e);
         }
+        self.ensure_storage_paths_available(&torrent.meta, torrent.download_dir.as_deref())
+            .await?;
         apply_network_state(&mut torrent, &self.network_health).await;
         let blocked = torrent.state == TorrentState::NetworkBlocked;
         let paused = torrent.state == TorrentState::Paused;
@@ -2625,6 +3155,7 @@ impl DaemonRuntime {
         if !blocked && !paused {
             self.schedule_reconcile_queue("watch_import_added").await;
         }
+        self.persist_state().await?;
         // Post-import action for the source file.
         match watch::post_import_action(folder, file) {
             watch::PostImportAction::Delete => {
@@ -2656,6 +3187,13 @@ impl DaemonRuntime {
 
     async fn apply_runtime_config_fields(&self) {
         let cfg = self.config.read().await.clone();
+        let inbound_session_limit = if cfg.bandwidth.max_peers == 0 {
+            crate::engine::DEFAULT_PEER_WORKER_LIMIT
+        } else {
+            cfg.bandwidth.max_peers
+        };
+        self.inbound_session_limit
+            .store(inbound_session_limit.max(1), Ordering::Relaxed);
         self.queue.lock().await.limits = cfg.queue.clone();
         self.global_limiter.set_capacity(
             swarmotter_core::bandwidth::RateDirection::Download,
@@ -2831,13 +3369,36 @@ fn redact_config(mut cfg: Config) -> Config {
 
 fn write_config_atomically(path: &Path, config: &Config) -> Result<()> {
     let toml = config.to_toml_string()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(CoreError::from)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(CoreError::from)?;
+    let sequence = CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("swarmotter.toml");
+    let tmp = path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
+    let result = (|| -> Result<()> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp).map_err(CoreError::from)?;
+        file.write_all(toml.as_bytes()).map_err(CoreError::from)?;
+        file.sync_all().map_err(CoreError::from)?;
+        drop(file);
+        fs::rename(&tmp, path).map_err(CoreError::from)?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(CoreError::from)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, toml).map_err(CoreError::from)?;
-    fs::rename(&tmp, path).map_err(CoreError::from)?;
-    Ok(())
+    result
 }
 
 fn restart_required_fields(previous: &Config, next: &Config) -> Vec<String> {
@@ -2860,16 +3421,52 @@ fn restart_required_fields(previous: &Config, next: &Config) -> Vec<String> {
     if previous.logging.file_path != next.logging.file_path {
         fields.push("logging.file_path".into());
     }
-    if previous.torrent.listen_port != next.torrent.listen_port {
-        fields.push("torrent.listen_port".into());
-    }
-    if previous.torrent.encryption_mode != next.torrent.encryption_mode {
-        fields.push("torrent.encryption_mode".into());
-    }
-    if previous.dht.port != next.dht.port {
-        fields.push("dht.port".into());
-    }
     fields
+}
+
+fn data_plane_config_changed(previous: &Config, next: &Config) -> bool {
+    previous.network != next.network
+        || previous.torrent.listen_port != next.torrent.listen_port
+        || previous.torrent.allow_ipv6 != next.torrent.allow_ipv6
+        || previous.torrent.utp_enabled != next.torrent.utp_enabled
+        || previous.torrent.utp_prefer_tcp != next.torrent.utp_prefer_tcp
+        || previous.torrent.encryption_mode != next.torrent.encryption_mode
+        || previous.dht != next.dht
+        || previous.pex.enabled != next.pex.enabled
+        || previous.pex.max_peers != next.pex.max_peers
+        || previous.storage.download_dir != next.storage.download_dir
+        || previous.storage.incomplete_dir != next.storage.incomplete_dir
+        || previous.storage.minimum_free_space_bytes != next.storage.minimum_free_space_bytes
+        || previous.storage.minimum_free_space_percent != next.storage.minimum_free_space_percent
+        || previous.storage.preallocate != next.storage.preallocate
+        || previous.storage.sparse != next.storage.sparse
+}
+
+fn validate_storage_config_transition(
+    previous: &Config,
+    next: &Config,
+    torrents: &[Torrent],
+) -> Result<()> {
+    if previous.storage.download_dir != next.storage.download_dir
+        && torrents
+            .iter()
+            .any(|torrent| torrent.download_dir.is_none())
+    {
+        return Err(CoreError::InvalidConfig(
+            "storage.download_dir cannot change while torrents still use the global download directory; move those torrents to explicit locations first"
+                .into(),
+        ));
+    }
+    if previous.storage.incomplete_dir != next.storage.incomplete_dir
+        && torrents
+            .iter()
+            .any(|torrent| !torrent.progress.is_complete())
+    {
+        return Err(CoreError::InvalidConfig(
+            "storage.incomplete_dir cannot change while torrents have incomplete payloads".into(),
+        ));
+    }
+    validate_restored_storage_ownership(torrents.iter(), next)
 }
 
 fn push_check(
@@ -3106,26 +3703,29 @@ fn apply_resolved_metadata(
     real: &swarmotter_core::meta::TorrentMeta,
     state: &EngineState,
 ) {
+    let initialize_files = t.needs_metadata || t.meta.files.len() != real.files.len();
     t.meta = real.clone();
     t.needs_metadata = false;
     t.magnet_info_hash = None;
     t.progress
         .replace_from_bitfield(&state.pieces_have, real.piece_count());
-    t.files = real
-        .files
-        .iter()
-        .enumerate()
-        .map(|(i, f)| TorrentFile {
-            index: i,
-            path: f.path.join("/"),
-            length: f.length,
-            bytes_completed: 0,
-            priority: FilePriority::Normal,
-            wanted: true,
-        })
-        .collect();
-    t.priorities = vec![FilePriority::Normal; real.files.len()];
-    t.wanted = vec![true; real.files.len()];
+    if initialize_files {
+        t.files = real
+            .files
+            .iter()
+            .enumerate()
+            .map(|(i, f)| TorrentFile {
+                index: i,
+                path: f.path.join("/"),
+                length: f.length,
+                bytes_completed: 0,
+                priority: FilePriority::Normal,
+                wanted: true,
+            })
+            .collect();
+        t.priorities = vec![FilePriority::Normal; real.files.len()];
+        t.wanted = vec![true; real.files.len()];
+    }
 }
 
 #[async_trait]
@@ -3207,6 +3807,7 @@ impl DaemonOps for DaemonRuntime {
         }
         self.queue.lock().await.clear_bypass(hash);
         self.reconcile_queue().await;
+        self.persist_state().await?;
         self.publish_torrent_event("torrent_changed", *hash, TorrentState::Paused);
         self.publish_event(stats_updated_event());
         Ok(())
@@ -3230,6 +3831,7 @@ impl DaemonOps for DaemonRuntime {
             queue.start_now(hash);
         }
         self.reconcile_queue().await;
+        self.persist_state().await?;
         self.publish_torrent_event("torrent_changed", *hash, TorrentState::Queued);
         self.publish_event(stats_updated_event());
         Ok(())
@@ -3249,6 +3851,7 @@ impl DaemonOps for DaemonRuntime {
             queue.start_now(hash);
         }
         self.reconcile_queue().await;
+        self.persist_state().await?;
         self.publish_event(stats_updated_event());
         Ok(())
     }
@@ -3258,6 +3861,13 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn recheck(&self, hash: &InfoHash) -> Result<()> {
+        let was_completed = self
+            .registry
+            .lock()
+            .await
+            .get(hash)
+            .map(|torrent| torrent.progress.is_complete())
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
         self.stop_engine(hash).await;
         {
             let mut reg = self.registry.lock().await;
@@ -3277,7 +3887,7 @@ impl DaemonOps for DaemonRuntime {
                 return Err(CoreError::NotFound("torrent".into()));
             };
             let complete_dir = self.resolve_download_dir(t).await;
-            let storage_dir = if t.state == TorrentState::Completed {
+            let storage_dir = if was_completed {
                 complete_dir
             } else {
                 self.resolve_incomplete_dir(&complete_dir).await
@@ -3294,7 +3904,7 @@ impl DaemonOps for DaemonRuntime {
                 let mut reg = self.registry.lock().await;
                 if let Some(t) = reg.get_mut(hash) {
                     t.progress.replace_from_bitfield(&bf, meta.piece_count());
-                    if bf.count(meta.piece_count()) == meta.piece_count() {
+                    if torrent_selection_complete(t, &bf) {
                         t.state = TorrentState::Completed;
                         t.date_completed = Some(now());
                         final_state = Some(TorrentState::Completed);
@@ -3311,6 +3921,7 @@ impl DaemonOps for DaemonRuntime {
                     }
                     self.publish_event(stats_updated_event());
                 }
+                self.persist_state().await?;
             }
             Err(e) => {
                 let mut reg = self.registry.lock().await;
@@ -3321,6 +3932,8 @@ impl DaemonOps for DaemonRuntime {
                 drop(reg);
                 self.publish_torrent_event("torrent_error", *hash, TorrentState::StorageError);
                 self.publish_event(stats_updated_event());
+                self.persist_state_best_effort("recheck_failed").await;
+                return Err(e);
             }
         }
         Ok(())
@@ -3338,14 +3951,84 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn move_data(&self, hash: &InfoHash, path: String) -> Result<()> {
-        let mut reg = self.registry.lock().await;
-        match reg.get_mut(hash) {
-            Some(t) => {
-                t.download_dir = Some(path);
-                Ok(())
-            }
-            None => Err(CoreError::NotFound("torrent".into())),
+        if path.trim().is_empty() {
+            return Err(CoreError::Storage(
+                "torrent data destination must not be empty".into(),
+            ));
         }
+        let storage_ownership = self.storage_ownership_lock.lock().await;
+        let torrent = self
+            .registry
+            .lock()
+            .await
+            .get(hash)
+            .cloned()
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+        self.ensure_storage_paths_available_except(&torrent.meta, Some(&path), Some(*hash))
+            .await?;
+        let was_active = matches!(
+            torrent.state,
+            TorrentState::Downloading | TorrentState::DownloadingMetadata
+        );
+        let state_completed = matches!(
+            torrent.state,
+            TorrentState::Completed | TorrentState::Seeding
+        );
+        let payload_in_complete = torrent.progress.is_complete();
+        self.stop_engine(hash).await;
+        let cfg = self.config.read().await.clone();
+        let old_complete = resolve_download_dir_from_config(torrent.download_dir.as_deref(), &cfg);
+        let source = if payload_in_complete {
+            old_complete
+        } else {
+            resolve_incomplete_dir_from_config(&old_complete, &cfg)
+        };
+        let destination = if payload_in_complete {
+            path.clone()
+        } else {
+            resolve_incomplete_dir_from_config(&path, &cfg)
+        };
+        let source_path = PathBuf::from(source);
+        let storage =
+            swarmotter_core::storage::StorageIo::new(torrent.meta.clone(), source_path.clone());
+        let moved_storage = match storage.move_to(PathBuf::from(destination)).await {
+            Ok(storage) => storage,
+            Err(error) => {
+                drop(storage_ownership);
+                if was_active {
+                    self.restart_engine_for_settings(hash).await;
+                } else if state_completed {
+                    self.reconcile_seeders().await;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(current) = self.registry.lock().await.get_mut(hash) {
+            current.download_dir = Some(path);
+        }
+        let persist_result = self.persist_state().await;
+        let result = if let Err(persist_error) = persist_result {
+            match moved_storage.move_to(source_path).await {
+                Ok(_) => {
+                    if let Some(current) = self.registry.lock().await.get_mut(hash) {
+                        current.download_dir = torrent.download_dir.clone();
+                    }
+                    Err(persist_error)
+                }
+                Err(rollback_error) => Err(CoreError::Storage(format!(
+                    "{persist_error}; data move rollback also failed: {rollback_error}"
+                ))),
+            }
+        } else {
+            Ok(())
+        };
+        drop(storage_ownership);
+        if was_active {
+            self.restart_engine_for_settings(hash).await;
+        } else if state_completed {
+            self.reconcile_seeders().await;
+        }
+        result
     }
 
     async fn rename_path(
@@ -3354,27 +4037,111 @@ impl DaemonOps for DaemonRuntime {
         file_index: usize,
         new_path: String,
     ) -> Result<()> {
-        let mut reg = self.registry.lock().await;
-        match reg.get_mut(hash) {
-            Some(t) => {
-                if file_index < t.files.len() {
-                    t.files[file_index].path = new_path;
-                }
-                Ok(())
-            }
-            None => Err(CoreError::NotFound("torrent".into())),
+        let components = validated_relative_path(&new_path)?;
+        let storage_ownership = self.storage_ownership_lock.lock().await;
+        let torrent = self
+            .registry
+            .lock()
+            .await
+            .get(hash)
+            .cloned()
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+        if file_index >= torrent.meta.files.len() {
+            return Err(CoreError::NotFound("torrent file".into()));
         }
+        let mut renamed_meta = torrent.meta.clone();
+        renamed_meta.files[file_index].path = components;
+        self.ensure_storage_paths_available_except(
+            &renamed_meta,
+            torrent.download_dir.as_deref(),
+            Some(*hash),
+        )
+        .await?;
+        let was_active = matches!(
+            torrent.state,
+            TorrentState::Downloading | TorrentState::DownloadingMetadata
+        );
+        let state_completed = matches!(
+            torrent.state,
+            TorrentState::Completed | TorrentState::Seeding
+        );
+        let payload_in_complete = torrent.progress.is_complete();
+        self.stop_engine(hash).await;
+        let complete_dir = self.resolve_download_dir(&torrent).await;
+        let storage_dir = if payload_in_complete {
+            complete_dir
+        } else {
+            self.resolve_incomplete_dir(&complete_dir).await
+        };
+        let old_storage = swarmotter_core::storage::StorageIo::new(
+            torrent.meta.clone(),
+            PathBuf::from(&storage_dir),
+        );
+        let old_path = old_storage.file_path(file_index)?;
+        let new_storage = swarmotter_core::storage::StorageIo::new(
+            renamed_meta.clone(),
+            PathBuf::from(storage_dir),
+        );
+        let new_file_path = new_storage.file_path(file_index)?;
+        if old_path == new_file_path {
+            drop(storage_ownership);
+            if was_active {
+                self.restart_engine_for_settings(hash).await;
+            } else if state_completed {
+                self.reconcile_seeders().await;
+            }
+            return Ok(());
+        }
+        let disk_outcome = match rename_payload_exclusive(&old_path, &new_file_path).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                drop(storage_ownership);
+                if was_active {
+                    self.restart_engine_for_settings(hash).await;
+                } else if state_completed {
+                    self.reconcile_seeders().await;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(torrent) = self.registry.lock().await.get_mut(hash) {
+            torrent.meta = renamed_meta;
+            torrent.files[file_index].path = new_path;
+        }
+        let result = if let Err(persist_error) = self.persist_state().await {
+            match rollback_payload_rename(&old_path, &new_file_path, disk_outcome).await {
+                Ok(()) => {
+                    if let Some(current) = self.registry.lock().await.get_mut(hash) {
+                        *current = torrent;
+                    }
+                    Err(persist_error)
+                }
+                Err(rollback_error) => Err(CoreError::Storage(format!(
+                    "{persist_error}; payload rename rollback also failed: {rollback_error}"
+                ))),
+            }
+        } else {
+            Ok(())
+        };
+        drop(storage_ownership);
+        if was_active {
+            self.restart_engine_for_settings(hash).await;
+        } else if state_completed {
+            self.reconcile_seeders().await;
+        }
+        result
     }
 
     async fn set_labels(&self, hash: &InfoHash, labels: Vec<String>) -> Result<()> {
-        let mut reg = self.registry.lock().await;
-        match reg.get_mut(hash) {
+        let result = match self.registry.lock().await.get_mut(hash) {
             Some(t) => {
                 t.labels = labels;
                 Ok(())
             }
             None => Err(CoreError::NotFound("torrent".into())),
-        }
+        };
+        result?;
+        self.persist_state().await
     }
 
     async fn set_torrent_limits(
@@ -3406,7 +4173,7 @@ impl DaemonOps for DaemonRuntime {
                 limits.upload,
             );
         }
-        Ok(())
+        self.persist_state().await
     }
 
     async fn list_files(&self, hash: &InfoHash) -> Option<Vec<TorrentFile>> {
@@ -3423,19 +4190,30 @@ impl DaemonOps for DaemonRuntime {
         file_indices: Vec<usize>,
         wanted: bool,
     ) -> Result<()> {
-        let mut reg = self.registry.lock().await;
-        match reg.get_mut(hash) {
-            Some(t) => {
-                for i in file_indices {
-                    if i < t.wanted.len() {
-                        t.wanted[i] = wanted;
-                        t.files[i].wanted = wanted;
-                    }
-                }
-                Ok(())
+        let should_restart = {
+            let mut reg = self.registry.lock().await;
+            let Some(t) = reg.get_mut(hash) else {
+                return Err(CoreError::NotFound("torrent".into()));
+            };
+            if file_indices.iter().any(|index| *index >= t.wanted.len()) {
+                return Err(CoreError::NotFound("torrent file".into()));
             }
-            None => Err(CoreError::NotFound("torrent".into())),
+            for i in file_indices {
+                t.wanted[i] = wanted;
+                t.files[i].wanted = wanted;
+            }
+            matches!(
+                t.state,
+                TorrentState::Downloading
+                    | TorrentState::DownloadingMetadata
+                    | TorrentState::Completed
+            )
+        };
+        self.persist_state().await?;
+        if should_restart {
+            self.restart_engine_for_settings(hash).await;
         }
+        Ok(())
     }
 
     async fn set_priority(
@@ -3444,66 +4222,74 @@ impl DaemonOps for DaemonRuntime {
         file_indices: Vec<usize>,
         priority: FilePriority,
     ) -> Result<()> {
-        let mut reg = self.registry.lock().await;
-        match reg.get_mut(hash) {
-            Some(t) => {
-                for i in file_indices {
-                    if i < t.priorities.len() {
-                        t.priorities[i] = priority;
-                        t.files[i].priority = priority;
-                    }
-                }
-                Ok(())
+        let should_restart = {
+            let mut reg = self.registry.lock().await;
+            let Some(t) = reg.get_mut(hash) else {
+                return Err(CoreError::NotFound("torrent".into()));
+            };
+            if file_indices
+                .iter()
+                .any(|index| *index >= t.priorities.len())
+            {
+                return Err(CoreError::NotFound("torrent file".into()));
             }
-            None => Err(CoreError::NotFound("torrent".into())),
+            for i in file_indices {
+                t.priorities[i] = priority;
+                t.files[i].priority = priority;
+            }
+            matches!(
+                t.state,
+                TorrentState::Downloading
+                    | TorrentState::DownloadingMetadata
+                    | TorrentState::Completed
+            )
+        };
+        self.persist_state().await?;
+        if should_restart {
+            self.restart_engine_for_settings(hash).await;
         }
+        Ok(())
     }
 
     async fn list_trackers(&self, hash: &InfoHash) -> Option<Vec<TrackerInfo>> {
         // Reflect real per-tracker announce results from the live engine, if
         // present. Success text is kept separate from last_error so the UI and
         // Transmission emulation do not report successful announces as errors.
-        let engine_trackers = self
+        let (engine_trackers, tracker_interval_seconds) = self
             .engine_states
             .read()
             .await
             .get(hash)
             .and_then(|s| s.try_lock().ok())
-            .map(|s| s.tracker_announces.clone())
+            .map(|s| (s.tracker_announces.clone(), s.tracker_interval_seconds))
             .unwrap_or_default();
         self.registry.lock().await.get(hash).map(|t| {
             let mut out = Vec::new();
-            let mut tier = 0usize;
-            let mut urls = Vec::new();
-            if let Some(a) = &t.meta.announce {
-                urls.push(a.clone());
-            }
-            for tlist in &t.meta.announce_list {
-                for url in tlist {
-                    urls.push(url.clone());
+            let tiers = tracker::announce_tiers(t.meta.announce.as_deref(), &t.meta.announce_list);
+            for (tier, urls) in tiers.iter().enumerate() {
+                for url in urls {
+                    let mut info = make_tracker(url, tier);
+                    if let Some(snapshot) = engine_trackers.get(url) {
+                        info.status = snapshot.status;
+                        info.seeders = snapshot.seeders;
+                        info.leechers = snapshot.leechers;
+                        info.downloads = snapshot.downloads;
+                        info.last_error = snapshot.last_error.clone();
+                        info.last_message = snapshot.last_message.clone();
+                        info.last_announce = snapshot.last_announce;
+                        info.next_announce = snapshot
+                            .last_announce
+                            .map(|last| last.saturating_add(tracker_interval_seconds.max(30)));
+                    }
+                    out.push(info);
                 }
-            }
-            for url in &urls {
-                let mut info = make_tracker(url, tier);
-                if let Some(snapshot) = engine_trackers.get(url) {
-                    info.status = snapshot.status;
-                    info.seeders = snapshot.seeders;
-                    info.leechers = snapshot.leechers;
-                    info.downloads = snapshot.downloads;
-                    info.last_error = snapshot.last_error.clone();
-                    info.last_message = snapshot.last_message.clone();
-                    info.last_announce = snapshot.last_announce;
-                }
-                out.push(info);
-                tier += 1;
             }
             out
         })
     }
 
     async fn add_tracker(&self, hash: &InfoHash, url: String) -> Result<()> {
-        let mut reg = self.registry.lock().await;
-        match reg.get_mut(hash) {
+        let result = match self.registry.lock().await.get_mut(hash) {
             Some(t) => {
                 if t.meta.announce.is_none() {
                     t.meta.announce = Some(url);
@@ -3513,12 +4299,13 @@ impl DaemonOps for DaemonRuntime {
                 Ok(())
             }
             None => Err(CoreError::NotFound("torrent".into())),
-        }
+        };
+        result?;
+        self.persist_state().await
     }
 
     async fn remove_tracker(&self, hash: &InfoHash, url: String) -> Result<()> {
-        let mut reg = self.registry.lock().await;
-        match reg.get_mut(hash) {
+        let result = match self.registry.lock().await.get_mut(hash) {
             Some(t) => {
                 if t.meta.announce.as_deref() == Some(&url) {
                     t.meta.announce = None;
@@ -3530,28 +4317,31 @@ impl DaemonOps for DaemonRuntime {
                 Ok(())
             }
             None => Err(CoreError::NotFound("torrent".into())),
-        }
+        };
+        result?;
+        self.persist_state().await
     }
 
     async fn edit_tracker(&self, hash: &InfoHash, old_url: String, new_url: String) -> Result<()> {
-        let mut reg = self.registry.lock().await;
-        match reg.get_mut(hash) {
+        let result = match self.registry.lock().await.get_mut(hash) {
             Some(t) => {
                 if t.meta.announce.as_deref() == Some(&old_url) {
                     t.meta.announce = Some(new_url);
-                    return Ok(());
-                }
-                for tier in t.meta.announce_list.iter_mut() {
-                    for u in tier.iter_mut() {
-                        if *u == old_url {
-                            *u = new_url.clone();
+                } else {
+                    for tier in t.meta.announce_list.iter_mut() {
+                        for u in tier.iter_mut() {
+                            if *u == old_url {
+                                *u = new_url.clone();
+                            }
                         }
                     }
                 }
                 Ok(())
             }
             None => Err(CoreError::NotFound("torrent".into())),
-        }
+        };
+        result?;
+        self.persist_state().await
     }
 
     async fn list_peers(&self, hash: &InfoHash) -> Option<Vec<Peer>> {
@@ -3586,7 +4376,7 @@ impl DaemonOps for DaemonRuntime {
         }
         self.queue.lock().await.move_up(hash);
         self.reconcile_queue().await;
-        Ok(())
+        self.persist_state().await
     }
     async fn queue_move_down(&self, hash: &InfoHash) -> Result<()> {
         {
@@ -3597,7 +4387,7 @@ impl DaemonOps for DaemonRuntime {
         }
         self.queue.lock().await.move_down(hash);
         self.reconcile_queue().await;
-        Ok(())
+        self.persist_state().await
     }
     async fn queue_move_to_top(&self, hash: &InfoHash) -> Result<()> {
         {
@@ -3608,7 +4398,7 @@ impl DaemonOps for DaemonRuntime {
         }
         self.queue.lock().await.move_to_top(hash);
         self.reconcile_queue().await;
-        Ok(())
+        self.persist_state().await
     }
     async fn queue_move_to_bottom(&self, hash: &InfoHash) -> Result<()> {
         {
@@ -3619,7 +4409,7 @@ impl DaemonOps for DaemonRuntime {
         }
         self.queue.lock().await.move_to_bottom(hash);
         self.reconcile_queue().await;
-        Ok(())
+        self.persist_state().await
     }
 
     async fn get_config(&self) -> Config {
@@ -3649,6 +4439,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn replace_config(&self, mut next: Config) -> Result<ConfigUpdateResult> {
+        let _config_transaction = self.config_write_lock.lock().await;
         let (previous, config_path) = {
             let cfg = self.config.read().await;
             (cfg.clone(), self.config_path.clone())
@@ -3657,16 +4448,48 @@ impl DaemonOps for DaemonRuntime {
             next.api.auth_token = previous.api.auth_token.clone();
         }
         next.validate()?;
+        let torrents = self
+            .registry
+            .lock()
+            .await
+            .torrents
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        validate_storage_config_transition(&previous, &next, &torrents)?;
 
         if let Some(path) = &config_path {
             write_config_atomically(path, &next)?;
         }
 
         let restart_required_fields = restart_required_fields(&previous, &next);
+        let rebuild_data_plane = data_plane_config_changed(&previous, &next);
+        let data_plane_transition = if rebuild_data_plane {
+            Some(self.data_plane_transition_lock.lock().await)
+        } else {
+            None
+        };
+        if rebuild_data_plane {
+            // Snapshot progress before stopping every task created from the old
+            // containment policy. No old binder, DHT runner, listener, tracker
+            // sidecar, or accepted peer session may survive the config swap.
+            self.reconcile_engine_progress().await;
+            let registry_hashes = self
+                .registry
+                .lock()
+                .await
+                .torrents
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            self.stop_all_torrent_tasks(&registry_hashes).await;
+            *self.dht_runner.lock().await = None;
+        }
         {
             let mut cfg = self.config.write().await;
             *cfg = next.clone();
         }
+        drop(data_plane_transition);
         self.apply_runtime_config_fields().await;
         self.publish_event(Event::new("settings_changed", json!({})));
         self.publish_event(stats_updated_event());
@@ -3684,7 +4507,10 @@ impl DaemonOps for DaemonRuntime {
                 "torrent.allow_ipv6".into(),
                 "torrent.utp_enabled".into(),
                 "torrent.utp_prefer_tcp".into(),
+                "torrent.listen_port".into(),
+                "torrent.encryption_mode".into(),
                 "torrent.selfish".into(),
+                "dht".into(),
                 "storage".into(),
                 "watch".into(),
                 "autopilot".into(),
@@ -3749,6 +4575,7 @@ impl DaemonOps for DaemonRuntime {
         }
 
         self.clear_download_runtime_state().await;
+        self.persist_state().await?;
 
         tracing::warn!(
             torrents_removed = torrents.len(),
@@ -4158,7 +4985,7 @@ impl DaemonOps for DaemonRuntime {
             t.autopilot_mode_override = mode;
         }
         self.refresh_autopilot_decisions(false).await;
-        Ok(())
+        self.persist_state().await
     }
 
     async fn watch_scan(&self) -> Result<()> {
@@ -4222,6 +5049,30 @@ fn make_tracker(url: &str, tier: usize) -> TrackerInfo {
     }
 }
 
+fn validate_restored_storage_ownership<'a>(
+    torrents: impl IntoIterator<Item = &'a Torrent>,
+    config: &Config,
+) -> Result<()> {
+    let mut ownerships = Vec::new();
+    for torrent in torrents {
+        let complete_dir =
+            resolve_download_dir_from_config(torrent.download_dir.as_deref(), config);
+        let active_dir = resolve_incomplete_dir_from_config(&complete_dir, config);
+        for root in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
+            ownerships.push(
+                swarmotter_core::storage::StorageIo::new(torrent.meta.clone(), root)
+                    .path_ownership()?,
+            );
+        }
+    }
+    for index in 0..ownerships.len() {
+        for other in ownerships.iter().skip(index + 1) {
+            ownerships[index].ensure_compatible_with(other)?;
+        }
+    }
+    Ok(())
+}
+
 fn unique_pathbufs<I>(paths: I) -> Vec<PathBuf>
 where
     I: IntoIterator<Item = PathBuf>,
@@ -4233,6 +5084,215 @@ where
         }
     }
     out
+}
+
+fn validated_relative_path(path: &str) -> Result<Vec<String>> {
+    if path.trim().is_empty() {
+        return Err(CoreError::Storage("renamed path must not be empty".into()));
+    }
+    let mut components = Vec::new();
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::Normal(value) => {
+                let value = value
+                    .to_str()
+                    .ok_or_else(|| CoreError::Storage("renamed path must be valid UTF-8".into()))?;
+                components.push(value.to_string());
+            }
+            _ => {
+                return Err(CoreError::Storage(
+                    "renamed path must be relative and must not contain '.' or '..'".into(),
+                ));
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err(CoreError::Storage("renamed path must not be empty".into()));
+    }
+    Ok(components)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PayloadRenameOutcome {
+    Moved,
+    PlaceholderCreated,
+}
+
+async fn rename_payload_exclusive(
+    source: &Path,
+    destination: &Path,
+) -> Result<PayloadRenameOutcome> {
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let source_metadata = match tokio::fs::symlink_metadata(source).await {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(CoreError::from(error)),
+    };
+    if source_metadata.is_none() {
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(destination)
+            .await
+            .map_err(|error| {
+                CoreError::Storage(format!(
+                    "cannot reserve rename destination {}: {error}",
+                    destination.display()
+                ))
+            })?;
+        file.sync_all().await.map_err(CoreError::from)?;
+        sync_parent_directory(destination).await?;
+        return Ok(PayloadRenameOutcome::PlaceholderCreated);
+    }
+    if !source_metadata.is_some_and(|metadata| metadata.is_file()) {
+        return Err(CoreError::Storage(format!(
+            "rename source is not a regular file: {}",
+            source.display()
+        )));
+    }
+
+    let move_result: Result<()> = match tokio::fs::hard_link(source, destination).await {
+        Ok(()) => Ok(()),
+        Err(link_error) => {
+            let mut input = tokio::fs::File::open(source)
+                .await
+                .map_err(CoreError::from)?;
+            let mut output = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)
+                .await
+                .map_err(|error| {
+                    CoreError::Storage(format!(
+                        "cannot rename {} to {} without replacing data: hard link failed ({link_error}); exclusive copy failed ({error})",
+                        source.display(),
+                        destination.display()
+                    ))
+                })?;
+            if let Err(error) = tokio::io::copy(&mut input, &mut output).await {
+                let _ = tokio::fs::remove_file(destination).await;
+                return Err(CoreError::from(error));
+            }
+            if let Err(error) = output.sync_all().await {
+                let _ = tokio::fs::remove_file(destination).await;
+                return Err(CoreError::from(error));
+            }
+            Ok(())
+        }
+    };
+    move_result?;
+    if let Err(error) = sync_parent_directory(destination).await {
+        let cleanup = tokio::fs::remove_file(destination).await;
+        return Err(CoreError::Storage(format!(
+            "cannot sync rename destination {}: {error}{}",
+            destination.display(),
+            cleanup
+                .err()
+                .map(|cleanup| format!("; destination cleanup failed: {cleanup}"))
+                .unwrap_or_default()
+        )));
+    }
+    if let Err(error) = tokio::fs::remove_file(source).await {
+        let cleanup = tokio::fs::remove_file(destination).await;
+        return Err(CoreError::Storage(format!(
+            "cannot remove rename source {}: {error}{}",
+            source.display(),
+            cleanup
+                .err()
+                .map(|cleanup| format!("; destination cleanup failed: {cleanup}"))
+                .unwrap_or_default()
+        )));
+    }
+    if let Err(error) = sync_parent_directory(source).await {
+        let rollback = async {
+            tokio::fs::hard_link(destination, source)
+                .await
+                .map_err(CoreError::from)?;
+            tokio::fs::remove_file(destination)
+                .await
+                .map_err(CoreError::from)?;
+            Ok::<(), CoreError>(())
+        }
+        .await;
+        return match rollback {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(CoreError::Storage(format!(
+                "{error}; rename rollback also failed: {rollback_error}"
+            ))),
+        };
+    }
+    Ok(PayloadRenameOutcome::Moved)
+}
+
+async fn rollback_payload_rename(
+    source: &Path,
+    destination: &Path,
+    outcome: PayloadRenameOutcome,
+) -> Result<()> {
+    match outcome {
+        PayloadRenameOutcome::Moved => {
+            if !matches!(
+                rename_payload_exclusive(destination, source).await?,
+                PayloadRenameOutcome::Moved
+            ) {
+                return Err(CoreError::Storage(
+                    "rename rollback found a missing destination payload".into(),
+                ));
+            }
+        }
+        PayloadRenameOutcome::PlaceholderCreated => {
+            tokio::fs::remove_file(destination)
+                .await
+                .map_err(CoreError::from)?;
+            sync_parent_directory(destination).await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn sync_parent_directory(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::fs::File::open(parent).and_then(|directory| directory.sync_all())
+    })
+    .await
+    .map_err(|error| CoreError::Storage(format!("sync directory task failed: {error}")))?
+    .map_err(CoreError::from)
+}
+
+#[cfg(not(unix))]
+async fn sync_parent_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn torrent_selection_complete(
+    torrent: &Torrent,
+    have: &swarmotter_core::storage::PieceBitfield,
+) -> bool {
+    (0..torrent.meta.piece_count()).all(|piece| {
+        let selected = swarmotter_core::storage::piece_file_ranges(&torrent.meta, piece)
+            .into_iter()
+            .any(|slice| {
+                torrent
+                    .wanted
+                    .get(slice.file_index)
+                    .copied()
+                    .unwrap_or(true)
+                    && torrent
+                        .priorities
+                        .get(slice.file_index)
+                        .copied()
+                        .unwrap_or(FilePriority::Normal)
+                        != FilePriority::Unwanted
+            });
+        !selected || have.has(piece)
+    })
 }
 
 fn add_storage_root_role(
@@ -4668,6 +5728,656 @@ mod tests {
         let mut bytes = [0u8; 20];
         bytes[..4].copy_from_slice(&n.to_be_bytes());
         bytes
+    }
+
+    #[tokio::test]
+    async fn durable_state_restores_torrents_settings_and_queue() {
+        let root = unique_dir("durable-state");
+        let state_path = root.join("state.json");
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::with_paths_broker_and_state(
+            cfg.clone(),
+            health.clone(),
+            None,
+            None,
+            Some(state_path.clone()),
+            EventBroker::default(),
+        );
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "persisted.bin",
+            b"durable daemon state",
+            8,
+            None,
+            false,
+        );
+        let hash = runtime
+            .add_torrent_file_with_options(bytes, AddTorrentOptions::new(None, true))
+            .await
+            .unwrap();
+        runtime
+            .set_labels(&hash, vec!["linux-release".into()])
+            .await
+            .unwrap();
+        drop(runtime);
+
+        let restored = DaemonRuntime::with_paths_broker_and_state(
+            cfg,
+            health,
+            None,
+            None,
+            Some(state_path),
+            EventBroker::default(),
+        );
+        assert_eq!(restored.restore_persisted_state().await.unwrap(), 1);
+        let torrent = restored.registry.lock().await.get(&hash).cloned().unwrap();
+        assert_eq!(torrent.state, TorrentState::Paused);
+        assert_eq!(torrent.labels, vec!["linux-release"]);
+        assert_eq!(restored.queue.lock().await.position(&hash), Some(1));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn torrent_add_rejects_cross_torrent_storage_path_collision() {
+        let root = unique_dir("path-collision");
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(root.display().to_string());
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let first = swarmotter_core::meta::build_single_file_torrent(
+            "shared-name.bin",
+            b"first lawful payload",
+            8,
+            None,
+            false,
+        );
+        let second = swarmotter_core::meta::build_single_file_torrent(
+            "shared-name.bin",
+            b"different lawful payload",
+            8,
+            None,
+            false,
+        );
+
+        runtime
+            .add_torrent_file_with_options(first, AddTorrentOptions::new(None, true))
+            .await
+            .unwrap();
+        let error = runtime
+            .add_torrent_file_with_options(second, AddTorrentOptions::new(None, true))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, CoreError::Storage(_)));
+        assert_eq!(runtime.registry.lock().await.torrents.len(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_torrent_adds_cannot_claim_the_same_storage_path() {
+        let root = unique_dir("concurrent-path-collision");
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(root.display().to_string());
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let first = swarmotter_core::meta::build_single_file_torrent(
+            "concurrent.bin",
+            b"first concurrent payload",
+            8,
+            None,
+            false,
+        );
+        let second = swarmotter_core::meta::build_single_file_torrent(
+            "concurrent.bin",
+            b"second concurrent payload",
+            8,
+            None,
+            false,
+        );
+
+        let (first, second) = tokio::join!(
+            runtime.add_torrent_file_with_options(first, AddTorrentOptions::new(None, true)),
+            runtime.add_torrent_file_with_options(second, AddTorrentOptions::new(None, true))
+        );
+        assert_ne!(first.is_ok(), second.is_ok());
+        let error = first.err().or_else(|| second.err()).unwrap();
+        assert!(matches!(error, CoreError::Storage(_)));
+        assert_eq!(runtime.registry.lock().await.torrents.len(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn distinct_same_name_magnets_cannot_share_placeholder_paths() {
+        let root = unique_dir("magnet-path-collision");
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(root.display().to_string());
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let first = "magnet:?xt=urn:btih:0000000000000000000000000000000000000001&dn=shared.bin";
+        let second = "magnet:?xt=urn:btih:0000000000000000000000000000000000000002&dn=shared.bin";
+
+        runtime
+            .add_magnet_with_options(first, AddTorrentOptions::new(None, true))
+            .await
+            .unwrap();
+        let error = runtime
+            .add_magnet_with_options(second, AddTorrentOptions::new(None, true))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoreError::Storage(_)));
+        assert_eq!(runtime.registry.lock().await.torrents.len(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn durable_restore_rejects_colliding_paths_and_invalid_progress() {
+        let root = unique_dir("restore-validation");
+        let state_path = root.join("state.json");
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(root.join("payload").display().to_string());
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let first_meta = swarmotter_core::meta::parse_torrent(
+            &swarmotter_core::meta::build_single_file_torrent(
+                "restored.bin",
+                b"first restored payload",
+                8,
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        let second_meta = swarmotter_core::meta::parse_torrent(
+            &swarmotter_core::meta::build_single_file_torrent(
+                "restored.bin",
+                b"second restored payload",
+                8,
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        let first = Torrent::new(first_meta, 1);
+        let second = Torrent::new(second_meta, 2);
+        crate::state_store::save(
+            &state_path,
+            &crate::state_store::DaemonState::new(
+                vec![first.clone(), second],
+                QueueState::new(cfg.queue.clone()),
+            ),
+        )
+        .unwrap();
+        let runtime = DaemonRuntime::with_paths_broker_and_state(
+            cfg.clone(),
+            health.clone(),
+            None,
+            None,
+            Some(state_path.clone()),
+            EventBroker::default(),
+        );
+        assert!(matches!(
+            runtime.restore_persisted_state().await.unwrap_err(),
+            CoreError::Storage(_)
+        ));
+
+        let mut invalid_progress = first;
+        invalid_progress.progress.total += 1;
+        crate::state_store::save(
+            &state_path,
+            &crate::state_store::DaemonState::new(
+                vec![invalid_progress],
+                QueueState::new(cfg.queue.clone()),
+            ),
+        )
+        .unwrap();
+        let runtime = DaemonRuntime::with_paths_broker_and_state(
+            cfg,
+            health,
+            None,
+            None,
+            Some(state_path),
+            EventBroker::default(),
+        );
+        assert!(matches!(
+            runtime.restore_persisted_state().await.unwrap_err(),
+            CoreError::Storage(_)
+        ));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn state_save_failure_rolls_back_move_and_rename() {
+        let root = unique_dir("storage-state-rollback");
+        let state_path = root.join("state-target");
+        std::fs::create_dir_all(&state_path).unwrap();
+        let old_root = root.join("old");
+        let new_root = root.join("new");
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(old_root.display().to_string());
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::with_paths_broker_and_state(
+            cfg,
+            health,
+            None,
+            None,
+            Some(state_path),
+            EventBroker::default(),
+        );
+        let payload = b"rollback payload";
+        let meta = swarmotter_core::meta::parse_torrent(
+            &swarmotter_core::meta::build_single_file_torrent(
+                "rollback.bin",
+                payload,
+                8,
+                None,
+                false,
+            ),
+        )
+        .unwrap();
+        let hash = meta.info_hash;
+        let mut torrent = Torrent::new(meta.clone(), 1);
+        torrent.state = TorrentState::Paused;
+        torrent.download_dir = Some(old_root.display().to_string());
+        for piece in 0..meta.piece_count() {
+            torrent.progress.have_piece(piece);
+        }
+        runtime.registry.lock().await.add(torrent).unwrap();
+        runtime.queue.lock().await.add(hash);
+        tokio::fs::create_dir_all(&old_root).await.unwrap();
+        tokio::fs::write(old_root.join("rollback.bin"), payload)
+            .await
+            .unwrap();
+
+        assert!(runtime
+            .move_data(&hash, new_root.display().to_string())
+            .await
+            .is_err());
+        assert_eq!(
+            tokio::fs::read(old_root.join("rollback.bin"))
+                .await
+                .unwrap(),
+            payload
+        );
+        assert!(!new_root.join("rollback.bin").exists());
+        assert_eq!(
+            runtime
+                .registry
+                .lock()
+                .await
+                .get(&hash)
+                .unwrap()
+                .download_dir
+                .as_deref(),
+            old_root.to_str()
+        );
+
+        assert!(runtime
+            .rename_path(&hash, 0, "renamed.bin".into())
+            .await
+            .is_err());
+        assert_eq!(
+            tokio::fs::read(old_root.join("rollback.bin"))
+                .await
+                .unwrap(),
+            payload
+        );
+        assert!(!old_root.join("renamed.bin").exists());
+        let restored = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+        assert_eq!(restored.meta.files[0].path, vec!["rollback.bin"]);
+        assert_eq!(restored.files[0].path, "rollback.bin");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn state_save_failure_rolls_back_torrent_registration() {
+        let root = unique_dir("add-state-rollback");
+        let state_path = root.join("state-target");
+        std::fs::create_dir_all(&state_path).unwrap();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::with_paths_broker_and_state(
+            Config::default(),
+            health,
+            None,
+            None,
+            Some(state_path),
+            EventBroker::default(),
+        );
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "registration-rollback.bin",
+            b"registration rollback payload",
+            8,
+            None,
+            false,
+        );
+
+        assert!(runtime
+            .add_torrent_file_with_options(bytes, AddTorrentOptions::new(None, true))
+            .await
+            .is_err());
+        assert!(runtime.registry.lock().await.torrents.is_empty());
+        assert!(runtime.queue.lock().await.order.is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn rename_rejects_the_torrents_own_resume_path() {
+        let root = unique_dir("rename-resume-collision");
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(root.display().to_string());
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "resume-name.bin",
+            b"resume collision payload",
+            8,
+            None,
+            false,
+        );
+        let hash = runtime
+            .add_torrent_file_with_options(bytes, AddTorrentOptions::new(None, true))
+            .await
+            .unwrap();
+
+        let error = runtime
+            .rename_path(&hash, 0, "resume-name.bin.swarmotter.resume".into())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoreError::Storage(_)));
+        assert_eq!(
+            runtime.registry.lock().await.get(&hash).unwrap().files[0].path,
+            "resume-name.bin"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn recheck_preserves_selected_file_completion() {
+        let root = unique_dir("selected-recheck");
+        let complete_root = root.join("complete");
+        let active_root = root.join("active");
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(complete_root.display().to_string());
+        cfg.storage.incomplete_dir = Some(active_root.display().to_string());
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let first = b"aaaa".as_slice();
+        let second = b"bbbb".as_slice();
+        let bytes = swarmotter_core::meta::build_multi_file_torrent(
+            "selection",
+            &[
+                (vec!["first.bin".into()], first.len() as u64),
+                (vec!["second.bin".into()], second.len() as u64),
+            ],
+            &[first, second],
+            4,
+            None,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = runtime
+            .add_torrent_file_with_options(bytes, AddTorrentOptions::new(None, true))
+            .await
+            .unwrap();
+        {
+            let mut registry = runtime.registry.lock().await;
+            let torrent = registry.get_mut(&hash).unwrap();
+            torrent.wanted[1] = false;
+            torrent.priorities[1] = FilePriority::Unwanted;
+            torrent.files[1].wanted = false;
+            torrent.files[1].priority = FilePriority::Unwanted;
+            torrent.progress.have_piece(0);
+            torrent.state = TorrentState::Completed;
+        }
+        let storage = swarmotter_core::storage::StorageIo::new(meta, active_root);
+        let first_path = storage.file_path(0).unwrap();
+        tokio::fs::create_dir_all(first_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(first_path, first).await.unwrap();
+
+        runtime.recheck(&hash).await.unwrap();
+        let torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+        assert_eq!(torrent.state, TorrentState::Completed);
+        assert_eq!(torrent.progress.pieces_have(), 1);
+        assert!(!torrent.progress.is_complete());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn move_and_rename_update_payload_and_registry_paths() {
+        let root = unique_dir("move-rename");
+        let old_root = root.join("old");
+        let new_root = root.join("new");
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(old_root.display().to_string());
+        cfg.storage.incomplete_dir = None;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let payload = b"move and rename lawful payload";
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "original.bin",
+            payload,
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = runtime
+            .add_torrent_file_with_options(bytes, AddTorrentOptions::new(None, true))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(&old_root).await.unwrap();
+        tokio::fs::write(old_root.join("original.bin"), payload)
+            .await
+            .unwrap();
+        {
+            let mut registry = runtime.registry.lock().await;
+            let torrent = registry.get_mut(&hash).unwrap();
+            for piece in 0..meta.piece_count() {
+                torrent.progress.have_piece(piece);
+            }
+            torrent.state = TorrentState::Completed;
+        }
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.move_data(&hash, new_root.display().to_string()),
+        )
+        .await
+        .expect("move_data timed out")
+        .unwrap();
+        assert!(!old_root.join("original.bin").exists());
+        assert_eq!(
+            tokio::fs::read(new_root.join("original.bin"))
+                .await
+                .unwrap(),
+            payload
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.rename_path(&hash, 0, "renamed.bin".into()),
+        )
+        .await
+        .expect("rename_path timed out")
+        .unwrap();
+        assert!(!new_root.join("original.bin").exists());
+        assert_eq!(
+            tokio::fs::read(new_root.join("renamed.bin")).await.unwrap(),
+            payload
+        );
+        let torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+        assert_eq!(torrent.download_dir.as_deref(), new_root.to_str());
+        assert_eq!(torrent.files[0].path, "renamed.bin");
+        assert_eq!(torrent.meta.files[0].path, vec!["renamed.bin"]);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_config_replacements_leave_runtime_and_disk_consistent() {
+        let root = unique_dir("config-replacement");
+        let config_path = root.join("swarmotter.toml");
+        let cfg = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::with_paths_and_broker(
+            cfg.clone(),
+            health,
+            Some(config_path.clone()),
+            None,
+            EventBroker::default(),
+        );
+        let mut first = cfg.clone();
+        first.queue.max_active_downloads = 2;
+        let mut second = cfg;
+        second.queue.max_active_downloads = 7;
+
+        let (first_result, second_result) = tokio::join!(
+            runtime.replace_config(first),
+            runtime.replace_config(second)
+        );
+        first_result.unwrap();
+        second_result.unwrap();
+
+        let disk = Config::from_file(&config_path).unwrap();
+        let live = runtime.config.read().await.clone();
+        assert_eq!(
+            disk.to_toml_string().unwrap(),
+            live.to_toml_string().unwrap()
+        );
+        assert_eq!(live.queue.max_active_downloads, 7);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&config_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_engine_starts_create_one_owned_task() {
+        let root = unique_dir("concurrent-engine-start");
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(root.display().to_string());
+        cfg.torrent.listen_port = 0;
+        cfg.dht.enabled = false;
+        cfg.pex.enabled = false;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "single-engine.bin",
+            b"single owned engine",
+            8,
+            None,
+            false,
+        );
+        let hash = runtime
+            .add_torrent_file_with_options(bytes, AddTorrentOptions::new(None, true))
+            .await
+            .unwrap();
+        runtime.registry.lock().await.get_mut(&hash).unwrap().state = TorrentState::Queued;
+
+        tokio::join!(runtime.start_engine(hash), runtime.start_engine(hash));
+
+        assert_eq!(runtime.engine_handles.read().await.len(), 1);
+        assert_eq!(runtime.engine_cmds.lock().await.len(), 1);
+        runtime.force_stop_engine(&hash).await;
+        assert!(runtime.engine_handles.read().await.is_empty());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_shared_listener_bind_does_not_register_or_announce_seeder() {
+        let occupied = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let root = unique_dir("seeder-bind-failure");
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(root.display().to_string());
+        cfg.torrent.listen_port = port;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = DaemonRuntime::new(cfg, health);
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "bind-failure.bin",
+            b"bind failure payload",
+            8,
+            Some("http://127.0.0.1:1/announce"),
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = meta.info_hash;
+        let mut torrent = Torrent::new(meta.clone(), 1);
+        torrent.state = TorrentState::Completed;
+        for piece in 0..meta.piece_count() {
+            torrent.progress.have_piece(piece);
+        }
+        runtime.registry.lock().await.add(torrent).unwrap();
+
+        runtime.reconcile_seeders().await;
+
+        assert!(!runtime.seeder_shutdowns.lock().await.contains_key(&hash));
+        assert!(!runtime.seeder_handles.lock().await.contains_key(&hash));
+        assert!(runtime.seeder_registry.is_empty().await);
+        drop(occupied);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
@@ -6800,7 +8510,7 @@ mod tests {
             false,
         );
         let mut meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-        meta.announce_list.push(vec![secondary.into()]);
+        meta.announce_list = vec![vec![primary.into(), secondary.into()]];
         let hash = meta.info_hash;
         runtime
             .registry
@@ -6851,6 +8561,7 @@ mod tests {
             Some("announce returned 64 peers")
         );
         assert_eq!(primary_row.last_announce, Some(1234));
+        assert_eq!(primary_row.tier, 0);
 
         let secondary_row = trackers.iter().find(|t| t.url == secondary).unwrap();
         assert_eq!(secondary_row.status, TrackerStatus::Error);
@@ -6859,6 +8570,7 @@ mod tests {
             Some("tracker announce timed out")
         );
         assert_eq!(secondary_row.last_message, None);
+        assert_eq!(secondary_row.tier, 0);
     }
 
     #[tokio::test]
@@ -6992,15 +8704,33 @@ mod tests {
     }
 
     #[test]
-    fn encryption_mode_change_requires_restart() {
+    fn encryption_mode_change_rebuilds_data_plane_without_process_restart() {
         let previous = Config::default();
         let mut next = previous.clone();
         next.torrent.encryption_mode = swarmotter_core::config::PeerEncryptionMode::Required;
 
-        assert_eq!(
-            restart_required_fields(&previous, &next),
-            vec!["torrent.encryption_mode".to_string()]
+        assert!(data_plane_config_changed(&previous, &next));
+        assert!(restart_required_fields(&previous, &next).is_empty());
+    }
+
+    #[test]
+    fn storage_root_changes_reject_torrents_that_still_depend_on_old_roots() {
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "storage-transition.bin",
+            b"storage transition payload",
+            8,
+            None,
+            false,
         );
+        let torrent = Torrent::new(swarmotter_core::meta::parse_torrent(&bytes).unwrap(), 1);
+        let previous = Config::default();
+        let mut next = previous.clone();
+        next.storage.download_dir = Some("/tmp/swarmotter-new-root".into());
+
+        assert!(matches!(
+            validate_storage_config_transition(&previous, &next, &[torrent]),
+            Err(CoreError::InvalidConfig(_))
+        ));
     }
 
     #[tokio::test]
