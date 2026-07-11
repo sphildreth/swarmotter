@@ -15,8 +15,12 @@ require_auth = true
 auth_token = "replace-with-a-long-random-token"
 ```
 
-Authentication is required when binding outside localhost. Browser requests
-must also be same-origin; reverse proxies must preserve the public `Host`.
+Authenticated access is strongly recommended when binding outside localhost.
+With `require_auth = true`, the Web UI asks for the token once and keeps it in
+browser-local storage. A trusted-LAN deployment may set `require_auth = false`;
+the UI then uses the same-origin API without a token prompt. Every client that
+can reach an unauthenticated listener can control SwarmOtter. Browser requests
+must remain same-origin, and reverse proxies must preserve the public `Host`.
 
 ## Add torrents
 

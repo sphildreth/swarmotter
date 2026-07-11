@@ -26,7 +26,8 @@ services:
         condition: service_healthy
     network_mode: "service:vpn"
     environment:
-      SWARMOTTER_API__AUTH_TOKEN: ${SWARMOTTER_API_TOKEN:?set SWARMOTTER_API_TOKEN in deploy/.env}
+      SWARMOTTER_API__REQUIRE_AUTH: ${SWARMOTTER_API_REQUIRE_AUTH:-true}
+      SWARMOTTER_API__AUTH_TOKEN: ${SWARMOTTER_API_TOKEN:-}
     volumes:
       - "${SWARMOTTER_CONFIG_DIR:-/srv/swarmotter/config}:/etc/swarmotter"
       - "${SWARMOTTER_DOWNLOADS:-/srv/swarmotter/downloads}:/data/downloads"

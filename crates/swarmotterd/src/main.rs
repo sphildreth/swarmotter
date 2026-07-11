@@ -37,6 +37,10 @@ struct Args {
     /// Path to the durable torrent and queue state file.
     #[arg(long, env = "SWARMOTTER_STATE_FILE")]
     state_file: Option<PathBuf>,
+
+    /// Validate the effective configuration and exit without starting services.
+    #[arg(long)]
+    check_config: bool,
 }
 
 #[tokio::main]
@@ -47,15 +51,18 @@ async fn main() -> Result<()> {
     // contained sockets work.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let mut config = if let Some(path) = &args.config {
-        Config::from_file(path)?
+    let env_vars: Vec<(String, String)> = std::env::vars().collect();
+    let config = if let Some(path) = &args.config {
+        Config::from_file_with_env_overrides(path, &env_vars)?
     } else {
-        Config::default()
+        Config::default().apply_env_overrides(&env_vars)?
     };
 
-    // Apply environment variable overrides.
-    let env_vars: Vec<(String, String)> = std::env::vars().collect();
-    config = config.apply_env_overrides(&env_vars)?;
+    if args.check_config {
+        println!("SwarmOtter configuration is valid");
+        return Ok(());
+    }
+
     let log_file = logging::init(&config.logging)?;
     if let Some(path) = &log_file {
         tracing::info!(path = %path.display(), "daemon file logging enabled");
@@ -66,6 +73,19 @@ async fn main() -> Result<()> {
         tracing::info!("no config file provided; using defaults");
     }
     tracing::info!(bind = %config.api.bind_address, "configured API bind address");
+    let api_bind = config
+        .api
+        .bind_address
+        .parse::<std::net::SocketAddr>()
+        .map_err(|e| {
+            swarmotter_core::error::CoreError::InvalidConfig(format!("api.bind_address: {e}"))
+        })?;
+    if !config.api.require_auth && !api_bind.ip().is_loopback() {
+        tracing::warn!(
+            bind = %api_bind,
+            "API and Web UI authentication is disabled on a non-loopback listener; every client that can reach this address can control SwarmOtter"
+        );
+    }
 
     // Validate network containment at startup. In strict mode with fail_closed,
     // this surfaces configuration/path issues immediately rather than at first
@@ -108,17 +128,7 @@ async fn main() -> Result<()> {
         qbittorrent: swarmotter_api::state::QbittorrentCompatState::default(),
     });
 
-    let bind: std::net::SocketAddr =
-        state
-            .config
-            .lock()
-            .await
-            .api
-            .bind_address
-            .parse()
-            .map_err(|e| {
-                swarmotter_core::error::CoreError::InvalidConfig(format!("api.bind_address: {e}"))
-            })?;
+    let bind = api_bind;
 
     tracing::info!(%bind, "swarmotterd starting; API + Web UI on control plane");
 

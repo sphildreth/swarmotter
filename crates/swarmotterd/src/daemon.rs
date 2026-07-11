@@ -4448,6 +4448,18 @@ impl DaemonOps for DaemonRuntime {
             next.api.auth_token = previous.api.auth_token.clone();
         }
         next.validate()?;
+        if !next.api.require_auth
+            && next
+                .api
+                .bind_address
+                .parse::<std::net::SocketAddr>()
+                .is_ok_and(|bind| !bind.ip().is_loopback())
+        {
+            tracing::warn!(
+                bind = %next.api.bind_address,
+                "configuration update disables API and Web UI authentication on a non-loopback listener; every client that can reach this address can control SwarmOtter"
+            );
+        }
         let torrents = self
             .registry
             .lock()

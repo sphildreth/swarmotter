@@ -327,10 +327,13 @@ impl Default for LoggingConfig {
 }
 
 impl Config {
+    fn parse_toml_str(s: &str) -> Result<Self> {
+        toml::from_str(s).map_err(|e| CoreError::InvalidConfig(format!("TOML parse error: {e}")))
+    }
+
     /// Load configuration from a TOML string.
     pub fn from_toml_str(s: &str) -> Result<Self> {
-        let cfg: Config = toml::from_str(s)
-            .map_err(|e| CoreError::InvalidConfig(format!("TOML parse error: {e}")))?;
+        let cfg = Self::parse_toml_str(s)?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -350,6 +353,18 @@ impl Config {
         Self::from_toml_str(&s)
     }
 
+    /// Load a TOML file, apply environment overrides, then validate the final
+    /// effective configuration.
+    pub fn from_file_with_env_overrides(
+        path: &std::path::Path,
+        env: &[(String, String)],
+    ) -> Result<Self> {
+        let s = std::fs::read_to_string(path).map_err(|e| {
+            CoreError::InvalidConfig(format!("failed to read config {}: {e}", path.display()))
+        })?;
+        Self::parse_toml_str(&s)?.apply_env_overrides(env)
+    }
+
     /// Apply environment variable overrides using prefix `SWARMOTTER_`.
     /// Nested fields separated by `__`. Overrides are merged onto the parsed
     /// config via a TOML value tree, then re-deserialized and validated.
@@ -357,6 +372,9 @@ impl Config {
         let mut toml_value: toml::Value =
             toml::Value::try_from(&self).map_err(|e| CoreError::InvalidConfig(e.to_string()))?;
         for (key, value) in env {
+            if matches!(key.as_str(), "SWARMOTTER_CONFIG" | "SWARMOTTER_STATE_FILE") {
+                continue;
+            }
             let Some(rest) = key.strip_prefix("SWARMOTTER_") else {
                 continue;
             };
@@ -389,16 +407,10 @@ impl Config {
                 "api.bind_address must not be empty".into(),
             ));
         }
-        let api_bind = self
-            .api
+        self.api
             .bind_address
             .parse::<std::net::SocketAddr>()
             .map_err(|e| CoreError::InvalidConfig(format!("api.bind_address: {e}")))?;
-        if !self.api.require_auth && !api_bind.ip().is_loopback() {
-            return Err(CoreError::InvalidConfig(
-                "api.require_auth must be true when api.bind_address is not loopback".into(),
-            ));
-        }
         if self.api.require_auth
             && self
                 .api
@@ -775,15 +787,17 @@ encryption_mode = "required"
     }
 
     #[test]
-    fn unauthenticated_api_must_remain_on_loopback() {
-        let err = Config::from_toml_str(
+    fn unauthenticated_api_can_use_a_non_loopback_bind() {
+        let cfg = Config::from_toml_str(
             r#"
 [api]
 bind_address = "0.0.0.0:9091"
+require_auth = false
 "#,
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("api.require_auth"));
+        .unwrap();
+        assert!(!cfg.api.require_auth);
+        assert_eq!(cfg.api.bind_address, "0.0.0.0:9091");
 
         let cfg = Config::from_toml_str(
             r#"
@@ -793,6 +807,37 @@ bind_address = "[::1]:9091"
         )
         .unwrap();
         assert!(!cfg.api.require_auth);
+    }
+
+    #[test]
+    fn environment_overrides_are_applied_before_final_validation() {
+        let cfg = Config::parse_toml_str(
+            r#"
+[api]
+require_auth = true
+"#,
+        )
+        .unwrap()
+        .apply_env_overrides(&[(
+            "SWARMOTTER_API__AUTH_TOKEN".into(),
+            "environment-token".into(),
+        )])
+        .unwrap();
+
+        assert!(cfg.api.require_auth);
+        assert_eq!(cfg.api.auth_token.as_deref(), Some("environment-token"));
+    }
+
+    #[test]
+    fn command_environment_is_not_treated_as_config_fields() {
+        let cfg = Config::default()
+            .apply_env_overrides(&[
+                ("SWARMOTTER_CONFIG".into(), "/tmp/swarmotter.toml".into()),
+                ("SWARMOTTER_STATE_FILE".into(), "/tmp/state.json".into()),
+            ])
+            .unwrap();
+
+        assert_eq!(cfg.api.bind_address, "127.0.0.1:9091");
     }
 
     #[test]

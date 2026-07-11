@@ -388,6 +388,7 @@ documented below; no required capability remains marked in progress.
 - ADR-0046: Shared inbound peer listener
 - ADR-0047: Transactional live data-plane reconfiguration
 - ADR-0048: File selection drives piece scheduling
+- ADR-0049: Configured unauthenticated LAN control plane
 
 ## Notes
 

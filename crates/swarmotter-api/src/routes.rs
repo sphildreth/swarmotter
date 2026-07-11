@@ -208,7 +208,7 @@ async fn require_api_auth(
     next: Next,
 ) -> Response {
     let cfg = state.daemon.get_config().await;
-    if let Some(response) = reject_unsafe_browser_request(&req, &cfg) {
+    if let Some(response) = reject_unsafe_browser_request(&req) {
         return response;
     }
     if !cfg.api.require_auth {
@@ -226,10 +226,7 @@ async fn require_api_auth(
     auth_error(StatusCode::UNAUTHORIZED, "missing or invalid API token")
 }
 
-fn reject_unsafe_browser_request(
-    req: &Request<Body>,
-    cfg: &swarmotter_core::config::Config,
-) -> Option<Response> {
+fn reject_unsafe_browser_request(req: &Request<Body>) -> Option<Response> {
     let origin = req
         .headers()
         .get(header::ORIGIN)
@@ -238,8 +235,6 @@ fn reject_unsafe_browser_request(
         .headers()
         .get("sec-fetch-site")
         .and_then(|value| value.to_str().ok());
-    let browser_request = origin.is_some() || fetch_site.is_some();
-
     if matches!(fetch_site, Some("cross-site" | "same-site")) {
         return Some(browser_security_error(
             "cross_origin_forbidden",
@@ -269,21 +264,6 @@ fn reject_unsafe_browser_request(
         }
     }
 
-    if browser_request && !cfg.api.require_auth {
-        let loopback_host = req
-            .headers()
-            .get(header::HOST)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<axum::http::uri::Authority>().ok())
-            .is_some_and(|authority| is_loopback_host(authority.host()));
-        if !loopback_host {
-            return Some(browser_security_error(
-                "host_forbidden",
-                "unauthenticated browser access requires a loopback Host",
-            ));
-        }
-    }
-
     None
 }
 
@@ -295,20 +275,6 @@ fn authority_matches(
         .trim_end_matches('.')
         .eq_ignore_ascii_case(right.host().trim_end_matches('.'))
         && left.port_u16() == right.port_u16()
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let host = host.trim_end_matches('.');
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    let ip_literal = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    ip_literal
-        .parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip.is_loopback())
 }
 
 pub(crate) fn request_has_token(req: &Request<Body>, expected: &str) -> bool {

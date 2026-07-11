@@ -80,7 +80,7 @@ curl -X POST http://127.0.0.1:9091/api/v1/torrents/file \
 ## LAN access
 
 To reach the Web UI from another machine on your LAN, bind the control plane to
-all IPv4 addresses and enable authentication:
+all IPv4 addresses. Authentication is strongly recommended:
 
 ```toml
 [api]
@@ -88,6 +88,11 @@ bind_address = "0.0.0.0:9091"
 require_auth = true
 auth_token = "replace-with-a-long-random-token"
 ```
+
+On a network that is deliberately the control-plane trust boundary, set
+`require_auth = false` and omit `auth_token`. The Web UI then works without a
+token prompt, but every client that can reach the listener can control
+SwarmOtter.
 
 API clients can authenticate with either:
 

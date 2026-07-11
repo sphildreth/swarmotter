@@ -7,8 +7,8 @@
 # --- Control plane (API + Web UI) ---
 [api]
 bind_address = "127.0.0.1:9091"
-# Authentication may be disabled only while bind_address is loopback. Set
-# require_auth = true and auth_token before binding to a LAN or proxy listener.
+# Authentication is strongly recommended for LAN or proxy listeners. When it
+# is disabled, every client that can reach bind_address can control SwarmOtter.
 require_auth = false
 # auth_token = "change-me"
 # Maximum API request body size in bytes.

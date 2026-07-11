@@ -23,15 +23,17 @@ updates use two API paths:
 - Defaults should be safe and operator-friendly.
 - Strict network containment must require an enforceable data-plane path.
 - API auth must require a non-empty token when enabled.
-- API auth must be enabled whenever the control-plane listener is not loopback
-  (ADR-0044).
+- Non-loopback control-plane listeners should use API auth by default; an
+  operator may deliberately trust the reachable network and disable it
+  (ADR-0049).
 - `GET /api/v1/settings` must redact `api.auth_token`.
 - Full config replacement must preserve the existing auth token when the
   request omits it.
 - Runtime updates must report fields that require restart.
 - Unknown top-level and nested fields must be rejected rather than silently
   ignored.
-- Environment overrides must pass through the same validation as file config.
+- Environment overrides must be applied before final validation and pass
+  through the same validation as file config.
 - Transport option changes are release-facing compatibility decisions.
 
 ## Compatibility boundaries
