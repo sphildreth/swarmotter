@@ -6,6 +6,7 @@
 //! and lifecycle. It exposes the API and Web UI via axum. All torrent
 //! data-plane traffic is enforced through the network containment layer.
 
+mod containment_gate;
 mod daemon;
 mod dht;
 mod engine;
@@ -57,6 +58,12 @@ async fn main() -> Result<()> {
     } else {
         Config::default().apply_env_overrides(&env_vars)?
     };
+
+    // Validate the effective configuration before logging initialization and
+    // before the --check-config success message. A run without --config fails
+    // unless env overrides provide a valid strict path or explicit disabled
+    // mode. See ADR-0051.
+    config.validate()?;
 
     if args.check_config {
         println!("SwarmOtter configuration is valid");

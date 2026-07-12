@@ -1053,6 +1053,7 @@ async fn settings_get_and_update() {
 #[tokio::test]
 async fn settings_put_replaces_and_preserves_auth_token() {
     let mut cfg = Config::default();
+    cfg.network.mode = swarmotter_core::models::network::NetworkContainmentMode::Disabled;
     cfg.api.auth_token = Some("existing-token".into());
 
     let state = fake_daemon::fake_state_with_config(cfg.clone());

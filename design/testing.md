@@ -85,6 +85,20 @@ feature completion and acceptance criteria, not by time estimates.
 - Torrent traffic blocked when fail-closed is active.
 - API listener remains available when torrent data plane is blocked, if
   configured that way.
+- Injected fake-probe live path-loss transition (ADR-0051): a mutable fake
+  `InterfaceProbe` drives `network_health_tick()` directly without sleeping;
+  flipping the required interface healthy-to-missing proves the gate blocks
+  before teardown, data-plane registries empty, torrent/API status is blocked,
+  and the control API still responds. Recovery resumes only formerly active
+  work, not paused/ratio/idle-stopped work. Injected bind failure and generic
+  strict policy denial expose `socket_bind_failed` and `blocked_fail_closed`.
+- Config matrix (ADR-0051): omitted table/file, strict with path, explicit
+  disabled, partial network table, env override, and `--check-config`.
+- Privileged Linux namespace transition (ADR-0051):
+  `scripts/test-network-containment-transition.sh` creates two temporary
+  namespaces joined by a veth pair, runs a generated local swarm, binds strict
+  containment to the daemon-side veth, proves traffic, deletes that veth during
+  transfer, and proves block/teardown with the control plane still available.
 
 ### Storage tests
 

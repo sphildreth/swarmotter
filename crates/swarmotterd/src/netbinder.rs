@@ -22,11 +22,14 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
 use swarmotter_core::error::{CoreError, Result};
-use swarmotter_core::models::network::NetworkContainmentMode;
+use swarmotter_core::models::network::{NetworkContainmentMode, NetworkContainmentStatus};
 use swarmotter_core::net::{
     self, parse_http_response, ContainedUdpSocket, HttpResponse, InterfaceProbe, NetworkBinder,
     NetworkConfig, PeerListener,
 };
+
+use crate::containment_gate::ContainmentGate;
+use crate::daemon::HealthReport;
 
 const MAX_TRACKER_HTTP_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
@@ -105,6 +108,15 @@ where
 pub struct ContainedBinder {
     config: Arc<RwLock<NetworkConfig>>,
     probe: Arc<dyn InterfaceProbe + Send + Sync>,
+    /// Optional process-wide containment gate. When present, `guard()` and
+    /// `traffic_allowed()` consult the gate in addition to the config/probe
+    /// evaluation so a live block immediately denies new operations. See
+    /// ADR-0051.
+    gate: Option<Arc<ContainmentGate>>,
+    /// Optional runtime health-report channel for bind/listen/source-bind
+    /// failures. A failure sends a report that blocks the gate and exposes
+    /// `socket_bind_failed`.
+    health_report_tx: Option<tokio::sync::mpsc::UnboundedSender<HealthReport>>,
 }
 
 impl ContainedBinder {
@@ -112,6 +124,32 @@ impl ContainedBinder {
         Self {
             config: Arc::new(RwLock::new(config)),
             probe,
+            gate: None,
+            health_report_tx: None,
+        }
+    }
+
+    /// Attach the process-wide containment gate and health-report channel so
+    /// the binder observes live blocks and reports bind failures. See
+    /// ADR-0051.
+    pub fn with_gate_and_health(
+        mut self,
+        gate: Arc<ContainmentGate>,
+        health_report_tx: tokio::sync::mpsc::UnboundedSender<HealthReport>,
+    ) -> Self {
+        self.gate = Some(gate);
+        self.health_report_tx = Some(health_report_tx);
+        self
+    }
+
+    /// Report a bind/listen/source-bind failure through the runtime health
+    /// channel so the gate blocks and `socket_bind_failed` is exposed.
+    fn report_bind_failure(&self, detail: impl Into<String>) {
+        if let Some(tx) = &self.health_report_tx {
+            let _ = tx.send(HealthReport {
+                status: NetworkContainmentStatus::SocketBindFailed,
+                detail: detail.into(),
+            });
         }
     }
 
@@ -123,6 +161,11 @@ impl ContainedBinder {
     }
 
     async fn guard(&self) -> Result<()> {
+        // The live gate is the authoritative check; if it is blocked, deny
+        // immediately without touching sockets. See ADR-0051.
+        if let Some(gate) = &self.gate {
+            gate.enforce()?;
+        }
         let cfg = self.config_snapshot()?;
         if cfg.mode == NetworkContainmentMode::Disabled {
             return Ok(());
@@ -327,12 +370,28 @@ impl NetworkBinder for ContainedBinder {
         {
             None
         } else {
-            Some(create_tcp_listener(SocketAddr::new(v4_addr, port), iface)?)
+            match create_tcp_listener(SocketAddr::new(v4_addr, port), iface) {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    self.report_bind_failure(format!(
+                        "bind peer listener v4 on port {port}: {error}"
+                    ));
+                    return Err(error);
+                }
+            }
         };
         let v6 = if cfg.allow_ipv6
             && (has_interface || namespace_only || cfg.required_source_ipv6.is_some())
         {
-            Some(create_tcp_listener(SocketAddr::new(v6_addr, port), iface)?)
+            match create_tcp_listener(SocketAddr::new(v6_addr, port), iface) {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    self.report_bind_failure(format!(
+                        "bind peer listener v6 on port {port}: {error}"
+                    ));
+                    return Err(error);
+                }
+            }
         } else {
             None
         };
@@ -340,9 +399,12 @@ impl NetworkBinder for ContainedBinder {
     }
 
     fn traffic_allowed(&self) -> bool {
-        // Synchronous check: evaluate against a snapshot. For strictness we
-        // re-evaluate; the async guard is the authoritative gate before any
-        // socket is opened.
+        // The live gate is authoritative when present. See ADR-0051.
+        if let Some(gate) = &self.gate {
+            if !gate.traffic_allowed() {
+                return false;
+            }
+        }
         let Ok(cfg) = self.config.read() else {
             return false;
         };

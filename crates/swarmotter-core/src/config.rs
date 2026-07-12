@@ -499,9 +499,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_validates() {
+    fn default_config_strict_requires_path() {
         let cfg = Config::default();
-        assert!(cfg.validate().is_ok());
+        // The default is strict containment without a path, so validation
+        // fails with invalid_config. See ADR-0051.
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.code().as_str(), "invalid_config");
+        assert!(err.to_string().contains("strict network containment"));
         assert_eq!(cfg.torrent.listen_port, 51413);
         assert_eq!(cfg.api.bind_address, "127.0.0.1:9091");
         assert!(cfg.network.allow_ipv6);
@@ -519,8 +523,25 @@ mod tests {
     }
 
     #[test]
+    fn default_config_with_disabled_mode_validates() {
+        let mut cfg = Config::default();
+        cfg.network.mode = crate::models::network::NetworkContainmentMode::Disabled;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn default_config_with_strict_path_validates() {
+        let mut cfg = Config::default();
+        cfg.network.required_interface = Some("tun0".into());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn autopilot_config_defaults_to_act() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [torrent]
 listen_port = 51413
 "#;
@@ -534,6 +555,9 @@ listen_port = 51413
     #[test]
     fn autopilot_config_parses_and_env_override() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [autopilot]
 mode = "observe"
 "#;
@@ -544,7 +568,10 @@ mode = "observe"
         ));
 
         let cfg = Config::default();
-        let env = vec![("SWARMOTTER_AUTOPILOT__MODE".into(), "disabled".into())];
+        let env = vec![
+            ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
+            ("SWARMOTTER_AUTOPILOT__MODE".into(), "disabled".into()),
+        ];
         let cfg = cfg.apply_env_overrides(&env).unwrap();
         assert!(matches!(
             cfg.autopilot.mode,
@@ -585,6 +612,9 @@ selfish = true
     #[test]
     fn partial_runtime_limit_tables_use_defaults() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [bandwidth]
 global_download = 1024
 
@@ -643,6 +673,9 @@ listen_port = 51413
     fn storage_free_space_percent_validates_range() {
         let err = Config::from_toml_str(
             r#"
+[network]
+mode = "disabled"
+
 [storage]
 minimum_free_space_percent = 101
 "#,
@@ -655,6 +688,7 @@ minimum_free_space_percent = 101
     fn storage_reserve_env_overrides_apply() {
         let cfg = Config::default()
             .apply_env_overrides(&[
+                ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
                 (
                     "SWARMOTTER_STORAGE__MINIMUM_FREE_SPACE_BYTES".into(),
                     "4096".into(),
@@ -688,6 +722,9 @@ minimum_free_space_percent = 101
     #[test]
     fn compatibility_parses_and_env_overrides() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [compatibility.transmission]
 enabled = true
 
@@ -700,6 +737,7 @@ enabled = true
 
         let cfg = Config::default();
         let env = vec![
+            ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
             (
                 "SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED".into(),
                 "true".into(),
@@ -726,6 +764,9 @@ listen_port = 0
     #[test]
     fn torrent_selfish_defaults_false() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [torrent]
 listen_port = 51413
 "#;
@@ -736,6 +777,9 @@ listen_port = 51413
     #[test]
     fn torrent_selfish_parses_true() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [torrent]
 selfish = true
 "#;
@@ -746,7 +790,10 @@ selfish = true
     #[test]
     fn torrent_selfish_env_override() {
         let cfg = Config::default();
-        let env = vec![("SWARMOTTER_TORRENT__SELFISH".into(), "true".into())];
+        let env = vec![
+            ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
+            ("SWARMOTTER_TORRENT__SELFISH".into(), "true".into()),
+        ];
         let cfg = cfg.apply_env_overrides(&env).unwrap();
         assert!(cfg.torrent.selfish);
     }
@@ -754,6 +801,9 @@ selfish = true
     #[test]
     fn torrent_encryption_mode_parses_and_env_override() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [torrent]
 encryption_mode = "required"
 "#;
@@ -761,10 +811,13 @@ encryption_mode = "required"
         assert_eq!(cfg.torrent.encryption_mode, PeerEncryptionMode::Required);
 
         let cfg = Config::default();
-        let env = vec![(
-            "SWARMOTTER_TORRENT__ENCRYPTION_MODE".into(),
-            "disabled".into(),
-        )];
+        let env = vec![
+            ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
+            (
+                "SWARMOTTER_TORRENT__ENCRYPTION_MODE".into(),
+                "disabled".into(),
+            ),
+        ];
         let cfg = cfg.apply_env_overrides(&env).unwrap();
         assert_eq!(cfg.torrent.encryption_mode, PeerEncryptionMode::Disabled);
     }
@@ -773,6 +826,7 @@ encryption_mode = "required"
     fn env_overrides_apply() {
         let cfg = Config::default();
         let env = vec![
+            ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
             ("SWARMOTTER_TORRENT__LISTEN_PORT".into(), "60000".into()),
             (
                 "SWARMOTTER_API__BIND_ADDRESS".into(),
@@ -790,6 +844,9 @@ encryption_mode = "required"
     fn unauthenticated_api_can_use_a_non_loopback_bind() {
         let cfg = Config::from_toml_str(
             r#"
+[network]
+mode = "disabled"
+
 [api]
 bind_address = "0.0.0.0:9091"
 require_auth = false
@@ -801,6 +858,9 @@ require_auth = false
 
         let cfg = Config::from_toml_str(
             r#"
+[network]
+mode = "disabled"
+
 [api]
 bind_address = "[::1]:9091"
 "#,
@@ -813,15 +873,21 @@ bind_address = "[::1]:9091"
     fn environment_overrides_are_applied_before_final_validation() {
         let cfg = Config::parse_toml_str(
             r#"
+[network]
+mode = "disabled"
+
 [api]
 require_auth = true
 "#,
         )
         .unwrap()
-        .apply_env_overrides(&[(
-            "SWARMOTTER_API__AUTH_TOKEN".into(),
-            "environment-token".into(),
-        )])
+        .apply_env_overrides(&[
+            ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
+            (
+                "SWARMOTTER_API__AUTH_TOKEN".into(),
+                "environment-token".into(),
+            ),
+        ])
         .unwrap();
 
         assert!(cfg.api.require_auth);
@@ -832,6 +898,7 @@ require_auth = true
     fn command_environment_is_not_treated_as_config_fields() {
         let cfg = Config::default()
             .apply_env_overrides(&[
+                ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
                 ("SWARMOTTER_CONFIG".into(), "/tmp/swarmotter.toml".into()),
                 ("SWARMOTTER_STATE_FILE".into(), "/tmp/state.json".into()),
             ])
@@ -843,12 +910,18 @@ require_auth = true
     #[test]
     fn auth_requires_token() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [api]
 require_auth = true
 "#;
         assert!(Config::from_toml_str(toml).is_err());
 
         let toml = r#"
+[network]
+mode = "disabled"
+
 [api]
 require_auth = true
 auth_token = "secret"
@@ -859,6 +932,9 @@ auth_token = "secret"
     #[test]
     fn request_body_limit_must_be_positive() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [api]
 max_request_body_bytes = 0
 "#;
@@ -868,6 +944,9 @@ max_request_body_bytes = 0
     #[test]
     fn dht_port_must_be_positive() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [dht]
 port = 0
 "#;
@@ -878,6 +957,9 @@ port = 0
     fn dht_partial_config_uses_default_bootstrap_nodes() {
         let cfg = Config::from_toml_str(
             r#"
+[network]
+mode = "disabled"
+
 [dht]
 port = 55145
 "#,
@@ -890,6 +972,9 @@ port = 55145
     fn logging_defaults_to_file_enabled() {
         let cfg = Config::from_toml_str(
             r#"
+[network]
+mode = "disabled"
+
 [logging]
 json = true
 "#,

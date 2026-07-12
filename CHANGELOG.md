@@ -9,7 +9,35 @@ date or duration estimates.
 
 ## [Unreleased]
 
+### Changed
+
+- **Strict containment is the default (breaking):** `NetworkConfig::default()`
+  now selects strict mode, matching the Serde default. An omitted `[network]`
+  table produces strict mode without a path and fails `Config::validate()` with
+  `invalid_config` before the control listener or any background task starts.
+  `--check-config` fails the same way, and full config validation now runs
+  before logging initialization and the success message. Existing users who
+  relied on the disabled default must configure a strict path or set
+  `mode = "disabled"` explicitly. See
+  [ADR-0051](design/adr/0051-explicit-network-path-and-live-containment-gate.md).
+  Version bump deferred to a later phase.
+
 ### Fixed
+
+- **Live containment gate:** one process-wide `ContainmentGate` (atomics plus
+  `tokio::sync::Notify`) is now shared by every torrent data-plane component.
+  Every bind, connect, resolve, accept-loop iteration, UDP send, tracker
+  request, webseed request, and DHT send observes the gate. On healthy-to-
+  unhealthy transition the gate blocks immediately, the inbound listener and
+  DHT runner stop, data-plane tasks are aborted, active torrents enter
+  `network_blocked`, state persists, and events publish — all while the control
+  plane remains available. Recovery reopens the gate and resumes only formerly
+  active work. The health loop now uses an injected `InterfaceProbe` (tests
+  inject a mutable fake) and exposes one `network_health_tick()` that tests
+  drive without sleeping. Bind/listen/source-bind failures route through a
+  runtime health-report channel and expose `socket_bind_failed`; strict policy
+  denials with no more specific status expose `blocked_fail_closed`. See
+  [ADR-0051](design/adr/0051-explicit-network-path-and-live-containment-gate.md).
 
 - **Bounded untrusted metainfo parsing:** the shared bencode decoder and
   metainfo builder now enforce fixed depth, node-count, file-count,

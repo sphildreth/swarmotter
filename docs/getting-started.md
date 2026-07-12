@@ -23,7 +23,14 @@ mkdir -p ~/.config/swarmotter
 mkdir -p ~/Downloads/swarmotter/downloads ~/Downloads/swarmotter/incomplete
 ```
 
-Minimal local-only configuration:
+Minimal local-only configuration. SwarmOtter's default containment posture is
+`strict`, which requires an explicit network path so torrent traffic can never
+silently fall back to the default route. For a local development run you must
+either bind to a specific interface/source or explicitly acknowledge disabled
+containment.
+
+Strict configuration bound to a specific interface (recommended for any real
+torrent traffic):
 
 ```toml
 [api]
@@ -34,7 +41,11 @@ download_dir = "/home/YOU/Downloads/swarmotter/downloads"
 incomplete_dir = "/home/YOU/Downloads/swarmotter/incomplete"
 
 [network]
-mode = "disabled"
+mode = "strict"
+required_interface = "tun0"
+required_source_ipv4 = "10.8.0.2"
+allow_ipv6 = false
+fail_closed = true
 
 [torrent]
 listen_port = 51413
@@ -43,6 +54,16 @@ utp_enabled = true
 utp_prefer_tcp = true
 encryption_mode = "preferred"
 ```
+
+> **Warning:** `[network] mode = "disabled"` is available only for local
+> development or a separately enforced boundary such as the supplied Gluetun
+> shared-network-namespace deployment. It must never be inferred from a missing
+> file/table, platform, bind failure, or unavailable interface. See ADR-0051.
+
+For a quick loopback-only test with no torrent traffic containment, you may set
+`mode = "disabled"` explicitly. An omitted `[network]` table no longer selects
+disabled mode: it produces strict mode without a path and fails startup with
+`invalid_config`.
 
 With this layout, active downloads write partial data under `incomplete`.
 Completed torrents move to `downloads` only after all pieces verify.

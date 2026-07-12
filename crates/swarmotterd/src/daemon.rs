@@ -30,7 +30,9 @@ use swarmotter_core::hash::InfoHash;
 use swarmotter_core::magnet::Magnet;
 use swarmotter_core::meta;
 use swarmotter_core::models::health::{HealthCalculator, HealthInput};
-use swarmotter_core::models::network::{NetworkContainmentMode, NetworkHealth};
+use swarmotter_core::models::network::{
+    NetworkContainmentMode, NetworkContainmentStatus, NetworkHealth,
+};
 use swarmotter_core::models::peer::{EnginePeerHealth, Peer};
 use swarmotter_core::models::stats::{
     AutopilotActionKind, AutopilotDecision, AutopilotInput, GlobalStats, PeerSchedulerDiagnostics,
@@ -54,6 +56,7 @@ use swarmotter_core::tracker::{self, AnnounceEvent, AnnounceRequest};
 use swarmotter_core::udp_tracker;
 use swarmotter_core::watch;
 
+use crate::containment_gate::ContainmentGate;
 use crate::engine::{EngineCommand, EngineState, TorrentEngine};
 use crate::netbinder::ContainedBinder;
 use crate::seeder::{SeedRegistration, SeedRegistry, SeederHub};
@@ -111,6 +114,53 @@ pub struct DaemonRuntime {
     dht_runner: Arc<Mutex<Option<Arc<crate::dht::DhtRunner>>>>,
     queue_reconcile: Arc<Mutex<QueueReconcileState>>,
     event_broker: EventBroker,
+    /// Process-wide containment gate shared by every data-plane component.
+    /// See ADR-0051.
+    pub(crate) containment_gate: Arc<ContainmentGate>,
+    /// Injected interface probe. Production injects `OsInterfaceProbe`; tests
+    /// inject a mutable fake. See ADR-0051.
+    pub(crate) interface_probe: Arc<dyn InterfaceProbe + Send + Sync>,
+    /// Runtime health-report channel for bind/listen/source-bind failures.
+    /// A report blocks the gate and exposes `socket_bind_failed`.
+    health_report_tx: tokio::sync::mpsc::UnboundedSender<HealthReport>,
+    health_report_rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<HealthReport>>>,
+}
+
+impl DaemonRuntime {
+    /// Borrow the process-wide containment gate. See ADR-0051.
+    #[allow(dead_code)]
+    pub fn containment_gate(&self) -> &ContainmentGate {
+        &self.containment_gate
+    }
+
+    /// Send a runtime health report (used by tests to inject bind-failure
+    /// transitions). See ADR-0051.
+    #[allow(dead_code)]
+    pub fn report_health(&self, status: NetworkContainmentStatus, detail: impl Into<String>) {
+        let _ = self.health_report_tx.send(HealthReport {
+            status,
+            detail: detail.into(),
+        });
+    }
+
+    /// Whether the engine handle registry is empty (test/diagnostic helper).
+    #[allow(dead_code)]
+    pub async fn engine_handles_empty(&self) -> bool {
+        self.engine_handles.read().await.is_empty()
+    }
+
+    /// Whether the seeder registries are empty (test/diagnostic helper).
+    #[allow(dead_code)]
+    pub async fn seeder_registries_empty(&self) -> bool {
+        self.seeder_shutdowns.lock().await.is_empty() && self.seeder_handles.lock().await.is_empty()
+    }
+}
+
+/// A runtime health report from a bind/listen/source-bind failure.
+#[derive(Debug, Clone)]
+pub struct HealthReport {
+    pub status: NetworkContainmentStatus,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -373,6 +423,30 @@ impl DaemonRuntime {
         state_path: Option<PathBuf>,
         event_broker: EventBroker,
     ) -> Self {
+        Self::with_paths_broker_state_and_probe(
+            config,
+            startup_health,
+            config_path,
+            log_file_path,
+            state_path,
+            event_broker,
+            Arc::new(OsInterfaceProbe),
+        )
+    }
+
+    /// Construct a runtime with an injected interface probe for deterministic
+    /// containment testing. Production injects `OsInterfaceProbe`; tests inject
+    /// a mutable fake. See ADR-0051.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_paths_broker_state_and_probe(
+        config: Config,
+        startup_health: NetworkHealth,
+        config_path: Option<PathBuf>,
+        log_file_path: Option<PathBuf>,
+        state_path: Option<PathBuf>,
+        event_broker: EventBroker,
+        interface_probe: Arc<dyn InterfaceProbe + Send + Sync>,
+    ) -> Self {
         let global_limiter = swarmotter_core::bandwidth::RateLimiter::new(
             config.bandwidth.effective_download(),
             config.bandwidth.effective_upload(),
@@ -382,6 +456,11 @@ impl DaemonRuntime {
         } else {
             config.bandwidth.max_peers
         };
+        let containment_gate = ContainmentGate::new(startup_health.traffic_allowed);
+        if !startup_health.traffic_allowed {
+            containment_gate.block(startup_health.status, startup_health.detail.clone());
+        }
+        let (health_report_tx, health_report_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             registry: Arc::new(Mutex::new(TorrentRegistry::default())),
             queue: Arc::new(Mutex::new(QueueState::new(config.queue.clone()))),
@@ -413,6 +492,10 @@ impl DaemonRuntime {
             dht_runner: Arc::new(Mutex::new(None)),
             queue_reconcile: Arc::new(Mutex::new(QueueReconcileState::default())),
             event_broker,
+            containment_gate,
+            interface_probe,
+            health_report_tx,
+            health_report_rx: Arc::new(Mutex::new(health_report_rx)),
         }
     }
 
@@ -657,7 +740,7 @@ impl DaemonRuntime {
             .await
     }
 
-    async fn add_torrent_file_with_options(
+    pub async fn add_torrent_file_with_options(
         &self,
         bytes: Vec<u8>,
         options: AddTorrentOptions,
@@ -2182,6 +2265,14 @@ impl DaemonRuntime {
         }
     }
 
+    /// Stop the shared DHT runner if one is active. Used by containment
+    /// transitions and data-plane reconstruction. See ADR-0051.
+    async fn stop_dht_runner(&self) {
+        // The runner is a shared resource with no long-running task of its own;
+        // dropping the stored Arc stops it.
+        *self.dht_runner.lock().await = None;
+    }
+
     /// Spawn an owned sidecar task that periodically announces the seeder to
     /// the torrent's trackers, so the seeder is visible in the swarm. The
     /// returned handle is awaited by the seeder task after signaling shutdown,
@@ -2591,10 +2682,10 @@ impl DaemonRuntime {
 
     async fn make_binder(&self) -> Arc<dyn swarmotter_core::net::NetworkBinder> {
         let cfg = self.config.read().await.clone();
-        Arc::new(ContainedBinder::new(
-            cfg.network.clone(),
-            Arc::new(OsInterfaceProbe),
-        ))
+        Arc::new(
+            ContainedBinder::new(cfg.network.clone(), self.interface_probe.clone())
+                .with_gate_and_health(self.containment_gate.clone(), self.health_report_tx.clone()),
+        )
     }
 
     /// Periodically re-evaluate network containment health and flip torrent
@@ -2603,66 +2694,183 @@ impl DaemonRuntime {
     pub async fn network_health_loop(self: Arc<Self>) {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let cfg = self.config.read().await.clone();
-            let probe = OsInterfaceProbe;
-            let health = net::evaluate(&cfg.network, &probe);
-            let traffic_allowed = health.traffic_allowed;
-            let network_changed = {
-                let mut current = self.network_health.write().await;
-                let changed = current.status != health.status
-                    || current.traffic_allowed != health.traffic_allowed
-                    || current.detail != health.detail;
-                *current = health.clone();
-                changed
-            };
-            if network_changed {
-                self.publish_event(Event::new(
-                    "network_status_changed",
-                    json!({
-                        "status": health.status.as_str(),
-                        "traffic_allowed": health.traffic_allowed,
-                        "detail": health.detail.clone(),
-                    }),
-                ));
-                self.publish_event(stats_updated_event());
+            self.network_health_tick().await;
+        }
+    }
+
+    /// One iteration of the network containment health monitor, extracted so
+    /// tests can drive it deterministically without sleeping. It evaluates the
+    /// injected interface probe, processes pending bind-failure health reports,
+    /// and on a healthy-to-unhealthy transition follows the exact order required
+    /// by ADR-0051: block the gate, stop the listener/DHT, abort data-plane tasks,
+    /// reconcile progress, set torrents `network_blocked`, persist, and publish.
+    pub async fn network_health_tick(&self) {
+        // Process pending bind/listen/source-bind failure reports first. A
+        // report blocks the gate and exposes socket_bind_failed.
+        let mut reported_status: Option<(NetworkContainmentStatus, String)> = None;
+        loop {
+            let report = self.health_report_rx.lock().await.try_recv();
+            match report {
+                Ok(r) => reported_status = Some((r.status, r.detail)),
+                Err(_) => break,
             }
-
-            // Reconcile live engine progress into torrent records.
+        }
+        if let Some((status, detail)) = reported_status {
+            let _transition = self.data_plane_transition_lock.lock().await;
+            self.containment_gate.block(status, detail.clone());
+            let hashes: Vec<InfoHash> = self.engine_handles.read().await.keys().copied().collect();
+            for h in &hashes {
+                self.stop_engine(h).await;
+            }
+            self.stop_seeder_listener(true).await;
+            self.stop_dht_runner().await;
+            let seeding_hashes = self
+                .seeder_shutdowns
+                .lock()
+                .await
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            for hash in &seeding_hashes {
+                self.force_stop_seeder(hash).await;
+            }
             self.reconcile_engine_progress().await;
-
-            if !traffic_allowed && health.mode != NetworkContainmentMode::Disabled {
-                // Stop all running engines and mark torrents network_blocked.
-                let hashes: Vec<InfoHash> =
-                    self.engine_handles.read().await.keys().copied().collect();
-                for h in hashes {
-                    self.stop_engine(&h).await;
-                    let mut reg = self.registry.lock().await;
-                    if let Some(t) = reg.get_mut(&h) {
-                        t.state = TorrentState::NetworkBlocked;
-                        t.error = Some(health.detail.clone());
-                    }
-                }
-                let seeding_hashes = self
-                    .seeder_shutdowns
-                    .lock()
-                    .await
-                    .keys()
-                    .copied()
-                    .collect::<Vec<_>>();
-                for hash in seeding_hashes {
-                    self.force_stop_seeder(&hash).await;
-                }
-            } else {
+            {
                 let mut reg = self.registry.lock().await;
                 for t in reg.torrents.values_mut() {
-                    if traffic_allowed && t.state == TorrentState::NetworkBlocked {
-                        t.state = TorrentState::Queued;
-                        t.error = None;
+                    match t.state {
+                        TorrentState::Queued
+                        | TorrentState::Downloading
+                        | TorrentState::DownloadingMetadata
+                        | TorrentState::Checking
+                        | TorrentState::Seeding => {
+                            t.state = TorrentState::NetworkBlocked;
+                            t.error = Some(detail.clone());
+                        }
+                        _ => {}
                     }
                 }
-                drop(reg);
-                self.reconcile_queue().await;
             }
+            let mut current = self.network_health.write().await;
+            current.status = status;
+            current.detail = detail.clone();
+            current.traffic_allowed = false;
+            drop(current);
+            self.persist_state_best_effort("network_blocked").await;
+            self.publish_event(Event::new(
+                "network_status_changed",
+                json!({
+                    "status": status.as_str(),
+                    "traffic_allowed": false,
+                    "detail": detail,
+                }),
+            ));
+            self.publish_event(stats_updated_event());
+            return;
+        }
+
+        let cfg = self.config.read().await.clone();
+        let health = net::evaluate(&cfg.network, self.interface_probe.as_ref());
+        let traffic_allowed = health.traffic_allowed;
+        let previously_allowed = self.network_health.read().await.traffic_allowed;
+        let network_changed = {
+            let mut current = self.network_health.write().await;
+            let changed = current.status != health.status
+                || current.traffic_allowed != health.traffic_allowed
+                || current.detail != health.detail;
+            *current = health.clone();
+            changed
+        };
+        if network_changed {
+            self.publish_event(Event::new(
+                "network_status_changed",
+                json!({
+                    "status": health.status.as_str(),
+                    "traffic_allowed": health.traffic_allowed,
+                    "detail": health.detail.clone(),
+                }),
+            ));
+            self.publish_event(stats_updated_event());
+        }
+
+        // Reconcile live engine progress into torrent records.
+        self.reconcile_engine_progress().await;
+
+        if !traffic_allowed && health.mode != NetworkContainmentMode::Disabled {
+            // Healthy-to-unhealthy transition: follow the exact order in
+            // ADR-0051 while holding the data-plane transition lock.
+            let _transition = self.data_plane_transition_lock.lock().await;
+            // 1. Block the gate immediately.
+            self.containment_gate
+                .block(health.status, health.detail.clone());
+            // 2. Stop the inbound listener and shared DHT runner.
+            self.stop_seeder_listener(true).await;
+            self.stop_dht_runner().await;
+            // 3. Abort/drop all downloader, metadata, tracker, webseed, and
+            //    seeder task handles; do not await graceful protocol shutdown.
+            let hashes: Vec<InfoHash> = self.engine_handles.read().await.keys().copied().collect();
+            for h in &hashes {
+                self.stop_engine(h).await;
+            }
+            let seeding_hashes = self
+                .seeder_shutdowns
+                .lock()
+                .await
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            for hash in &seeding_hashes {
+                self.force_stop_seeder(hash).await;
+            }
+            // 4. Reconcile byte counters and verified progress already reported.
+            self.reconcile_engine_progress().await;
+            // 5. Set previously active torrents to network_blocked, retain prior
+            //    activity for recovery, persist, and publish events.
+            {
+                let mut reg = self.registry.lock().await;
+                for t in reg.torrents.values_mut() {
+                    // Active, queued, downloading, and seeding torrents block.
+                    // Paused, completed (not seeding), storage-error, and already
+                    // blocked torrents retain their state for recovery.
+                    match t.state {
+                        TorrentState::Queued
+                        | TorrentState::Downloading
+                        | TorrentState::DownloadingMetadata
+                        | TorrentState::Checking
+                        | TorrentState::Seeding => {
+                            t.state = TorrentState::NetworkBlocked;
+                            t.error = Some(health.detail.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            self.persist_state_best_effort("network_blocked").await;
+        } else if traffic_allowed && !previously_allowed {
+            // Recovery: update health (already done), allow the gate,
+            // reconstruct listener/DHT, and requeue only work active before the
+            // block. Paused and automatically seed-stopped torrents remain stopped.
+            self.containment_gate.allow();
+            let mut reg = self.registry.lock().await;
+            for t in reg.torrents.values_mut() {
+                if t.state == TorrentState::NetworkBlocked {
+                    t.state = TorrentState::Queued;
+                    t.error = None;
+                }
+            }
+            drop(reg);
+            self.reconcile_queue().await;
+            self.reconcile_seeders().await;
+        } else {
+            let mut reg = self.registry.lock().await;
+            for t in reg.torrents.values_mut() {
+                if traffic_allowed && t.state == TorrentState::NetworkBlocked {
+                    t.state = TorrentState::Queued;
+                    t.error = None;
+                }
+            }
+            drop(reg);
+            self.reconcile_queue().await;
         }
     }
 
@@ -6267,7 +6475,8 @@ mod tests {
     async fn concurrent_config_replacements_leave_runtime_and_disk_consistent() {
         let root = unique_dir("config-replacement");
         let config_path = root.join("swarmotter.toml");
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        cfg.network.mode = NetworkContainmentMode::Disabled;
         let health = NetworkHealth::blocked(
             NetworkContainmentMode::Disabled,
             swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
@@ -8748,6 +8957,7 @@ mod tests {
     #[tokio::test]
     async fn replace_config_preserves_and_redacts_auth_token() {
         let mut cfg = Config::default();
+        cfg.network.mode = NetworkContainmentMode::Disabled;
         cfg.api.auth_token = Some("existing-token".into());
         cfg.api.require_auth = true;
         let health = NetworkHealth::blocked(

@@ -315,7 +315,7 @@ sized up front.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `mode` | `disabled` when the entire table is omitted; `strict` inside a partial table | Torrent data-plane containment mode. |
+| `mode` | `strict` | Torrent data-plane containment mode. An omitted `[network]` table produces strict mode without a path, which fails startup with `invalid_config`. Explicit `mode = "disabled"` is for development or a separately enforced boundary only. See ADR-0051. |
 | `required_interface` | unset | Interface name, such as `br0` or `tun0`. |
 | `required_source_ipv4` | unset | Required IPv4 source address. |
 | `required_source_ipv6` | unset | Required IPv6 source address. |
@@ -325,10 +325,24 @@ sized up front.
 | `validate_route` | `false` | Requires route validation when supported by the probe. |
 | `validate_dns` | `false` | Reports `dns_not_constrained` in network health when DNS cannot be proven constrained. Hostname resolution is still fail-closed unless DNS is constrained or a network namespace is used. |
 
-Strict mode requires at least one enforceable path: interface, source address,
-or network namespace. On Linux, route and DNS path validation invoke
-`ip route get`; direct and tarball installs must provide the `ip` utility from
-the distribution's `iproute2` or `iproute` package.
+Strict mode is the default and requires at least one enforceable path: interface,
+source address, or network namespace. **Breaking change (ADR-0051):** an omitted
+`[network]` table no longer selects disabled mode. It produces strict mode
+without a path and the daemon fails at startup with `invalid_config`. Existing
+users who relied on the disabled default must configure a strict path or set
+`mode = "disabled"` explicitly. Never infer disabled mode from a missing
+file/table, platform, bind failure, or unavailable interface; never auto-change
+strict to preferred or disabled.
+
+The daemon observes one process-wide containment gate shared by every torrent
+data-plane component (binder, DHT, listener, engine, seeder, tracker, webseed,
+metadata). On live path loss the gate blocks immediately, the inbound listener
+and DHT runner stop, data-plane tasks are aborted, and active torrents enter
+`network_blocked` while the control plane remains available. On recovery the
+gate reopens and only formerly active work resumes; paused and automatically
+seed-stopped torrents remain stopped. On Linux, route and DNS path validation
+invoke `ip route get`; direct and tarball installs must provide the `ip` utility
+from the distribution's `iproute2` or `iproute` package.
 
 ### `[autopilot]`
 
