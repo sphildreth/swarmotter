@@ -523,7 +523,14 @@ async fn native_seeding_put_rejects_non_replacement_and_invalid_values() {
         r#"{"ratio_limit":null,"idle_limit":1.5,"seed_forever":false}"#,
         r#"{"ratio_limit":1e999,"idle_limit":null,"seed_forever":false}"#,
         r#"{"ratio_limit":null,"idle_limit":18446744073709551616,"seed_forever":false}"#,
+        r#"{"ratio_limit":"1.5","idle_limit":null,"seed_forever":false}"#,
+        r#"{"ratio_limit":true,"idle_limit":null,"seed_forever":false}"#,
+        r#"{"ratio_limit":null,"idle_limit":"1800","seed_forever":false}"#,
+        r#"{"ratio_limit":null,"idle_limit":true,"seed_forever":false}"#,
+        r#"{"ratio_limit":null,"idle_limit":null,"seed_forever":null}"#,
+        r#"{"ratio_limit":null,"idle_limit":null,"seed_forever":"false"}"#,
         r#"{"ratio_limit":null,"idle_limit":null,"seed_forever":false,"extra":1}"#,
+        r#"[]"#,
     ];
     for body in invalid {
         let (status, response) = put_raw(&app, &uri, body).await;
