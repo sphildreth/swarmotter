@@ -96,7 +96,10 @@ feature completion and acceptance criteria, not by time estimates.
   authenticated WebSocket handshake with HTTP 101, proving the accepted path
   reaches Hyper's production upgrade extension rather than only a Tower
   extraction boundary.
-- Validate Web UI static security headers and required operation wiring.
+- Validate Web UI static security headers and required operation wiring. The
+  ES-module route matrix covers `/app.js` and every `/js/*.js` feature module,
+  asserting HTTP 200, JavaScript content type, the shared `script-src 'self'`
+  CSP, and the intentionally unchanged entry-script cache policy.
 - Import torrent from watch folder.
 - Pause/resume/remove lifecycle.
 - Recheck lifecycle.
@@ -174,8 +177,9 @@ node crates/swarmotter-web/tests/seeding-policy.test.js
 The matrix definition of done also requires `cargo fmt --all -- --check`,
 `cargo check --locked --workspace --all-targets --all-features`,
 `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`,
-`cargo test --locked --workspace --all-targets --all-features`, JavaScript
-syntax checks, `mdbook build`, and `git diff --check` to pass. Documentation
+`cargo test --locked --workspace --all-targets --all-features`, `node --check`
+for every file below `crates/swarmotter-web/assets`, both executable DOM
+harnesses, `mdbook build`, and `git diff --check` to pass. Documentation
 must keep `design/requirements.md`, architecture/API/configuration design,
 operator API/configuration/Web UI guides, the completion tracker, changelog,
 and affected ADRs (including ADR-0052 and ADR-0054) aligned with the tested

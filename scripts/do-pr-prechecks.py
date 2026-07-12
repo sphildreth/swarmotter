@@ -10,7 +10,8 @@ pull requests:
   - cargo check --workspace --all-targets --all-features
   - cargo clippy --workspace --all-targets --all-features -- -D warnings
   - cargo test --all --all-features
-  - node --check for both Web UI scripts
+  - node --check for every embedded Web UI JavaScript asset
+  - executable Web UI DOM-state harnesses
   - docker compose config for the supported deployment manifest
   - cargo +1.88.0 check --locked --workspace --all-targets --all-features
   - mdbook build
@@ -58,8 +59,8 @@ PR_CHECKS = (
     "cargo check --workspace --all-targets --all-features",
     "cargo clippy --workspace --all-targets --all-features -- -D warnings",
     "cargo test --all --all-features",
-    "node --check crates/swarmotter-web/assets/theme-bootstrap.js",
-    "node --check crates/swarmotter-web/assets/app.js",
+    "find crates/swarmotter-web/assets -type f -name '*.js' -exec node --check {} \\;",
+    "node crates/swarmotter-web/tests/watch-history.test.js && node crates/swarmotter-web/tests/seeding-policy.test.js",
     "GLUETUN_ENV_FILE=gluetun.env.example docker compose --env-file deploy/.env.example -f deploy/compose.yml config",
     "cargo +1.88.0 check --locked --workspace --all-targets --all-features",
     "mdbook build",
@@ -179,16 +180,25 @@ def build_steps(args: argparse.Namespace) -> list[CheckStep]:
         ]
     )
 
+    for javascript in sorted(Path("crates/swarmotter-web/assets").rglob("*.js")):
+        steps.append(
+            CheckStep(
+                f"Validate JavaScript: {javascript.relative_to('crates/swarmotter-web/assets')}",
+                ["node", "--check", str(javascript)],
+                PR_CHECKS[4],
+            )
+        )
+
     steps.extend(
         [
             CheckStep(
-                "Validate theme bootstrap JavaScript",
-                ["node", "--check", "crates/swarmotter-web/assets/theme-bootstrap.js"],
-                PR_CHECKS[4],
+                "Validate watch-history DOM state",
+                ["node", "crates/swarmotter-web/tests/watch-history.test.js"],
+                PR_CHECKS[5],
             ),
             CheckStep(
-                "Validate Web UI JavaScript",
-                ["node", "--check", "crates/swarmotter-web/assets/app.js"],
+                "Validate seeding-policy DOM state",
+                ["node", "crates/swarmotter-web/tests/seeding-policy.test.js"],
                 PR_CHECKS[5],
             ),
             CheckStep(

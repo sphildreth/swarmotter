@@ -78,6 +78,54 @@ crates/
 └── swarmotter-web/   # embedded static Web UI
 ```
 
+The daemon and engine use explicit ownership modules while preserving the
+`swarmotterd::daemon::*` and `swarmotterd::engine::*` library facades:
+
+```text
+swarmotterd/src/
+├── daemon/
+│   ├── mod.rs                         # runtime types and public facade
+│   ├── construction.rs                # shared-resource wiring
+│   ├── lifecycle.rs                   # DaemonOps lifecycle implementation
+│   ├── scheduler.rs, seeding.rs       # queue and seeder ownership
+│   ├── settings.rs, watch.rs          # reconfiguration and watch ingestion
+│   ├── containment.rs, diagnostics.rs # gate/recovery and observations
+│   ├── persistence.rs                 # restore, checkpoints, rollback
+│   └── tests.rs
+└── engine/
+    ├── mod.rs                         # engine types, builders, public facade
+    ├── discovery.rs, peer_session.rs  # candidate sources and wire sessions
+    ├── download.rs, parallel.rs       # serial and parallel scheduling
+    ├── endgame.rs, webseed.rs         # bounded specialized download paths
+    ├── progress.rs                    # accounting updates
+    └── tests.rs
+```
+
+The binary imports `swarmotterd::{daemon, logging}` and does not redeclare
+library modules. Consequently daemon unit tests compile once under the library
+target. Native torrent handlers follow the same ownership rule under
+`swarmotter-api/src/handlers/torrents/`: `add`, `bulk`, `query`, `lifecycle`,
+and `settings` are re-exported by `mod.rs`, preserving the existing router and
+handler paths.
+
+## Web UI asset and module boundary
+
+The Web UI remains build-step-free vanilla JavaScript. `/app.js` is an ES-module
+entry that alone composes the feature modules served under `/js/`: `api.js`,
+`state.js`, `torrents.js`, `details.js`, `settings.js`, `events.js`, and
+`ui.js`. Feature modules depend only on the shared API/state/UI layers and use
+entry-injected callbacks for cross-feature actions, so the import graph is
+acyclic. `swarmotter-web/src/lib.rs` embeds and routes every module with
+`application/javascript; charset=utf-8`.
+
+Every HTML and module response passes through the same security middleware.
+The Content Security Policy remains `script-src 'self'` with no inline-script
+exception, and the module routes retain the entry script's absence of an
+explicit cache header. Route tests assert status, content type, CSP, and cache
+policy for every module. Contributor checks run `node --check` on every
+JavaScript asset; the executable watch-history and seeding-policy DOM harnesses
+remain part of the test surface.
+
 ## Control plane vs data plane
 
 The control plane (API/Web UI) is separate from the torrent data plane. The

@@ -6,18 +6,6 @@
 //! and lifecycle. It exposes the API and Web UI via axum. All torrent
 //! data-plane traffic is enforced through the network containment layer.
 
-mod containment_gate;
-mod daemon;
-mod dht;
-mod engine;
-mod logging;
-mod metadata;
-mod netbinder;
-mod peer_permits;
-mod runtime;
-mod seeder;
-mod state_store;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -25,6 +13,7 @@ use clap::Parser;
 use swarmotter_core::config::Config;
 use swarmotter_core::error::Result;
 use swarmotter_core::net::{self, OsInterfaceProbe};
+use swarmotterd::{daemon, logging};
 
 use swarmotter_api::state::{AppState, BuildInfo};
 

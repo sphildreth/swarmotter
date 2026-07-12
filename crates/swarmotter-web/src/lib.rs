@@ -22,7 +22,25 @@ use axum::{
 };
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
-const APP_JS: &str = include_str!("../assets/app.js");
+const APP_JS_ENTRY: &str = include_str!("../assets/app.js");
+const API_JS: &str = include_str!("../assets/js/api.js");
+const STATE_JS: &str = include_str!("../assets/js/state.js");
+const TORRENTS_JS: &str = include_str!("../assets/js/torrents.js");
+const DETAILS_JS: &str = include_str!("../assets/js/details.js");
+const SETTINGS_JS: &str = include_str!("../assets/js/settings.js");
+const EVENTS_JS: &str = include_str!("../assets/js/events.js");
+const UI_JS: &str = include_str!("../assets/js/ui.js");
+#[cfg(test)]
+const APP_JS: &str = concat!(
+    include_str!("../assets/app.js"),
+    include_str!("../assets/js/api.js"),
+    include_str!("../assets/js/state.js"),
+    include_str!("../assets/js/torrents.js"),
+    include_str!("../assets/js/details.js"),
+    include_str!("../assets/js/settings.js"),
+    include_str!("../assets/js/events.js"),
+    include_str!("../assets/js/ui.js"),
+);
 const SEEDING_POLICY_JS: &str = include_str!("../assets/seeding-policy.js");
 const WATCH_HISTORY_JS: &str = include_str!("../assets/watch-history.js");
 const THEME_BOOTSTRAP_JS: &str = include_str!("../assets/theme-bootstrap.js");
@@ -54,6 +72,13 @@ pub fn web_router() -> Router {
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
+        .route("/js/api.js", get(api_js))
+        .route("/js/state.js", get(state_js))
+        .route("/js/torrents.js", get(torrents_js))
+        .route("/js/details.js", get(details_js))
+        .route("/js/settings.js", get(settings_js))
+        .route("/js/events.js", get(events_js))
+        .route("/js/ui.js", get(ui_js))
         .route("/seeding-policy.js", get(seeding_policy_js))
         .route("/watch-history.js", get(watch_history_js))
         .route("/theme-bootstrap.js", get(theme_bootstrap_js))
@@ -84,12 +109,44 @@ async fn index() -> Response {
 }
 
 async fn app_js() -> Response {
+    javascript(APP_JS_ENTRY)
+}
+
+async fn api_js() -> Response {
+    javascript(API_JS)
+}
+
+async fn state_js() -> Response {
+    javascript(STATE_JS)
+}
+
+async fn torrents_js() -> Response {
+    javascript(TORRENTS_JS)
+}
+
+async fn details_js() -> Response {
+    javascript(DETAILS_JS)
+}
+
+async fn settings_js() -> Response {
+    javascript(SETTINGS_JS)
+}
+
+async fn events_js() -> Response {
+    javascript(EVENTS_JS)
+}
+
+async fn ui_js() -> Response {
+    javascript(UI_JS)
+}
+
+fn javascript(source: &'static str) -> Response {
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "application/javascript; charset=utf-8",
         )],
-        APP_JS,
+        source,
     )
         .into_response()
 }
@@ -250,6 +307,14 @@ mod tests {
     fn assets_are_nonempty() {
         assert!(!INDEX_HTML.is_empty());
         assert!(!APP_JS.is_empty());
+        assert!(!APP_JS_ENTRY.is_empty());
+        assert!(!API_JS.is_empty());
+        assert!(!STATE_JS.is_empty());
+        assert!(!TORRENTS_JS.is_empty());
+        assert!(!DETAILS_JS.is_empty());
+        assert!(!SETTINGS_JS.is_empty());
+        assert!(!EVENTS_JS.is_empty());
+        assert!(!UI_JS.is_empty());
         assert!(!THEME_BOOTSTRAP_JS.is_empty());
         assert!(!STYLE_CSS.is_empty());
         assert!(!TABULATOR_JS.is_empty());
@@ -401,10 +466,10 @@ mod tests {
             );
         }
         for needle in [
-            "let selectedTorrents = new Map();",
-            "let visibleTorrents = [];",
-            "let torrentTable = null;",
-            "let bulkRemoveInFlight = false;",
+            "selectedTorrents: new Map(),",
+            "visibleTorrents: [],",
+            "torrentTable: null,",
+            "bulkRemoveInFlight: false,",
             "new Tabulator(\"#torrent-table\"",
             "function torrentSelectionFormatter(",
             "function renderTorrentSelection(",
@@ -416,7 +481,7 @@ mod tests {
             "api(\"/torrents/remove\"",
             "info_hashes: selected.map(([hash]) => hash)",
             "not_found",
-            "selectedTorrents.delete(hash);",
+            "state.selectedTorrents.delete(hash);",
             "$(\"#select-all-torrents-btn\").addEventListener(\"click\", selectAllVisibleTorrents);",
             "$(\"#deselect-all-torrents-btn\").addEventListener(\"click\", deselectAllTorrents);",
             "$(\"#remove-selected-torrents-btn\").addEventListener(\"click\", removeSelectedTorrents);",
@@ -468,11 +533,11 @@ mod tests {
             "headerFilterFunc: numericHeaderFilter",
             "function parseNumericFilter(",
             "function clearTorrentFilters(",
-            "let torrentTableReady = Promise.resolve();",
-            "torrentTable.on(\"tableBuilt\"",
-            "await torrentTableReady;",
-            "torrentTable.replaceData(rows)",
-            "torrentTable.getRows(\"active\")",
+            "torrentTableReady: Promise.resolve(),",
+            "state.torrentTable.on(\"tableBuilt\"",
+            "await state.torrentTableReady;",
+            "state.torrentTable.replaceData(rows)",
+            "state.torrentTable.getRows(\"active\")",
         ] {
             assert!(
                 APP_JS.contains(needle),
@@ -518,7 +583,7 @@ mod tests {
             "function saveTorrentQueryView(",
             "function loadTorrentQueryView(",
             "function clearTorrentQueryView(",
-            "torrentTable.on(\"dataSorted\"",
+            "state.torrentTable.on(\"dataSorted\"",
             "function handleTorrentTableSort(",
             "function renderTorrentQuerySummary(",
             "$(\"#save-torrent-view-btn\").addEventListener(\"click\", saveTorrentQueryView);",
@@ -574,7 +639,7 @@ mod tests {
             "function toggleTheme(",
             "document.documentElement.dataset.theme = next;",
             "tableElement.dataset.theme = theme;",
-            "torrentTable.redraw(true)",
+            "state.torrentTable.redraw(true)",
             "window.localStorage.setItem(THEME_STORAGE_KEY, next);",
             "themeToggle.addEventListener(\"click\", toggleTheme);",
         ] {
@@ -899,11 +964,11 @@ mod tests {
     #[test]
     fn web_ui_scopes_removal_observation_to_the_active_query() {
         for needle in [
-            "let lastTorrentObservationKey = null;",
+            "lastTorrentObservationKey: null,",
             "observeTorrentRemovals(torrents, queryParams, query);",
-            "const observesCompleteLibrary = !torrentQueryState.q",
+            "const observesCompleteLibrary = !state.torrentQueryState.q",
             "if (!observesCompleteLibrary)",
-            "if (observationKey !== lastTorrentObservationKey)",
+            "if (observationKey !== state.lastTorrentObservationKey)",
         ] {
             assert!(
                 APP_JS.contains(needle),
@@ -919,7 +984,7 @@ mod tests {
             "function beginDetailsLoad()",
             "if (!detailsRequestIsCurrent(hash)) return;",
             "#details-controls\").classList.add(\"hidden\")",
-            "const hash = currentHash;",
+            "const hash = state.currentHash;",
             "button.dataset.pendingHash = hash;",
             "if (button.dataset.pendingHash === hash)",
         ] {
@@ -1054,7 +1119,7 @@ mod tests {
 
         for needle in [
             "function renderSettingsEditor(",
-            "let activeSettingsPanel = \"api\";",
+            "activeSettingsPanel: \"api\"",
             "function activateSettingsPanel(",
             "$$(\".settings-nav-item\").forEach",
             "const panel = invalid?.closest(\"[data-settings-panel]\")?.dataset.settingsPanel;",
@@ -1076,7 +1141,7 @@ mod tests {
             "api(\"/reset\"",
             "Reset all downloads?",
             "let resetError = null;",
-            "selectedTorrents.clear();",
+            "state.selectedTorrents.clear();",
             "const remaining = finiteNumber(query?.total);",
             "Reset incomplete",
             "torrents are still listed after reset.",
@@ -1255,6 +1320,51 @@ mod tests {
                 content_type
             );
         }
+    }
+
+    #[tokio::test]
+    async fn es_module_routes_preserve_security_and_cache_policy() {
+        let app = web_router();
+        for path in [
+            "/app.js",
+            "/js/api.js",
+            "/js/state.js",
+            "/js/torrents.js",
+            "/js/details.js",
+            "/js/settings.js",
+            "/js/events.js",
+            "/js/ui.js",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request is valid"),
+                )
+                .await
+                .expect("module route responds");
+            assert_eq!(response.status(), StatusCode::OK, "route {path}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/javascript; charset=utf-8",
+                "route {path}",
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(header::CONTENT_SECURITY_POLICY)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.contains("script-src 'self'")),
+                "route {path}",
+            );
+            assert!(
+                response.headers().get(header::CACHE_CONTROL).is_none(),
+                "module route {path} must retain the entry script's uncached policy",
+            );
+        }
+        assert!(INDEX_HTML.contains("<script type=\"module\" src=\"/app.js\"></script>"));
     }
 
     #[tokio::test]
