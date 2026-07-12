@@ -64,10 +64,12 @@ pub fn scan_torrent_files(dir: &std::path::Path, recursive: bool) -> Vec<PathBuf
 
 /// Import a single `.torrent` file into a torrent record. Duplicate detection
 /// is performed by the caller against the registry; here we parse and build.
+/// Reads through the bounded [`meta::read_torrent_file`] helper so oversized
+/// files are rejected before allocation.
 pub fn import_torrent_file(path: &std::path::Path, date_added: u64) -> Result<Torrent> {
-    let bytes = std::fs::read(path).map_err(CoreError::Io)?;
-    let meta = meta::parse_torrent(&bytes)?;
-    Ok(Torrent::new(meta, date_added))
+    let bytes = meta::read_torrent_file(path)?;
+    let parsed = meta::parse_torrent(&bytes)?;
+    Ok(Torrent::new(parsed, date_added))
 }
 
 /// Decide the archive/leave/delete behavior after a successful import.

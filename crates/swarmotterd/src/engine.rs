@@ -1037,7 +1037,7 @@ impl TorrentEngine {
             // If unchoked and we have a candidate piece, request blocks.
             if !peer_choking && peer_bf.is_some() {
                 if let Some(piece_index) = self.pick_piece(peer_bf.as_ref(), have) {
-                    let plen = self.piece_length(piece_index) as u32;
+                    let plen = self.meta.piece_length_for_index_u32(piece_index)?;
                     let reqs = block_requests(plen);
                     let expected_blocks: HashMap<u32, u32> = reqs.iter().copied().collect();
                     // Send all block requests for this piece.
@@ -3289,11 +3289,7 @@ async fn endgame_peer_session(
                 peer::write_message(&mut write_half, &Message::NotInterested).await?;
                 break;
             };
-            let piece_len = if piece_index + 1 == piece_count {
-                meta.last_piece_length()
-            } else {
-                meta.piece_length
-            } as u32;
+            let piece_len = meta.piece_length_for_index_u32(piece_index)?;
             let reqs = block_requests(piece_len);
             // Request blocks respecting the duplicate cap.
             let mut sent_any = false;
@@ -3736,11 +3732,7 @@ where
         }) else {
             break;
         };
-        let piece_len = if piece_index + 1 == piece_count {
-            meta.last_piece_length()
-        } else {
-            meta.piece_length
-        } as u32;
+        let piece_len = meta.piece_length_for_index_u32(piece_index)?;
         let mut download = ParallelPieceDownload::new(piece_index, piece_len);
         if let Err(e) = download
             .send_more(write_half, global_in_flight, request_budget)

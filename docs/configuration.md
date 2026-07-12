@@ -472,6 +472,12 @@ In strict mode, bootstrap hostnames are subject to DNS containment policy.
 | `failure_dir` | unset | Where failed imports are moved. |
 | `delete_after_import` | `true` | Deletes imported watch files when no archive is configured. |
 
+Watch files are read through a bounded reader that enforces the shared 16 MiB
+metadata limit (`MAX_TORRENT_METADATA_BYTES`) before parsing and before any
+piece-sized allocation, regardless of `max_request_body_bytes`. Oversized or
+malformed watch files are rejected as `malformed_torrent` / `bencode_error`
+and never panic the daemon. See ADR-0050.
+
 ### `[logging]`
 
 | Option | Default | Meaning |

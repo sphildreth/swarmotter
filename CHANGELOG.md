@@ -7,6 +7,24 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [Unreleased]
+
+### Fixed
+
+- **Bounded untrusted metainfo parsing:** the shared bencode decoder and
+  metainfo builder now enforce fixed depth, node-count, file-count,
+  piece-count, piece-length, and 16 MiB metadata byte budgets before any
+  piece-sized allocation. The budgets apply equally to `.torrent` uploads, bulk
+  base64 metainfo, magnet `info` dicts fetched via BEP 9, watch-folder files,
+  and restored durable daemon state. The decoder rejects empty/leading-zero/
+  negative-zero integers, missing terminators, duplicate and non-string
+  dictionary keys, overflowing string lengths, and trailing bytes, and
+  requires EOF after exactly one top-level value. No malformed input may panic
+  the daemon. Durable SHA-1 piece hashes are validated to be exactly 20 bytes
+  with piece-index context before copying. Engine/storage boundaries narrow
+  piece length with `u32::try_from` rather than `as`. See
+  [ADR-0050](design/adr/0050-bounded-untrusted-metainfo-parsing.md).
+
 ## [1.3.1] - [2026-07-12]
 
 ### Fixed

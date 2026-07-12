@@ -3121,7 +3121,7 @@ impl DaemonRuntime {
         folder: &swarmotter_core::config::WatchFolderConfig,
         _global_dir: Option<&str>,
     ) -> Result<InfoHash> {
-        let bytes = std::fs::read(file).map_err(CoreError::from)?;
+        let bytes = meta::read_torrent_file(file)?;
         let parsed = meta::parse_torrent(&bytes)?;
         let hash = parsed.info_hash;
         let mut torrent = Torrent::new(parsed, now());

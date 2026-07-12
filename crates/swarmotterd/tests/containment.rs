@@ -244,3 +244,81 @@ async fn watch_folder_moves_failed_import_to_failure_dir() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn watch_folder_rejects_oversized_metadata_file() {
+    use swarmotter_core::config::{StartBehavior, WatchFolderConfig};
+    use swarmotter_core::meta::MAX_TORRENT_METADATA_BYTES;
+    let mut cfg = Config::default();
+    cfg.network.mode = swarmotter_core::models::network::NetworkContainmentMode::Disabled;
+    let healthy = NetworkHealth::blocked(
+        swarmotter_core::models::network::NetworkContainmentMode::Disabled,
+        NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let dir = std::env::temp_dir().join(format!(
+        "swarmotter-watch-oversize-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let big_file = dir.join("oversize.torrent");
+    // Write a file one byte over the metadata limit. The bounded read rejects
+    // it before parsing and before any allocation sized to the attacker input.
+    std::fs::write(&big_file, vec![b'x'; MAX_TORRENT_METADATA_BYTES + 1]).unwrap();
+
+    cfg.watch = vec![WatchFolderConfig {
+        path: dir.display().to_string(),
+        recursive: false,
+        download_dir: None,
+        label: None,
+        start_behavior: StartBehavior::Start,
+        archive_dir: None,
+        failure_dir: Some(dir.join("failed").display().to_string()),
+        delete_after_import: false,
+    }];
+
+    let runtime = Arc::new(DaemonRuntime::new(cfg, healthy));
+    runtime.watch_scan().await.unwrap();
+
+    // No torrent should have been imported.
+    let list = runtime.list_torrents().await;
+    assert!(list.is_empty(), "oversized metadata must not be imported");
+
+    // Import history records the failure.
+    let hist = runtime.watch_history().await;
+    assert_eq!(hist.len(), 1);
+    assert!(!hist[0].success);
+    assert!(
+        hist[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("exceeds maximum")),
+        "expected size-limit error, got: {:?}",
+        hist[0].error
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn api_add_rejects_oversized_metadata_bytes() {
+    use swarmotter_core::meta::MAX_TORRENT_METADATA_BYTES;
+    let cfg = Config::default();
+    let healthy = NetworkHealth::blocked(
+        swarmotter_core::models::network::NetworkContainmentMode::Disabled,
+        NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = Arc::new(DaemonRuntime::new(cfg, healthy));
+    // Feed bytes one byte over the metadata limit directly through the same
+    // production add path used by the HTTP API. The bencode byte limit inside
+    // parse_torrent rejects it before any piece-sized allocation.
+    let oversize = vec![b'd'; MAX_TORRENT_METADATA_BYTES + 1];
+    let err = runtime.add_torrent_file(oversize, None).await.unwrap_err();
+    assert!(err.to_string().contains("exceeds maximum"));
+    assert!(runtime.list_torrents().await.is_empty());
+}

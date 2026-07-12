@@ -61,6 +61,15 @@ API request bodies are capped by `api.max_request_body_bytes`; this applies to
 JSON requests and raw `.torrent` uploads. The root `/health` alias remains a
 control-plane health endpoint outside `/api/v1`.
 
+Torrent metadata (`.torrent` uploads, bulk base64 `metainfo`, magnet `info`
+dicts fetched via BEP 9, watch-folder files, and restored durable state) is
+additionally bounded by a shared 16 MiB metadata limit
+(`MAX_TORRENT_METADATA_BYTES`) enforced by the core parser before any
+piece-sized allocation. A `.torrent` body or assembled magnet `info` dict that
+exceeds the limit is rejected with `malformed_torrent` (or `bencode_error` for
+raw decoder overruns) regardless of `api.max_request_body_bytes`, which may be
+higher for other request payloads. See ADR-0050.
+
 ## Health, version, and stats
 
 All paths in this section are under `/api/v1`, except the root `/health` alias.

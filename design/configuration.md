@@ -41,6 +41,18 @@ updates use two API paths:
 Configuration table names, field names, environment override names, defaults,
 and validation behavior are release-facing. Breaking changes should follow
 `VERSIONING_GUIDE.md`.
+
+## Metadata trust boundary
+
+All torrent metadata ingress paths — `.torrent` uploads, bulk base64 metainfo,
+magnet `info` dicts fetched via BEP 9, watch-folder files, and restored
+durable daemon state — share one bounded bencode parser in `swarmotter-core`
+(see ADR-0050). The shared `MAX_TORRENT_METADATA_BYTES` (16 MiB) limit is
+enforced by the core parser before any piece-sized allocation, independent of
+`api.max_request_body_bytes` (which may be higher for other request payloads).
+Watch files are read through a bounded reader that checks file size before
+allocation and rejects growth past the limit during the read. Oversized or
+malformed metadata is rejected with a typed error and never panics the daemon.
 - Autopilot control is compatible through `[autopilot].mode`, with exactly
   three values: `disabled`, `observe`, and `act`. Default is `act`.
   In `act` mode, stalled active torrents with no recent block progress are

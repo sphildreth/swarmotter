@@ -32,6 +32,23 @@ feature completion and acceptance criteria, not by time estimates.
   missing pieces with zero sources / good active swarm / many connected but
   useless peers / slow-but-completable / private torrent (no DHT/PEX
   penalty) / bar+label mapping.
+- Bencode parser budgets and adversarial cases (ADR-0050): depth boundary
+  (128 accepted, 129 rejected), node-count boundary (`MAX_BENCODE_NODES`
+  accepted, one more rejected), overflowing/beyond-input string lengths,
+  missing terminators, empty/leading-zero/negative-zero integer forms,
+  duplicate and non-string dictionary keys, unsorted-but-unique keys accepted,
+  trailing bytes rejected, and the 16 MiB metadata byte limit accepted at the
+  boundary and rejected one byte over. Every malformed corpus case must be
+  panic-free under `std::panic::catch_unwind`.
+- Metainfo shape budgets (ADR-0050): piece length zero/over-limit, mismatched
+  piece count, too many files, too many pieces, and total-length overflow all
+  produce typed `MalformedTorrent` errors.
+- Durable piece-hash decode: SHA-1 hashes of 0, 19, 20, and 21 decoded bytes;
+  only 20 succeeds, with the piece index in the error message and no payload
+  data or content paths.
+- Production metadata ingress bounds: `.torrent` bodies at and one byte over
+  `MAX_TORRENT_METADATA_BYTES` through the core parser, API add, watch import,
+  and BEP 9 metadata assembly.
 
 ### Integration tests
 

@@ -25,12 +25,11 @@ use swarmotter_core::config::PeerEncryptionMode;
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::extensions::{self, MetadataMsgType};
 use swarmotter_core::hash::InfoHash;
-use swarmotter_core::meta::TorrentMeta;
+use swarmotter_core::meta::{TorrentMeta, MAX_TORRENT_METADATA_BYTES};
 use swarmotter_core::net::NetworkBinder;
 use swarmotter_core::peer::{self, Handshake, Message, PeerAddr};
 use swarmotter_core::utp::{self, PeerDuplex, PeerTransport};
 
-const MAX_METADATA_SIZE: usize = 16 * 1024 * 1024;
 const METADATA_CANDIDATE_CONCURRENCY: usize = 32;
 
 #[derive(Clone)]
@@ -240,9 +239,9 @@ async fn fetch_metadata_over_stream(
     let total = usize::try_from(total_u64).map_err(|_| {
         CoreError::Internal("metadata peer reported size too large for this platform".into())
     })?;
-    if total == 0 || total > MAX_METADATA_SIZE {
+    if total == 0 || total > MAX_TORRENT_METADATA_BYTES {
         return Err(CoreError::Internal(format!(
-            "metadata size {total} exceeds maximum {MAX_METADATA_SIZE}"
+            "metadata size {total} exceeds maximum {MAX_TORRENT_METADATA_BYTES}"
         )));
     }
 
@@ -795,7 +794,7 @@ mod tests {
                 let _ = serve_metadata_peer_with_reported_size(
                     stream,
                     info_hash,
-                    (MAX_METADATA_SIZE as u64) + 1,
+                    (MAX_TORRENT_METADATA_BYTES as u64) + 1,
                 )
                 .await;
             }

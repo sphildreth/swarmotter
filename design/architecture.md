@@ -9,7 +9,15 @@ SwarmOtter is a Rust async daemon with these layers:
 - **Core engine** (`swarmotter-core`): bencode, torrent/magnet parsing, info
   hash, domain models, network containment logic, queue/bandwidth/ratio
   logic, storage layout and fast-resume, watch-folder import logic, and the
-  torrent registry. Pure, testable logic with no direct socket creation.
+  torrent registry. Pure, testable logic with no direct socket creation. The
+  bencode decoder in `swarmotter-core::bencode` and the metainfo builder in
+  `swarmotter-core::meta` form the shared parser trust boundary (ADR-0050):
+  every untrusted metainfo ingress path — `.torrent` uploads, bulk base64
+  metainfo, magnet `info` dicts fetched via BEP 9, watch-folder files, and
+  restored durable daemon state — is bounded by `MAX_TORRENT_METADATA_BYTES`,
+  `MAX_BENCODE_DEPTH`, `MAX_BENCODE_NODES`, `MAX_TORRENT_FILES`,
+  `MAX_TORRENT_PIECES`, and `MAX_PIECE_LENGTH` before any piece-sized
+  allocation. No malformed input may panic the daemon.
 - **Network layer** (`swarmotter-core::net`): centralized interface/source
   binding, route validation, VPN/NIC health, and fail-closed enforcement via
   the `InterfaceProbe` trait and the live `NetworkBinder` abstraction. No

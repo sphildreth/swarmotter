@@ -63,6 +63,19 @@ ADR-0009 and ADR-0010.
 - Optional qBittorrent compatibility is intentionally limited to core
   automation endpoints and does not include indexer/search/discovery APIs.
 
+## Metadata trust boundary
+
+- All torrent metadata ingress paths — `.torrent` uploads to `/api/v1/torrents`,
+  bulk base64 `metainfo`, magnet `info` dicts fetched via BEP 9, watch-folder
+  files, and restored durable daemon state — share one bounded bencode parser
+  in `swarmotter-core` (see ADR-0050).
+- The shared metadata limit `MAX_TORRENT_METADATA_BYTES` (16 MiB) is enforced by
+  the core parser before any piece-sized allocation, independent of
+  `api.max_request_body_bytes` (which may be higher for other request payloads).
+- Oversized or malformed metadata is rejected with `malformed_torrent` (or
+  `bencode_error` for raw decoder overruns). No malformed input may panic the
+  daemon or allocate attacker-controlled memory.
+
 ## Storage API contract
 
 - `GET /api/v1/storage/roots` exposes storage-root diagnostics used for
