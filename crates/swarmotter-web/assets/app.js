@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SwarmOtter Web UI controller. Consumes the same REST API as external tools.
 const API = "/api/v1";
+const watchHistoryUi = globalThis.SwarmOtterWatchHistory;
 const DEFAULT_TOAST_DISPLAY_MS = 5000;
 const MAX_TOAST_DISPLAY_MS = 60000;
 const MAX_VISIBLE_TOASTS = 3;
@@ -1216,9 +1217,11 @@ function beginDetailsLoad() {
   $("#details-title").textContent = "Loading torrent details";
   $("#details-health").innerHTML = "";
   $("#details-summary").innerHTML = "";
+  $$("#details-seeding-summary dd").forEach(field => { field.textContent = ""; });
   $("#details-autopilot").innerHTML = "";
   $("#details-activity").innerHTML = `<h3>Activity</h3><p class="muted">Loading activity...</p>`;
   $("#details-controls").classList.add("hidden");
+  $("#details-seeding-error").textContent = "";
   $("#tracker-add-btn").disabled = true;
   $("#tracker-add-url").value = "";
   for (const selector of ["#files-table tbody", "#peers-table tbody", "#trackers-table tbody"]) {
@@ -1344,6 +1347,14 @@ function renderDetailsSummary(t) {
       ["Peers", `${fmtCount(t.active_peer_workers)} active / ${fmtCount(t.known_peers)} known`],
       ["Rate down", fmtRate(t.rate_down)],
       ["Rate up", fmtRate(t.rate_up)],
+      ["Ratio", finiteNumber(t.ratio) === null ? "" : String(t.ratio)],
+      ["Uploaded", fmtBytes(t.uploaded)],
+      ["Seeding status", String(t.seeding_status || "not_eligible").replace(/_/g, " ")],
+      ["Stored ratio target", t.seeding?.ratio_limit === null ? "inherit" : String(t.seeding?.ratio_limit)],
+      ["Effective ratio target", t.effective_ratio_limit === null ? "none" : String(t.effective_ratio_limit)],
+      ["Stored idle target", t.seeding?.idle_limit === null ? "inherit" : `${t.seeding?.idle_limit} s`],
+      ["Effective idle target", t.effective_idle_limit === null ? "none" : `${t.effective_idle_limit} s`],
+      ["Seed forever", t.seeding?.seed_forever ? "yes" : "no"],
       ["Download cap", fmtBytes(t.download_limit || 0)],
       ["Upload cap", fmtBytes(t.upload_limit || 0)],
       ["Queue position", fmtCount(t.queue_position)],
@@ -1358,6 +1369,7 @@ function renderDetailsControls(t) {
   $("#details-labels").value = (t.labels || []).join(", ");
   $("#details-download-limit").value = String(finiteNumber(t.download_limit) ?? 0);
   $("#details-upload-limit").value = String(finiteNumber(t.upload_limit) ?? 0);
+  SwarmOtterSeedingPolicy.render(document, t);
 }
 
 function renderDetailsActivity(stats) {
@@ -1789,6 +1801,35 @@ $("#details-limits-btn").addEventListener("click", event => {
     download_limit: downloadLimit,
     upload_limit: uploadLimit,
   });
+});
+
+$("#details-ratio-inherit").addEventListener("change", event => {
+  void event;
+  SwarmOtterSeedingPolicy.syncInheritance(document);
+});
+
+$("#details-idle-inherit").addEventListener("change", event => {
+  void event;
+  SwarmOtterSeedingPolicy.syncInheritance(document);
+});
+
+$("#details-seeding-save-btn").addEventListener("click", async event => {
+  if (!currentHash) return;
+  const hash = currentHash;
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await SwarmOtterSeedingPolicy.save(document, hash, api);
+    if (!detailsRequestIsCurrent(hash)) return;
+    showToast("Seeding policy saved", "", "success");
+    await openDetails(hash);
+    refreshTorrents();
+  } catch (error) {
+    if (!detailsRequestIsCurrent(hash)) return;
+    showError("Seeding policy failed", error);
+  } finally {
+    button.disabled = false;
+  }
 });
 
 // --- Add ---
@@ -2485,13 +2526,14 @@ function renderWatch(status, scanDetail = "") {
     <h3>Scan history</h3>
     ${imports.length === 0 ? `<p class="muted">No imports recorded.</p>` : `
       <table>
-        <thead><tr><th>Path</th><th>Status</th><th>Info hash</th><th>Detail</th></tr></thead>
+        <thead><tr><th>Path</th><th>Outcome</th><th>Status</th><th>Info hash</th><th>Detail</th></tr></thead>
         <tbody>${imports.slice().reverse().slice(0, 40).map(item => `
           <tr>
             <td>${escapeHtml(item.path)}</td>
-            <td>${renderStatus(item.success ? "ok" : "invalid")}</td>
+            <td>${escapeHtml(watchHistoryUi.outcomeLabel(item))}</td>
+            <td>${renderStatus(watchHistoryUi.statusKey(item))}</td>
             <td>${escapeHtml(item.info_hash_hex || "")}</td>
-            <td>${escapeHtml(importStatus(item))}</td>
+            <td>${escapeHtml(watchHistoryUi.detail(item))}</td>
           </tr>`).join("")}</tbody>
       </table>`}`;
 }
@@ -2516,12 +2558,6 @@ function renderWatchFolderRow(folder) {
     </tr>`;
 }
 
-function importStatus(item) {
-  if (item.success === true) return "ok";
-  if (item.error) return item.error;
-  if (item.success === false) return "fail";
-  return "";
-}
 $("#watch-scan-btn").addEventListener("click", async () => {
   try {
     const before = await api("/watch/status");

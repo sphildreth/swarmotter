@@ -38,7 +38,7 @@ impl Default for SeedingPolicy {
 }
 
 /// Per-torrent seeding settings.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TorrentSeeding {
     /// Per-torrent ratio limit. `None` = inherit global.
     pub ratio_limit: Option<f64>,
@@ -46,6 +46,22 @@ pub struct TorrentSeeding {
     pub idle_limit: Option<u64>,
     /// Seed forever overrides limits entirely.
     pub seed_forever: bool,
+}
+
+impl TorrentSeeding {
+    /// Effective ratio target after applying inheritance and seed-forever.
+    pub fn effective_ratio_limit(&self, global: &SeedingPolicy) -> Option<f64> {
+        (!self.seed_forever)
+            .then(|| self.ratio_limit.or(global.global_ratio_limit))
+            .flatten()
+    }
+
+    /// Effective idle target after applying inheritance and seed-forever.
+    pub fn effective_idle_limit(&self, global: &SeedingPolicy) -> Option<u64> {
+        (!self.seed_forever)
+            .then(|| self.idle_limit.or(global.global_idle_limit))
+            .flatten()
+    }
 }
 
 /// Accounting for a torrent.
@@ -84,14 +100,14 @@ pub fn evaluate_seeding(
         return SeedDecision::Continue;
     }
 
-    let ratio_limit = per.ratio_limit.or(global.global_ratio_limit);
+    let ratio_limit = per.effective_ratio_limit(global);
     if let Some(limit) = ratio_limit {
-        if acc.downloaded > 0 && acc.ratio() >= limit {
+        if limit == 0.0 || (acc.downloaded > 0 && acc.ratio() >= limit) {
             return SeedDecision::StopOnRatio;
         }
     }
 
-    let idle_limit = per.idle_limit.or(global.global_idle_limit);
+    let idle_limit = per.effective_idle_limit(global);
     if let Some(idle) = idle_limit {
         if acc.idle_seconds >= idle {
             return SeedDecision::StopOnIdle;
@@ -209,5 +225,104 @@ mod tests {
             idle_seconds: 0,
         };
         assert_eq!(acc.ratio(), 0.0);
+    }
+
+    #[test]
+    fn zero_ratio_target_stops_without_download_accounting() {
+        let acc = TorrentAccounting {
+            downloaded: 0,
+            uploaded: 0,
+            idle_seconds: 0,
+        };
+        let no_global_target = SeedingPolicy {
+            global_ratio_limit: None,
+            global_idle_limit: None,
+        };
+        let explicit_zero = TorrentSeeding {
+            ratio_limit: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_seeding(&acc, &no_global_target, &explicit_zero),
+            SeedDecision::StopOnRatio
+        );
+
+        let inherited_zero = SeedingPolicy {
+            global_ratio_limit: Some(0.0),
+            global_idle_limit: None,
+        };
+        assert_eq!(
+            evaluate_seeding(&acc, &inherited_zero, &TorrentSeeding::default()),
+            SeedDecision::StopOnRatio
+        );
+
+        let nonzero_target = SeedingPolicy {
+            global_ratio_limit: Some(1.0),
+            global_idle_limit: None,
+        };
+        assert_eq!(
+            evaluate_seeding(&acc, &nonzero_target, &TorrentSeeding::default()),
+            SeedDecision::Continue,
+            "a nonzero ratio target must retain the divide-by-zero guard"
+        );
+    }
+
+    #[test]
+    fn explicit_zero_overrides_inherited_targets() {
+        let acc = TorrentAccounting {
+            downloaded: 10,
+            uploaded: 0,
+            idle_seconds: 0,
+        };
+        let global = SeedingPolicy {
+            global_ratio_limit: Some(2.0),
+            global_idle_limit: Some(1800),
+        };
+        let ratio_zero = TorrentSeeding {
+            ratio_limit: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_seeding(&acc, &global, &ratio_zero),
+            SeedDecision::StopOnRatio
+        );
+
+        let idle_zero = TorrentSeeding {
+            ratio_limit: None,
+            idle_limit: Some(0),
+            seed_forever: false,
+        };
+        let no_global_ratio = SeedingPolicy {
+            global_ratio_limit: None,
+            ..global
+        };
+        assert_eq!(
+            evaluate_seeding(&acc, &no_global_ratio, &idle_zero),
+            SeedDecision::StopOnIdle
+        );
+    }
+
+    #[test]
+    fn effective_targets_distinguish_inherit_override_and_forever() {
+        let global = SeedingPolicy {
+            global_ratio_limit: Some(2.0),
+            global_idle_limit: Some(1800),
+        };
+        let inherited = TorrentSeeding::default();
+        assert_eq!(inherited.effective_ratio_limit(&global), Some(2.0));
+        assert_eq!(inherited.effective_idle_limit(&global), Some(1800));
+        let override_policy = TorrentSeeding {
+            ratio_limit: Some(0.0),
+            idle_limit: Some(7),
+            seed_forever: false,
+        };
+        assert_eq!(override_policy.effective_ratio_limit(&global), Some(0.0));
+        assert_eq!(override_policy.effective_idle_limit(&global), Some(7));
+        let forever = TorrentSeeding {
+            seed_forever: true,
+            ..override_policy
+        };
+        assert_eq!(forever.effective_ratio_limit(&global), None);
+        assert_eq!(forever.effective_idle_limit(&global), None);
     }
 }

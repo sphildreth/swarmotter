@@ -26,8 +26,10 @@ Use one process-wide `SeederHub` for the configured inbound TCP peer port.
   the contained listener successfully bound the configured port. Bind failure
   removes the pending registration so the daemon never advertises an
   unreachable inbound endpoint.
-- Accepted sessions are owned by the hub in a `JoinSet`, subject to a bounded
-  concurrent-session limit, and are aborted and awaited when the hub stops.
+- Accepted sessions are owned by the hub in a `JoinSet`, acquire the
+  process-wide peer permit before handshake and the routed torrent permit once
+  its info hash is known, and are aborted and awaited when the hub stops
+  (ADR-0053).
 - Listener health is checked against the binder. A failed containment path or
   data-plane reconfiguration stops the listener and every accepted session;
   no session may retain an obsolete binder policy.
@@ -53,3 +55,4 @@ operation uses the shared hub.
 - ADR-0012 (centralized network binder)
 - ADR-0013 (peer-wire protocol architecture)
 - ADR-0016 (task runtime model)
+- [ADR-0053: Process-Wide Peer Session Permit Pool](0053-process-wide-peer-session-permit-pool.md)

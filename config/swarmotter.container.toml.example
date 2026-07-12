@@ -26,6 +26,10 @@ preallocate = false
 sparse = true
 
 [network]
+# This explicit exception is valid only because deploy/compose.yml joins the
+# Gluetun network namespace (`network_mode: service:vpn`), whose firewall and
+# kill switch are the fail-closed boundary. Do not copy disabled mode into a
+# standalone container or native deployment.
 mode = "disabled"
 
 [autopilot]
@@ -46,8 +50,8 @@ global_upload = 0
 alt_download = 0
 alt_upload = 0
 alt_enabled = false
-max_peers = 0
-max_peers_per_torrent = 0
+max_peers = 0             # all inbound/outbound peer sessions; 0 = unlimited
+max_peers_per_torrent = 0 # additional per-torrent cap; 0 = daemon default 64
 
 [queue]
 max_active_downloads = 5

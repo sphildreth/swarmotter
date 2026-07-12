@@ -61,6 +61,30 @@ all currently visible rows, clear the current selection, and remove all selected
 torrents. Bulk removal removes torrent records through `POST
 /api/v1/torrents/remove` and keeps downloaded data.
 
+## Per-torrent seeding policy
+
+Torrent Details includes a Seeding Policy card. Its read-only summary reports
+the uploaded-byte count, ratio, exact seeding status, stored ratio/idle targets,
+effective ratio/idle targets after global inheritance, and whether seed-forever
+is enabled. Status values are displayed as `not eligible`, `queued`, `active`,
+`stopped ratio`, `stopped idle`, or `stopped manual`.
+
+Use the Ratio target and Idle target controls as follows:
+
+- Select **Inherit global ratio** or **Inherit global idle** to store `null` and
+  use the corresponding value from Settings > Seeding.
+- Clear inheritance and enter `0` to request an immediate automatic stop. Zero
+  is a real target; it is not the same as inheritance.
+- Select **Seed forever** to suppress both effective automatic targets while
+  preserving the stored overrides for later use.
+
+**Save Seeding Policy** replaces all three per-torrent fields together. The UI
+waits for the server response and reloads Torrent Details before displaying the
+new summary; it does not predict a status transition locally. Invalid input or
+a persistence failure is shown in the card's alert and leaves the last rendered
+stored/effective values unchanged. A policy edit never resumes a torrent that
+an operator manually paused; use Resume or Start Now when that is intentional.
+
 ## Large-library operations console
 
 For large libraries, the Operations Console is optimized for speed and low
@@ -183,6 +207,18 @@ Operational diagnostics in the UI come from:
 - `GET /api/v1/logs/recent` for live-tail style log snapshots.
 - `GET /api/v1/doctor` for a consolidated operational check summary.
 - `GET /api/v1/version` for the application version shown in the Doctor view.
+
+The Watch history table has a separate stable Outcome column: `imported`,
+`duplicate`, `permanent failure`, or `transient failure`. Duplicate means the
+existing torrent was retained unchanged and the configured success action ran.
+Transient failures remain eligible for a later stable scan; permanent failures
+do not retry an unchanged fingerprint. The Status column is warning-colored
+when `post_action_error` is present even if the primary outcome is imported or
+duplicate, and Detail shows both the primary error and archive/delete/failure-
+move error so the operator can resolve a retained source or destination
+collision. Pending counts include unseen, changed, stabilizing, and transient-
+retry files but exclude unchanged processed files. Watch history contains only
+the current daemon run and retains its newest 10,000 results.
 
 The Settings view also exposes a destructive Reset action. After confirmation,
 it calls `POST /api/v1/reset` to stop torrent activity, remove torrent records,

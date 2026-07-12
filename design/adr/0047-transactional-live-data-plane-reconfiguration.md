@@ -35,6 +35,14 @@ daemon transaction.
   policy.
 - The daemon installs the new configuration, re-evaluates containment, and
   reconciles eligible torrent tasks using newly constructed binders.
+- Peer-limit changes use the same transaction. The transition lock remains
+  held through provisional pool/config installation and policy-eligible engine
+  and seeder reconstruction, so an unrelated start cannot enter the partially
+  rebuilt set. Candidate pools are never resized in place (ADR-0053).
+- Failed provisional reconstruction or post-reconstruction persistence restores the
+  exact prior pool identities, configuration bytes, torrent lifecycle/recovery
+  intent, durable state, and formerly owned task set. Irreversible completion
+  policy is activated only after persistent commit.
 - Control-plane bind/body-limit and logging destination changes remain
   explicitly restart-required because the running server or logging
   subscriber owns those resources.
@@ -63,3 +71,4 @@ No old data-plane task is allowed to survive the configuration boundary.
 - ADR-0012 (centralized network binder)
 - ADR-0025 (runtime diagnostics and atomic config replacement)
 - ADR-0046 (shared inbound peer listener)
+- [ADR-0053: Process-Wide Peer Session Permit Pool](0053-process-wide-peer-session-permit-pool.md)

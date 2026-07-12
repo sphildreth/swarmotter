@@ -16,9 +16,10 @@ use crate::error::{CoreError, Result};
 use crate::hash::InfoHash;
 use serde::{Deserialize, Serialize};
 
-/// Maximum total size of a `.torrent` metadata document (or magnet `info`
-/// dict) accepted by any ingress path: API upload, watch folder, BEP 9
-/// metadata exchange, restored daemon state, and direct core parser callers.
+/// Maximum total size of a bencoded `.torrent` metadata document (or magnet
+/// `info` dict) accepted through API upload, watch-folder import, BEP 9
+/// metadata exchange, or a direct core parser call. Restored daemon state is
+/// JSON and instead uses exact piece-hash decoding plus [`TorrentMeta::validate`].
 /// See ADR-0050.
 pub const MAX_TORRENT_METADATA_BYTES: usize = 16 * 1024 * 1024;
 
@@ -86,9 +87,32 @@ impl TorrentMeta {
                 "piece length must be greater than zero".into(),
             ));
         }
+        if self.piece_length > MAX_PIECE_LENGTH {
+            return Err(CoreError::MalformedTorrent(format!(
+                "piece length {} exceeds maximum {MAX_PIECE_LENGTH}",
+                self.piece_length
+            )));
+        }
         if self.files.is_empty() {
             return Err(CoreError::MalformedTorrent(
                 "torrent must contain at least one file".into(),
+            ));
+        }
+        if self.files.len() > MAX_TORRENT_FILES {
+            return Err(CoreError::MalformedTorrent(format!(
+                "file count {} exceeds maximum {MAX_TORRENT_FILES}",
+                self.files.len()
+            )));
+        }
+        if self.pieces.len() > MAX_TORRENT_PIECES {
+            return Err(CoreError::MalformedTorrent(format!(
+                "piece count {} exceeds maximum {MAX_TORRENT_PIECES}",
+                self.pieces.len()
+            )));
+        }
+        if self.total_length == 0 {
+            return Err(CoreError::MalformedTorrent(
+                "torrent total length must be greater than zero".into(),
             ));
         }
         if !self.is_multi_file && self.files.len() != 1 {
@@ -122,11 +146,12 @@ impl TorrentMeta {
                 self.total_length
             )));
         }
-        let expected_pieces_u64 = if total == 0 {
-            1
-        } else {
-            total.div_ceil(self.piece_length)
-        };
+        let expected_pieces_u64 = total.div_ceil(self.piece_length);
+        if expected_pieces_u64 > MAX_TORRENT_PIECES as u64 {
+            return Err(CoreError::MalformedTorrent(format!(
+                "expected piece count {expected_pieces_u64} exceeds maximum {MAX_TORRENT_PIECES}"
+            )));
+        }
         let expected_pieces = usize::try_from(expected_pieces_u64).map_err(|_| {
             CoreError::MalformedTorrent("piece count exceeds platform limits".into())
         })?;
@@ -196,6 +221,12 @@ impl TorrentMeta {
     /// valid torrent fits, but this avoids relying on `as` narrowing at
     /// engine/storage boundaries. See ADR-0050.
     pub fn piece_length_u32(&self) -> Result<u32> {
+        if self.piece_length > MAX_PIECE_LENGTH {
+            return Err(CoreError::MalformedTorrent(format!(
+                "piece length {} exceeds maximum {MAX_PIECE_LENGTH}",
+                self.piece_length
+            )));
+        }
         u32::try_from(self.piece_length).map_err(|_| {
             CoreError::MalformedTorrent(format!(
                 "piece length {} exceeds u32 range",
@@ -207,10 +238,16 @@ impl TorrentMeta {
     /// Convert the piece length for a given piece index to `u32`, returning
     /// `MalformedTorrent` if it does not fit. The last piece may be shorter.
     pub fn piece_length_for_index_u32(&self, index: usize) -> Result<u32> {
-        let len = if index + 1 == self.piece_count() {
+        let regular_piece_length = self.piece_length_u32()?;
+        if index >= self.piece_count() {
+            return Err(CoreError::MalformedTorrent(format!(
+                "piece index {index} is out of range"
+            )));
+        }
+        let len = if index.checked_add(1) == Some(self.piece_count()) {
             self.last_piece_length()
         } else {
-            self.piece_length
+            return Ok(regular_piece_length);
         };
         u32::try_from(len).map_err(|_| {
             CoreError::MalformedTorrent(format!("piece length {len} exceeds u32 range"))
@@ -228,6 +265,47 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta> {
     let info_bytes = bencode::extract_value_bytes(bytes, b"info")
         .ok_or_else(|| CoreError::MalformedTorrent("missing 'info' dictionary".into()))?;
 
+    parse_torrent_root(root, info_bytes)
+}
+
+/// Parse a raw BEP 9 `info` dictionary and attach magnet tracker context.
+///
+/// The unwrapped `info` bytes are subject to the same metadata byte, bencode
+/// depth, and node budgets as a `.torrent` document. Parsing the raw dictionary
+/// directly avoids adding trusted wrapper bytes that would incorrectly reject
+/// an otherwise valid `info` dictionary at the exact metadata-size boundary.
+pub fn parse_info_dict(info_bytes: &[u8], trackers: &[String]) -> Result<TorrentMeta> {
+    let info = bencode::decode(info_bytes)?;
+    if info.as_dict().is_none() {
+        return Err(CoreError::MalformedTorrent(
+            "BEP 9 info metadata must be a dictionary".into(),
+        ));
+    }
+
+    let mut root = Vec::new();
+    if let Some(primary) = trackers.first() {
+        root.push((
+            b"announce".to_vec(),
+            Value::Str(primary.as_bytes().to_vec()),
+        ));
+    }
+    if trackers.len() > 1 {
+        root.push((
+            b"announce-list".to_vec(),
+            Value::List(vec![Value::List(
+                trackers[1..]
+                    .iter()
+                    .map(|tracker| Value::Str(tracker.as_bytes().to_vec()))
+                    .collect(),
+            )]),
+        ));
+    }
+    root.push((b"info".to_vec(), info));
+
+    parse_torrent_root(&root, info_bytes)
+}
+
+fn parse_torrent_root(root: &[(Vec<u8>, Value)], info_bytes: &[u8]) -> Result<TorrentMeta> {
     let info_hash = InfoHash::from_info_bencoded(info_bytes);
 
     let info = root
@@ -358,12 +436,19 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta> {
             ));
         };
 
+    if total_length == 0 {
+        return Err(CoreError::MalformedTorrent(
+            "torrent total length must be greater than zero".into(),
+        ));
+    }
+
     // Validate piece count matches total length within one piece.
-    let expected_pieces_u64 = if total_length == 0 {
-        1u64
-    } else {
-        total_length.div_ceil(piece_length)
-    };
+    let expected_pieces_u64 = total_length.div_ceil(piece_length);
+    if expected_pieces_u64 > MAX_TORRENT_PIECES as u64 {
+        return Err(CoreError::MalformedTorrent(format!(
+            "expected piece count {expected_pieces_u64} exceeds maximum {MAX_TORRENT_PIECES}"
+        )));
+    }
     let expected_pieces = usize::try_from(expected_pieces_u64)
         .map_err(|_| CoreError::MalformedTorrent("piece count exceeds platform limits".into()))?;
     if pieces.len() != expected_pieces {
@@ -402,7 +487,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta> {
     let created_by = get_str(root, b"created by").map(|s| s.to_string());
     let creation_date = get_int(root, b"creation date").map(|i| i as u64);
 
-    Ok(TorrentMeta {
+    let meta = TorrentMeta {
         info_hash,
         name,
         piece_length,
@@ -417,7 +502,9 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta> {
         created_by,
         creation_date,
         is_multi_file,
-    })
+    };
+    meta.validate()?;
+    Ok(meta)
 }
 
 fn get_str<'a>(dict: &'a [(Vec<u8>, Value)], key: &[u8]) -> Option<&'a str> {
@@ -481,7 +568,12 @@ fn validate_path_component(value: &str, kind: &str) -> Result<()> {
 }
 
 mod hex_piece_hashes {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::fmt;
+
+    use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
+    use serde::{Deserializer, Serialize, Serializer};
+
+    use super::MAX_TORRENT_PIECES;
 
     pub fn serialize<S: Serializer>(v: &[[u8; 20]], s: S) -> std::result::Result<S::Ok, S::Error> {
         let hexes: Vec<String> = v.iter().map(hex::encode).collect();
@@ -491,47 +583,141 @@ mod hex_piece_hashes {
     pub fn deserialize<'de, D: Deserializer<'de>>(
         d: D,
     ) -> std::result::Result<Vec<[u8; 20]>, D::Error> {
-        let hexes: Vec<String> = Vec::deserialize(d)?;
-        hexes
-            .iter()
-            .enumerate()
-            .map(|(index, h)| {
-                let b = hex::decode(h).map_err(serde::de::Error::custom)?;
-                if b.len() != 20 {
-                    return Err(serde::de::Error::custom(format!(
-                        "piece hash {index} has length {} but SHA-1 hashes must be exactly 20 bytes",
-                        b.len()
+        struct PieceHashesVisitor;
+
+        impl<'de> Visitor<'de> for PieceHashesVisitor {
+            type Value = Vec<[u8; 20]>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded array of 40-character SHA-1 hashes")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                if sequence
+                    .size_hint()
+                    .is_some_and(|size| size > MAX_TORRENT_PIECES)
+                {
+                    return Err(A::Error::custom(format!(
+                        "piece hash count exceeds maximum {MAX_TORRENT_PIECES}"
                     )));
                 }
-                let mut a = [0u8; 20];
-                a.copy_from_slice(&b);
-                Ok(a)
-            })
-            .collect()
+
+                let initial_capacity = sequence.size_hint().unwrap_or(0).min(4096);
+                let mut hashes = Vec::with_capacity(initial_capacity);
+                loop {
+                    if hashes.len() == MAX_TORRENT_PIECES {
+                        if sequence.next_element::<IgnoredAny>()?.is_some() {
+                            return Err(A::Error::custom(format!(
+                                "piece hash count exceeds maximum {MAX_TORRENT_PIECES}"
+                            )));
+                        }
+                        break;
+                    }
+
+                    let index = hashes.len();
+                    let Some(encoded) = sequence.next_element::<String>()? else {
+                        break;
+                    };
+                    if encoded.len() != 40 {
+                        if encoded.len() % 2 == 0 {
+                            return Err(A::Error::custom(format!(
+                                "piece hash {index} has length {} but SHA-1 hashes must be exactly 20 bytes",
+                                encoded.len() / 2
+                            )));
+                        }
+                        return Err(A::Error::custom(format!(
+                            "piece hash {index} has odd encoded length {}; expected 40 hex characters",
+                            encoded.len()
+                        )));
+                    }
+
+                    let mut hash = [0u8; 20];
+                    hex::decode_to_slice(encoded.as_bytes(), &mut hash).map_err(|_| {
+                        A::Error::custom(format!("piece hash {index} is not valid hex"))
+                    })?;
+                    hashes.push(hash);
+                }
+                Ok(hashes)
+            }
+        }
+
+        d.deserialize_seq(PieceHashesVisitor)
     }
 }
 
 /// Read a `.torrent` metadata file from disk, enforcing the
 /// [`MAX_TORRENT_METADATA_BYTES`] limit before allocation. The file size is
-/// checked with `symlink_metadata` first; then the bytes are read into a
-/// buffer allocated to exactly the checked length. A length that grows past
-/// the limit during the read is rejected. Returns `MalformedTorrent` when the
-/// file exceeds the limit and `Io` for filesystem errors.
+/// checked before opening and again on the opened file; then the bytes are read
+/// through a `MAX_TORRENT_METADATA_BYTES + 1` limiter into a buffer initially
+/// allocated to the checked length. The opened file's final length must equal
+/// both its initial length and the number of bytes read. Returns
+/// `MalformedTorrent` when the file exceeds the limit or changes during the
+/// read and `Io` for filesystem errors.
 pub fn read_torrent_file(path: &std::path::Path) -> Result<Vec<u8>> {
-    let len = std::fs::symlink_metadata(path)
+    let path_len = std::fs::symlink_metadata(path)
         .map_err(CoreError::Io)?
         .len();
-    if len > MAX_TORRENT_METADATA_BYTES as u64 {
-        return Err(CoreError::MalformedTorrent(format!(
-            "torrent file size {len} exceeds maximum {MAX_TORRENT_METADATA_BYTES}"
-        )));
+    validate_torrent_file_length(path_len, "path metadata")?;
+
+    let mut file = std::fs::File::open(path).map_err(CoreError::Io)?;
+    let initial_len = file.metadata().map_err(CoreError::Io)?.len();
+    validate_torrent_file_length(initial_len, "opened file")?;
+    if initial_len != path_len {
+        return Err(CoreError::MalformedTorrent(
+            "torrent file changed between metadata check and open".into(),
+        ));
     }
-    let len_usize = usize::try_from(len).map_err(|_| {
+
+    let len_usize = usize::try_from(initial_len).map_err(|_| {
         CoreError::MalformedTorrent("torrent file size exceeds platform usize".into())
     })?;
-    let mut file = std::fs::File::open(path).map_err(CoreError::Io)?;
-    let mut buf = Vec::with_capacity(len_usize);
-    std::io::Read::read_to_end(&mut file, &mut buf).map_err(CoreError::Io)?;
+    let buf = read_bounded_torrent_bytes(&mut file, len_usize)?;
+
+    let final_len = file.metadata().map_err(CoreError::Io)?.len();
+    validate_torrent_file_length(final_len, "final file metadata")?;
+    validate_completed_torrent_read(initial_len, final_len, buf.len())?;
+    Ok(buf)
+}
+
+fn validate_torrent_file_length(len: u64, observation: &str) -> Result<()> {
+    if len > MAX_TORRENT_METADATA_BYTES as u64 {
+        return Err(CoreError::MalformedTorrent(format!(
+            "torrent file {observation} size {len} exceeds maximum {MAX_TORRENT_METADATA_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+fn read_bounded_torrent_bytes<R: std::io::Read>(
+    reader: &mut R,
+    initial_capacity: usize,
+) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(initial_capacity);
+    let read_limit = MAX_TORRENT_METADATA_BYTES
+        .checked_add(1)
+        .ok_or_else(|| CoreError::MalformedTorrent("metadata read limit overflow".into()))?;
+    let mut chunk = [0u8; 8192];
+    while buf.len() < read_limit {
+        let remaining = read_limit - buf.len();
+        let to_read = remaining.min(chunk.len());
+        let count = std::io::Read::read(reader, &mut chunk[..to_read]).map_err(CoreError::Io)?;
+        if count == 0 {
+            break;
+        }
+        let required_capacity = buf
+            .len()
+            .checked_add(count)
+            .ok_or_else(|| CoreError::MalformedTorrent("metadata read length overflow".into()))?;
+        if required_capacity > buf.capacity() {
+            // The argument is additional capacity relative to `len`, not
+            // relative to the allocator-provided current capacity.
+            buf.reserve_exact(required_capacity - buf.len());
+        }
+        buf.extend_from_slice(&chunk[..count]);
+    }
     if buf.len() > MAX_TORRENT_METADATA_BYTES {
         return Err(CoreError::MalformedTorrent(format!(
             "torrent file grew to {} during read, exceeding maximum {MAX_TORRENT_METADATA_BYTES}",
@@ -539,6 +725,22 @@ pub fn read_torrent_file(path: &std::path::Path) -> Result<Vec<u8>> {
         )));
     }
     Ok(buf)
+}
+
+fn validate_completed_torrent_read(
+    initial_len: u64,
+    final_len: u64,
+    read_len: usize,
+) -> Result<()> {
+    let read_len = u64::try_from(read_len).map_err(|_| {
+        CoreError::MalformedTorrent("torrent bytes read exceed platform u64".into())
+    })?;
+    if initial_len != final_len || final_len != read_len {
+        return Err(CoreError::MalformedTorrent(format!(
+            "torrent file changed during read (initial {initial_len}, final {final_len}, read {read_len})"
+        )));
+    }
+    Ok(())
 }
 
 /// Build a minimal valid single-file `.torrent` body (for tests/fixtures) from
@@ -710,6 +912,30 @@ fn write_int(out: &mut Vec<u8>, n: u64) {
 mod tests {
     use super::*;
 
+    fn torrent_padded_to_size(target: usize) -> Vec<u8> {
+        let mut bytes =
+            build_single_file_torrent("limit.bin", b"bounded metadata payload", 8, None, false);
+        assert_eq!(bytes.pop(), Some(b'e'));
+        bytes.extend_from_slice(b"7:padding");
+
+        let mut padding_len = target.saturating_sub(bytes.len() + 2);
+        for _ in 0..32 {
+            let encoded_len = bytes.len() + padding_len.to_string().len() + 1 + padding_len + 1;
+            if encoded_len == target {
+                bytes.extend_from_slice(padding_len.to_string().as_bytes());
+                bytes.push(b':');
+                bytes.extend(std::iter::repeat_n(b'x', padding_len));
+                bytes.push(b'e');
+                assert_eq!(bytes.len(), target);
+                return bytes;
+            }
+            padding_len = target
+                .checked_sub(bytes.len() + padding_len.to_string().len() + 2)
+                .expect("target must accommodate the generated torrent");
+        }
+        panic!("could not solve bencode padding for target size {target}");
+    }
+
     fn raw_single_file_torrent_with_length(length: i64) -> Vec<u8> {
         let mut out = b"d4:infod6:lengthi".to_vec();
         out.extend_from_slice(length.to_string().as_bytes());
@@ -829,6 +1055,7 @@ mod tests {
     fn rejects_total_file_length_overflow() {
         let torrent = raw_multi_file_torrent_with_lengths(&[i64::MAX, i64::MAX, i64::MAX]);
         let error = parse_torrent(&torrent).unwrap_err();
+        assert!(matches!(&error, CoreError::MalformedTorrent(_)));
         assert!(error.to_string().contains("total file length exceeds u64"));
     }
 
@@ -949,16 +1176,58 @@ mod tests {
     }
 
     #[test]
+    fn deserialized_metadata_validation_enforces_all_metainfo_budgets() {
+        let bytes = build_single_file_torrent("state.bin", b"state payload", 8, None, false);
+
+        let mut meta = parse_torrent(&bytes).unwrap();
+        meta.piece_length = MAX_PIECE_LENGTH + 1;
+        let err = meta.validate().unwrap_err();
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
+        assert!(err.to_string().contains("piece length"));
+        assert!(err.to_string().contains("exceeds maximum"));
+
+        let mut meta = parse_torrent(&bytes).unwrap();
+        meta.files = vec![meta.files[0].clone(); MAX_TORRENT_FILES + 1];
+        let err = meta.validate().unwrap_err();
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
+        assert!(err.to_string().contains("file count"));
+        assert!(err.to_string().contains("exceeds maximum"));
+
+        let mut meta = parse_torrent(&bytes).unwrap();
+        meta.pieces = vec![[0u8; 20]; MAX_TORRENT_PIECES + 1];
+        let err = meta.validate().unwrap_err();
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
+        assert!(err.to_string().contains("piece count"));
+        assert!(err.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn deserialized_metadata_validation_rejects_zero_total_with_one_hash() {
+        let bytes = build_single_file_torrent("state.bin", b"state payload", 8, None, false);
+        let mut meta = parse_torrent(&bytes).unwrap();
+        meta.total_length = 0;
+        meta.files[0].length = 0;
+        meta.pieces = vec![[0u8; 20]];
+
+        let err = meta.validate().unwrap_err();
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
+        assert!(err.to_string().contains("total length"));
+        assert!(err.to_string().contains("greater than zero"));
+    }
+
+    #[test]
     fn rejects_piece_length_zero_and_over_limit() {
         // Zero piece length is invalid; build a torrent with piece_length 0 by
         // manually encoding the info dict.
         let zero = manual_single_file_torrent(0, 1, &[0u8; 20]);
         let err = parse_torrent(&zero).unwrap_err();
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
         assert!(err.to_string().contains("piece_length"));
 
         // Piece length over the maximum.
         let over = manual_single_file_torrent(MAX_PIECE_LENGTH + 1, 1, &[0u8; 20]);
         let err = parse_torrent(&over).unwrap_err();
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
         assert!(err.to_string().contains("exceeds maximum"));
     }
 
@@ -967,13 +1236,23 @@ mod tests {
         // Provide 2 hashes but the total length implies 1 piece.
         let too_many = manual_single_file_torrent(8, 8, &[0u8; 40]);
         let err = parse_torrent(&too_many).unwrap_err();
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
         assert!(err.to_string().contains("piece count"));
 
         // Provide 0 hashes: pieces string length 0 is a multiple of 20, so the
         // piece-count mismatch (0 vs expected 1) is reported.
         let none = manual_single_file_torrent(8, 8, &[]);
         let err = parse_torrent(&none).unwrap_err();
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
         assert!(err.to_string().contains("piece count"));
+    }
+
+    #[test]
+    fn rejects_pieces_string_not_multiple_of_sha1_length() {
+        let torrent = manual_single_file_torrent(8, 8, &[0u8; 21]);
+        let error = parse_torrent(&torrent).unwrap_err();
+        assert!(matches!(&error, CoreError::MalformedTorrent(_)));
+        assert!(error.to_string().contains("not multiple of 20"));
     }
 
     #[test]
@@ -984,12 +1263,32 @@ mod tests {
         let total: u64 = (MAX_TORRENT_PIECES as u64 + 1) * 16;
         let over = manual_single_file_torrent(16, total, &pieces_blob);
         let err = parse_torrent(&over).unwrap_err();
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
         assert!(err.to_string().contains("exceeds maximum"));
     }
 
     #[test]
-    fn rejects_too_many_files() {
-        // Build a multi-file torrent with MAX_TORRENT_FILES + 1 entries.
+    fn parse_torrent_root_rejects_file_count_over_limit_directly() {
+        let info = Value::Dict(vec![
+            (b"name".to_vec(), Value::Str(b"root".to_vec())),
+            (b"piece length".to_vec(), Value::Int(16)),
+            (b"pieces".to_vec(), Value::Str(vec![0u8; 20])),
+            (
+                b"files".to_vec(),
+                Value::List(vec![Value::Int(0); MAX_TORRENT_FILES + 1]),
+            ),
+        ]);
+        let root = vec![(b"info".to_vec(), info)];
+        let error = parse_torrent_root(&root, b"direct-file-count-test").unwrap_err();
+        assert!(matches!(&error, CoreError::MalformedTorrent(_)));
+        assert!(error.to_string().contains("file count"));
+        assert!(error.to_string().contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn public_decode_node_budget_precedes_file_count_for_encoded_corpus() {
+        // A fully encoded MAX_TORRENT_FILES + 1 corpus necessarily exceeds the
+        // smaller public bencode node budget before metainfo construction.
         let mut out = b"d4:infod5:filesl".to_vec();
         for i in 0..(MAX_TORRENT_FILES + 1) {
             out.extend_from_slice(b"d6:lengthi1e4:pathl");
@@ -1000,11 +1299,9 @@ mod tests {
         out.extend_from_slice(b"e4:name1:d12:piece lengthi16e6:pieces20:");
         out.extend_from_slice(&[0u8; 20]);
         out.extend_from_slice(b"ee");
-        let err = parse_torrent(&out).unwrap_err();
-        assert!(
-            err.to_string().contains("exceeds maximum"),
-            "expected file-count error, got: {err}"
-        );
+        let error = bencode::decode(&out).unwrap_err();
+        assert!(matches!(&error, CoreError::Bencode(_)));
+        assert!(error.to_string().contains("node count"));
     }
 
     #[test]
@@ -1021,43 +1318,34 @@ mod tests {
         out.extend_from_slice(&[0u8; 60]);
         out.extend_from_slice(b"ee");
         let err = parse_torrent(&out).unwrap_err();
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
         assert!(err.to_string().contains("exceeds u64"));
     }
 
     #[test]
-    fn rejects_empty_torrent_pieces_mismatch() {
-        // Zero total length still requires exactly one piece hash.
-        let empty = manual_single_file_torrent(16, 0, &[]);
-        let err = parse_torrent(&empty).unwrap_err();
-        assert!(err.to_string().contains("piece count"));
+    fn rejects_empty_torrent_with_zero_or_one_piece_hash() {
+        let one_hash = [0u8; 20];
+        for pieces in [&[][..], one_hash.as_slice()] {
+            let empty = manual_single_file_torrent(16, 0, pieces);
+            let err = parse_torrent(&empty).unwrap_err();
+            assert!(matches!(&err, CoreError::MalformedTorrent(_)));
+            assert!(err.to_string().contains("total length"));
+            assert!(err.to_string().contains("greater than zero"));
+        }
     }
 
     #[test]
     fn metadata_at_byte_limit_parses() {
-        // Build a single-file torrent with a large piece length so the pieces
-        // blob is small, and a content body that brings the document near the
-        // byte limit. Use a piece length of 1 MiB so content of ~16 MiB yields
-        // only ~16 hashes.
-        let content_len: usize = MAX_TORRENT_METADATA_BYTES - 400;
-        let content: Vec<u8> = std::iter::repeat_n(b'x', content_len).collect();
-        let bytes = build_single_file_torrent("limit.bin", &content, 1024 * 1024, None, false);
-        assert!(bytes.len() <= MAX_TORRENT_METADATA_BYTES);
+        let bytes = torrent_padded_to_size(MAX_TORRENT_METADATA_BYTES);
+        assert_eq!(bytes.len(), MAX_TORRENT_METADATA_BYTES);
         assert!(parse_torrent(&bytes).is_ok());
     }
 
     #[test]
     fn metadata_one_byte_over_limit_rejected() {
-        // Construct a torrent document one byte over the metadata limit. We do
-        // this by padding a valid document with a trailing byte after the
-        // closing 'e', which the EOF check rejects, and ensure the size check
-        // also fires for genuinely oversized input.
-        let content_len: usize = MAX_TORRENT_METADATA_BYTES;
-        let mut bytes: Vec<u8> = Vec::with_capacity(content_len + 1);
-        bytes.extend_from_slice(b"l");
-        bytes.extend(std::iter::repeat_n(b'e', content_len - 2));
-        bytes.push(b'e');
+        let mut bytes = torrent_padded_to_size(MAX_TORRENT_METADATA_BYTES);
         bytes.push(b'X');
-        assert_eq!(bytes.len(), content_len + 1);
+        assert_eq!(bytes.len(), MAX_TORRENT_METADATA_BYTES + 1);
         let err = parse_torrent(&bytes).unwrap_err();
         assert!(err.to_string().contains("exceeds maximum"));
     }
@@ -1099,6 +1387,56 @@ mod tests {
     }
 
     #[test]
+    fn durable_piece_hash_rejects_oversized_encoding_before_hex_decode() {
+        let oversized = "00".repeat(4096);
+        let input = serde_json::to_string(&vec![oversized]).unwrap();
+        let mut deserializer = serde_json::Deserializer::from_str(&input);
+        let error = hex_piece_hashes::deserialize(&mut deserializer)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("piece hash 0"));
+        assert!(error.contains("length 4096"));
+        assert!(!error.contains("00000000"));
+    }
+
+    #[test]
+    fn durable_piece_hash_rejects_odd_length_and_non_hex_separately() {
+        for (encoded, expected) in [
+            ("0".repeat(39), "odd encoded length"),
+            ("g".repeat(40), "not valid hex"),
+        ] {
+            let input = serde_json::to_string(&vec![encoded]).unwrap();
+            let mut deserializer = serde_json::Deserializer::from_str(&input);
+            let error = hex_piece_hashes::deserialize(&mut deserializer)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("piece hash 0"));
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
+    fn durable_piece_hash_count_accepts_limit_and_rejects_one_more() {
+        use serde::de::value::{Error as ValueError, SeqDeserializer};
+
+        const HASH: &str = "0000000000000000000000000000000000000000";
+        let exact =
+            SeqDeserializer::<_, ValueError>::new(std::iter::repeat_n(HASH, MAX_TORRENT_PIECES));
+        let decoded = hex_piece_hashes::deserialize(exact).unwrap();
+        assert_eq!(decoded.len(), MAX_TORRENT_PIECES);
+
+        let one_over = SeqDeserializer::<_, ValueError>::new(std::iter::repeat_n(
+            HASH,
+            MAX_TORRENT_PIECES + 1,
+        ));
+        let error = hex_piece_hashes::deserialize(one_over)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("piece hash count"));
+        assert!(error.contains("exceeds maximum"));
+    }
+
+    #[test]
     fn read_torrent_file_rejects_oversized_file() {
         let dir = std::env::temp_dir().join(format!(
             "swarmotter-meta-{}-{}",
@@ -1110,9 +1448,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("big.torrent");
-        // Write a file one byte over the limit.
-        let big = vec![b'x'; MAX_TORRENT_METADATA_BYTES + 1];
-        std::fs::write(&path, &big).unwrap();
+        // A sparse file is sufficient because the initial metadata check must
+        // reject it before allocating or reading the declared length.
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len((MAX_TORRENT_METADATA_BYTES + 1) as u64)
+            .unwrap();
         let err = read_torrent_file(&path).unwrap_err();
         assert!(err.to_string().contains("exceeds maximum"));
         std::fs::remove_dir_all(&dir).ok();
@@ -1137,11 +1477,82 @@ mod tests {
     }
 
     #[test]
+    fn read_torrent_file_accepts_exact_metadata_limit() {
+        let dir = std::env::temp_dir().join(format!(
+            "swarmotter-meta-exact-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("exact.torrent");
+        let bytes = torrent_padded_to_size(MAX_TORRENT_METADATA_BYTES);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let read = read_torrent_file(&path).unwrap();
+        assert_eq!(read.len(), MAX_TORRENT_METADATA_BYTES);
+        assert!(parse_torrent(&read).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bounded_reader_stops_after_limit_plus_one_byte() {
+        struct CountingReader {
+            remaining: usize,
+            bytes_read: usize,
+        }
+
+        impl std::io::Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let count = buf.len().min(self.remaining);
+                buf[..count].fill(b'x');
+                self.remaining -= count;
+                self.bytes_read += count;
+                Ok(count)
+            }
+        }
+
+        let mut reader = CountingReader {
+            remaining: MAX_TORRENT_METADATA_BYTES + 4096,
+            bytes_read: 0,
+        };
+        let err = read_bounded_torrent_bytes(&mut reader, 0).unwrap_err();
+        assert!(err.to_string().contains("exceeding maximum"));
+        assert_eq!(reader.bytes_read, MAX_TORRENT_METADATA_BYTES + 1);
+    }
+
+    #[test]
+    fn completed_read_requires_matching_initial_final_and_read_lengths() {
+        assert!(validate_completed_torrent_read(10, 10, 10).is_ok());
+        for (initial, final_len, read) in [(10, 11, 11), (10, 10, 9), (10, 9, 10)] {
+            let err = validate_completed_torrent_read(initial, final_len, read).unwrap_err();
+            assert!(err.to_string().contains("changed during read"));
+        }
+    }
+
+    #[test]
     fn piece_length_u32_helpers_succeed_for_valid_torrent() {
         let bytes = build_single_file_torrent("f", b"abcdef0123456789", 8, None, false);
         let meta = parse_torrent(&bytes).unwrap();
         assert_eq!(meta.piece_length_u32().unwrap(), 8);
         assert_eq!(meta.piece_length_for_index_u32(0).unwrap(), 8);
+    }
+
+    #[test]
+    fn piece_length_u32_helpers_reject_limit_violation_before_narrowing() {
+        let bytes = build_single_file_torrent("f", b"abcdef0123456789", 8, None, false);
+        let mut meta = parse_torrent(&bytes).unwrap();
+        meta.piece_length = MAX_PIECE_LENGTH + 1;
+
+        for error in [
+            meta.piece_length_u32().unwrap_err(),
+            meta.piece_length_for_index_u32(0).unwrap_err(),
+        ] {
+            assert!(matches!(&error, CoreError::MalformedTorrent(_)));
+            assert!(error.to_string().contains("exceeds maximum"));
+        }
     }
 
     fn manual_single_file_torrent(piece_length: u64, total_length: u64, pieces: &[u8]) -> Vec<u8> {

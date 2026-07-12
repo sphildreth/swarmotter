@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Proposed
 
 ## Context
 
@@ -15,15 +15,20 @@ an entire file before applying the API/BEP 9 metadata-size policy. Malformed
 durable piece-hash data could reach an exact-slice copy without first checking
 the decoded length.
 
-A crafted `.torrent` file, magnet metadata payload, or restored daemon-state
-record could therefore consume unbounded stack, memory, or disk-read resources,
-or panic the decoder. The same trust boundary applies to API uploads, watch
-folders, magnet metadata, restored state, and direct core parser callers.
+A crafted `.torrent` file or magnet metadata payload could therefore consume
+unbounded stack, memory, or disk-read resources or panic the bencode decoder.
+Malformed JSON daemon state could independently panic while decoding a piece
+hash. These are adjacent but distinct trust boundaries: API uploads, watch
+folders, magnet metadata, and direct bencoded parser callers use the shared
+bencode decoder, while restored daemon state bypasses that decoder and requires
+validation of its deserialized `TorrentMeta` values and piece hashes.
 
 ## Decision
 
-Define one shared set of public parser budgets in `swarmotter-core/src/meta.rs`
-and enforce them at every untrusted metainfo ingress:
+Define one shared set of public metainfo limits in `swarmotter-core/src/meta.rs`.
+Enforce the byte, depth, and node budgets at every bencoded metainfo ingress.
+Enforce the file-count, piece-count, and piece-length limits both while building
+parsed metainfo and when validating a `TorrentMeta` restored from JSON state:
 
 - `MAX_TORRENT_METADATA_BYTES = 16 * 1024 * 1024`
 - `MAX_BENCODE_DEPTH = 128` (root is depth zero; entering a list/dict increments)
@@ -67,20 +72,47 @@ bounded read that rejects growth over the limit. The same limit applies to API
 adds and BEP 9 metadata even when `api.max_request_body_bytes` is higher for
 other requests.
 
-In durable-state deserialization, each decoded SHA-1 piece hash is required to be
-exactly 20 bytes before copying. Errors include torrent record and piece index
-context and carry no payload data or content paths.
+Raw API uploads are streamed into an accumulator bounded by the lower of
+`api.max_request_body_bytes` and `MAX_TORRENT_METADATA_BYTES`. A lower configured
+API limit retains its HTTP 413 `payload_too_large` contract; when that limit
+permits a larger request, the metadata limit returns `MalformedTorrent`. Bulk
+and Transmission base64 metainfo use a bounded decoder that checks output length
+before reserving or appending each decoded byte.
 
-These limits apply equally to API uploads, watch folders, magnet metadata,
-restored state, and direct core parser callers.
+BEP 9 applies the byte limit to the raw `info` dictionary advertised and
+assembled on the wire. After that dictionary passes the shared bencode budgets,
+core metainfo construction parses it directly and attaches trusted tracker
+context as values; it does not add an internal bencode wrapper that would make
+an exact-limit wire payload appear oversized.
+
+BEP 9 message dictionaries use the same hardened parser through a prefix-decode
+entry point that returns the consumed header length while preserving the
+trailing binary piece. It retains the depth, node, duplicate-key, grammar, byte,
+and checked-arithmetic rules of full-document decoding. Advertised sizes,
+per-message totals, assembled length, and the final info hash are validated
+before the metadata reaches metainfo construction.
+
+In durable-state deserialization, the piece-hash sequence is capped at
+`MAX_TORRENT_PIECES`. Each encoded SHA-1 hash must represent exactly 20 bytes
+before hex decoding and copying. Errors include torrent record and piece index
+context and carry no payload data or content paths. Before restored metadata
+reaches runtime engine or storage paths, `TorrentMeta::validate()` enforces the
+applicable shape limits and invariants.
+
+API uploads, watch folders, magnet metadata, and direct core callers that accept
+bencoded bytes share the byte, depth, and node budgets. Restored daemon state is
+JSON and is therefore not described as passing through the bencode decoder or
+the 16 MiB bencoded-document limit.
 
 ## Consequences
 
-Crafted or corrupted metainfo can no longer exhaust stack, memory, or disk-read
-resources or panic the daemon. Operators receive typed errors with enough
-context to identify the offending torrent record. The fixed budgets are part of
-the parser trust boundary documented in `design/architecture.md` and the limits
-documented in `design/api.md`, `docs/api.md`, `design/configuration.md`, and
+Crafted bencoded metainfo is rejected within fixed parser and shape budgets.
+Malformed durable piece hashes are rejected before copying, and invalid
+restored `TorrentMeta` shapes are rejected before runtime use. Operators receive
+typed errors with enough context to identify the offending torrent record. The
+separate bencoded-input and restored-state trust boundaries are documented in
+`design/architecture.md`; operator-visible limits are documented in
+`design/api.md`, `docs/api.md`, `design/configuration.md`, and
 `docs/configuration.md`. Adversarial corpus cases are part of the required test
 set in `design/testing.md`.
 

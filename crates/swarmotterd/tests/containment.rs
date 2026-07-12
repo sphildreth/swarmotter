@@ -125,6 +125,9 @@ async fn watch_folder_imports_torrent() {
 
     let runtime = Arc::new(DaemonRuntime::new(cfg, healthy));
     runtime.watch_scan().await.unwrap();
+    assert!(runtime.list_torrents().await.is_empty());
+    assert!(runtime.watch_history().await.is_empty());
+    runtime.watch_scan().await.unwrap();
 
     let list = runtime.list_torrents().await;
     assert_eq!(list.len(), 1);
@@ -140,6 +143,10 @@ async fn watch_folder_imports_torrent() {
     let hist = runtime.watch_history().await;
     assert_eq!(hist.len(), 1);
     assert!(hist[0].success);
+    assert_eq!(
+        hist[0].outcome,
+        swarmotter_core::watch::ImportOutcome::Imported
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -184,6 +191,8 @@ async fn watch_folder_start_import_is_queued_for_scheduler() {
     }];
 
     let runtime = Arc::new(DaemonRuntime::new(cfg, healthy));
+    runtime.watch_scan().await.unwrap();
+    assert!(runtime.list_torrents().await.is_empty());
     runtime.watch_scan().await.unwrap();
 
     let list = runtime.list_torrents().await;
@@ -235,12 +244,18 @@ async fn watch_folder_moves_failed_import_to_failure_dir() {
 
     let runtime = Arc::new(DaemonRuntime::new(cfg, healthy));
     runtime.watch_scan().await.unwrap();
+    assert!(runtime.watch_history().await.is_empty());
+    runtime.watch_scan().await.unwrap();
 
     assert!(!bad_file.exists());
     assert!(failure_dir.join("bad.torrent").exists());
     let hist = runtime.watch_history().await;
     assert_eq!(hist.len(), 1);
     assert!(!hist[0].success);
+    assert_eq!(
+        hist[0].outcome,
+        swarmotter_core::watch::ImportOutcome::PermanentFailure
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -282,6 +297,8 @@ async fn watch_folder_rejects_oversized_metadata_file() {
     }];
 
     let runtime = Arc::new(DaemonRuntime::new(cfg, healthy));
+    runtime.watch_scan().await.unwrap();
+    assert!(runtime.watch_history().await.is_empty());
     runtime.watch_scan().await.unwrap();
 
     // No torrent should have been imported.

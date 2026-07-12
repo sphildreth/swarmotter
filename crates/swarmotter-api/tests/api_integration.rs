@@ -10,7 +10,7 @@ use axum::Router;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeSet;
 use swarmotter_core::config::{Config, StartBehavior, WatchFolderConfig};
-use swarmotter_core::meta::build_single_file_torrent;
+use swarmotter_core::meta::{build_single_file_torrent, MAX_TORRENT_METADATA_BYTES};
 use swarmotter_core::models::network::NetworkContainmentStatus;
 use swarmotter_core::models::{
     ConfigUpdateResult, DiagnosticLevel, DoctorReport, LogSnapshot, NetworkDiagnostics, WatchStatus,
@@ -27,6 +27,29 @@ fn bulk_magnet(index: usize) -> String {
 
 fn named_magnet(index: usize, name: &str) -> String {
     format!("magnet:?xt=urn:btih:{:040x}&dn={name}", index + 1)
+}
+
+fn torrent_padded_to_size(name: &str, target: usize) -> Vec<u8> {
+    let mut bytes = build_single_file_torrent(name, b"bounded API payload", 8, None, false);
+    assert_eq!(bytes.pop(), Some(b'e'));
+    bytes.extend_from_slice(b"7:padding");
+
+    let mut padding_len = target.saturating_sub(bytes.len() + 2);
+    for _ in 0..32 {
+        let encoded_len = bytes.len() + padding_len.to_string().len() + 1 + padding_len + 1;
+        if encoded_len == target {
+            bytes.extend_from_slice(padding_len.to_string().as_bytes());
+            bytes.push(b':');
+            bytes.extend(std::iter::repeat_n(b'x', padding_len));
+            bytes.push(b'e');
+            assert_eq!(bytes.len(), target);
+            return bytes;
+        }
+        padding_len = target
+            .checked_sub(bytes.len() + padding_len.to_string().len() + 2)
+            .expect("target must accommodate the generated torrent");
+    }
+    panic!("could not solve bencode padding for target size {target}");
 }
 
 async fn get_json(app: &Router, uri: &str) -> (StatusCode, serde_json::Value) {
@@ -66,6 +89,35 @@ async fn post_json(
         .unwrap();
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     (status, value)
+}
+
+async fn put_raw(app: &Router, uri: &str, body: &str) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&body).unwrap();
+    (status, value)
+}
+
+async fn put_json(
+    app: &Router,
+    uri: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    put_raw(app, uri, &body.to_string()).await
 }
 
 async fn add_named_test_magnet(
@@ -395,6 +447,95 @@ async fn add_and_list_torrents() {
 }
 
 #[tokio::test]
+async fn native_seeding_put_replaces_policy_and_list_detail_are_truthful() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let hash = add_named_test_magnet(&app, 90, "seeding-policy", false, "/data").await;
+    let uri = format!("/api/v1/torrents/{hash}/seeding");
+
+    let (status, body) = put_json(
+        &app,
+        &uri,
+        serde_json::json!({
+            "ratio_limit": 0.0,
+            "idle_limit": 0,
+            "seed_forever": false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["seeding"]["ratio_limit"], 0.0);
+    assert_eq!(body["data"]["seeding"]["idle_limit"], 0);
+
+    let (status, body) = put_json(
+        &app,
+        &uri,
+        serde_json::json!({
+            "ratio_limit": null,
+            "idle_limit": null,
+            "seed_forever": false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"]["seeding"]["ratio_limit"],
+        serde_json::Value::Null
+    );
+    assert_eq!(body["data"]["effective_ratio_limit"], 2.0);
+    assert_eq!(body["data"]["effective_idle_limit"], 1800);
+
+    let (status, body) = put_json(
+        &app,
+        &uri,
+        serde_json::json!({
+            "ratio_limit": 1.5,
+            "idle_limit": 77,
+            "seed_forever": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["seeding"]["ratio_limit"], 1.5);
+    assert_eq!(body["data"]["seeding"]["idle_limit"], 77);
+    assert!(body["data"]["effective_ratio_limit"].is_null());
+    assert!(body["data"]["effective_idle_limit"].is_null());
+
+    let (_, detail) = get_json(&app, &format!("/api/v1/torrents/{hash}")).await;
+    assert_eq!(detail["data"]["seeding"]["seed_forever"], true);
+    let (_, list) = get_json(&app, "/api/v1/torrents").await;
+    assert_eq!(list["data"][0]["seeding"]["seed_forever"], true);
+    assert_eq!(list["data"][0]["seeding_status"], "not_eligible");
+}
+
+#[tokio::test]
+async fn native_seeding_put_rejects_non_replacement_and_invalid_values() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+    let hash = add_named_test_magnet(&app, 91, "seeding-validation", false, "/data").await;
+    let uri = format!("/api/v1/torrents/{hash}/seeding");
+    let invalid = [
+        r#"{"ratio_limit":null,"idle_limit":null}"#,
+        r#"{"ratio_limit":null,"seed_forever":false}"#,
+        r#"{"idle_limit":null,"seed_forever":false}"#,
+        r#"{"ratio_limit":-1,"idle_limit":null,"seed_forever":false}"#,
+        r#"{"ratio_limit":null,"idle_limit":-1,"seed_forever":false}"#,
+        r#"{"ratio_limit":null,"idle_limit":1.5,"seed_forever":false}"#,
+        r#"{"ratio_limit":1e999,"idle_limit":null,"seed_forever":false}"#,
+        r#"{"ratio_limit":null,"idle_limit":18446744073709551616,"seed_forever":false}"#,
+        r#"{"ratio_limit":null,"idle_limit":null,"seed_forever":false,"extra":1}"#,
+    ];
+    for body in invalid {
+        let (status, response) = put_raw(&app, &uri, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+        assert_eq!(
+            response["error"]["code"], "invalid_argument",
+            "body: {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn torrent_query_filters_sorts_paginates_counts_and_groups() {
     let state = fake_daemon::fake_state();
     let app = swarmotter_api::app_router(state);
@@ -685,6 +826,71 @@ async fn bulk_add_accepts_many_magnets_paused() {
     let torrents = v["data"].as_array().unwrap();
     assert_eq!(torrents.len(), ADD_COUNT);
     assert!(torrents.iter().all(|torrent| torrent["state"] == "paused"));
+}
+
+#[tokio::test]
+async fn bulk_metainfo_base64_accepts_exact_decoded_limit_and_rejects_one_over() {
+    let state = fake_daemon::fake_state();
+    let app =
+        swarmotter_api::routes::app_router_with_body_limit(state, MAX_TORRENT_METADATA_BYTES * 2);
+
+    let exact = torrent_padded_to_size("bulk-api-limit.bin", MAX_TORRENT_METADATA_BYTES);
+    let encoded = test_base64(&exact);
+    drop(exact);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/bulk?paused=true")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "torrent_files": [{ "metainfo": encoded }] }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(envelope["data"]["added"].as_array().unwrap().len(), 1);
+    assert!(envelope["data"]["failed"].as_array().unwrap().is_empty());
+
+    let mut one_over = torrent_padded_to_size("bulk-api-limit.bin", MAX_TORRENT_METADATA_BYTES);
+    one_over.push(b'X');
+    let encoded = test_base64(&one_over);
+    drop(one_over);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/bulk?paused=true")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "torrent_files": [{ "metainfo": encoded }] }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(envelope["data"]["added"].as_array().unwrap().is_empty());
+    assert_eq!(envelope["data"]["failed"][0]["code"], "malformed_torrent");
+    assert!(envelope["data"]["failed"][0]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("exceeds maximum")));
+
+    let (status, list) = get_json(&app, "/api/v1/torrents").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["data"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1711,6 +1917,54 @@ async fn transmission_rpc_reuses_api_token_for_basic_auth() {
 }
 
 #[tokio::test]
+async fn compatibility_keeps_only_previously_supported_ratio_and_upload_fields() {
+    let mut cfg = Config::default();
+    cfg.compatibility.transmission.enabled = true;
+    cfg.compatibility.qbittorrent.enabled = true;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+    let hash = add_named_test_magnet(&app, 92, "compat-seeding", false, "/data").await;
+    let (status, _) = put_json(
+        &app,
+        &format!("/api/v1/torrents/{hash}/seeding"),
+        serde_json::json!({
+            "ratio_limit": 1.25,
+            "idle_limit": 75,
+            "seed_forever": false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let session = transmission_session(app.clone(), None).await;
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "method": "torrent-get",
+            "arguments": {
+                "fields": ["hashString", "uploadRatio", "uploadedEver", "seedRatioLimit"]
+            }
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let row = &body["arguments"]["torrents"][0];
+    assert_eq!(row["uploadRatio"], 0.0);
+    assert_eq!(row["uploadedEver"], 0);
+    assert!(row["seedRatioLimit"].is_null());
+
+    let (status, text) = qb_get(app, "/api/v2/torrents/info", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(rows[0]["ratio"], 0.0);
+    assert_eq!(rows[0]["uploaded"], 0);
+    assert!(rows[0].get("ratio_limit").is_none());
+    assert!(rows[0].get("seeding_time_limit").is_none());
+}
+
+#[tokio::test]
 async fn transmission_rpc_add_get_action_and_remove_torrent() {
     let mut cfg = Config::default();
     cfg.compatibility.transmission.enabled = true;
@@ -1841,6 +2095,64 @@ async fn transmission_rpc_adds_base64_metainfo_and_rejects_remote_urls() {
 }
 
 #[tokio::test]
+async fn transmission_metainfo_base64_accepts_exact_decoded_limit_and_rejects_one_over() {
+    let mut cfg = Config::default();
+    cfg.compatibility.transmission.enabled = true;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app =
+        swarmotter_api::routes::app_router_with_body_limit(state, MAX_TORRENT_METADATA_BYTES * 2);
+    let session = transmission_session(app.clone(), None).await;
+
+    let exact = torrent_padded_to_size("transmission-api-limit.bin", MAX_TORRENT_METADATA_BYTES);
+    let encoded = test_base64(&exact);
+    drop(exact);
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "torrent_add",
+            "params": { "metainfo": encoded, "paused": true },
+            "id": 41
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"]["torrent_added"]["name"],
+        "transmission-api-limit.bin"
+    );
+
+    let mut one_over =
+        torrent_padded_to_size("transmission-api-limit.bin", MAX_TORRENT_METADATA_BYTES);
+    one_over.push(b'X');
+    let encoded = test_base64(&one_over);
+    drop(one_over);
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "torrent_add",
+            "params": { "metainfo": encoded, "paused": true },
+            "id": 42
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["error"]["code"], -32000);
+    assert!(body["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("exceeds maximum")));
+
+    let (status, list) = get_json(&app, "/api/v1/torrents").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["data"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn settings_redacts_auth_token() {
     let mut cfg = Config::default();
     cfg.api.auth_token = Some("secret-token".into());
@@ -1869,18 +2181,92 @@ async fn api_body_limit_rejects_oversized_upload() {
     let state = fake_daemon::fake_state();
     let app = swarmotter_api::routes::app_router_with_body_limit(state, 8);
 
-    let resp = app
+    for uri in ["/api/v1/torrents/file", "/api/v1/torrents"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(vec![0u8; 16]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn torrent_metadata_limit_applies_through_real_router_when_api_body_limit_is_higher() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::routes::app_router_with_body_limit(
+        state,
+        MAX_TORRENT_METADATA_BYTES + 1024,
+    );
+    for (uri, name) in [
+        ("/api/v1/torrents/file", "dedicated-api-limit.bin"),
+        ("/api/v1/torrents", "multiplex-api-limit.bin"),
+    ] {
+        let exact = torrent_padded_to_size(name, MAX_TORRENT_METADATA_BYTES);
+        let mut one_over = exact.clone();
+        one_over.push(b'X');
+
+        let accepted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(exact))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK, "{uri}");
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(one_over))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST, "{uri}");
+        let body = axum::body::to_bytes(rejected.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(envelope["error"]["code"], "malformed_torrent");
+        assert!(envelope["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("exceeds maximum")));
+    }
+
+    let malformed = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/torrents/file")
                 .header("content-type", "application/octet-stream")
-                .body(Body::from(vec![0u8; 16]))
+                .body(Body::from("not bencoded metainfo"))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(malformed.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(envelope["error"]["code"], "bencode_error");
 }
 
 #[tokio::test]

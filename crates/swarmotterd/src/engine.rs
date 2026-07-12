@@ -49,11 +49,13 @@ use swarmotter_core::tracker::{self, AnnounceEvent, AnnounceRequest};
 use swarmotter_core::udp_tracker;
 use swarmotter_core::utp::{self, PeerTransport};
 
+use crate::peer_permits::PeerSessionBudget;
+
 /// Default simultaneous peer download workers when no per-torrent peer cap is
 /// configured. Trackers commonly return far more than 16 usable peers for
 /// public Linux distribution torrents, so the default should be high enough to
 /// keep several useful peers busy without requiring operator tuning.
-pub const DEFAULT_PEER_WORKER_LIMIT: usize = 128;
+pub const DEFAULT_PEER_WORKER_LIMIT: usize = crate::peer_permits::DEFAULT_PER_TORRENT_PEER_LIMIT;
 const PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const NORMAL_PEER_SESSION_DEADLINE: Duration = Duration::from_secs(180);
 const DHT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
@@ -85,30 +87,34 @@ impl PieceSelection {
         }
     }
 
-    fn from_files(meta: &TorrentMeta, priorities: &[FilePriority], wanted: &[bool]) -> Self {
+    fn from_files(
+        meta: &TorrentMeta,
+        priorities: &[FilePriority],
+        wanted: &[bool],
+    ) -> Result<Self> {
         if priorities.len() != meta.files.len() || wanted.len() != meta.files.len() {
-            return Self::all(meta);
+            return Ok(Self::all(meta));
         }
         let priorities = (0..meta.piece_count())
-            .map(|piece| {
-                piece_file_ranges(meta, piece)
+            .map(|piece| -> Result<Option<i32>> {
+                Ok(piece_file_ranges(meta, piece)?
                     .into_iter()
                     .filter_map(|slice| {
                         let priority = priorities[slice.file_index];
                         (wanted[slice.file_index] && priority != FilePriority::Unwanted)
                             .then_some(priority.weight())
                     })
-                    .max()
+                    .max())
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let target_count = priorities
             .iter()
             .filter(|priority| priority.is_some())
             .count();
-        Self {
+        Ok(Self {
             priorities: Arc::new(priorities),
             target_count,
-        }
+        })
     }
 
     fn includes(&self, piece: usize) -> bool {
@@ -293,6 +299,9 @@ pub struct TorrentEngine {
     file_priorities: Vec<FilePriority>,
     wanted: Vec<bool>,
     piece_selection: PieceSelection,
+    /// Shared global plus per-torrent lifetime permits for every peer wire
+    /// session opened by this engine. See ADR-0053.
+    peer_session_budget: PeerSessionBudget,
 }
 
 impl TorrentEngine {
@@ -334,7 +343,7 @@ impl TorrentEngine {
         commands: tokio::sync::mpsc::Receiver<EngineCommand>,
         seed_peers: Vec<PeerAddr>,
         listen_port: u16,
-        limiter: RateLimiter,
+        limiter: impl Into<Arc<RateLimiter>>,
         magnet: Option<MagnetParams>,
     ) -> Self {
         let piece_selection = PieceSelection::all(&meta);
@@ -349,7 +358,7 @@ impl TorrentEngine {
             commands: Arc::new(Mutex::new(commands)),
             seed_peers,
             listen_port,
-            limiter: ShapedLimiter::from_rate_limiter(limiter),
+            limiter: ShapedLimiter::from_shared_rate_limiter(limiter.into()),
             magnet,
             metadata_preflight: None,
             dht: None,
@@ -367,6 +376,7 @@ impl TorrentEngine {
             file_priorities: vec![FilePriority::Normal; file_count],
             wanted: vec![true; file_count],
             piece_selection,
+            peer_session_budget: PeerSessionBudget::unlimited(),
         }
     }
 
@@ -449,12 +459,22 @@ impl TorrentEngine {
         self
     }
 
-    pub fn with_file_selection(mut self, priorities: Vec<FilePriority>, wanted: Vec<bool>) -> Self {
+    /// Attach the runtime-owned global and per-torrent peer-session budgets.
+    pub fn with_peer_session_budget(mut self, budget: PeerSessionBudget) -> Self {
+        self.peer_session_budget = budget;
+        self
+    }
+
+    pub fn with_file_selection(
+        mut self,
+        priorities: Vec<FilePriority>,
+        wanted: Vec<bool>,
+    ) -> Result<Self> {
         self.file_priorities = priorities;
         self.wanted = wanted;
         self.piece_selection =
-            PieceSelection::from_files(&self.meta, &self.file_priorities, &self.wanted);
-        self
+            PieceSelection::from_files(&self.meta, &self.file_priorities, &self.wanted)?;
+        Ok(self)
     }
 
     /// Validate and reserve resolved magnet metadata with the daemon before
@@ -511,7 +531,7 @@ impl TorrentEngine {
             self.wanted = vec![true; self.meta.files.len()];
         }
         self.piece_selection =
-            PieceSelection::from_files(&self.meta, &self.file_priorities, &self.wanted);
+            PieceSelection::from_files(&self.meta, &self.file_priorities, &self.wanted)?;
 
         let piece_count = self.meta.piece_count();
         let total_length = self.meta.total_length;
@@ -957,6 +977,7 @@ impl TorrentEngine {
         if !self.peer_allowed(peer_addr) {
             return Ok((false, "peer_rejected_by_policy"));
         }
+        let _peer_permit = self.peer_session_budget.acquire_outbound().await?;
         let (mut reader, mut write_half, transport) = connect_peer_wire_with_transport(
             self.binder.clone(),
             *peer_addr,
@@ -1334,6 +1355,7 @@ impl TorrentEngine {
             let utp_prefer_tcp = self.utp_prefer_tcp;
             let encryption_mode = self.encryption_mode;
             let selection = selection.clone();
+            let peer_session_budget = self.peer_session_budget.clone();
             handles.push(tokio::spawn(async move {
                 endgame_peer_session(
                     binder,
@@ -1351,6 +1373,7 @@ impl TorrentEngine {
                     utp_enabled,
                     utp_prefer_tcp,
                     encryption_mode,
+                    peer_session_budget,
                 )
                 .await
             }));
@@ -1451,6 +1474,7 @@ impl TorrentEngine {
                 self.allow_ipv6,
                 self.pex_max_peers,
                 planned_session_count,
+                self.peer_session_budget.clone(),
             );
             next_candidate += 1;
         }
@@ -1560,6 +1584,7 @@ impl TorrentEngine {
                     self.allow_ipv6,
                     self.pex_max_peers,
                     planned_session_count,
+                    self.peer_session_budget.clone(),
                 );
                 next_candidate += 1;
             }
@@ -1968,14 +1993,17 @@ impl TorrentEngine {
                     candidates = candidates.len(),
                     "attempting magnet metadata fetch from discovered peers"
                 );
-                match crate::metadata::fetch_metadata_from_candidates_with_transport(
-                    self.binder.clone(),
-                    magnet.info_hash,
-                    self.peer_id,
+                match crate::metadata::fetch_metadata_from_candidates_with_budget(
+                    crate::metadata::MetadataFetchContext::new(
+                        self.peer_session_budget.clone(),
+                        self.binder.clone(),
+                        magnet.info_hash,
+                        self.peer_id,
+                        self.utp_enabled,
+                        self.utp_prefer_tcp,
+                        self.encryption_mode,
+                    ),
                     &candidates,
-                    self.utp_enabled,
-                    self.utp_prefer_tcp,
-                    self.encryption_mode,
                 )
                 .await
                 {
@@ -2663,7 +2691,7 @@ async fn fetch_piece_from_webseed(
         .map_err(|_| CoreError::Internal(format!("piece {piece_index} length exceeds usize")))?;
     let mut piece = vec![0u8; piece_len];
 
-    for slice in piece_file_ranges(meta, piece_index) {
+    for slice in piece_file_ranges(meta, piece_index)? {
         if slice.length == 0 {
             continue;
         }
@@ -3221,10 +3249,12 @@ async fn endgame_peer_session(
     utp_enabled: bool,
     utp_prefer_tcp: bool,
     encryption_mode: PeerEncryptionMode,
+    peer_session_budget: PeerSessionBudget,
 ) -> Result<bool> {
     if !binder.traffic_allowed() {
         return Ok(false);
     }
+    let _peer_permit = peer_session_budget.acquire_outbound().await?;
     let storage = StorageIo::new(meta.clone(), download_dir);
     let (mut reader, mut write_half, transport) = connect_peer_wire_with_transport(
         binder.clone(),
@@ -3527,6 +3557,7 @@ fn spawn_parallel_peer_task(
     allow_ipv6: bool,
     pex_max_peers: usize,
     candidate_count: usize,
+    peer_session_budget: PeerSessionBudget,
 ) {
     tasks.spawn(async move {
         let result = parallel_peer_session(
@@ -3548,6 +3579,7 @@ fn spawn_parallel_peer_task(
             allow_ipv6,
             pex_max_peers,
             candidate_count,
+            peer_session_budget,
         )
         .await;
         (peer_addr, result)
@@ -3770,6 +3802,7 @@ async fn parallel_peer_session(
     allow_ipv6: bool,
     pex_max_peers: usize,
     candidate_count: usize,
+    peer_session_budget: PeerSessionBudget,
 ) -> Result<PeerSessionOutcome> {
     if !binder.traffic_allowed() {
         let reason = "transport_blocked";
@@ -3785,6 +3818,7 @@ async fn parallel_peer_session(
         );
         return Ok(PeerSessionOutcome::NoProgress);
     }
+    let _peer_permit = peer_session_budget.acquire_outbound().await?;
     let mut no_progress_reason: &'static str = "session_in_progress";
 
     let (mut reader, mut write_half, transport) = connect_peer_wire_with_transport(
@@ -4328,7 +4362,8 @@ mod tests {
             &meta,
             &[FilePriority::Normal, FilePriority::High],
             &[false, true],
-        );
+        )
+        .unwrap();
         assert!(!selection.includes(0));
         assert!(selection.includes(1));
         let mut have = PieceBitfield::new(meta.piece_count());
@@ -4347,7 +4382,8 @@ mod tests {
             &meta,
             &[FilePriority::Normal, FilePriority::High],
             &[false, true],
-        );
+        )
+        .unwrap();
         assert!(selection.includes(0));
     }
 

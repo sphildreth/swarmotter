@@ -15,7 +15,6 @@
 //! See `design/vpn-network-containment.md` and ADR-0013.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,7 +33,9 @@ use swarmotter_core::storage::StorageIo;
 use swarmotter_core::utp::PeerDuplex;
 
 use crate::engine::EngineState;
+use crate::peer_permits::{PeerPermit, PeerPermitPool, PeerSessionBudget};
 
+#[cfg(test)]
 const DEFAULT_MAX_INBOUND_SESSIONS: usize = 256;
 
 /// A torrent registered with the process-wide inbound peer listener.
@@ -51,11 +52,12 @@ impl SeedRegistration {
         complete_storage: Option<Arc<StorageIo>>,
         state: Arc<Mutex<EngineState>>,
         peer_id: [u8; 20],
-        limiter: RateLimiter,
+        limiter: impl Into<Arc<RateLimiter>>,
         global_limiter: Option<RateLimiter>,
+        peer_session_budget: PeerSessionBudget,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
-        let mut limiter = ShapedLimiter::from_rate_limiter(limiter);
+        let mut limiter = ShapedLimiter::from_shared_rate_limiter(limiter.into());
         if let Some(global) = global_limiter {
             limiter = limiter.with_global(global);
         }
@@ -67,6 +69,7 @@ impl SeedRegistration {
                 state,
                 peer_id,
                 limiter,
+                peer_session_budget,
                 shutdown,
             },
         }
@@ -99,6 +102,26 @@ impl SeedRegistry {
         self.inner.read().await.is_empty()
     }
 
+    pub async fn len(&self) -> usize {
+        self.inner.read().await.len()
+    }
+
+    pub async fn contains(&self, info_hash: &swarmotter_core::hash::InfoHash) -> bool {
+        self.inner.read().await.contains_key(info_hash)
+    }
+
+    #[cfg(test)]
+    pub async fn limiter_for_test(
+        &self,
+        info_hash: &swarmotter_core::hash::InfoHash,
+    ) -> Option<Arc<RateLimiter>> {
+        self.inner
+            .read()
+            .await
+            .get(info_hash)
+            .map(|context| context.limiter.per_torrent.clone())
+    }
+
     pub async fn clear(&self) {
         self.inner.write().await.clear();
     }
@@ -110,7 +133,7 @@ impl SeedRegistry {
         self.inner.read().await.get(info_hash).cloned()
     }
 
-    async fn info_hashes(&self) -> Vec<swarmotter_core::hash::InfoHash> {
+    pub async fn info_hashes(&self) -> Vec<swarmotter_core::hash::InfoHash> {
         self.inner.read().await.keys().copied().collect()
     }
 }
@@ -124,7 +147,7 @@ pub struct SeederHub {
     port: u16,
     encryption_mode: PeerEncryptionMode,
     shutdown: tokio::sync::watch::Receiver<bool>,
-    max_sessions: Arc<AtomicUsize>,
+    global_peer_permits: Arc<PeerPermitPool>,
     bound_addr: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
 }
 
@@ -135,7 +158,7 @@ impl SeederHub {
         port: u16,
         encryption_mode: PeerEncryptionMode,
         shutdown: tokio::sync::watch::Receiver<bool>,
-        max_sessions: usize,
+        global_peer_permits: Arc<PeerPermitPool>,
     ) -> Self {
         Self {
             registry,
@@ -143,14 +166,9 @@ impl SeederHub {
             port,
             encryption_mode,
             shutdown,
-            max_sessions: Arc::new(AtomicUsize::new(max_sessions.max(1))),
+            global_peer_permits,
             bound_addr: None,
         }
-    }
-
-    pub fn with_dynamic_session_limit(mut self, max_sessions: Arc<AtomicUsize>) -> Self {
-        self.max_sessions = max_sessions;
-        self
     }
 
     pub(crate) fn with_bound_addr(
@@ -199,17 +217,21 @@ impl SeederHub {
                             continue;
                         }
                     };
-                    let max_sessions = self.max_sessions.load(Ordering::Relaxed).max(1);
-                    if sessions.len() >= max_sessions {
-                        tracing::warn!(max_sessions, "inbound peer session limit reached");
+                    let Some(global_peer_permit) = self.global_peer_permits.try_acquire() else {
+                        tracing::warn!("process-wide peer session limit reached; inbound socket rejected before handshake");
                         drop(stream);
                         continue;
-                    }
+                    };
                     let peer_addr = stream.peer_addr().ok();
                     let registry = self.registry.clone();
                     let encryption_mode = self.encryption_mode;
                     sessions.spawn(async move {
-                        if let Err(error) = serve_routed_peer(stream, registry, encryption_mode).await {
+                        if let Err(error) = serve_routed_peer(
+                            stream,
+                            registry,
+                            encryption_mode,
+                            global_peer_permit,
+                        ).await {
                             tracing::debug!(peer = ?peer_addr, %error, "inbound peer session ended");
                         }
                     });
@@ -229,6 +251,7 @@ impl SeederHub {
 /// `limiter` shapes upload throughput. `shutdown` completes when the seeder
 /// should stop (pause/remove).
 #[allow(dead_code)]
+#[cfg(test)]
 pub struct Seeder {
     meta: TorrentMeta,
     storage: Arc<StorageIo>,
@@ -241,12 +264,14 @@ pub struct Seeder {
     shutdown: tokio::sync::watch::Receiver<bool>,
     limiter: ShapedLimiter,
     max_sessions: usize,
+    peer_session_budget: PeerSessionBudget,
     /// Optional one-shot sender receiving the bound listen address, for tests
     /// that bind on port 0 and need to learn the actual port.
     bound_addr: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
 }
 
 #[allow(dead_code)]
+#[cfg(test)]
 impl Seeder {
     #[allow(clippy::too_many_arguments, dead_code)]
     pub fn new(
@@ -257,6 +282,7 @@ impl Seeder {
         port: u16,
         peer_id: [u8; 20],
         shutdown: tokio::sync::watch::Receiver<bool>,
+        peer_session_budget: PeerSessionBudget,
     ) -> Self {
         Self::with_limiter(
             meta,
@@ -267,6 +293,7 @@ impl Seeder {
             peer_id,
             shutdown,
             RateLimiter::unlimited(),
+            peer_session_budget,
         )
     }
 
@@ -279,7 +306,8 @@ impl Seeder {
         port: u16,
         peer_id: [u8; 20],
         shutdown: tokio::sync::watch::Receiver<bool>,
-        limiter: RateLimiter,
+        limiter: impl Into<Arc<RateLimiter>>,
+        peer_session_budget: PeerSessionBudget,
     ) -> Self {
         Self {
             meta,
@@ -291,8 +319,9 @@ impl Seeder {
             peer_id,
             encryption_mode: PeerEncryptionMode::default(),
             shutdown,
-            limiter: ShapedLimiter::from_rate_limiter(limiter),
+            limiter: ShapedLimiter::from_shared_rate_limiter(limiter.into()),
             max_sessions: DEFAULT_MAX_INBOUND_SESSIONS,
+            peer_session_budget,
             bound_addr: None,
         }
     }
@@ -389,6 +418,20 @@ impl Seeder {
                         drop(stream);
                         continue;
                     }
+                    let Some(global_peer_permit) =
+                        self.peer_session_budget.try_acquire_global_inbound()
+                    else {
+                        tracing::warn!("process-wide peer session limit reached; inbound socket rejected before handshake");
+                        drop(stream);
+                        continue;
+                    };
+                    let Some(torrent_peer_permit) =
+                        self.peer_session_budget.try_acquire_torrent_inbound()
+                    else {
+                        tracing::warn!("per-torrent peer session limit reached; inbound socket rejected before handshake");
+                        drop(stream);
+                        continue;
+                    };
                     let peer_addr = stream.peer_addr().ok();
                     let context = PeerServeContext {
                         meta: self.meta.clone(),
@@ -397,10 +440,13 @@ impl Seeder {
                         state: self.state.clone(),
                         peer_id: self.peer_id,
                         limiter: self.limiter.clone(),
+                        peer_session_budget: self.peer_session_budget.clone(),
                         shutdown: self.shutdown.clone(),
                     };
                     let encryption_mode = self.encryption_mode;
                     sessions.spawn(async move {
+                        let _global_peer_permit = global_peer_permit;
+                        let _torrent_peer_permit = torrent_peer_permit;
                         if let Err(error) = serve_known_peer(stream, context, encryption_mode).await {
                             tracing::debug!(peer = ?peer_addr, %error, "inbound peer session ended");
                         }
@@ -421,10 +467,11 @@ struct PeerServeContext {
     state: Arc<Mutex<EngineState>>,
     peer_id: [u8; 20],
     limiter: ShapedLimiter,
+    peer_session_budget: PeerSessionBudget,
     shutdown: tokio::sync::watch::Receiver<bool>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 async fn serve_known_peer(
     stream: tokio::net::TcpStream,
     context: PeerServeContext,
@@ -440,6 +487,7 @@ async fn serve_routed_peer(
     stream: tokio::net::TcpStream,
     registry: SeedRegistry,
     encryption_mode: PeerEncryptionMode,
+    _global_peer_permit: PeerPermit,
 ) -> Result<()> {
     let plaintext = looks_like_plaintext_peer_handshake(&stream).await?;
     let (mut stream, encrypted_hash): (Box<dyn PeerDuplex>, Option<_>) = match encryption_mode {
@@ -470,6 +518,10 @@ async fn serve_routed_peer(
         .context(&their_hs.info_hash)
         .await
         .ok_or_else(|| CoreError::NotFound("registered inbound torrent".into()))?;
+    let _torrent_peer_permit = context
+        .peer_session_budget
+        .try_acquire_torrent_inbound()
+        .ok_or_else(|| CoreError::Internal("per-torrent peer session limit reached".into()))?;
     serve_peer(stream, context, their_hs).await
 }
 
@@ -490,6 +542,7 @@ async fn serve_peer(
         state,
         peer_id,
         limiter,
+        peer_session_budget: _,
         mut shutdown,
     } = context;
     if their_hs.info_hash != meta.info_hash {
@@ -722,6 +775,7 @@ mod tests {
     use swarmotter_core::net::binder::LoopbackBinder;
     use swarmotter_core::peer::BLOCK_SIZE;
     use swarmotter_core::storage::resume::PieceBitfield;
+    use tokio::io::AsyncReadExt as _;
 
     fn unique_dir(label: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -792,6 +846,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shared_listener_routes_multiple_torrents_and_owns_sessions() {
         let registry = SeedRegistry::default();
+        let global_peer_permits = PeerPermitPool::unlimited();
         let mut torrent_shutdowns = Vec::new();
         let mut fixtures = Vec::new();
         for (name, content) in [
@@ -822,6 +877,10 @@ mod tests {
                     peer_id(b"-HUBSRV-"),
                     RateLimiter::unlimited(),
                     None,
+                    PeerSessionBudget::new(
+                        global_peer_permits.clone(),
+                        PeerPermitPool::unlimited(),
+                    ),
                     shutdown_rx,
                 ))
                 .await;
@@ -837,7 +896,7 @@ mod tests {
             0,
             PeerEncryptionMode::Preferred,
             hub_shutdown_rx,
-            8,
+            global_peer_permits,
         )
         .with_bound_addr(bound_tx);
         let task = tokio::spawn(hub.run());
@@ -855,6 +914,308 @@ mod tests {
         for (_, _, dir) in fixtures {
             std::fs::remove_dir_all(dir).ok();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mixed_inbound_and_metadata_outbound_share_both_lifetime_caps() {
+        let content = b"generated mixed-direction peer budget".to_vec();
+        let bytes = build_single_file_torrent(
+            "mixed-direction.bin",
+            &content,
+            content.len() as u64,
+            None,
+            false,
+        );
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("mixed-direction");
+        let storage = Arc::new(StorageIo::new(meta.clone(), dir.clone()));
+        storage.write_piece(0, &content).await.unwrap();
+        let mut have = PieceBitfield::new(1);
+        have.set(0);
+        let state = Arc::new(Mutex::new(EngineState {
+            piece_count: 1,
+            total_length: content.len() as u64,
+            pieces_have: have,
+            finished: true,
+            ..EngineState::default()
+        }));
+        let denied = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let global = PeerPermitPool::new(1, denied.clone()).unwrap();
+        let torrent = PeerPermitPool::new(1, denied).unwrap();
+        let budget = PeerSessionBudget::new(global.clone(), torrent.clone());
+        let registry = SeedRegistry::default();
+        let (torrent_shutdown_tx, torrent_shutdown_rx) = tokio::sync::watch::channel(false);
+        registry
+            .register(SeedRegistration::new(
+                meta.clone(),
+                storage,
+                None,
+                state,
+                peer_id(b"-MIXSRV-"),
+                RateLimiter::unlimited(),
+                None,
+                budget.clone(),
+                torrent_shutdown_rx,
+            ))
+            .await;
+        let (hub_shutdown_tx, hub_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+        let hub = SeederHub::new(
+            registry,
+            Arc::new(LoopbackBinder),
+            0,
+            PeerEncryptionMode::Disabled,
+            hub_shutdown_rx,
+            global.clone(),
+        )
+        .with_bound_addr(bound_tx);
+        let hub_task = tokio::spawn(hub.run());
+        let hub_addr = bound_rx.await.unwrap();
+
+        let inbound = tokio::net::TcpStream::connect(hub_addr).await.unwrap();
+        let (mut inbound_read, mut inbound_write) = tokio::io::split(inbound);
+        peer::write_handshake(
+            &mut inbound_write,
+            &Handshake {
+                info_hash: meta.info_hash,
+                peer_id: peer_id(b"-MIXCLI-"),
+                reserved: swarmotter_core::extensions::EXTENSION_RESERVED,
+            },
+        )
+        .await
+        .unwrap();
+        {
+            let mut inbound_reader = PeerReader::new(&mut inbound_read);
+            inbound_reader.read_handshake().await.unwrap();
+            assert!(matches!(
+                inbound_reader.read_message().await.unwrap(),
+                Some(Message::Bitfield { .. })
+            ));
+        }
+        assert_eq!(global.snapshot().in_use, 1);
+        assert_eq!(torrent.snapshot().in_use, 1);
+
+        // A second accepted socket is rejected before its handshake because
+        // the process-wide permit is already held by the first inbound peer.
+        let mut rejected = tokio::net::TcpStream::connect(hub_addr).await.unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), rejected.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(global.snapshot().denied, 1);
+
+        let outbound_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let outbound_addr = outbound_listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move { outbound_listener.accept().await.unwrap().0 });
+        let outbound_budget = budget.clone();
+        let outbound_meta = meta.clone();
+        let outbound_task = tokio::spawn(async move {
+            let context = crate::metadata::MetadataFetchContext::new(
+                outbound_budget,
+                Arc::new(LoopbackBinder),
+                outbound_meta.info_hash,
+                peer_id(b"-MIXOUT-"),
+                false,
+                true,
+                PeerEncryptionMode::Disabled,
+            );
+            crate::metadata::fetch_metadata_with_transport(
+                &context,
+                swarmotter_core::peer::PeerAddr::from_socket_addr(outbound_addr),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!accept_task.is_finished());
+        assert!(!outbound_task.is_finished());
+
+        drop(inbound_read);
+        drop(inbound_write);
+        let outbound_stream = tokio::time::timeout(Duration::from_secs(2), accept_task)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while global.snapshot().in_use != 1 || torrent.snapshot().in_use != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(outbound_stream);
+        assert!(outbound_task.await.unwrap().is_err());
+        assert_eq!(global.snapshot().in_use, 0);
+        assert_eq!(torrent.snapshot().in_use, 0);
+
+        let _ = torrent_shutdown_tx.send(true);
+        let _ = hub_shutdown_tx.send(true);
+        hub_task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Production-path upload shaping with Tokio's deterministic clock. The
+    /// first 1 KiB consumes the token bucket's documented initial burst. A
+    /// second 1 KiB must still be blocked at 400 ms under 1 KiB/s, then finish
+    /// at the limiter's 500 ms wake boundary after a live increase to 4 KiB/s.
+    /// The 100 ms virtual-time tolerance accounts only for that bounded wake
+    /// interval. Wall time only bounds request-dispatch synchronization; all
+    /// shaping assertions use the paused virtual clock.
+    #[tokio::test(start_paused = true)]
+    async fn active_registered_upload_observes_live_limit_without_replacement() {
+        let content = vec![0x5au8; 4096];
+        let bytes = build_single_file_torrent("live-limit.bin", &content, 4096, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("live-limit");
+        let storage = Arc::new(StorageIo::new(meta.clone(), dir.clone()));
+        storage.write_piece(0, &content).await.unwrap();
+        let mut have = PieceBitfield::new(1);
+        have.set(0);
+        let state = Arc::new(Mutex::new(EngineState {
+            piece_count: 1,
+            total_length: content.len() as u64,
+            pieces_have: have,
+            finished: true,
+            ..EngineState::default()
+        }));
+        let limiter = Arc::new(RateLimiter::new(0, 1024));
+        let (torrent_shutdown_tx, torrent_shutdown_rx) = tokio::sync::watch::channel(false);
+        let registry = SeedRegistry::default();
+        let global_peer_permits = PeerPermitPool::unlimited();
+        let peer_session_budget =
+            PeerSessionBudget::new(global_peer_permits.clone(), PeerPermitPool::unlimited());
+        registry
+            .register(SeedRegistration::new(
+                meta.clone(),
+                storage,
+                None,
+                state.clone(),
+                peer_id(b"-LVLIM1-"),
+                limiter.clone(),
+                None,
+                peer_session_budget,
+                torrent_shutdown_rx,
+            ))
+            .await;
+        let registered_limiter = registry
+            .inner
+            .read()
+            .await
+            .get(&meta.info_hash)
+            .unwrap()
+            .limiter
+            .per_torrent
+            .clone();
+        assert!(Arc::ptr_eq(&limiter, &registered_limiter));
+
+        let (hub_shutdown_tx, hub_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+        let hub = SeederHub::new(
+            registry.clone(),
+            Arc::new(LoopbackBinder),
+            0,
+            PeerEncryptionMode::Preferred,
+            hub_shutdown_rx,
+            global_peer_permits,
+        )
+        .with_bound_addr(bound_tx);
+        let hub_task = tokio::spawn(hub.run());
+        let address = bound_rx.await.unwrap();
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (read, mut write) = tokio::io::split(stream);
+        peer::write_handshake(
+            &mut write,
+            &Handshake {
+                info_hash: meta.info_hash,
+                peer_id: peer_id(b"-LVCLI1-"),
+                reserved: swarmotter_core::extensions::EXTENSION_RESERVED,
+            },
+        )
+        .await
+        .unwrap();
+        let mut reader = PeerReader::new(read);
+        reader.read_handshake().await.unwrap();
+        assert!(matches!(
+            reader.read_message().await.unwrap(),
+            Some(Message::Bitfield { .. })
+        ));
+        peer::write_message(&mut write, &Message::Interested)
+            .await
+            .unwrap();
+        loop {
+            if matches!(reader.read_message().await.unwrap(), Some(Message::Unchoke)) {
+                break;
+            }
+        }
+
+        for offset in [0, 1024] {
+            peer::write_message(
+                &mut write,
+                &Message::Request {
+                    piece: 0,
+                    offset,
+                    length: 1024,
+                },
+            )
+            .await
+            .unwrap();
+            if offset == 0 {
+                assert!(matches!(
+                    reader.read_message().await.unwrap(),
+                    Some(Message::Piece { block, .. }) if block.len() == 1024
+                ));
+            }
+        }
+
+        let second_block = tokio::spawn(async move { reader.read_message().await });
+        // Accounted bytes are updated immediately before the production
+        // limiter is awaited. Wait for the second request to reach that point,
+        // then yield once more so its 500 ms limiter sleep is armed before
+        // advancing the paused clock. A single unconditional yield can race
+        // request dispatch when the full test suite is scheduling many tasks.
+        let dispatch_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while state.lock().await.uploaded != 2048 {
+            assert!(
+                std::time::Instant::now() < dispatch_deadline,
+                "second upload request did not reach the live limiter"
+            );
+            std::thread::yield_now();
+            tokio::task::yield_now().await;
+        }
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(400)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !second_block.is_finished(),
+            "old 1 KiB/s window was not enforced"
+        );
+        limiter.set_capacity(RateDirection::Upload, 4096);
+        assert!(registry.contains(&meta.info_hash).await);
+        assert!(Arc::ptr_eq(&limiter, &registered_limiter));
+        tokio::time::advance(Duration::from_millis(100)).await;
+        for _ in 0..100 {
+            if second_block.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            second_block.is_finished(),
+            "new 4 KiB/s window was not observed live"
+        );
+        assert!(matches!(
+            second_block.await.unwrap().unwrap(),
+            Some(Message::Piece { block, .. }) if block.len() == 1024
+        ));
+
+        let _ = torrent_shutdown_tx.send(true);
+        let _ = hub_shutdown_tx.send(true);
+        hub_task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// A leecher that connects to the seeder, requests a block, and verifies
@@ -904,6 +1265,7 @@ mod tests {
             0,
             peer_id(b"-SW0001-"),
             shutdown_rx,
+            PeerSessionBudget::unlimited(),
         )
         .with_bound_addr(bound_tx);
         let seeder_task = tokio::spawn(async move { seeder.run().await });
@@ -1021,6 +1383,7 @@ mod tests {
             0,
             peer_id(b"-SW0002-"),
             shutdown_rx,
+            PeerSessionBudget::unlimited(),
         )
         .with_encryption_mode(PeerEncryptionMode::Required)
         .with_bound_addr(bound_tx);

@@ -7,8 +7,9 @@ use crate::autopilot::AutopilotMode;
 use crate::hash::InfoHash;
 use crate::meta::TorrentMeta;
 use crate::models::torrent::{
-    FilePriority, TorrentFile, TorrentHealth, TorrentState, TorrentSummary,
+    FilePriority, SeedingStatus, TorrentFile, TorrentHealth, TorrentState, TorrentSummary,
 };
+use crate::ratio::TorrentSeeding;
 use crate::storage::PieceProgress;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -22,6 +23,20 @@ pub struct TorrentSettings {
     pub wanted: Vec<bool>,
 }
 
+/// Durable intent used only to recover work that was live when fail-closed
+/// containment blocked the torrent data plane.
+///
+/// This is deliberately separate from the coarse public lifecycle state: a
+/// `network_blocked` record must not make paused, stopped, queued, or
+/// pre-existing blocked work start automatically when the path recovers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainmentRecoveryIntent {
+    Downloading,
+    DownloadingMetadata,
+    Seeding,
+}
+
 /// An in-memory torrent record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Torrent {
@@ -30,6 +45,12 @@ pub struct Torrent {
     pub progress: PieceProgress,
     pub downloaded: u64,
     pub uploaded: u64,
+    /// Per-torrent ratio/idle overrides. Missing in legacy state means inherit.
+    #[serde(default)]
+    pub seeding: TorrentSeeding,
+    /// Fine-grained persisted seeding lifecycle.
+    #[serde(default)]
+    pub seeding_status: SeedingStatus,
     pub rate_down: u64,
     pub rate_up: u64,
     pub active_peer_workers: usize,
@@ -57,6 +78,12 @@ pub struct Torrent {
     pub magnet_trackers: Vec<String>,
     /// Optional per-torrent autopilot mode override.
     pub autopilot_mode_override: Option<AutopilotMode>,
+    /// Work that was actually live when containment transitioned to blocked.
+    /// Persisted so a daemon restart while the path is down cannot lose or
+    /// broaden the recovery set. Cleared atomically when recovery is applied
+    /// or an operator lifecycle command supersedes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub containment_recovery_intent: Option<ContainmentRecoveryIntent>,
 }
 
 impl Torrent {
@@ -82,6 +109,8 @@ impl Torrent {
             progress: PieceProgress::new(piece_count),
             downloaded: 0,
             uploaded: 0,
+            seeding: TorrentSeeding::default(),
+            seeding_status: SeedingStatus::NotEligible,
             rate_down: 0,
             rate_up: 0,
             active_peer_workers: 0,
@@ -102,6 +131,7 @@ impl Torrent {
             magnet_name: None,
             magnet_trackers: Vec::new(),
             autopilot_mode_override: None,
+            containment_recovery_intent: None,
         }
     }
 
@@ -120,7 +150,7 @@ impl Torrent {
     }
 
     pub fn bytes_completed(&self) -> u64 {
-        (self.progress.fraction() * self.meta.total_length as f64) as u64
+        verified_bytes(&self.meta, self.progress.bitfield())
     }
 
     pub fn progress(&self) -> f64 {
@@ -144,6 +174,10 @@ impl Torrent {
             bytes_completed: self.bytes_completed(),
             uploaded: self.uploaded,
             downloaded: self.downloaded,
+            seeding: self.seeding.clone(),
+            seeding_status: self.seeding_status,
+            effective_ratio_limit: None,
+            effective_idle_limit: None,
             piece_count: self.meta.piece_count(),
             pieces_have: self.pieces_have(),
             piece_length: self.meta.piece_length,
@@ -164,6 +198,49 @@ impl Torrent {
             health: self.health.clone(),
         }
     }
+
+    /// Recompute every file's progress from verified piece byte ranges.
+    /// Boundary pieces credit only the bytes intersecting each file.
+    pub fn recompute_file_bytes_completed(&mut self) {
+        let bitfield = self.progress.bitfield();
+        let piece_length = self.meta.piece_length;
+        let mut file_start = 0u64;
+        for (index, file) in self.meta.files.iter().enumerate() {
+            let file_end = file_start.saturating_add(file.length);
+            let mut completed = 0u64;
+            if file.length > 0 && piece_length > 0 {
+                let first_piece = file_start / piece_length;
+                let last_piece = (file_end - 1) / piece_length;
+                for piece in first_piece..=last_piece {
+                    if bitfield.has(piece as usize) {
+                        let piece_start = piece.saturating_mul(piece_length);
+                        let piece_end = piece_start
+                            .saturating_add(piece_length)
+                            .min(self.meta.total_length);
+                        completed = completed.saturating_add(
+                            file_end
+                                .min(piece_end)
+                                .saturating_sub(file_start.max(piece_start)),
+                        );
+                    }
+                }
+            }
+            if let Some(row) = self.files.get_mut(index) {
+                row.bytes_completed = completed.min(file.length);
+            }
+            file_start = file_end;
+        }
+    }
+}
+
+/// Exact verified bytes represented by a piece bitfield. The final piece is
+/// credited only for its actual byte length.
+pub fn verified_bytes(meta: &TorrentMeta, bitfield: &crate::storage::PieceBitfield) -> u64 {
+    (0..meta.piece_count())
+        .filter(|index| bitfield.has(*index))
+        .filter_map(|index| meta.piece_byte_range(index as u64))
+        .map(|(start, end)| end.saturating_sub(start))
+        .sum()
 }
 
 /// A registry holding all torrents keyed by info hash, with duplicate
@@ -206,7 +283,7 @@ impl TorrentRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::meta::build_single_file_torrent;
+    use crate::meta::{build_multi_file_torrent, build_single_file_torrent};
 
     #[test]
     fn registry_duplicate_detection() {
@@ -235,5 +312,51 @@ mod tests {
         assert!(t.progress().abs() < f64::EPSILON);
         let summary = t.to_summary();
         assert!(summary.autopilot_mode_override.is_none());
+    }
+
+    #[test]
+    fn exact_single_file_bytes_use_actual_final_piece_length() {
+        let bytes = build_single_file_torrent("nine.bin", b"123456789", 4, None, false);
+        let meta = crate::meta::parse_torrent(&bytes).unwrap();
+        let mut torrent = Torrent::new(meta, 1);
+        torrent.progress.have_piece(2);
+        torrent.recompute_file_bytes_completed();
+        assert_eq!(torrent.bytes_completed(), 1);
+        assert_eq!(torrent.files[0].bytes_completed, 1);
+    }
+
+    #[test]
+    fn exact_multi_file_bytes_split_verified_boundary_pieces() {
+        let files = vec![
+            (vec!["a.bin".into()], 3),
+            (vec!["b.bin".into()], 4),
+            (vec!["c.bin".into()], 2),
+        ];
+        let bytes = build_multi_file_torrent("bundle", &files, &[b"abc", b"defg", b"hi"], 4, None);
+        let meta = crate::meta::parse_torrent(&bytes).unwrap();
+        let mut torrent = Torrent::new(meta, 1);
+        torrent.progress.have_piece(0);
+        torrent.recompute_file_bytes_completed();
+        assert_eq!(torrent.bytes_completed(), 4);
+        assert_eq!(
+            torrent
+                .files
+                .iter()
+                .map(|file| file.bytes_completed)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 0]
+        );
+
+        torrent.progress.have_piece(2);
+        torrent.recompute_file_bytes_completed();
+        assert_eq!(torrent.bytes_completed(), 5);
+        assert_eq!(
+            torrent
+                .files
+                .iter()
+                .map(|file| file.bytes_completed)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 1]
+        );
     }
 }

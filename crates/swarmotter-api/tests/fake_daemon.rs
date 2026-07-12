@@ -39,6 +39,9 @@ pub struct FakeDaemon {
     registry: Arc<Mutex<TorrentRegistry>>,
     config: Arc<Mutex<Config>>,
     health: Arc<Mutex<NetworkHealth>>,
+    /// Production-boundary calls observed by route-ordering tests. The origin
+    /// guard must reject an unsafe browser request before this list changes.
+    pub calls: Arc<Mutex<Vec<&'static str>>>,
     pub watch_imports: Arc<Mutex<Vec<ImportResult>>>,
     #[allow(dead_code)]
     pub events: Arc<Mutex<Vec<String>>>,
@@ -60,6 +63,7 @@ impl FakeDaemon {
             registry: Arc::new(Mutex::new(TorrentRegistry::default())),
             config: Arc::new(Mutex::new(config)),
             health: Arc::new(Mutex::new(health)),
+            calls: Arc::new(Mutex::new(Vec::new())),
             events: Arc::new(Mutex::new(Vec::new())),
             watch_imports: Arc::new(Mutex::new(Vec::new())),
         }
@@ -74,11 +78,50 @@ impl FakeDaemon {
     }
 
     async fn summary(&self, hash: &InfoHash) -> Option<TorrentSummary> {
-        self.registry
+        let mut summary = self
+            .registry
             .lock()
             .await
             .get(hash)
-            .map(Torrent::to_summary)
+            .map(Torrent::to_summary)?;
+        let global = &self.config.lock().await.seeding;
+        summary.effective_ratio_limit = summary.seeding.effective_ratio_limit(global);
+        summary.effective_idle_limit = summary.seeding.effective_idle_limit(global);
+        Some(summary)
+    }
+
+    async fn record_call(&self, call: &'static str) {
+        self.calls.lock().await.push(call);
+    }
+
+    #[allow(dead_code)]
+    pub async fn clear_calls(&self) {
+        self.calls.lock().await.clear();
+    }
+
+    #[allow(dead_code)]
+    pub async fn observed_calls(&self) -> Vec<&'static str> {
+        self.calls.lock().await.clone()
+    }
+
+    /// Snapshot mutable fake-daemon state without recording an API operation.
+    /// This lets security tests prove rejected requests did not cause a hidden
+    /// state transition even if a handler later gains additional calls.
+    #[allow(dead_code)]
+    pub async fn state_snapshot(&self) -> serde_json::Value {
+        let torrents = self
+            .registry
+            .lock()
+            .await
+            .list()
+            .iter()
+            .map(|torrent| torrent.to_summary())
+            .collect::<Vec<_>>();
+        let config = self.config.lock().await.clone();
+        serde_json::json!({
+            "torrents": torrents,
+            "config": config,
+        })
     }
 }
 
@@ -91,13 +134,20 @@ impl Default for FakeDaemon {
 #[async_trait]
 impl swarmotter_api::state::DaemonOps for FakeDaemon {
     async fn list_torrents(&self) -> Vec<TorrentSummary> {
-        self.registry
+        let mut summaries = self
+            .registry
             .lock()
             .await
             .list()
             .iter()
             .map(|t| t.to_summary())
-            .collect()
+            .collect::<Vec<_>>();
+        let config = self.config.lock().await;
+        for summary in &mut summaries {
+            summary.effective_ratio_limit = summary.seeding.effective_ratio_limit(&config.seeding);
+            summary.effective_idle_limit = summary.seeding.effective_idle_limit(&config.seeding);
+        }
+        summaries
     }
     async fn get_torrent(&self, hash: &InfoHash) -> Option<TorrentSummary> {
         self.summary(hash).await
@@ -107,6 +157,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         bytes: Vec<u8>,
         options: AddTorrentOptions,
     ) -> Result<InfoHash> {
+        self.record_call("add_torrent_file").await;
         let meta = meta::parse_torrent(&bytes)?;
         let mut t = Torrent::new(meta, now());
         t.download_dir = options.download_dir;
@@ -116,6 +167,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         self.insert(t).await
     }
     async fn add_magnet(&self, magnet: &str, options: AddTorrentOptions) -> Result<InfoHash> {
+        self.record_call("add_magnet").await;
         let m = Magnet::parse(magnet)?;
         // Build a minimal single-file meta from the magnet for testing.
         let bytes = meta::build_single_file_torrent(
@@ -136,6 +188,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         self.insert(t).await
     }
     async fn remove_torrent(&self, hash: &InfoHash, _delete_data: bool) -> Result<()> {
+        self.record_call("remove_torrent").await;
         self.registry
             .lock()
             .await
@@ -144,6 +197,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             .ok_or_else(|| CoreError::NotFound("torrent".into()))
     }
     async fn pause(&self, hash: &InfoHash) -> Result<()> {
+        self.record_call("pause").await;
         let mut reg = self.registry.lock().await;
         match reg.get_mut(hash) {
             Some(t) => {
@@ -154,6 +208,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         }
     }
     async fn resume(&self, hash: &InfoHash) -> Result<()> {
+        self.record_call("resume").await;
         let mut reg = self.registry.lock().await;
         match reg.get_mut(hash) {
             Some(t) => {
@@ -224,6 +279,23 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             }
             None => Err(CoreError::NotFound("torrent".into())),
         }
+    }
+    async fn set_torrent_seeding(
+        &self,
+        hash: &InfoHash,
+        seeding: swarmotter_core::ratio::TorrentSeeding,
+    ) -> Result<TorrentSummary> {
+        self.record_call("set_torrent_seeding").await;
+        {
+            let mut reg = self.registry.lock().await;
+            let torrent = reg
+                .get_mut(hash)
+                .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+            torrent.seeding = seeding;
+        }
+        self.summary(hash)
+            .await
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))
     }
     async fn list_files(&self, hash: &InfoHash) -> Option<Vec<TorrentFile>> {
         self.registry
@@ -355,9 +427,11 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         Ok(())
     }
     async fn get_config(&self) -> Config {
+        self.record_call("get_config").await;
         self.config.lock().await.clone()
     }
     async fn update_settings(&self, patch: swarmotter_api::state::SettingsPatch) -> Result<()> {
+        self.record_call("update_settings").await;
         let mut cfg = self.config.lock().await;
         if let Some(b) = patch.bandwidth {
             cfg.bandwidth = b;
@@ -374,6 +448,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         Ok(())
     }
     async fn replace_config(&self, config: Config) -> Result<ConfigUpdateResult> {
+        self.record_call("replace_config").await;
         config.validate()?;
         *self.config.lock().await = config.clone();
         let mut redacted = config;
@@ -652,15 +727,23 @@ pub fn fake_state() -> swarmotter_api::state::SharedState {
 }
 
 pub fn fake_state_with_config(config: Config) -> swarmotter_api::state::SharedState {
+    fake_state_with_config_and_daemon(config).0
+}
+
+pub fn fake_state_with_config_and_daemon(
+    config: Config,
+) -> (swarmotter_api::state::SharedState, Arc<FakeDaemon>) {
     use swarmotter_api::state::{AppState, BuildInfo};
-    Arc::new(AppState {
-        daemon: Arc::new(FakeDaemon::with_config(config.clone())),
+    let daemon = Arc::new(FakeDaemon::with_config(config.clone()));
+    let state = Arc::new(AppState {
+        daemon: daemon.clone(),
         config: Arc::new(Mutex::new(config)),
         build: BuildInfo::default(),
         broker: swarmotter_api::handlers::events::EventBroker::default(),
         transmission: swarmotter_api::state::TransmissionCompatState::default(),
         qbittorrent: swarmotter_api::state::QbittorrentCompatState::default(),
-    })
+    });
+    (state, daemon)
 }
 
 // Suppress unused import warnings for models referenced only in trait impls.

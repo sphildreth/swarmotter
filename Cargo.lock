@@ -558,6 +558,7 @@ dependencies = [
  "pin-project-lite",
  "smallvec",
  "tokio",
+ "want",
 ]
 
 [[package]]
@@ -976,15 +977,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-pemfile"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1197,15 +1189,22 @@ dependencies = [
  "async-trait",
  "bytes",
  "hex",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "sha1",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "toml",
  "tracing",
  "url",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -1231,9 +1230,7 @@ dependencies = [
  "hyper",
  "libc",
  "once_cell",
- "rcgen",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "socket2",
@@ -1241,13 +1238,11 @@ dependencies = [
  "swarmotter-core",
  "swarmotter-web",
  "tokio",
- "tokio-rustls",
  "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",
  "url",
- "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -1581,6 +1576,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "try-lock"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
 name = "tungstenite"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1663,6 +1664,15 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "want"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bfa7760aed19e106de2c7c0b581b509f2f25d3dacaf737cb82ac61bc6d760b0e"
+dependencies = [
+ "try-lock",
+]
 
 [[package]]
 name = "wasi"

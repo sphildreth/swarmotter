@@ -77,6 +77,18 @@ pub struct SchedulerDiagnostics {
     pub effective_peer_worker_limit: usize,
     pub peer_worker_budget: usize,
     pub active_peer_workers: usize,
+    /// Exact process-wide peer-session budget. Zero means unlimited.
+    #[serde(default)]
+    pub peer_limit: usize,
+    /// Live inbound plus outbound peer sessions holding a global RAII guard.
+    #[serde(default)]
+    pub peer_permits_in_use: usize,
+    /// Remaining bounded permits, or null when the global budget is unlimited.
+    #[serde(default)]
+    pub peer_permits_available: Option<usize>,
+    /// Inbound sockets rejected before session start by either applicable cap.
+    #[serde(default)]
+    pub peer_sessions_denied: u64,
     pub download_slots_saturated: bool,
     pub metadata_fetch_slots_saturated: bool,
     pub peer_worker_budget_saturated: bool,

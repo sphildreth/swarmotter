@@ -113,6 +113,15 @@ The daemon **fails closed** and never silently falls back to the default route
 if the configured path is unavailable. The Web UI/API control plane is separate
 from the torrent data plane.
 
+Containment is strict by default. Omitting `[network]` leaves strict mode
+without an enforceable path and fails configuration validation; disabled mode
+must be selected explicitly and is limited to development or a separately
+enforced boundary such as the supplied Gluetun shared namespace. Live path loss
+blocks one process-wide gate before socket-owning tasks are aborted. Concrete
+socket bind failures block immediately and remain latched until an explicit,
+fully validated configuration replacement proves both UDP and peer-listener
+binds succeed; a healthy interface probe alone never reopens traffic.
+
 See [`docs/network-containment.md`](docs/network-containment.md).
 
 ## Lawful Use

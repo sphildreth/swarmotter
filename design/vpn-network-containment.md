@@ -58,12 +58,32 @@ unavailable, torrent networking must stop. Fail-closed conditions include:
 
 When a fail-closed condition occurs:
 
+- The process-wide containment gate must block before teardown begins.
 - Existing torrent network sockets must be closed.
 - New torrent network connections must be blocked.
 - Torrents enter a clear network-blocked state.
 - The API must report the network containment failure.
 - The Web UI must show the network containment failure.
 - Logs must clearly identify the failed requirement.
+
+Each top-level data-plane task captures the gate generation and races normal
+work against cancellation. Every block advances that generation, including a
+more-specific report while already blocked. Waiter registration is
+wakeup-safe, and a block followed immediately by recovery still cancels tasks
+created under the old generation; no connected stream may survive a blocked
+interval.
+
+The daemon persists recovery intent only for work that was demonstrably live at
+the containment edge. Recovery consumes that durable intent once. Paused,
+queued, ratio/idle-stopped, completed-without-a-live-seeder, and stale
+`network_blocked` records do not start merely because the path becomes healthy.
+
+Socket/source/listener bind errors block the gate synchronously before their
+health report is processed. `socket_bind_failed` and generic
+`blocked_fail_closed` reports are latched: a later healthy interface probe is
+insufficient to reopen traffic. Only an explicit full configuration replacement
+that validates an ephemeral contained UDP bind and peer-listener bind may clear
+the latch. Failed validation preserves the old configuration and blocked state.
 
 ## Network health states
 
@@ -78,6 +98,10 @@ Required states include `healthy`, `disabled`, `interface_missing`,
   the required interface, source address, or network namespace is unavailable.
 - The daemon blocks torrent traffic when the configured VPN/NIC path disappears
   while running.
+- During a generated tracker/peer transfer, deleting the required veth produces
+  `interface_missing`, leaves partial verified progress stable, moves the
+  torrent to `network_blocked`, empties data-plane scheduler diagnostics, and
+  leaves `/health` reachable.
 - Peer, tracker, DHT, and webseed traffic cannot fall back to the default
   route.
 - Hostname resolution for tracker, UDP tracker, DHT, and other torrent
@@ -118,6 +142,15 @@ TCP listeners to the configured interface/source path. A `LoopbackBinder`
 (test feature) lets integration tests exercise the full engine over loopback
 without the default route, and a `BlockedBinder` proves fail-closed behavior
 for TCP, UDP, uTP, and the listener. See ADR-0012, ADR-0022, and ADR-0023.
+
+The CI acceptance harness
+`scripts/test-network-containment-transition.sh` creates PID-qualified daemon
+and peer namespaces joined only by a veth pair, gives neither namespace a
+default route, generates a lawful payload/torrent, and runs a local compact
+HTTP tracker plus throttled TCP BitTorrent seed. Cargo, the fixture, API clients,
+and daemon all run with the normal CI identity. Only `sudo ip` performs
+namespace/link operations, and the daemon receives only `CAP_NET_RAW` for
+`SO_BINDTODEVICE`; the tracker and seed receive no capabilities.
 
 ## Maintenance
 

@@ -3,10 +3,14 @@
 //! Torrent management handlers.
 
 use axum::{
-    extract::{Path, Query, State},
-    response::Response,
+    body::Body,
+    extract::rejection::JsonRejection,
+    extract::{Extension, Path, Query, Request, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
+use futures_util::StreamExt;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,11 +18,12 @@ use serde::{Deserialize, Serialize};
 use swarmotter_core::config::StartBehavior;
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
+use swarmotter_core::meta::MAX_TORRENT_METADATA_BYTES;
 use swarmotter_core::models::torrent::{HealthLabel, TorrentState, TorrentSummary};
 
-use crate::encoding::decode_base64;
+use crate::encoding::{decode_base64_bounded, BoundedBase64DecodeError};
 use crate::error::{err_response, into_response, ok_empty_response};
-use crate::routes::{parse_hash, DeleteQuery};
+use crate::routes::{parse_hash, ConfiguredRequestBodyLimit, DeleteQuery};
 use crate::state::{AddTorrentOptions, SharedState};
 
 const DEFAULT_TORRENT_LIST_PAGE_SIZE: usize = 200;
@@ -563,14 +568,22 @@ fn display_group_label(key: &str) -> String {
 pub async fn add_torrent_file_or_magnet(
     State(state): State<SharedState>,
     Query(query): Query<AddTorrentQuery>,
-    headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    Extension(ConfiguredRequestBodyLimit(configured_limit)): Extension<ConfiguredRequestBodyLimit>,
+    request: Request,
 ) -> Response {
-    let ct = headers
+    let is_json = request
+        .headers()
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if ct.contains("application/json") {
+        .is_some_and(|content_type| content_type.contains("application/json"));
+    if is_json {
+        let body = match read_body_bounded(request.into_body(), configured_limit).await {
+            Ok(body) => body,
+            Err(BoundedBodyReadError::LimitExceeded { observed }) => {
+                return payload_too_large_response(configured_limit, observed);
+            }
+            Err(error) => return bounded_body_failure_response(error),
+        };
         match serde_json::from_slice::<AddMagnetBody>(&body) {
             Ok(b) => {
                 let options = match add_options(
@@ -598,10 +611,14 @@ pub async fn add_torrent_file_or_magnet(
         Ok(options) => options,
         Err(e) => return err_response(e),
     };
+    let body = match read_torrent_metadata_body(request.into_body(), configured_limit).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     into_response(
         state
             .daemon
-            .add_torrent_file(body.to_vec(), options)
+            .add_torrent_file(body, options)
             .await
             .map(|h| h.to_hex()),
     )
@@ -633,16 +650,21 @@ pub async fn add_magnet(
 pub async fn add_torrent_file(
     State(state): State<SharedState>,
     Query(query): Query<AddTorrentQuery>,
-    body: axum::body::Bytes,
+    Extension(ConfiguredRequestBodyLimit(configured_limit)): Extension<ConfiguredRequestBodyLimit>,
+    request: Request,
 ) -> Response {
     let options = match add_options(None, None, None, Some(&query)) {
         Ok(options) => options,
         Err(e) => return err_response(e),
     };
+    let body = match read_torrent_metadata_body(request.into_body(), configured_limit).await {
+        Ok(body) => body,
+        Err(response) => return response,
+    };
     into_response(
         state
             .daemon
-            .add_torrent_file(body.to_vec(), options)
+            .add_torrent_file(body, options)
             .await
             .map(|h| h.to_hex()),
     )
@@ -681,14 +703,17 @@ pub async fn add_torrents(
         }
     }
     for (index, file) in body.torrent_files.into_iter().enumerate() {
-        let Some(bytes) = decode_base64(&file.metainfo) else {
-            failed.push(add_failure(
-                "torrent_file",
-                index,
-                CoreError::InvalidArgument("metainfo must be valid base64".into()),
-            ));
-            continue;
+        let bytes = match decode_torrent_metainfo_base64(&file.metainfo) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                failed.push(add_failure("torrent_file", index, error));
+                continue;
+            }
         };
+        if let Err(error) = validate_torrent_metadata_size(bytes.len()) {
+            failed.push(add_failure("torrent_file", index, error));
+            continue;
+        }
         match state.daemon.add_torrent_file(bytes, options.clone()).await {
             Ok(hash) => added.push(AddTorrentItemResult {
                 kind: "torrent_file",
@@ -708,6 +733,111 @@ fn add_failure(kind: &'static str, index: usize, error: CoreError) -> AddTorrent
         index,
         code: error.code().as_str().to_string(),
         message: error.to_string(),
+    }
+}
+
+pub(super) fn validate_torrent_metadata_size(len: usize) -> Result<()> {
+    if len > MAX_TORRENT_METADATA_BYTES {
+        return Err(CoreError::MalformedTorrent(format!(
+            "torrent metadata size {len} exceeds maximum {MAX_TORRENT_METADATA_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn decode_torrent_metainfo_base64(input: &str) -> Result<Vec<u8>> {
+    match decode_base64_bounded(input, MAX_TORRENT_METADATA_BYTES) {
+        Ok(bytes) => Ok(bytes),
+        Err(BoundedBase64DecodeError::InvalidEncoding) => Err(CoreError::InvalidArgument(
+            "metainfo must be valid base64".into(),
+        )),
+        Err(BoundedBase64DecodeError::LimitExceeded) => Err(CoreError::MalformedTorrent(format!(
+            "decoded torrent metadata exceeds maximum {MAX_TORRENT_METADATA_BYTES}"
+        ))),
+        Err(BoundedBase64DecodeError::AllocationFailed) => Err(CoreError::Internal(
+            "unable to allocate bounded torrent metadata output".into(),
+        )),
+    }
+}
+
+#[derive(Debug)]
+enum BoundedBodyReadError {
+    LimitExceeded { observed: usize },
+    Read(String),
+    AllocationFailed,
+}
+
+async fn read_body_bounded(
+    body: Body,
+    limit: usize,
+) -> std::result::Result<Vec<u8>, BoundedBodyReadError> {
+    let mut stream = body.into_data_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| BoundedBodyReadError::Read(error.to_string()))?;
+        let next_len =
+            bytes
+                .len()
+                .checked_add(chunk.len())
+                .ok_or(BoundedBodyReadError::LimitExceeded {
+                    observed: usize::MAX,
+                })?;
+        if next_len > limit {
+            return Err(BoundedBodyReadError::LimitExceeded { observed: next_len });
+        }
+        bytes
+            .try_reserve_exact(chunk.len())
+            .map_err(|_| BoundedBodyReadError::AllocationFailed)?;
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn read_torrent_metadata_body(
+    body: Body,
+    configured_limit: usize,
+) -> std::result::Result<Vec<u8>, Response> {
+    let effective_limit = configured_limit.min(MAX_TORRENT_METADATA_BYTES);
+    match read_body_bounded(body, effective_limit).await {
+        Ok(bytes) => Ok(bytes),
+        Err(BoundedBodyReadError::LimitExceeded { observed })
+            if configured_limit < MAX_TORRENT_METADATA_BYTES =>
+        {
+            Err(payload_too_large_response(configured_limit, observed))
+        }
+        Err(BoundedBodyReadError::LimitExceeded { observed }) => {
+            Err(err_response(CoreError::MalformedTorrent(format!(
+                "torrent metadata size {observed} exceeds maximum {MAX_TORRENT_METADATA_BYTES}"
+            ))))
+        }
+        Err(error) => Err(bounded_body_failure_response(error)),
+    }
+}
+
+fn payload_too_large_response(limit: usize, observed: usize) -> Response {
+    let body = crate::envelope::error_to_json(
+        "payload_too_large",
+        &format!("request body size {observed} exceeds configured maximum {limit}"),
+    );
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        [(header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
+}
+
+fn bounded_body_failure_response(error: BoundedBodyReadError) -> Response {
+    match error {
+        BoundedBodyReadError::Read(message) => err_response(CoreError::InvalidArgument(format!(
+            "request body read failed: {message}"
+        ))),
+        BoundedBodyReadError::AllocationFailed => err_response(CoreError::Internal(
+            "unable to allocate bounded request body".into(),
+        )),
+        BoundedBodyReadError::LimitExceeded { observed } => err_response(
+            CoreError::InvalidArgument(format!("request body exceeds bounded size at {observed}")),
+        ),
     }
 }
 
@@ -905,6 +1035,76 @@ pub async fn set_limits(
     }
 }
 
+pub async fn set_seeding(
+    State(state): State<SharedState>,
+    Path(hash): Path<String>,
+    body: std::result::Result<Json<serde_json::Value>, JsonRejection>,
+) -> Response {
+    let Json(value) = match body {
+        Ok(body) => body,
+        Err(error) => {
+            return err_response(CoreError::InvalidArgument(format!(
+                "invalid seeding policy: {}",
+                error.body_text()
+            )))
+        }
+    };
+    let Some(body) = value.as_object() else {
+        return err_response(CoreError::InvalidArgument(
+            "seeding policy must be a JSON object".into(),
+        ));
+    };
+    let required = ["ratio_limit", "idle_limit", "seed_forever"];
+    if body.len() != required.len() || required.iter().any(|key| !body.contains_key(*key)) {
+        return err_response(CoreError::InvalidArgument(
+            "seeding policy PUT requires exactly ratio_limit, idle_limit, and seed_forever".into(),
+        ));
+    }
+    let ratio_limit = match &body["ratio_limit"] {
+        serde_json::Value::Null => None,
+        serde_json::Value::Number(number) => number.as_f64(),
+        _ => None,
+    };
+    if !body["ratio_limit"].is_null() && ratio_limit.is_none()
+        || ratio_limit.is_some_and(|value| !value.is_finite() || value < 0.0)
+    {
+        return err_response(CoreError::InvalidArgument(
+            "ratio_limit must be a finite non-negative number or null".into(),
+        ));
+    }
+    let idle_limit = match &body["idle_limit"] {
+        serde_json::Value::Null => None,
+        serde_json::Value::Number(number) => number.as_u64(),
+        _ => None,
+    };
+    if !body["idle_limit"].is_null() && idle_limit.is_none() {
+        return err_response(CoreError::InvalidArgument(
+            "idle_limit must be a non-negative integer number of seconds or null".into(),
+        ));
+    }
+    let Some(seed_forever) = body["seed_forever"].as_bool() else {
+        return err_response(CoreError::InvalidArgument(
+            "seed_forever must be a boolean".into(),
+        ));
+    };
+    match require_hash(&hash).await {
+        Ok(hash) => into_response(
+            state
+                .daemon
+                .set_torrent_seeding(
+                    &hash,
+                    swarmotter_core::ratio::TorrentSeeding {
+                        ratio_limit,
+                        idle_limit,
+                        seed_forever,
+                    },
+                )
+                .await,
+        ),
+        Err(error) => err_response(error),
+    }
+}
+
 // Suppress unused warnings for helper used across handlers.
 #[allow(unused_imports)]
 use Serialize as _;
@@ -948,6 +1148,10 @@ mod tests {
             bytes_completed: 500,
             uploaded: 0,
             downloaded: 0,
+            seeding: swarmotter_core::ratio::TorrentSeeding::default(),
+            seeding_status: swarmotter_core::models::torrent::SeedingStatus::NotEligible,
+            effective_ratio_limit: None,
+            effective_idle_limit: None,
             piece_count: 1,
             pieces_have: 1,
             piece_length: 1000,

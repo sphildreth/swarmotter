@@ -30,16 +30,41 @@ use swarmotter_core::net::NetworkBinder;
 use swarmotter_core::peer::{self, Handshake, Message, PeerAddr};
 use swarmotter_core::utp::{self, PeerDuplex, PeerTransport};
 
+use crate::peer_permits::PeerSessionBudget;
+
 const METADATA_CANDIDATE_CONCURRENCY: usize = 32;
 
 #[derive(Clone)]
-struct MetadataFetchContext {
+pub(crate) struct MetadataFetchContext {
+    peer_session_budget: PeerSessionBudget,
     binder: Arc<dyn NetworkBinder>,
     info_hash: InfoHash,
     peer_id: [u8; 20],
     utp_enabled: bool,
     utp_prefer_tcp: bool,
     encryption_mode: PeerEncryptionMode,
+}
+
+impl MetadataFetchContext {
+    pub(crate) fn new(
+        peer_session_budget: PeerSessionBudget,
+        binder: Arc<dyn NetworkBinder>,
+        info_hash: InfoHash,
+        peer_id: [u8; 20],
+        utp_enabled: bool,
+        utp_prefer_tcp: bool,
+        encryption_mode: PeerEncryptionMode,
+    ) -> Self {
+        Self {
+            peer_session_budget,
+            binder,
+            info_hash,
+            peer_id,
+            utp_enabled,
+            utp_prefer_tcp,
+            encryption_mode,
+        }
+    }
 }
 
 /// Fetch the torrent metadata (`info` dict) from a peer via `ut_metadata`.
@@ -49,31 +74,31 @@ struct MetadataFetchContext {
 /// tracker, PEX, or DHT). The connection goes through the binder. On success
 /// the raw `info` bytes can be turned into a `TorrentMeta` via
 /// [`build_meta_from_info`].
-pub async fn fetch_metadata_with_transport(
-    binder: Arc<dyn NetworkBinder>,
-    info_hash: InfoHash,
-    peer_id: [u8; 20],
+pub(crate) async fn fetch_metadata_with_transport(
+    context: &MetadataFetchContext,
     peer: PeerAddr,
-    utp_enabled: bool,
-    utp_prefer_tcp: bool,
-    encryption_mode: PeerEncryptionMode,
 ) -> Result<Vec<u8>> {
-    if !binder.traffic_allowed() {
+    if !context.binder.traffic_allowed() {
         return Err(CoreError::NetworkBlocked(
             "torrent data plane blocked; cannot fetch metadata".into(),
         ));
     }
-    let transports = peer_transport_order(utp_enabled, utp_prefer_tcp, encryption_mode);
+    let _peer_permit = context.peer_session_budget.acquire_outbound().await?;
+    let transports = peer_transport_order(
+        context.utp_enabled,
+        context.utp_prefer_tcp,
+        context.encryption_mode,
+    );
 
     let mut last_error = None;
     for transport in transports {
         match fetch_metadata_via_transport(
-            binder.clone(),
+            context.binder.clone(),
             transport,
-            info_hash,
-            peer_id,
+            context.info_hash,
+            context.peer_id,
             peer,
-            encryption_mode,
+            context.encryption_mode,
         )
         .await
         {
@@ -234,13 +259,18 @@ async fn fetch_metadata_over_stream(
     }
     let remote_id = remote_metadata_id
         .ok_or_else(|| CoreError::Internal("metadata peer does not support ut_metadata".into()))?;
-    let total_u64 = metadata_size
-        .ok_or_else(|| CoreError::Internal("metadata peer did not report metadata_size".into()))?;
-    let total = usize::try_from(total_u64).map_err(|_| {
-        CoreError::Internal("metadata peer reported size too large for this platform".into())
+    let total_u64 = metadata_size.ok_or_else(|| {
+        CoreError::MalformedTorrent("metadata peer did not report metadata_size".into())
     })?;
-    if total == 0 || total > MAX_TORRENT_METADATA_BYTES {
-        return Err(CoreError::Internal(format!(
+    let total = usize::try_from(total_u64)
+        .map_err(|_| CoreError::MalformedTorrent("metadata size exceeds platform limit".into()))?;
+    if total == 0 {
+        return Err(CoreError::MalformedTorrent(
+            "metadata size must be greater than zero".into(),
+        ));
+    }
+    if total > MAX_TORRENT_METADATA_BYTES {
+        return Err(CoreError::MalformedTorrent(format!(
             "metadata size {total} exceeds maximum {MAX_TORRENT_METADATA_BYTES}"
         )));
     }
@@ -249,7 +279,10 @@ async fn fetch_metadata_over_stream(
     let pieces = extensions::metadata_pieces(total).max(1);
     let mut assembled: Vec<u8> = Vec::with_capacity(total);
     for piece in 0..pieces {
-        let req = extensions::encode_metadata_request(piece as u32);
+        let piece_index = u32::try_from(piece).map_err(|_| {
+            CoreError::MalformedTorrent("metadata piece index exceeds u32 range".into())
+        })?;
+        let req = extensions::encode_metadata_request(piece_index);
         peer::write_message(
             &mut write_half,
             &Message::Extended {
@@ -273,19 +306,26 @@ async fn fetch_metadata_over_stream(
                     continue;
                 }
                 match extensions::parse_metadata_message(&payload) {
-                    Ok(m) if m.msg_type == MetadataMsgType::Data && m.piece as usize == piece => {
-                        let room = total - assembled.len();
+                    Ok(m)
+                        if m.msg_type == MetadataMsgType::Data
+                            && usize::try_from(m.piece).ok() == Some(piece) =>
+                    {
+                        let room = total.checked_sub(assembled.len()).ok_or_else(|| {
+                            CoreError::MalformedTorrent(
+                                "assembled metadata exceeds advertised size".into(),
+                            )
+                        })?;
                         if m.data.len() > room {
-                            return Err(CoreError::Internal(
-                                "metadata piece data exceeds announced total size".into(),
-                            ));
+                            return Err(CoreError::MalformedTorrent(format!(
+                                "metadata piece {piece} data exceeds advertised size {total}"
+                            )));
                         }
                         assembled.extend_from_slice(&m.data);
                         if let Some(peer_total) = m.total_size {
                             if peer_total != total_u64 {
-                                return Err(CoreError::Internal(
-                                    "metadata total_size mismatch".into(),
-                                ));
+                                return Err(CoreError::MalformedTorrent(format!(
+                                    "metadata total_size {peer_total} does not match advertised {total_u64}"
+                                )));
                             }
                         }
                         got_piece = true;
@@ -307,13 +347,17 @@ async fn fetch_metadata_over_stream(
         }
     }
 
-    // Truncate to the reported total size (the last piece may be padded).
-    assembled.truncate(total);
+    if assembled.len() != total {
+        return Err(CoreError::MalformedTorrent(format!(
+            "assembled metadata length {} does not match advertised {total}",
+            assembled.len()
+        )));
+    }
 
     // Verify the assembled info dict hashes to the info hash.
     let computed = swarmotter_core::hash::InfoHash::from_info_bencoded(&assembled);
     if computed != info_hash {
-        return Err(CoreError::Internal(
+        return Err(CoreError::MalformedTorrent(
             "fetched metadata info hash mismatch; rejecting".into(),
         ));
     }
@@ -321,41 +365,16 @@ async fn fetch_metadata_over_stream(
 }
 
 /// Build a `TorrentMeta` from raw `info` dict bytes plus the magnet's name and
-/// trackers. Constructs a full `.torrent`-style bencoded document (announce +
-/// info) and parses it, so all the normal metadata validation applies.
+/// trackers. The raw BEP 9 dictionary is parsed directly so an exact-limit
+/// payload is not rejected because of internally generated wrapper bytes.
 pub fn build_meta_from_info(
     info_bytes: &[u8],
     name: &str,
     trackers: &[String],
 ) -> Result<TorrentMeta> {
-    let mut doc = Vec::new();
-    doc.push(b'd');
-    if let Some(primary) = trackers.first() {
-        write_str(&mut doc, b"announce");
-        write_str(&mut doc, primary.as_bytes());
-    }
-    if trackers.len() > 1 {
-        write_str(&mut doc, b"announce-list");
-        doc.push(b'l');
-        // Group trackers into a single tier.
-        doc.push(b'l');
-        for t in &trackers[1..] {
-            write_str(&mut doc, t.as_bytes());
-        }
-        doc.push(b'e');
-        doc.push(b'e');
-    }
-    write_str(&mut doc, b"info");
-    doc.extend_from_slice(info_bytes);
-    doc.push(b'e');
-    let meta = swarmotter_core::meta::parse_torrent(&doc)?;
+    let meta = swarmotter_core::meta::parse_info_dict(info_bytes, trackers)?;
     let _ = name; // name is derived from the info dict
     Ok(meta)
-}
-
-fn write_str(out: &mut Vec<u8>, s: &[u8]) {
-    out.extend_from_slice(format!("{}:", s.len()).as_bytes());
-    out.extend_from_slice(s);
 }
 
 // Re-export Instant for module-local use without an extra import line at top.
@@ -364,14 +383,9 @@ use std::time::Instant;
 /// Convenience: fetch metadata from the first peer that succeeds, racing a
 /// bounded set of candidates so one slow peer cannot block metadata discovery
 /// for an entire public swarm.
-pub async fn fetch_metadata_from_candidates_with_transport(
-    binder: Arc<dyn NetworkBinder>,
-    info_hash: InfoHash,
-    peer_id: [u8; 20],
+pub(crate) async fn fetch_metadata_from_candidates_with_budget(
+    fetch_context: MetadataFetchContext,
     candidates: &[PeerAddr],
-    utp_enabled: bool,
-    utp_prefer_tcp: bool,
-    encryption_mode: PeerEncryptionMode,
 ) -> Result<Vec<u8>> {
     let mut seen = HashSet::new();
     let candidates: Vec<PeerAddr> = candidates
@@ -388,15 +402,6 @@ pub async fn fetch_metadata_from_candidates_with_transport(
     let mut tasks = tokio::task::JoinSet::new();
     let mut last_err: Option<String> = None;
     let mut next = 0usize;
-    let fetch_context = MetadataFetchContext {
-        binder,
-        info_hash,
-        peer_id,
-        utp_enabled,
-        utp_prefer_tcp,
-        encryption_mode,
-    };
-
     while next < candidates.len() && tasks.len() < METADATA_CANDIDATE_CONCURRENCY {
         spawn_metadata_fetch(&mut tasks, fetch_context.clone(), candidates[next]);
         next += 1;
@@ -429,16 +434,7 @@ fn spawn_metadata_fetch(
     peer: PeerAddr,
 ) {
     tasks.spawn(async move {
-        let result = fetch_metadata_with_transport(
-            context.binder,
-            context.info_hash,
-            context.peer_id,
-            peer,
-            context.utp_enabled,
-            context.utp_prefer_tcp,
-            context.encryption_mode,
-        )
-        .await;
+        let result = fetch_metadata_with_transport(&context, peer).await;
         (peer, result)
     });
 }
@@ -446,6 +442,8 @@ fn spawn_metadata_fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::peer_permits::PeerPermitPool;
+    use std::sync::atomic::AtomicU64;
     use swarmotter_core::meta::{build_single_file_torrent, parse_torrent};
     use swarmotter_core::net::binder::LoopbackBinder;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -470,6 +468,33 @@ mod tests {
         id
     }
 
+    fn info_dict_padded_to_size(target: usize) -> Vec<u8> {
+        let torrent =
+            build_single_file_torrent("bep9-limit.bin", b"bounded BEP 9 payload", 8, None, false);
+        let mut info = swarmotter_core::bencode::extract_value_bytes(&torrent, b"info")
+            .expect("generated torrent contains info")
+            .to_vec();
+        assert_eq!(info.pop(), Some(b'e'));
+        info.extend_from_slice(b"7:padding");
+
+        let mut padding_len = target.saturating_sub(info.len() + 2);
+        for _ in 0..32 {
+            let encoded_len = info.len() + padding_len.to_string().len() + 1 + padding_len + 1;
+            if encoded_len == target {
+                info.extend_from_slice(padding_len.to_string().as_bytes());
+                info.push(b':');
+                info.extend(std::iter::repeat_n(b'x', padding_len));
+                info.push(b'e');
+                assert_eq!(info.len(), target);
+                return info;
+            }
+            padding_len = target
+                .checked_sub(info.len() + padding_len.to_string().len() + 2)
+                .expect("target must accommodate the generated info dictionary");
+        }
+        panic!("could not solve bencode padding for target size {target}");
+    }
+
     #[test]
     fn preferred_encryption_preserves_metadata_transport_preference() {
         assert_eq!(
@@ -489,11 +514,14 @@ mod tests {
     /// A peer that serves the `info` dict over ut_metadata. It speaks the
     /// extension protocol and replies to metadata requests with the raw info
     /// bytes split into pieces.
-    async fn serve_metadata_peer(
-        stream: tokio::net::TcpStream,
+    async fn serve_metadata_peer<S>(
+        stream: S,
         info_hash: InfoHash,
         info_bytes: Vec<u8>,
-    ) -> swarmotter_core::Result<()> {
+    ) -> swarmotter_core::Result<()>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let (mut rd, mut wr) = tokio::io::split(stream);
         let mut hs = [0u8; 68];
         rd.read_exact(&mut hs).await?;
@@ -608,10 +636,11 @@ mod tests {
         Ok(())
     }
 
-    async fn serve_metadata_peer_with_oversize_piece(
+    async fn serve_metadata_peer_with_piece_response(
         stream: tokio::net::TcpStream,
         info_hash: InfoHash,
-        total: usize,
+        advertised_total: usize,
+        response_total: u64,
         piece_payload: usize,
     ) -> swarmotter_core::Result<()> {
         let (mut rd, mut wr) = tokio::io::split(stream);
@@ -634,7 +663,7 @@ mod tests {
         let ext_hs = extensions::encode_extension_handshake(
             &[(extensions::UT_METADATA_NAME, local_metadata_id)],
             "MetaSeed/0.1",
-            Some(total as u64),
+            Some(advertised_total as u64),
         );
         peer::write_message(
             &mut wr,
@@ -668,7 +697,8 @@ mod tests {
                 if let Ok(m) = extensions::parse_metadata_message(&payload) {
                     if m.msg_type == MetadataMsgType::Request {
                         let data = vec![0xAA; piece_payload];
-                        let data_msg = extensions::encode_metadata_data(0, total as u64, &data);
+                        let data_msg =
+                            extensions::encode_metadata_data(m.piece, response_total, &data);
                         peer::write_message(
                             &mut wr,
                             &Message::Extended {
@@ -682,6 +712,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    async fn fetch_custom_piece_error(
+        advertised_total: usize,
+        response_total: u64,
+        piece_payload: usize,
+    ) -> CoreError {
+        let info_hash = InfoHash::from_bytes([0x5a; 20]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = serve_metadata_peer_with_piece_response(
+                    stream,
+                    info_hash,
+                    advertised_total,
+                    response_total,
+                    piece_payload,
+                )
+                .await;
+            }
+        });
+
+        fetch_metadata_with_transport(
+            &MetadataFetchContext::new(
+                PeerSessionBudget::unlimited(),
+                Arc::new(LoopbackBinder),
+                info_hash,
+                peer_id(b"-SW0093-"),
+                false,
+                true,
+                PeerEncryptionMode::Disabled,
+            ),
+            PeerAddr::from_socket_addr(addr),
+        )
+        .await
+        .unwrap_err()
     }
 
     async fn read_one_message<R: AsyncReadExt + Unpin>(
@@ -741,13 +808,16 @@ mod tests {
 
         let binder = Arc::new(LoopbackBinder);
         let fetched = fetch_metadata_with_transport(
-            binder,
-            info_hash,
-            peer_id(b"-SW0090-"),
+            &MetadataFetchContext::new(
+                PeerSessionBudget::unlimited(),
+                binder,
+                info_hash,
+                peer_id(b"-SW0090-"),
+                false,
+                true,
+                PeerEncryptionMode::Disabled,
+            ),
             PeerAddr::from_socket_addr(addr),
-            false,
-            true,
-            PeerEncryptionMode::Disabled,
         )
         .await
         .expect("metadata fetch should succeed");
@@ -768,79 +838,304 @@ mod tests {
     async fn fetch_metadata_blocked_by_fail_closed_binder() {
         let binder = Arc::new(swarmotter_core::net::binder::BlockedBinder);
         let err = fetch_metadata_with_transport(
-            binder,
-            InfoHash::from_bytes([0u8; 20]),
-            peer_id(b"-SW0091-"),
+            &MetadataFetchContext::new(
+                PeerSessionBudget::unlimited(),
+                binder,
+                InfoHash::from_bytes([0u8; 20]),
+                peer_id(b"-SW0091-"),
+                false,
+                true,
+                PeerEncryptionMode::Disabled,
+            ),
             PeerAddr::from_socket_addr("127.0.0.1:9".parse().unwrap()),
-            false,
-            true,
-            PeerEncryptionMode::Disabled,
         )
         .await
         .unwrap_err();
         assert!(err.is_network_blocked());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn fetch_metadata_accepts_exact_metadata_size_limit() {
+        let info_bytes = info_dict_padded_to_size(MAX_TORRENT_METADATA_BYTES);
+        let info_hash = InfoHash::from_info_bencoded(&info_bytes);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = info_bytes.clone();
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = serve_metadata_peer(stream, info_hash, served).await;
+            }
+        });
+
+        let fetched = fetch_metadata_with_transport(
+            &MetadataFetchContext::new(
+                PeerSessionBudget::unlimited(),
+                Arc::new(LoopbackBinder),
+                info_hash,
+                peer_id(b"-SW0094-"),
+                false,
+                true,
+                PeerEncryptionMode::Disabled,
+            ),
+            PeerAddr::from_socket_addr(addr),
+        )
+        .await
+        .expect("exact-limit BEP 9 metadata must assemble");
+
+        assert_eq!(fetched.len(), MAX_TORRENT_METADATA_BYTES);
+        assert_eq!(fetched, info_bytes);
+        let rebuilt = build_meta_from_info(&fetched, "bep9-limit.bin", &[])
+            .expect("exact-limit assembled info must parse without wrapper overhead");
+        assert_eq!(rebuilt.info_hash, info_hash);
+    }
+
     #[tokio::test]
-    async fn fetch_metadata_rejects_oversized_reported_size() {
+    async fn fetch_metadata_rejects_zero_and_oversized_reported_size_as_malformed() {
         let content = b"meta metadata size cap test";
         let bytes = build_single_file_torrent("meta.bin", content, 8, None, false);
         let meta = parse_torrent(&bytes).unwrap();
         let info_hash = meta.info_hash;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                let _ = serve_metadata_peer_with_reported_size(
-                    stream,
-                    info_hash,
-                    (MAX_TORRENT_METADATA_BYTES as u64) + 1,
-                )
-                .await;
-            }
-        });
+        for (reported_size, expected_context) in [
+            (0, "greater than zero"),
+            ((MAX_TORRENT_METADATA_BYTES as u64) + 1, "exceeds maximum"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let _ =
+                        serve_metadata_peer_with_reported_size(stream, info_hash, reported_size)
+                            .await;
+                }
+            });
 
-        let binder = Arc::new(LoopbackBinder);
-        let err = fetch_metadata_with_transport(
-            binder,
-            info_hash,
-            peer_id(b"-SW0092-"),
-            PeerAddr::from_socket_addr(addr),
-            false,
-            true,
-            PeerEncryptionMode::Disabled,
-        )
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("exceeds maximum"));
+            let err = fetch_metadata_with_transport(
+                &MetadataFetchContext::new(
+                    PeerSessionBudget::unlimited(),
+                    Arc::new(LoopbackBinder),
+                    info_hash,
+                    peer_id(b"-SW0092-"),
+                    false,
+                    true,
+                    PeerEncryptionMode::Disabled,
+                ),
+                PeerAddr::from_socket_addr(addr),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(&err, CoreError::MalformedTorrent(_)));
+            assert!(err.to_string().contains(expected_context), "error: {err}");
+        }
     }
 
     #[tokio::test]
     async fn fetch_metadata_rejects_piece_data_exceeding_announced_total() {
-        let content = b"metadata piece size cap test payload";
-        let bytes = build_single_file_torrent("meta.bin", content, 8, None, false);
-        let meta = parse_torrent(&bytes).unwrap();
-        let info_hash = meta.info_hash;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            if let Ok((stream, _)) = listener.accept().await {
-                let _ = serve_metadata_peer_with_oversize_piece(stream, info_hash, 8, 1024).await;
-            }
-        });
+        let err = fetch_custom_piece_error(8, 8, 9).await;
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
+        assert!(err.to_string().contains("exceeds advertised size"));
+    }
 
-        let binder = Arc::new(LoopbackBinder);
-        let err = fetch_metadata_with_transport(
-            binder,
-            info_hash,
-            peer_id(b"-SW0093-"),
-            PeerAddr::from_socket_addr(addr),
-            false,
-            true,
-            PeerEncryptionMode::Disabled,
+    #[tokio::test]
+    async fn fetch_metadata_rejects_piece_total_size_mismatch_as_malformed() {
+        let err = fetch_custom_piece_error(8, 9, 8).await;
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
+        assert!(err.to_string().contains("does not match advertised"));
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_rejects_incomplete_assembly_as_malformed() {
+        let err = fetch_custom_piece_error(8, 8, 7).await;
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
+        assert!(err.to_string().contains("assembled metadata length 7"));
+        assert!(err.to_string().contains("advertised 8"));
+    }
+
+    #[tokio::test]
+    async fn fetch_metadata_rejects_info_hash_mismatch_as_malformed() {
+        let err = fetch_custom_piece_error(8, 8, 8).await;
+        assert!(matches!(&err, CoreError::MalformedTorrent(_)));
+        assert!(err.to_string().contains("info hash mismatch"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn utp_metadata_path_holds_permit_for_transport_and_protocol_lifetime() {
+        let content = b"generated uTP metadata permit fixture";
+        let bytes = build_single_file_torrent("utp-meta.bin", content, 8, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let info_bytes = swarmotter_core::bencode::extract_value_bytes(&bytes, b"info")
+            .unwrap()
+            .to_vec();
+        let binder: Arc<dyn NetworkBinder> = Arc::new(LoopbackBinder);
+        let socket: Arc<dyn swarmotter_core::net::ContainedUdpSocket> =
+            binder.udp_socket().await.unwrap().into();
+        let address = socket.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        let server_info = info_bytes.clone();
+        let info_hash = meta.info_hash;
+        let server = tokio::spawn(async move {
+            let mut packet = vec![0u8; 2048];
+            let (peer, length) = socket.recv_from(&mut packet).await.unwrap();
+            let (syn, _) = swarmotter_core::utp::UtpHeader::decode(&packet[..length]).unwrap();
+            assert_eq!(syn.typ, swarmotter_core::utp::UtpType::Syn);
+            let connection =
+                swarmotter_core::utp::UtpConnection::accept_from_syn(socket, peer, &syn)
+                    .await
+                    .unwrap();
+            let stream = swarmotter_core::utp::UtpStream::spawn(connection);
+            let _ = accepted_tx.send(());
+            let _ = continue_rx.await;
+            serve_metadata_peer(stream, info_hash, server_info).await
+        });
+        let denied = Arc::new(AtomicU64::new(0));
+        let global = PeerPermitPool::new(1, denied.clone()).unwrap();
+        let torrent = PeerPermitPool::new(1, denied).unwrap();
+        let budget = PeerSessionBudget::new(global.clone(), torrent.clone());
+        let client_budget = budget.clone();
+        let client = tokio::spawn(async move {
+            let context = MetadataFetchContext::new(
+                client_budget,
+                Arc::new(LoopbackBinder),
+                info_hash,
+                peer_id(b"-UTPMETA"),
+                true,
+                false,
+                PeerEncryptionMode::Disabled,
+            );
+            fetch_metadata_with_transport(&context, PeerAddr::from_socket_addr(address)).await
+        });
+        accepted_rx.await.unwrap();
+        assert_eq!(global.snapshot().in_use, 1);
+        assert_eq!(torrent.snapshot().in_use, 1);
+        continue_tx.send(()).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), client)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            info_bytes
+        );
+        server.abort();
+        let _ = server.await;
+        assert_eq!(global.snapshot().in_use, 0);
+        assert_eq!(torrent.snapshot().in_use, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn metadata_session_raii_releases_on_connect_handshake_eof_and_cancellation() {
+        let denied = Arc::new(AtomicU64::new(0));
+        let global = PeerPermitPool::new(1, denied.clone()).unwrap();
+        let torrent = PeerPermitPool::new(1, denied).unwrap();
+        let budget = PeerSessionBudget::new(global.clone(), torrent.clone());
+        let info_hash = InfoHash::from_bytes([0x5a; 20]);
+
+        let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unused_addr = unused.local_addr().unwrap();
+        drop(unused);
+        assert!(fetch_metadata_with_transport(
+            &MetadataFetchContext::new(
+                budget.clone(),
+                Arc::new(LoopbackBinder),
+                info_hash,
+                peer_id(b"-RAIICN-"),
+                false,
+                true,
+                PeerEncryptionMode::Disabled,
+            ),
+            PeerAddr::from_socket_addr(unused_addr),
         )
         .await
-        .unwrap_err();
-        assert!(err.to_string().contains("exceeds announced total"));
+        .is_err());
+        assert_eq!(global.snapshot().in_use, 0);
+        assert_eq!(torrent.snapshot().in_use, 0);
+
+        let malformed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let malformed_addr = malformed.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = malformed.accept().await.unwrap();
+            let _ = stream.write_all(b"not-a-peer-handshake").await;
+        });
+        assert!(fetch_metadata_with_transport(
+            &MetadataFetchContext::new(
+                budget.clone(),
+                Arc::new(LoopbackBinder),
+                info_hash,
+                peer_id(b"-RAIIHS-"),
+                false,
+                true,
+                PeerEncryptionMode::Disabled,
+            ),
+            PeerAddr::from_socket_addr(malformed_addr),
+        )
+        .await
+        .is_err());
+        assert_eq!(global.snapshot().in_use, 0);
+        assert_eq!(torrent.snapshot().in_use, 0);
+
+        let eof_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let eof_addr = eof_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = eof_listener.accept().await.unwrap();
+            let mut request = [0u8; 68];
+            stream.read_exact(&mut request).await.unwrap();
+            peer::write_handshake(
+                &mut stream,
+                &Handshake {
+                    info_hash,
+                    peer_id: peer_id(b"-RAIIEOF"),
+                    reserved: extensions::EXTENSION_RESERVED,
+                },
+            )
+            .await
+            .unwrap();
+        });
+        assert!(fetch_metadata_with_transport(
+            &MetadataFetchContext::new(
+                budget.clone(),
+                Arc::new(LoopbackBinder),
+                info_hash,
+                peer_id(b"-RAIIOU-"),
+                false,
+                true,
+                PeerEncryptionMode::Disabled,
+            ),
+            PeerAddr::from_socket_addr(eof_addr),
+        )
+        .await
+        .is_err());
+        assert_eq!(global.snapshot().in_use, 0);
+        assert_eq!(torrent.snapshot().in_use, 0);
+
+        let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_addr = stalled.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let stalled_server = tokio::spawn(async move {
+            let (stream, _) = stalled.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            let _stream = stream;
+            std::future::pending::<()>().await;
+        });
+        let cancelled_budget = budget.clone();
+        let cancelled = tokio::spawn(async move {
+            let context = MetadataFetchContext::new(
+                cancelled_budget,
+                Arc::new(LoopbackBinder),
+                info_hash,
+                peer_id(b"-RAIICA-"),
+                false,
+                true,
+                PeerEncryptionMode::Disabled,
+            );
+            fetch_metadata_with_transport(&context, PeerAddr::from_socket_addr(stalled_addr)).await
+        });
+        accepted_rx.await.unwrap();
+        assert_eq!(global.snapshot().in_use, 1);
+        assert_eq!(torrent.snapshot().in_use, 1);
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        assert_eq!(global.snapshot().in_use, 0);
+        assert_eq!(torrent.snapshot().in_use, 0);
+        stalled_server.abort();
     }
 }

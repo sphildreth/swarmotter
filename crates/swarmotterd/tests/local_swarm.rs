@@ -821,7 +821,8 @@ async fn local_swarm_downloads_from_seed_via_udp_tracker() {
 /// contained network path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_swarm_seeds_completed_download_to_leecher() {
-    use swarmotterd::seeder::Seeder;
+    use swarmotterd::peer_permits::{PeerPermitPool, PeerSessionBudget};
+    use swarmotterd::seeder::{SeedRegistration, SeedRegistry, SeederHub};
 
     let mut content = Vec::with_capacity(32 * 1024 + 5);
     for i in 0..32 * 1024 + 5 {
@@ -865,15 +866,32 @@ async fn local_swarm_seeds_completed_download_to_leecher() {
     drop(probe);
 
     let binder = Arc::new(LoopbackBinder);
+    let global_peer_permits = PeerPermitPool::unlimited();
+    let peer_session_budget =
+        PeerSessionBudget::new(global_peer_permits.clone(), PeerPermitPool::unlimited());
+    let registry = SeedRegistry::default();
+    let (torrent_shutdown_tx, torrent_shutdown_rx) = tokio::sync::watch::channel(false);
+    registry
+        .register(SeedRegistration::new(
+            meta.clone(),
+            seed_storage.clone(),
+            None,
+            seed_state.clone(),
+            peer_id(b"-SD0010-"),
+            swarmotter_core::bandwidth::RateLimiter::unlimited(),
+            None,
+            peer_session_budget,
+            torrent_shutdown_rx,
+        ))
+        .await;
     let (seeder_shutdown_tx, seeder_shutdown_rx) = tokio::sync::watch::channel(false);
-    let seeder = Seeder::new(
-        meta.clone(),
-        seed_storage.clone(),
-        seed_state.clone(),
+    let seeder = SeederHub::new(
+        registry,
         binder.clone(),
         port,
-        peer_id(b"-SD0010-"),
+        swarmotter_core::config::PeerEncryptionMode::Preferred,
         seeder_shutdown_rx,
+        global_peer_permits,
     );
     let seeder_task = tokio::spawn(async move { seeder.run().await });
     let seed_peer_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -927,6 +945,7 @@ async fn local_swarm_seeds_completed_download_to_leecher() {
     assert_eq!(written, content, "leecher content mismatches seed content");
 
     // Shutdown the seeder.
+    let _ = torrent_shutdown_tx.send(true);
     let _ = seeder_shutdown_tx.send(true);
     let _ = seeder_task.await;
     std::fs::remove_dir_all(&seed_dir).ok();

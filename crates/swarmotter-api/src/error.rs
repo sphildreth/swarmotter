@@ -37,9 +37,11 @@ fn status_for(e: &CoreError) -> StatusCode {
         | CoreError::InvalidArgument(_)
         | CoreError::MalformedMagnet(_)
         | CoreError::MalformedTorrent(_)
-        | CoreError::InvalidInfoHash(_) => StatusCode::BAD_REQUEST,
+        | CoreError::InvalidInfoHash(_)
+        | CoreError::Bencode(_) => StatusCode::BAD_REQUEST,
         CoreError::DuplicateTorrent(_) => StatusCode::CONFLICT,
         CoreError::NetworkBlocked(_) => StatusCode::SERVICE_UNAVAILABLE,
+        CoreError::HttpProtocol(_) | CoreError::HttpStatus(_) => StatusCode::BAD_GATEWAY,
         CoreError::Storage(_) | CoreError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     }
@@ -79,4 +81,21 @@ pub fn ok_empty_response() -> Response {
         bytes,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_http_errors_map_to_bad_gateway() {
+        assert_eq!(
+            status_for(&CoreError::HttpProtocol("bad framing".into())),
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            status_for(&CoreError::HttpStatus("upstream 500".into())),
+            StatusCode::BAD_GATEWAY
+        );
+    }
 }

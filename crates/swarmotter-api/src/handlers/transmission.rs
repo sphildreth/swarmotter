@@ -497,8 +497,12 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
     let add_options = AddTorrentOptions::new(download_dir.clone(), paused);
 
     let add_result = if let Some(metainfo) = string_arg(&args, &["metainfo"]) {
-        let bytes = decode_base64(&metainfo)
-            .ok_or_else(|| RpcFailure::invalid("metainfo must be valid base64"))?;
+        let bytes = super::torrents::decode_torrent_metainfo_base64(&metainfo).map_err(
+            |error| match error {
+                CoreError::InvalidArgument(message) => RpcFailure::invalid(message),
+                error => RpcFailure::from_core(error),
+            },
+        )?;
         state
             .daemon
             .add_torrent_file(bytes, add_options.clone())

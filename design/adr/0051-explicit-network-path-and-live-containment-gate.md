@@ -52,15 +52,20 @@ and metadata task. It uses atomics plus `tokio::sync::Notify`, not a new
 dependency. It provides:
 
 - `allow()`: permit traffic and advance generation only on blocked-to-allowed.
-- `block(status, detail)`: deny operations, store status/detail, advance the
-  generation, and notify waiters.
+- `block(status, detail)`: deny operations, store status/detail, always advance
+  the generation (including when already blocked), and notify waiters.
 - `enforce()`: return `CoreError::NetworkBlocked` when denied.
-- `cancelled_since(generation)`: complete when generation changes to blocked.
+- `cancelled_since(generation)`: register a wakeup-safe waiter and complete when
+  the generation differs, regardless of the gate's state at observation time.
 
 Every bind, connect, resolve, accept-loop iteration, UDP send, tracker request,
 webseed request, and DHT send calls `enforce()`. Each top-level data-plane task
 selects normal work against `cancelled_since(start_generation)` so connected
-TCP/TLS streams drop on block. The control listener never uses this gate.
+TCP/TLS streams drop on block. Registering the notification before checking the
+generation closes the lost-wakeup window. A block followed by allow before an
+old task polls still changes generation and cancels that task; no stream from an
+old generation may bridge a blocked interval. The control listener never uses
+this gate.
 
 ### Injected interface probe
 
@@ -79,20 +84,50 @@ lock, perform this exact order:
 3. Abort/drop all downloader, metadata, tracker, webseed, and seeder task
    handles; do not await graceful protocol shutdown before dropping sockets.
 4. Reconcile byte counters and verified progress already reported by tasks.
-5. Set previously active torrents to `network_blocked`, retain prior activity
-   for recovery, persist, and publish torrent plus network-status events.
+5. Set previously active torrents to `network_blocked`, attach a durable typed
+   recovery intent (`downloading`, `downloading_metadata`, or `seeding`),
+   persist, and publish torrent plus network-status events.
 
 On recovery, update health, allow the gate, reconstruct listener/DHT, and
-requeue only work active before the block. Paused and automatically seed-stopped
-torrents remain stopped.
+consume recovery intent only for work demonstrably live before the block.
+Paused, merely queued, ratio/idle-stopped, completed-without-a-live-seeder, and
+stale `network_blocked` torrents have no intent and remain stopped. Persisting
+the intent makes the same rule survive daemon reconstruction; consuming it once
+prevents repeated recovery from restarting unrelated work.
 
 ### Bind-failure health reporting
 
 Route bind/listen/source-bind failures through a runtime health-report channel.
-Such a report blocks the gate and exposes `socket_bind_failed`. Use
-`blocked_fail_closed` only when strict policy denies traffic and no more
-specific interface/address/namespace/route/DNS/bind status applies. Both statuses
-require production-path API tests.
+The binder blocks the gate synchronously before queueing the report, so no new
+operation can race the next health tick. Such a report exposes
+`socket_bind_failed`. Use `blocked_fail_closed` only when strict policy denies
+traffic and no more specific interface/address/namespace/route/DNS/bind status
+applies.
+
+Both statuses are latched. Periodic probe health, a lifecycle command, and a
+partial settings patch cannot reopen the gate. Only an explicit full
+configuration replacement may attempt recovery. Before clearing the latch it
+constructs a binder from the replacement and successfully opens then drops an
+ephemeral contained UDP socket and configured peer listener. A validation or
+persistence failure preserves the old configuration, status, and blocked gate.
+Production-path API tests cover immediate block, latching across a healthy
+probe, failed repair, successful replacement, and the generic denial status.
+
+### Privileged namespace acceptance
+
+The Linux CI harness builds as the normal runner user and creates two
+PID-qualified namespaces connected only by a veth, with no default route. It
+generates a lawful payload/torrent and runs a local compact HTTP tracker plus a
+throttled TCP BitTorrent seed. After real tracker discovery and partial verified
+peer-wire progress, deleting the daemon veth must yield `interface_missing`, a
+`network_blocked` torrent, stable bytes, empty data-plane scheduler diagnostics,
+and a responsive control API.
+
+The script invokes sudo only as `sudo ip` for namespace/link operations.
+Commands entered through `ip netns exec` immediately drop to the caller UID/GID.
+Tracker, seed, generator, and API clients have no capabilities. SwarmOtter has a
+bounding/effective/ambient set containing only `CAP_NET_RAW`, the capability
+required for `SO_BINDTODEVICE`; the harness verifies these sets before traffic.
 
 ## Consequences
 
@@ -108,7 +143,7 @@ performs the version bump.
 - Supersedes earlier text permitting an omitted network table to select
   disabled containment.
 - [ADR-0005](0005-strict-network-containment-fail-closed.md)
-- [ADR-0012](0012-centralized-network-binder.md)
+- [ADR-0012](0012-network-binder-centralized-containment.md)
 - [ADR-0047](0047-transactional-live-data-plane-reconfiguration.md)
 - `design/vpn-network-containment.md`
 - `design/configuration.md`, `docs/configuration.md`

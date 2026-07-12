@@ -339,10 +339,19 @@ data-plane component (binder, DHT, listener, engine, seeder, tracker, webseed,
 metadata). On live path loss the gate blocks immediately, the inbound listener
 and DHT runner stop, data-plane tasks are aborted, and active torrents enter
 `network_blocked` while the control plane remains available. On recovery the
-gate reopens and only formerly active work resumes; paused and automatically
-seed-stopped torrents remain stopped. On Linux, route and DNS path validation
-invoke `ip route get`; direct and tarball installs must provide the `ip` utility
-from the distribution's `iproute2` or `iproute` package.
+gate reopens and only work carrying durable formerly-live recovery intent
+resumes; paused, queued, stale blocked, and automatically seed-stopped torrents
+remain stopped. Every block advances the gate generation, so tasks from before
+a blocked interval cancel even if recovery is immediate.
+
+Concrete bind failures block synchronously and latch `socket_bind_failed` (or
+`blocked_fail_closed` for a generic policy denial). A healthy probe alone does
+not clear the latch. Only an explicit `PUT /api/v1/settings` replacement whose
+contained UDP and peer-listener bind validation succeeds may recover it; a
+failed replacement preserves the prior configuration and blocked state. On
+Linux, route and DNS path validation invoke `ip route get`; direct and tarball
+installs must provide the `ip` utility from the distribution's `iproute2` or
+`iproute` package.
 
 ### `[autopilot]`
 
@@ -370,8 +379,8 @@ from the distribution's `iproute2` or `iproute` package.
 | `alt_download` | `0` | Alternate download bytes/sec. |
 | `alt_upload` | `0` | Alternate upload bytes/sec. |
 | `alt_enabled` | `false` | Uses alternate limits when true. |
-| `max_peers` | `0` | Global peer worker cap divided across active downloads, `0` means no global cap. |
-| `max_peers_per_torrent` | `0` | Per-torrent peer worker cap. `0` uses the daemon default worker pool of 64. |
+| `max_peers` | `0` | Exact process-wide peer-session cap shared by inbound and outbound peer TCP/uTP across all torrents. `0` is unlimited. Trackers, webseeds, DHT, and DNS are excluded. |
+| `max_peers_per_torrent` | `0` | Additional per-torrent session cap shared by inbound and outbound peers. `0` uses the daemon default of 64. |
 
 ### `[queue]`
 
@@ -402,12 +411,19 @@ maintain responsive performance:
   torrents consume upload bandwidth and peer connections.
 
 **Peer limits:**
-- Set `max_peers` to cap total peer connections across all torrents. With
-  1,000 torrents and 50 peers each, that's 50,000 connections. A global cap
-  of 5,000-10,000 is often sufficient.
+- Set `max_peers` to a nonzero value to hard-bound total peer sessions across
+  all torrents. Size it together with the service file-descriptor limit and
+  leave headroom for files, trackers, DHT, and control-plane descriptors.
 - Set `max_peers_per_torrent` to limit per-torrent peer connections (default
   64). Lower values (e.g., 30-50) reduce resource usage with minimal impact
   on download speed for well-seeded torrents.
+
+Both limits apply for the full peer-session lifetime, including metadata,
+normal serial/parallel, endgame, seeding, TCP, and uTP paths. An inbound socket
+that cannot obtain capacity is closed before its peer session starts. Live
+changes replace the permit pools and synchronously reconstruct eligible work;
+if reconstruction or full-config persistence fails, the old limits and live
+ownership remain in effect.
 
 **Bandwidth limits:**
 - Set `global_download` and `global_upload` to prevent network saturation.
@@ -418,9 +434,9 @@ maintain responsive performance:
 
 **File descriptors:**
 - Ensure the daemon has sufficient file descriptor limits (see
-  [Deployment](deployment.md#file-descriptor-requirements)). Each active
-  torrent requires 50+ file descriptors for peer connections, trackers, and
-  file handles.
+  [Deployment](deployment.md#file-descriptor-requirements)). Peer descriptors
+  are bounded by `max_peers` when configured, with additional workload-specific
+  file, tracker, DHT, and control-plane overhead.
 
 **Autopilot:**
 - Enable `autopilot.mode = "act"` (default) to allow automatic queue slot
@@ -455,6 +471,16 @@ mode = "act"
 | `global_idle_limit` | `1800` | Stops idle seeding after this many seconds, unless overridden. |
 
 Omit a field to use its default.
+
+`global_ratio_limit` must be finite and non-negative. Invalid negative or
+non-finite values fail configuration validation with `invalid_config`.
+
+Per-torrent policy is stored in durable daemon state rather than TOML. Set it
+with `PUT /api/v1/torrents/:hash/seeding`: a `null` ratio/idle value inherits
+these globals, explicit zero is a real immediate target, and `seed_forever`
+temporarily suppresses both effective targets without deleting the stored
+values. Policy and automatic/manual status survive restart without a daemon
+state version bump because legacy records default to inherited targets.
 
 ### `[dht]`
 
@@ -491,6 +517,48 @@ metadata limit (`MAX_TORRENT_METADATA_BYTES`) before parsing and before any
 piece-sized allocation, regardless of `max_request_body_bytes`. Oversized or
 malformed watch files are rejected as `malformed_torrent` / `bencode_error`
 and never panic the daemon. See ADR-0050.
+
+Watch ingestion is stability-gated (ADR-0054). The scanner walks in a blocking
+filesystem task, sorts root-relative paths, rejects a configured symlink root,
+and skips every child symlink without descending through symlinked directories.
+A file is eligible only after two consecutive scans report the same length and
+modified timestamp. The bounded read rechecks both the path and opened-file
+metadata; a change discards the bytes and restarts stability without recording
+an import result. Manual and automatic scans are serialized.
+
+`path`, `archive_dir`, and `failure_dir` must not be whitespace-only. An archive
+or failure directory must not lexically normalize to the watch root itself. If
+one is a strict descendant of its watch root, that destination and its subtree
+are excluded from this configured folder's scan; this prevents recursive scans
+from re-importing moved inputs. Exclusion uses path-component boundaries
+without resolving symlinks; similarly named siblings are not excluded. A
+separately configured overlapping watch root evaluates its own destinations and
+can still scan that path.
+
+Observations are memory-only. Restart requires a fresh first observation. An
+unchanged registered torrent then becomes a successful `duplicate` on the
+second scan: its existing path, labels, queue position/bypass, and settings are
+unchanged, while the configured success action runs once. With no archive and
+`delete_after_import = false`, `leave` marks that fingerprint processed, so it
+does not repeat until length or modified time changes. Watch status does not
+advance stability and excludes unchanged processed files from its pending
+count.
+
+Only bencode, malformed-torrent, invalid-info-hash, and parse errors are
+permanent input failures; they execute `failure_dir` handling and do not retry
+unchanged input. Storage, I/O, persistence, containment, and internal failures
+are transient: the source stays and a later stable scan retries it. Archive and
+failure directories are created when absent, and create-new copy/remove actions
+never overwrite a destination. A delete/copy/remove/collision error preserves
+the primary result, appears as `post_action_error`, and leaves the fingerprint
+processed for manual resolution. A crash during an archive/failure copy can
+leave source plus a partial destination; recovery will not overwrite it.
+
+`GET /api/v1/watch/history` and Watch status retain the newest 10,000 results in
+insertion order for the current daemon run. Each result keeps compatibility
+fields (`success`, `duplicate`, `error`) and reports `outcome` as `imported`,
+`duplicate`, `permanent_failure`, or `transient_failure`, plus an optional
+`post_action_error`. This operational history is not persisted.
 
 ### `[logging]`
 

@@ -272,8 +272,9 @@ When managing large torrent libraries, monitor these indicators:
 
 ### Check file descriptor usage
 
-Each active torrent requires 50+ file descriptors. Check the daemon's current
-limit and usage:
+Peer-session descriptors are bounded by a nonzero `max_peers`; payload files,
+trackers, DHT, the shared listener, and the control plane add workload-specific
+overhead. Check the daemon's current limit and usage:
 
 ```bash
 PID=$(pgrep swarmotterd)
@@ -296,11 +297,17 @@ Key fields:
 
 - `requested_downloads` vs `granted_downloads`: if requested exceeds granted,
   the download slot cap is the bottleneck.
-- `requested_metadata` vs `granted_metadata`: if requested exceeds granted,
+- `requested_metadata_fetches` vs `granted_metadata_fetches`: if requested exceeds granted,
   the metadata fetch slot cap is the bottleneck.
-- `peer_worker_saturation`: `true` means the global peer worker cap is fully
-  consumed; active torrents may have fewer peers than configured.
-- `retry_backoff_count`: high values indicate many torrents waiting for retry
+- `peer_limit`, `peer_permits_in_use`, and `peer_permits_available`: the
+  authoritative process-wide peer-session cap and current usage. Available is
+  `null` when unlimited.
+- `peer_sessions_denied`: inbound sockets rejected before session start by an
+  applicable global or per-torrent cap.
+- `peer_worker_budget_saturated` (and legacy peer-worker budget fields): engine
+  worker-pressure compatibility telemetry. It does not mean the process-wide
+  peer connection cap is full; use the permit fields above for that decision.
+- `retry_backoff_torrents`: high values indicate many torrents waiting for retry
   after transient failures.
 
 ### Check event subscriber lag

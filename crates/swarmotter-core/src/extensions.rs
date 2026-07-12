@@ -125,7 +125,9 @@ pub fn parse_extension_handshake(payload: &[u8]) -> Result<ExtensionHandshake> {
         if let Some(mdict) = m.as_dict() {
             for (k, v) in mdict {
                 if let (Ok(name), Some(id)) = (std::str::from_utf8(k), v.as_int()) {
-                    extensions.push((name.to_string(), id as u8));
+                    let id = u8::try_from(id)
+                        .map_err(|_| CoreError::Parse("extension id out of range".into()))?;
+                    extensions.push((name.to_string(), id));
                 }
             }
         }
@@ -135,16 +137,27 @@ pub fn parse_extension_handshake(payload: &[u8]) -> Result<ExtensionHandshake> {
         .find(|(k, _)| k == b"v")
         .and_then(|(_, v)| v.as_str_utf8())
         .map(|s| s.to_string());
-    let metadata_size = dict
+    let metadata_size = match dict
         .iter()
         .find(|(k, _)| k == b"metadata_size")
         .and_then(|(_, v)| v.as_int())
-        .map(|i| i as u64);
-    let reqq = dict
+    {
+        Some(value) => Some(
+            u64::try_from(value)
+                .map_err(|_| CoreError::Parse("metadata_size out of range".into()))?,
+        ),
+        None => None,
+    };
+    let reqq = match dict
         .iter()
         .find(|(k, _)| k == b"reqq")
         .and_then(|(_, v)| v.as_int())
-        .and_then(|i| (i > 0).then_some(i as u64));
+    {
+        Some(0) | None => None,
+        Some(value) => {
+            Some(u64::try_from(value).map_err(|_| CoreError::Parse("reqq out of range".into()))?)
+        }
+    };
     Ok(ExtensionHandshake {
         extensions,
         client_version,
@@ -350,13 +363,17 @@ pub struct MetadataMessage {
     pub data: Vec<u8>,
 }
 
+/// A decoded bencode dictionary entry list (key bytes to value).
+pub type BencodeDict = Vec<(Vec<u8>, Value)>;
+
 /// Parse a `ut_metadata` message payload. The dict portion is bencoded; the
 /// remainder (for Data messages) is the raw metadata piece bytes.
 pub fn parse_metadata_message(payload: &[u8]) -> Result<MetadataMessage> {
-    // Decode only the leading dict; bencode::decode consumes the full buffer,
-    // so we find the dict end by re-encoding bounds. Simpler: decode the dict
-    // and track the consumed byte count via a bounded parser.
-    let (dict, consumed) = decode_dict_bounded(payload)?;
+    let (root, consumed) = bencode::decode_prefix(payload)?;
+    let dict = match root {
+        Value::Dict(dict) => dict,
+        _ => return Err(CoreError::Parse("metadata message not a dict".into())),
+    };
     let msg_type = dict
         .iter()
         .find(|(k, _)| k == b"msg_type")
@@ -376,13 +393,20 @@ pub fn parse_metadata_message(payload: &[u8]) -> Result<MetadataMessage> {
         .iter()
         .find(|(k, _)| k == b"piece")
         .and_then(|(_, v)| v.as_int())
-        .ok_or_else(|| CoreError::Parse("metadata message missing piece".into()))?
-        as u32;
-    let total_size = dict
+        .ok_or_else(|| CoreError::Parse("metadata message missing piece".into()))?;
+    let piece =
+        u32::try_from(piece).map_err(|_| CoreError::Parse("metadata piece out of range".into()))?;
+    let total_size = match dict
         .iter()
         .find(|(k, _)| k == b"total_size")
         .and_then(|(_, v)| v.as_int())
-        .map(|i| i as u64);
+    {
+        Some(value) => Some(
+            u64::try_from(value)
+                .map_err(|_| CoreError::Parse("metadata total_size out of range".into()))?,
+        ),
+        None => None,
+    };
     let data = payload[consumed..].to_vec();
     Ok(MetadataMessage {
         msg_type,
@@ -390,95 +414,6 @@ pub fn parse_metadata_message(payload: &[u8]) -> Result<MetadataMessage> {
         total_size,
         data,
     })
-}
-
-/// A decoded bencode dict entry list (key bytes -> value).
-pub type BencodeDict = Vec<(Vec<u8>, Value)>;
-
-/// Decode a leading bencoded dict, returning the dict and the number of bytes
-/// consumed (so trailing raw bytes, e.g. metadata piece data, are preserved).
-#[allow(clippy::type_complexity)]
-fn decode_dict_bounded(bytes: &[u8]) -> Result<(BencodeDict, usize)> {
-    let mut p = BoundedParser { bytes, pos: 0 };
-    let v = p.parse()?;
-    let consumed = p.pos;
-    match v {
-        Value::Dict(d) => Ok((d, consumed)),
-        _ => Err(CoreError::Parse("metadata message not a dict".into())),
-    }
-}
-
-struct BoundedParser<'a> {
-    bytes: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> BoundedParser<'a> {
-    fn parse(&mut self) -> Result<Value> {
-        if self.pos >= self.bytes.len() {
-            return Err(CoreError::Parse("metadata message truncated".into()));
-        }
-        match self.bytes[self.pos] {
-            b'd' => {
-                self.pos += 1;
-                let mut dict = Vec::new();
-                while self.pos < self.bytes.len() && self.bytes[self.pos] != b'e' {
-                    let key = self.parse_bytes_str()?;
-                    let val = self.parse()?;
-                    dict.push((key, val));
-                }
-                if self.pos >= self.bytes.len() {
-                    return Err(CoreError::Parse("unterminated metadata dict".into()));
-                }
-                self.pos += 1; // consume 'e'
-                Ok(Value::Dict(dict))
-            }
-            b'i' => {
-                self.pos += 1;
-                let start = self.pos;
-                while self.pos < self.bytes.len() && self.bytes[self.pos] != b'e' {
-                    self.pos += 1;
-                }
-                if self.pos >= self.bytes.len() {
-                    return Err(CoreError::Parse("unterminated int".into()));
-                }
-                let s = std::str::from_utf8(&self.bytes[start..self.pos])
-                    .map_err(|e| CoreError::Parse(format!("bad int: {e}")))?;
-                let n: i64 = s
-                    .parse()
-                    .map_err(|e| CoreError::Parse(format!("bad int {s}: {e}")))?;
-                self.pos += 1; // 'e'
-                Ok(Value::Int(n))
-            }
-            b'0'..=b'9' => {
-                let s = self.parse_bytes_str()?;
-                Ok(Value::Str(s))
-            }
-            _ => Err(CoreError::Parse("metadata message bad token".into())),
-        }
-    }
-
-    fn parse_bytes_str(&mut self) -> Result<Vec<u8>> {
-        let len_start = self.pos;
-        while self.pos < self.bytes.len() && self.bytes[self.pos] != b':' {
-            self.pos += 1;
-        }
-        if self.pos >= self.bytes.len() {
-            return Err(CoreError::Parse("missing ':' in byte string".into()));
-        }
-        let len_s = std::str::from_utf8(&self.bytes[len_start..self.pos])
-            .map_err(|e| CoreError::Parse(format!("bad strlen: {e}")))?;
-        let len: usize = len_s
-            .parse()
-            .map_err(|e| CoreError::Parse(format!("bad strlen {len_s}: {e}")))?;
-        self.pos += 1; // ':'
-        if self.pos + len > self.bytes.len() {
-            return Err(CoreError::Parse("byte string overruns payload".into()));
-        }
-        let s = self.bytes[self.pos..self.pos + len].to_vec();
-        self.pos += len;
-        Ok(s)
-    }
 }
 
 /// Split a metadata blob (the `info` dict bytes) into piece-sized chunks for
@@ -526,14 +461,37 @@ mod tests {
         let hs = parse_extension_handshake(b"d4:reqqi32ee").unwrap();
         assert_eq!(hs.reqq, Some(32));
 
-        for payload in [
-            &b"d4:reqqi0ee"[..],
-            &b"d4:reqqi-1ee"[..],
-            &b"d4:reqq1:xe"[..],
-        ] {
+        for payload in [&b"d4:reqqi0ee"[..], &b"d4:reqq1:xe"[..]] {
             let hs = parse_extension_handshake(payload).unwrap();
             assert_eq!(hs.reqq, None);
         }
+
+        let error = parse_extension_handshake(b"d4:reqqi-1ee").unwrap_err();
+        assert!(matches!(&error, CoreError::Parse(_)));
+        assert!(error.to_string().contains("reqq out of range"));
+
+        let error = parse_extension_handshake(b"d4:reqqi9223372036854775808ee").unwrap_err();
+        assert!(matches!(error, CoreError::Bencode(_)));
+    }
+
+    #[test]
+    fn extension_handshake_rejects_negative_and_oversized_numbers() {
+        for payload in [
+            &b"d1:md11:ut_metadatai-1eee"[..],
+            &b"d1:md11:ut_metadatai256eee"[..],
+        ] {
+            let error = parse_extension_handshake(payload).unwrap_err();
+            assert!(matches!(&error, CoreError::Parse(_)));
+            assert!(error.to_string().contains("extension id out of range"));
+        }
+
+        let error = parse_extension_handshake(b"d13:metadata_sizei-1ee").unwrap_err();
+        assert!(matches!(&error, CoreError::Parse(_)));
+        assert!(error.to_string().contains("metadata_size out of range"));
+
+        let error =
+            parse_extension_handshake(b"d13:metadata_sizei9223372036854775808ee").unwrap_err();
+        assert!(matches!(error, CoreError::Bencode(_)));
     }
 
     #[test]
@@ -614,6 +572,51 @@ mod tests {
         assert_eq!(msg.piece, 0);
         assert_eq!(msg.total_size, Some(data.len() as u64));
         assert_eq!(msg.data, data);
+    }
+
+    #[test]
+    fn metadata_message_rejects_negative_and_oversized_numbers() {
+        for payload in [
+            &b"d8:msg_typei0e5:piecei-1ee"[..],
+            &b"d8:msg_typei0e5:piecei4294967296ee"[..],
+        ] {
+            let error = parse_metadata_message(payload).unwrap_err();
+            assert!(matches!(&error, CoreError::Parse(_)));
+            assert!(error.to_string().contains("metadata piece out of range"));
+        }
+
+        let error =
+            parse_metadata_message(b"d8:msg_typei1e5:piecei0e10:total_sizei-1ee").unwrap_err();
+        assert!(matches!(&error, CoreError::Parse(_)));
+        assert!(error
+            .to_string()
+            .contains("metadata total_size out of range"));
+
+        let error =
+            parse_metadata_message(b"d8:msg_typei1e5:piecei0e10:total_sizei9223372036854775808ee")
+                .unwrap_err();
+        assert!(matches!(error, CoreError::Bencode(_)));
+    }
+
+    #[test]
+    fn metadata_message_hardened_prefix_rejects_malformed_input_without_panicking() {
+        let overflowing = format!("d8:msg_typei0e5:piece{}:x", usize::MAX);
+        let too_deep = {
+            let mut payload = b"d8:msg_typei0e5:piecei0e1:a".to_vec();
+            payload.extend(std::iter::repeat_n(b'l', crate::meta::MAX_BENCODE_DEPTH));
+            payload.extend_from_slice(b"i0e");
+            payload.extend(std::iter::repeat_n(b'e', crate::meta::MAX_BENCODE_DEPTH));
+            payload.push(b'e');
+            payload
+        };
+        for payload in [overflowing.as_bytes(), too_deep.as_slice()] {
+            let result = std::panic::catch_unwind(|| parse_metadata_message(payload));
+            assert!(result.is_ok(), "metadata parser must not panic");
+            assert!(result.unwrap().is_err());
+        }
+
+        let duplicate = parse_metadata_message(b"d8:msg_typei0e5:piecei0e5:piecei1ee").unwrap_err();
+        assert!(matches!(duplicate, CoreError::Bencode(_)));
     }
 
     #[test]

@@ -62,17 +62,19 @@ impl ContainmentGate {
     /// Deny operations, store status/detail, advance the generation, and
     /// notify waiters.
     pub fn block(&self, status: NetworkContainmentStatus, detail: impl Into<String>) {
-        let was_allowed = self.allowed.swap(false, Ordering::SeqCst);
+        self.allowed.store(false, Ordering::SeqCst);
         if let Ok(mut guard) = self.status.lock() {
             *guard = Some(status);
         }
         if let Ok(mut guard) = self.detail.lock() {
             *guard = detail.into();
         }
-        if was_allowed {
-            self.generation.fetch_add(1, Ordering::SeqCst);
-            self.notify.notify_waiters();
-        }
+        // Every block is a cancellation edge, including a more-specific
+        // failure reported while already blocked. Tasks created after an
+        // earlier block cannot run (enforce rejects them), while existing
+        // waiters must never miss a later report/status transition.
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 
     /// Return `CoreError::NetworkBlocked` when denied.
@@ -129,18 +131,23 @@ impl ContainmentGate {
         self.generation.load(Ordering::SeqCst)
     }
 
-    /// Complete when the generation advances to a blocked state past the given
-    /// starting generation. Tasks select normal work against this so connected
-    /// TCP/TLS streams drop on block.
+    /// Complete after any transition beyond the task's starting generation.
+    /// A block followed immediately by recovery must still cancel a task born
+    /// under the old generation; otherwise its already-connected stream could
+    /// survive the blocked interval and resume traffic on a stale path.
     #[allow(dead_code)]
     pub async fn cancelled_since(&self, start_generation: u64) {
         loop {
-            if !self.allowed.load(Ordering::SeqCst)
-                && self.generation.load(Ordering::SeqCst) != start_generation
-            {
+            // Register the waiter before checking state. `notify_waiters` does
+            // not retain a permit, so checking first has a lost-wakeup window
+            // between the atomic loads and the first poll of `notified()`.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.generation.load(Ordering::SeqCst) != start_generation {
                 return;
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 }
@@ -292,11 +299,44 @@ mod tests {
     fn block_when_already_blocked_keeps_status_detail() {
         let gate = ContainmentGate::new(false);
         gate.block(NetworkContainmentStatus::RouteInvalid, "no route");
-        assert_eq!(gate.generation(), 0); // was already blocked
+        assert_eq!(gate.generation(), 1);
         assert_eq!(
             gate.blocked_status(),
             Some(NetworkContainmentStatus::RouteInvalid)
         );
         assert!(gate.blocked_detail().contains("no route"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_since_has_no_registration_lost_wakeup() {
+        use std::time::Duration;
+
+        for _ in 0..1_000 {
+            let gate = ContainmentGate::new(true);
+            let generation = gate.generation();
+            let waiter = {
+                let gate = gate.clone();
+                tokio::spawn(async move { gate.cancelled_since(generation).await })
+            };
+            gate.block(NetworkContainmentStatus::InterfaceDown, "down");
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("containment cancellation waiter lost a wakeup")
+                .expect("waiter task panicked");
+        }
+    }
+
+    #[tokio::test]
+    async fn intervening_block_then_allow_still_cancels_old_generation() {
+        use std::time::Duration;
+
+        let gate = ContainmentGate::new(true);
+        let generation = gate.generation();
+        gate.block(NetworkContainmentStatus::InterfaceDown, "down");
+        gate.allow();
+        assert!(gate.traffic_allowed());
+        tokio::time::timeout(Duration::from_secs(1), gate.cancelled_since(generation))
+            .await
+            .expect("an intervening block must cancel old data-plane tasks");
     }
 }

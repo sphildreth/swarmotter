@@ -492,6 +492,7 @@ fn core_error_text(error: CoreError) -> Response {
         | CoreError::MalformedTorrent(_)
         | CoreError::InvalidInfoHash(_) => StatusCode::BAD_REQUEST,
         CoreError::NetworkBlocked(_) => StatusCode::SERVICE_UNAVAILABLE,
+        CoreError::HttpProtocol(_) | CoreError::HttpStatus(_) => StatusCode::BAD_GATEWAY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     text_response(status, &error.to_string())

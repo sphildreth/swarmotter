@@ -18,12 +18,12 @@
 
 pub mod binder;
 pub mod config;
+pub mod http;
 pub mod probe;
 
-pub use binder::{
-    parse_http_response, ContainedUdpSocket, HttpResponse, NetworkBinder, PeerListener,
-};
+pub use binder::{ContainedUdpSocket, NetworkBinder, PeerListener};
 pub use config::NetworkConfig;
+pub use http::{ContainedHttpClient, HttpResponse, MAX_TRACKER_HTTP_BODY_BYTES};
 pub use probe::{InterfaceInfo, InterfaceProbe, InterfaceStatus, OsInterfaceProbe};
 
 use crate::error::{CoreError, Result};

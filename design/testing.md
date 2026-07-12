@@ -39,16 +39,29 @@ feature completion and acceptance criteria, not by time estimates.
   duplicate and non-string dictionary keys, unsorted-but-unique keys accepted,
   trailing bytes rejected, and the 16 MiB metadata byte limit accepted at the
   boundary and rejected one byte over. Every malformed corpus case must be
-  panic-free under `std::panic::catch_unwind`.
+  panic-free under `std::panic::catch_unwind`. BEP 9 prefix decoding repeats
+  the same depth/node/duplicate/length checks while preserving trailing piece
+  bytes.
 - Metainfo shape budgets (ADR-0050): piece length zero/over-limit, mismatched
-  piece count, too many files, too many pieces, and total-length overflow all
-  produce typed `MalformedTorrent` errors.
-- Durable piece-hash decode: SHA-1 hashes of 0, 19, 20, and 21 decoded bytes;
-  only 20 succeeds, with the piece index in the error message and no payload
-  data or content paths.
+  piece count, non-20-byte-multiple pieces, too many files, too many pieces,
+  total-length overflow, and cumulative storage file-offset overflow all
+  produce typed `MalformedTorrent` errors without panicking.
+- Durable JSON-state metadata: SHA-1 hashes of 0, 19, 20, and 21 decoded bytes;
+  only 20 succeeds, with the torrent record and piece index in the error and no
+  payload data or content paths. The sequence accepts exactly
+  `MAX_TORRENT_PIECES` hashes and rejects one more. Restored `TorrentMeta`
+  values must also pass the file-count, piece-count, piece-length,
+  total-length, and piece-count consistency checks in `TorrentMeta::validate()`.
+  JSON state does not pass through the bencode byte, depth, or node budgets.
 - Production metadata ingress bounds: `.torrent` bodies at and one byte over
-  `MAX_TORRENT_METADATA_BYTES` through the core parser, API add, watch import,
-  and BEP 9 metadata assembly.
+  `MAX_TORRENT_METADATA_BYTES` through the core parser, dedicated and
+  multiplexed raw API add, bulk/Transmission bounded-base64 add, watch import,
+  and BEP 9 metadata assembly. A configured API body limit below the metadata
+  limit retains its HTTP 413 behavior.
+- Watch scanner/read boundary (ADR-0054): sorted recursive/non-recursive walks,
+  child/root symlink rejection, composite lexical root-relative keys, exact
+  bounded-read limit, typed metadata-change result, and create-new
+  non-overwriting archive/failure actions.
 
 ### Integration tests
 
@@ -57,6 +70,21 @@ feature completion and acceptance criteria, not by time estimates.
 - Upload torrent file through Web UI/API path.
 - Reject cross-origin native API mutations and WebSocket handshakes while
   preserving same-origin browser requests and non-browser API clients.
+- Route matrix (ADR-0044/ADR-0049, Phase 3): a table-driven real-router matrix
+  for authentication enabled/disabled covering native add/pause/remove/settings
+  mutation/WebSocket/SSE, Transmission session negotiation and a mutating RPC
+  method, and qBittorrent login/add/pause/resume/delete form endpoints. It
+  accepts same-origin (including scheme-changing TLS termination),
+  `Sec-Fetch-Site: none`, and absent browser headers. It rejects same-site,
+  cross-site, unknown, duplicate, and invalid-byte Fetch Metadata plus foreign,
+  malformed, opaque/`null`, duplicate/multi-value, invalid-byte, path, query,
+  fragment, and userinfo origins and duplicate/invalid Hosts. Every rejection
+  returns the surface-specific 403 shape before auth/session/compatibility
+  checks and leaves fake-daemon calls and state unchanged.
+- Start the real local HTTP control server and complete a same-origin,
+  authenticated WebSocket handshake with HTTP 101, proving the accepted path
+  reaches Hyper's production upgrade extension rather than only a Tower
+  extraction boundary.
 - Validate Web UI static security headers and required operation wiring.
 - Import torrent from watch folder.
 - Pause/resume/remove lifecycle.
@@ -74,6 +102,60 @@ feature completion and acceptance criteria, not by time estimates.
   endpoint both include a `health` object with score, bars, label, and
   per-component sub-scores.
 
+### Watch-folder stability and atomicity acceptance matrix
+
+ADR-0054 is accepted only when every production boundary below passes. Scanner
+helpers alone do not substitute for daemon/API/event/UI behavior.
+
+| Capability | Required assertions | Acceptance evidence |
+| --- | --- | --- |
+| Stable bounded ingestion | A partial copy needs two unchanged scans after its last change. A deterministic change between bounded read and post-read metadata check discards bytes, resets to one, and emits no result/action. Exact 16 MiB is accepted and one-over is rejected before input-sized allocation. | `watch::tests::bounded_watch_read_accepts_exact_limit_and_rejects_one_over_before_read`, `daemon::tests::watch_partial_copy_and_read_time_change_reset_without_terminal_result` |
+| Safe deterministic walk | Recursive/non-recursive paths are sorted; child symlinks are ignored; a symlink/missing root is incomplete; normalized overlapping roots do not alias. Strict-descendant archive/failure exclusions are component-aware and scoped to one configured folder; an equal-root or whitespace-only path is invalid. A failed root scan retains observations, while successful disappearance and removed config roots prune them. | `watch::tests::scans_torrent_files`, `watch::tests::scan_ignores_file_and_directory_symlinks`, `watch::tests::symlink_watch_root_is_an_incomplete_scan_error`, `watch::tests::configured_scan_exclusions_are_descendant_component_aware_and_per_folder`, `config::tests::watch_paths_reject_whitespace_and_action_destination_equal_to_root`, `daemon::tests::overlapping_watch_roots_have_distinct_composite_observation_keys`, `daemon::tests::watch_action_exclusion_does_not_hide_separately_configured_overlapping_root`, `daemon::tests::incomplete_watch_root_scan_retains_prior_observations`, `daemon::tests::watch_observations_prune_disappeared_files_and_removed_roots` |
+| Idempotence and status | `leave` produces one result per unchanged fingerprint; read-only status calls do not advance stability and exclude processed unchanged files from pending; replacement processes once. Restart re-observes, returns duplicate success, applies the success action once, and preserves exact existing torrent/queue state. Recursive in-root archive and permanent-failure moves are excluded and remain one history result after later scans. Concurrent manual scans serialize around the complete scan and create one terminal result. | `daemon::tests::watch_leave_processes_each_fingerprint_once_and_status_excludes_it`, `daemon::tests::watch_restart_duplicate_runs_success_action_once_without_mutation`, `daemon::tests::recursive_watch_excludes_in_root_archive_after_success`, `daemon::tests::recursive_watch_excludes_in_root_failure_after_permanent_failure`, `daemon::tests::concurrent_manual_watch_scans_produce_one_terminal_result` |
+| Shared durable add | Deterministic persistence failure restores exact registry/queue membership, creates no limiter/permit pool, emits no torrent/watch-success event, and schedules nothing. The real HTTP file-add route retains its success/error envelope contract. | `daemon::tests::shared_add_persistence_failure_restores_exact_state_and_has_no_side_effects`, `daemon::tests::api_add_uses_shared_injected_rollback_without_event_or_schedule`, `api_torrent_file_add_retains_envelope_and_shared_rollback_contract` in `crates/swarmotterd/tests/daemon_download.rs` |
+| Outcomes and actions | Only the four parser variants are permanent and move to failure; transient storage/persistence errors stay and retry. Existing destinations remain byte-for-byte unchanged, primary outcome survives in history/event, `post_action_error` is populated, and the fingerprint is not retried. | `daemon::tests::watch_error_classification_has_only_the_four_permanent_variants`, `daemon::tests::watch_permanent_failure_moves_while_transient_stays_and_retries`, `daemon::tests::watch_destination_collision_preserves_both_files_and_processes_once` |
+| Bounded history, events, and UI | Entry 10,001 evicts entry 1. Imported/duplicate/failure events expose stable payloads only after determination. The Web UI distinguishes all four outcomes and warns for a post-action error while retaining compatibility fields. | `daemon::tests::watch_history_evicts_oldest_entry_at_ten_thousand_and_one`, broker assertions in the daemon tests above, `swarmotter_web::tests::web_ui_renders_stable_watch_outcomes_and_post_action_errors`, `node crates/swarmotter-web/tests/watch-history.test.js` |
+
+Run the watch renderer harness directly with the other Web checks:
+
+```bash
+node crates/swarmotter-web/tests/watch-history.test.js
+```
+
+### Seeding policy, lifecycle, and accounting acceptance matrix
+
+ADR-0052 is complete only when every row below passes through the named
+production boundary. Helper-only assertions do not substitute for daemon/API/UI
+entry-point coverage.
+
+| Capability | Required production boundary and assertions | Acceptance evidence |
+| --- | --- | --- |
+| Effective policy | Resolve nullable per-torrent ratio/idle fields against `[seeding]`; explicit or inherited ratio zero stops immediately even when a fully verified import has no downloaded counter; nonzero targets retain the divide-by-zero guard; seed-forever suppresses both effective targets without erasing stored overrides; ratio targets reject negative and non-finite values. | `ratio::tests::zero_ratio_target_stops_without_download_accounting`, `ratio::tests::explicit_zero_overrides_inherited_targets`, `ratio::tests::effective_targets_distinguish_inherit_override_and_forever`, `config::tests::rejects_negative_and_non_finite_global_ratio_limits` |
+| Durable wire state | Serialize exactly `not_eligible`, `queued`, `active`, `stopped_ratio`, `stopped_idle`, and `stopped_manual`; load legacy version-1 records with defaults and no version bump; round-trip every status and policy. | `models::torrent::tests::seeding_statuses_serialize_with_exact_wire_values`, `state_store::tests::legacy_state_defaults_absent_seeding_fields_without_version_bump`, `state_store::tests::every_seeding_status_round_trips_in_version_one_state` |
+| Policy replacement transaction | Call `DaemonOps::set_torrent_seeding`; persist the complete replacement before reconciling live tasks; on write failure restore only the prior policy and prove state, status, registration, and task ownership never changed. | `daemon::tests::seeding_policy_persistence_failure_restores_policy_status_and_state` |
+| Completion and seed slots | Drive real `DaemonRuntime` completion/reconciliation. Fully verified content is `completed` + `queued` until a slot exists, then `seeding` + `active`; `GlobalStats.active_seeds` equals live `SeedRegistry` registrations. Exercise ratio and idle stops, policy relaxation, seed-forever, manual pause, Resume, Start Now, forced task cancellation, listener failure, and removal. Every `torrent_changed` event must report the state present after reconciliation. | `daemon::tests::complete_seeding_lifecycle_policy_slots_tasks_and_limiter_identity_are_truthful`, `daemon::tests::failed_shared_listener_bind_does_not_register_or_announce_seeder`, `daemon::tests::reconcile_publishes_completion_events` |
+| Restart and containment | Reconstruct eligible seeders after durable restore while leaving automatic and manual stops stopped. On containment loss, atomically stop the accepting task and registration, preserve recovery status/intent under `network_blocked`, report zero active seeds, and make list/detail/stats/events agree. On recovery, rebuild only eligible live intent and publish the reconstructed state. | `daemon::tests::restart_reconstructs_eligible_seeder_and_preserves_automatic_and_manual_stops`, `daemon::tests::active_seeding_containment_block_preserves_status_and_recovery_rebuilds_task` |
+| Exact file accounting | Calculate completed bytes from intersections between verified piece byte ranges and each file range. Cover a short final piece and a piece spanning a multi-file boundary after restore, partial forced recheck, and full forced recheck; never derive file bytes from torrent-wide completion fraction. | `torrent::tests::exact_single_file_bytes_use_actual_final_piece_length`, `torrent::tests::exact_multi_file_bytes_split_verified_boundary_pieces`, `daemon::tests::single_file_final_piece_bytes_are_exact_after_restore_and_recheck`, `daemon::tests::boundary_file_bytes_are_exact_after_restore_and_each_recheck` |
+| Live upload shaping | Start a production `DaemonRuntime` seeder and accepted TCP peer request. Prove the initial burst, the old 1 KiB/s window at 400 ms, then update through `DaemonOps::set_torrent_limits` and prove release in the bounded next window. Assert the persisted value and `Arc<RateLimiter>` identity in the daemon map and live registration do not change; global shaping remains an additional layer. | `daemon::tests::daemon_limit_update_changes_active_registered_upload_without_replacement` |
+| Native API contract | Send strict `PUT /api/v1/torrents/:hash/seeding` requests through the real router. Require all and only `ratio_limit`, `idle_limit`, and `seed_forever`; reject missing/unknown/negative/non-finite/fractional-idle/overflow/wrong-type values as `invalid_argument`; verify stored and effective fields in both list and detail. | `native_seeding_put_replaces_policy_and_list_detail_are_truthful`, `native_seeding_put_rejects_non_replacement_and_invalid_values` in `crates/swarmotter-api/tests/api_integration.rs` |
+| Web UI and compatibility | Render stored/effective/status values in Torrent Details, distinguish inherit from explicit zero, submit the exact replacement body, and retain rendered state while displaying a server rejection. Transmission and qBittorrent responses must retain only their previously documented ratio/uploaded fields; do not invent policy fields. | `node crates/swarmotter-web/tests/seeding-policy.test.js`, `swarmotter_web::tests::web_ui_renders_and_replaces_seeding_policy_without_optimistic_drift`, `compatibility_keeps_only_previously_supported_ratio_and_upload_fields` |
+
+Run the executable DOM-state harness directly in addition to the Rust suite:
+
+```bash
+node crates/swarmotter-web/tests/seeding-policy.test.js
+```
+
+The matrix definition of done also requires `cargo fmt --all -- --check`,
+`cargo check --locked --workspace --all-targets --all-features`,
+`cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`,
+`cargo test --locked --workspace --all-targets --all-features`, JavaScript
+syntax checks, `mdbook build`, and `git diff --check` to pass. Documentation
+must keep `design/requirements.md`, architecture/API/configuration design,
+operator API/configuration/Web UI guides, the completion tracker, changelog,
+and affected ADRs (including ADR-0052 and ADR-0054) aligned with the tested
+behavior.
+
 ### Network containment tests
 
 - Required interface missing.
@@ -89,16 +171,28 @@ feature completion and acceptance criteria, not by time estimates.
   `InterfaceProbe` drives `network_health_tick()` directly without sleeping;
   flipping the required interface healthy-to-missing proves the gate blocks
   before teardown, data-plane registries empty, torrent/API status is blocked,
-  and the control API still responds. Recovery resumes only formerly active
-  work, not paused/ratio/idle-stopped work. Injected bind failure and generic
-  strict policy denial expose `socket_bind_failed` and `blocked_fail_closed`.
+  and the control API still responds. Recovery consumes durable intent only for
+  demonstrably live work, not paused/queued/ratio/idle-stopped or stale blocked
+  records. A block followed immediately by allow still cancels old-generation
+  tasks, and cancellation waiter registration has no lost-wakeup window.
+  Concrete source/listener bind failure blocks immediately and stays latched
+  across healthy probe ticks; only a full replacement with successful UDP and
+  peer-listener bind validation clears it. Generic strict policy denial exposes
+  `blocked_fail_closed` through the production control API.
 - Config matrix (ADR-0051): omitted table/file, strict with path, explicit
   disabled, partial network table, env override, and `--check-config`.
 - Privileged Linux namespace transition (ADR-0051):
   `scripts/test-network-containment-transition.sh` creates two temporary
-  namespaces joined by a veth pair, runs a generated local swarm, binds strict
-  containment to the daemon-side veth, proves traffic, deletes that veth during
-  transfer, and proves block/teardown with the control plane still available.
+  PID-qualified namespaces joined by a veth pair with no default route. It
+  generates lawful payload/metainfo, runs a compact HTTP tracker and throttled
+  TCP BitTorrent seed, registers the raw torrent through the real API, proves
+  partial tracker-discovered peer-wire traffic, deletes the daemon veth, and
+  requires `interface_missing`, `network_blocked`, stable partial bytes, empty
+  scheduler registries, diagnostics, and a responsive control route. CI builds
+  and invokes the script as its normal user. Only `sudo ip` handles namespace
+  and link operations; `setpriv` gives the daemon only `CAP_NET_RAW` for
+  `SO_BINDTODEVICE`, while the tracker, seed, generator, and curl clients have
+  no capabilities.
 
 ### Storage tests
 
@@ -134,6 +228,19 @@ feature completion and acceptance criteria, not by time estimates.
 - Per-torrent health during active download: an actively-downloading
   generated lawful local payload reports a non-zero health score and at
   least one bar, computed from the live engine state.
+- Peer-session budgets (ADR-0053): generated stalling swarms sample live
+  diagnostics while five torrents share a global cap, while one torrent has a
+  smaller per-torrent cap, and while normal parallel and endgame sessions hold
+  permits. Serial cancellation/removal, BEP 9 metadata, TCP connect/handshake/
+  EOF/cancellation, uTP metadata, mixed inbound/outbound routing, inbound
+  denial, unlimited observation, panic release, and concurrent snapshot churn
+  have focused production-path or RAII tests.
+- Peer-limit reconstruction tests cover PATCH and full PUT success,
+  post-provisional failure, post-reconstruction persistence failure, exact pool
+  identity/lifecycle/queue/config/state restoration, blocked and recovering
+  containment, occupied listeners, unrelated-start exclusion, old/new pool
+  non-overlap, candidate-only task rollback, and pre-commit selfish-completion
+  suppression.
 
 ### Scale tests
 

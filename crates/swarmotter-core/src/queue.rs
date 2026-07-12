@@ -64,6 +64,15 @@ pub struct QueueEntry {
     pub paused: bool,
 }
 
+/// Exact membership of one hash in queue order and bypass order. This is used
+/// by daemon mutation transactions to restore only the affected hash without
+/// overwriting unrelated concurrent queue state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueMembershipSnapshot {
+    order_index: Option<usize>,
+    bypass_index: Option<usize>,
+}
+
 /// Queue state.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct QueueState {
@@ -191,6 +200,28 @@ impl QueueState {
             self.order.push(hash);
             self.order_index.insert(hash, pos);
         }
+    }
+
+    /// Capture the exact positions occupied by one hash.
+    pub fn membership_snapshot(&self, hash: &InfoHash) -> QueueMembershipSnapshot {
+        QueueMembershipSnapshot {
+            order_index: self.order.iter().position(|candidate| candidate == hash),
+            bypass_index: self.bypass.iter().position(|candidate| candidate == hash),
+        }
+    }
+
+    /// Restore one hash to a previously captured membership without changing
+    /// the relative order or flags of any other hash.
+    pub fn restore_membership(&mut self, hash: InfoHash, snapshot: QueueMembershipSnapshot) {
+        self.order.retain(|candidate| *candidate != hash);
+        self.bypass.retain(|candidate| *candidate != hash);
+        if let Some(index) = snapshot.order_index {
+            self.order.insert(index.min(self.order.len()), hash);
+        }
+        if let Some(index) = snapshot.bypass_index {
+            self.bypass.insert(index.min(self.bypass.len()), hash);
+        }
+        self.rebuild_membership_sets();
     }
 
     /// Remove a torrent from the queue.
@@ -405,6 +436,23 @@ mod tests {
         q.add(h(2));
         assert_eq!(q.position(&h(2)), Some(2));
         assert_eq!(q.position(&h(9)), None);
+    }
+
+    #[test]
+    fn membership_snapshot_restores_exact_order_and_bypass_position() {
+        let mut q = QueueState::default();
+        q.add_many([h(1), h(2), h(3)]);
+        q.start_now(&h(3));
+        q.start_now(&h(2));
+        let snapshot = q.membership_snapshot(&h(2));
+
+        q.remove(&h(2));
+        q.add(h(4));
+        q.restore_membership(h(2), snapshot);
+
+        assert_eq!(q.order, [h(1), h(2), h(3), h(4)]);
+        assert_eq!(q.bypass, [h(3), h(2)]);
+        assert_eq!(q.position(&h(2)), Some(2));
     }
 
     #[test]

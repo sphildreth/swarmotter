@@ -9,7 +9,67 @@ date or duration estimates.
 
 ## [Unreleased]
 
-### Changed
+### Added
+
+- **Durable per-torrent seeding lifecycle:** each torrent now persists nullable
+  ratio and idle overrides plus seed-forever policy, exposes stored/effective
+  targets and exact seeding status through the native API, and provides a strict
+  replacement control in Torrent Details. Seeder registration is authoritative
+  for active counts and lifecycle state across queue slots, automatic/manual
+  stops, restart, and fail-closed containment recovery. Verified piece ranges
+  now produce exact single- and multi-file completed-byte accounting at file and
+  final-piece boundaries. Downloader and seeder retain one live per-torrent
+  limiter, so an upload-limit update shapes an accepted peer transfer without
+  replacing the registration. See
+  [ADR-0052](design/adr/0052-persisted-per-torrent-seeding-policy-and-runtime-lifecycle.md).
+
+### Fixed
+
+- **Stable, idempotent, transactional watch ingestion:** complete sorted
+  directory walks now run off the async workers, reject symlink roots, skip
+  child symlinks, and require two unchanged length/modified-time observations.
+  Bounded reads recheck path/open-file metadata and reset without a terminal
+  result when copying continues. One in-memory processed fingerprint prevents
+  repeated `leave` imports; restart duplicates are successful and preserve the
+  existing torrent/queue/settings while applying the success action once. API,
+  magnet, and watch adds share one locked durable transaction with exact
+  registry/queue rollback and no pre-persistence events or scheduling.
+  Permanent parser errors move to failure while transient operational errors
+  stay for retry. Archive/failure actions use create-new semantics, never
+  overwrite, and expose `post_action_error`. Recursive folders exclude their
+  own strict-descendant archive/failure paths without affecting separately
+  configured overlapping roots; whitespace-only and equal-root action paths
+  are rejected. Stable outcomes/events and a 10,000-entry in-memory history are
+  rendered in the Watch UI. See
+  [ADR-0054](design/adr/0054-watch-folder-stability-idempotence-and-import-atomicity.md).
+
+- **One process-wide peer-session budget:** `bandwidth.max_peers` now enforces
+  one runtime-owned limit across metadata, serial, parallel, endgame, inbound
+  seeding, TCP, and uTP sessions for every torrent, while
+  `max_peers_per_torrent` is an additional per-torrent cap shared across
+  inbound and outbound sessions.
+  Trackers, webseeds, DHT, DNS, discovery, and retry waits remain outside the
+  peer-specific budget. Live diagnostics expose exact limit, observed in-use,
+  coherent availability, and inbound-denial counters, including unlimited
+  observation. PATCH and full PUT replace pool objects through locked
+  data-plane reconstruction; failed provisional work or persistence restores
+  exact prior pool identities, task/lifecycle/queue ownership, config bytes,
+  and durable state without enabling pre-commit selfish removal. See
+  [ADR-0053](design/adr/0053-process-wide-peer-session-permit-pool.md).
+
+- **Browser-origin protection for every control API:** the shared
+  `browser_origin_guard` middleware is now applied as the outermost layer to
+  every browser-reachable control route — `/api/v1`, `/transmission/rpc`, and
+  `/api/v2` — so cross-site/same-site Fetch Metadata, foreign/malformed/`null`
+  /multi-value/opaque origins are rejected with 403 before authentication,
+  session negotiation, and compatibility-enabled checks in both authentication
+  modes. Duplicate or invalid-byte Origin/Host/`Sec-Fetch-Site` fields, unknown
+  Fetch Metadata values, and origins containing userinfo, a path, query, or
+  fragment now fail closed. Rejections retain the native, Transmission, or
+  qBittorrent error format, and the duplicate guard call was removed from native
+  auth. See
+  [ADR-0044](design/adr/0044-browser-origin-and-loopback-api-security.md),
+  [ADR-0049](design/adr/0049-configured-unauthenticated-lan-control-plane.md).
 
 - **Strict containment is the default (breaking):** `NetworkConfig::default()`
   now selects strict mode, matching the Serde default. An omitted `[network]`
@@ -22,8 +82,6 @@ date or duration estimates.
   [ADR-0051](design/adr/0051-explicit-network-path-and-live-containment-gate.md).
   Version bump deferred to a later phase.
 
-### Fixed
-
 - **Live containment gate:** one process-wide `ContainmentGate` (atomics plus
   `tokio::sync::Notify`) is now shared by every torrent data-plane component.
   Every bind, connect, resolve, accept-loop iteration, UDP send, tracker
@@ -31,26 +89,42 @@ date or duration estimates.
   unhealthy transition the gate blocks immediately, the inbound listener and
   DHT runner stop, data-plane tasks are aborted, active torrents enter
   `network_blocked`, state persists, and events publish — all while the control
-  plane remains available. Recovery reopens the gate and resumes only formerly
-  active work. The health loop now uses an injected `InterfaceProbe` (tests
-  inject a mutable fake) and exposes one `network_health_tick()` that tests
-  drive without sleeping. Bind/listen/source-bind failures route through a
-  runtime health-report channel and expose `socket_bind_failed`; strict policy
-  denials with no more specific status expose `blocked_fail_closed`. See
+  plane remains available. Every block advances a wakeup-safe cancellation
+  generation, so an immediate block/recovery cycle still terminates streams
+  from the old generation. Recovery consumes durable typed intent only for
+  downloads, metadata work, and seeders demonstrably live at the block edge;
+  paused, queued, stopped, and stale blocked records stay stopped. The health
+  loop now uses an injected `InterfaceProbe` (tests inject a mutable fake) and
+  exposes one `network_health_tick()` that tests drive without sleeping.
+  Bind/listen/source-bind failures block synchronously, expose
+  `socket_bind_failed`, and remain latched across healthy probe results until an
+  explicit full configuration replacement validates contained UDP and listener
+  binds; strict policy denials with no more specific status expose
+  `blocked_fail_closed`. A CI harness now proves a real generated local
+  tracker/peer transfer stops when its route-less namespace veth is deleted,
+  while running fixtures without capabilities and granting the daemon only
+  `CAP_NET_RAW` for `SO_BINDTODEVICE`. See
   [ADR-0051](design/adr/0051-explicit-network-path-and-live-containment-gate.md).
 
 - **Bounded untrusted metainfo parsing:** the shared bencode decoder and
   metainfo builder now enforce fixed depth, node-count, file-count,
   piece-count, piece-length, and 16 MiB metadata byte budgets before any
-  piece-sized allocation. The budgets apply equally to `.torrent` uploads, bulk
+  piece-sized allocation. These bencode budgets cover `.torrent` uploads, bulk
   base64 metainfo, magnet `info` dicts fetched via BEP 9, watch-folder files,
-  and restored durable daemon state. The decoder rejects empty/leading-zero/
+  and direct core parser callers. The decoder rejects empty/leading-zero/
   negative-zero integers, missing terminators, duplicate and non-string
   dictionary keys, overflowing string lengths, and trailing bytes, and
   requires EOF after exactly one top-level value. No malformed input may panic
-  the daemon. Durable SHA-1 piece hashes are validated to be exactly 20 bytes
-  with piece-index context before copying. Engine/storage boundaries narrow
-  piece length with `u32::try_from` rather than `as`. See
+  the daemon. Raw uploads stream only to the lower configured/metadata limit;
+  bulk and Transmission base64 decoders stop before decoded output exceeds the
+  metadata limit. BEP 9 uses the hardened prefix parser for a bounded dictionary
+  followed by binary piece data and validates advertised/per-message/final
+  assembly values. Restored daemon state is JSON: its piece-hash sequence is
+  capped at `MAX_TORRENT_PIECES`, each SHA-1 hash is validated to encode exactly
+  20 bytes with record/piece-index context before decoding/copying, and restored
+  `TorrentMeta` values must pass shape validation before runtime use.
+  Engine/storage boundaries narrow piece length with `u32::try_from` rather
+  than `as`. See
   [ADR-0050](design/adr/0050-bounded-untrusted-metainfo-parsing.md).
 
 ## [1.3.1] - [2026-07-12]
@@ -281,7 +355,7 @@ date or duration estimates.
   concurrent torrents sharing a global limiter no longer serialize on the same
   two locks.
 - **Daemon state lock contention:** read-heavy daemon state maps (`config`,
-  `network_health`, `engine_states`, `engine_handles`, `engine_limiters`,
+  `network_health`, `engine_states`, `engine_handles`, `torrent_limiters`,
   `rate_samples`, `engine_retry_after`, `autopilot_decisions`,
   `autopilot_last_action`) now use `tokio::sync::RwLock` instead of
   `tokio::sync::Mutex`, allowing concurrent readers during progress

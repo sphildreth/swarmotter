@@ -35,7 +35,9 @@ foundational dependency stack rationale.
 | axum | 0.7 | MIT | Async HTTP API framework (control plane only) |
 | tower | 0.5 | MIT | Tower service/middleware for axum |
 | tower-http | 0.6 | MIT | HTTP middleware (static fs, trace, cors) |
-| hyper | 1 | MIT | HTTP server under axum |
+| hyper | 1 | MIT | HTTP server under axum and HTTP/1 client codec over binder-provided contained streams; its client connector/pool is not used |
+| hyper-util | 0.1 | MIT | Tokio I/O adapter for Hyper over an already-connected contained TCP/TLS stream; no connector is enabled or used |
+| http-body-util | 0.1 | MIT | Empty GET request bodies and framed decoded-body streaming for the bounded contained HTTP client |
 | sha1 | 0.10 | BSD-3-Clause | Info-hash and piece-hash computation (pure Rust) |
 | hex | 0.4 | MIT/Apache-2.0 | Hex encoding/decoding |
 | url | 2 | MIT/Apache-2.0 | Magnet link and tracker URL parsing |
@@ -46,16 +48,15 @@ foundational dependency stack rationale.
 | clap | 4 | MIT/Apache-2.0 | CLI argument parsing |
 | libc | 0.2 | MIT/Apache-2.0 | Linux interface discovery and `SO_BINDTODEVICE` socket binding |
 | socket2 | 0.6 | MIT/Apache-2.0 | Constructing interface-bound TCP/UDP sockets before handing them to Tokio |
-| tokio-rustls | 0.26 | MIT/Apache-2.0 | TLS handshake over contained TCP sockets (HTTPS trackers) |
-| rustls | 0.23 | Apache-2.0/MIT/ISC | Rustls TLS implementation with the ring crypto provider (HTTPS trackers) |
-| webpki-roots | 0.26 | MPL-2.0 | Platform root CA trust store for HTTPS tracker certificate validation |
+| tokio-rustls | 0.26 | MIT/Apache-2.0 | TLS handshake over binder-provided contained TCP sockets for tracker and webseed HTTPS |
+| rustls | 0.23 | Apache-2.0/MIT/ISC | Validating TLS implementation with the ring crypto provider for the contained HTTP client |
+| webpki-roots | 0.26 | MPL-2.0 | Root CA trust store for contained HTTPS tracker and webseed certificate validation |
 
 ### Dev-dependencies (test-only)
 
 | Crate | Version | License | Justification |
 |-------|---------|---------|---------------|
 | rcgen | 0.13 | MIT/Apache-2.0 | Self-signed certificate generation for the local HTTPS tracker fixture only |
-| rustls-pemfile | 2 | Apache-2.0/MIT | PEM parsing for test TLS fixtures |
 
 ## Documentation tooling and vendored assets
 
@@ -85,9 +86,11 @@ operating-system packages in a specific artifact.
 None of the direct dependencies above create torrent data-plane network
 traffic on their own. All torrent-related sockets (peers, trackers, DHT, PEX,
 webseeds, magnet metadata) are created through SwarmOtter's central network
-containment layer. `axum`/`hyper`/`tower-http` are scoped to the control plane
-(API/Web UI) and do not participate in torrent data traffic. The vendored
-Tabulator browser asset only renders API data already returned to the Web UI.
+containment layer. `axum`/`tower-http` use Hyper on the control plane. The data
+plane uses only Hyper's HTTP/1 codec and `hyper-util` Tokio adapter over a stream
+already resolved and connected by `NetworkBinder`; no Hyper connector,
+resolver, pool, or general client is enabled. The vendored Tabulator browser
+asset only renders API data already returned to the Web UI.
 
 ## Notes
 

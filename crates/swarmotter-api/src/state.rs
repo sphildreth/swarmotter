@@ -105,6 +105,12 @@ pub trait DaemonOps: Send + Sync + 'static {
         hash: &InfoHash,
         limits: swarmotter_core::bandwidth::TorrentBandwidth,
     ) -> Result<()>;
+    /// Replace the complete persisted per-torrent seeding policy.
+    async fn set_torrent_seeding(
+        &self,
+        hash: &InfoHash,
+        seeding: swarmotter_core::ratio::TorrentSeeding,
+    ) -> Result<TorrentSummary>;
 
     /// List files for a torrent.
     async fn list_files(&self, hash: &InfoHash) -> Option<Vec<TorrentFile>>;

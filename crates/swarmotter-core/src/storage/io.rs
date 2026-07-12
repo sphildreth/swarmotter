@@ -1338,11 +1338,14 @@ pub fn build_resume_with_wanted(
 }
 
 /// Re-export the piece-to-file mapping for tests.
-pub fn piece_file_mapping(meta: &TorrentMeta, piece_index: usize) -> Vec<(usize, u64, u64)> {
-    piece_file_ranges(meta, piece_index)
+pub fn piece_file_mapping(
+    meta: &TorrentMeta,
+    piece_index: usize,
+) -> Result<Vec<(usize, u64, u64)>> {
+    Ok(piece_file_ranges(meta, piece_index)?
         .into_iter()
         .map(|s| (s.file_index, s.offset_in_file, s.length))
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -1371,9 +1374,9 @@ mod tests {
     fn piece_to_file_offset_mapping_single() {
         let bytes = build_single_file_torrent("f", b"0123456789abcdef", 8, None, false);
         let meta = parse_torrent(&bytes).unwrap();
-        let m = piece_file_mapping(&meta, 0);
+        let m = piece_file_mapping(&meta, 0).unwrap();
         assert_eq!(m, vec![(0, 0, 8)]);
-        let m1 = piece_file_mapping(&meta, 1);
+        let m1 = piece_file_mapping(&meta, 1).unwrap();
         assert_eq!(m1, vec![(0, 8, 8)]);
     }
 
@@ -1388,12 +1391,12 @@ mod tests {
         let bytes = build_multi_file_torrent("dir", &files, &contents, 4, None);
         let meta = parse_torrent(&bytes).unwrap();
         // Piece 0: bytes 0..4 -> a.txt [0..4]
-        assert_eq!(piece_file_mapping(&meta, 0), vec![(0, 0, 4)]);
+        assert_eq!(piece_file_mapping(&meta, 0).unwrap(), vec![(0, 0, 4)]);
         // Piece 1: bytes 4..8 -> a.txt [4..5] (1 byte) + b.bin [0..3] (3 bytes)
-        let p1 = piece_file_mapping(&meta, 1);
+        let p1 = piece_file_mapping(&meta, 1).unwrap();
         assert_eq!(p1, vec![(0, 4, 1), (1, 0, 3)]);
         // Piece 2: bytes 8..12 -> b.bin [3..7]
-        assert_eq!(piece_file_mapping(&meta, 2), vec![(1, 3, 4)]);
+        assert_eq!(piece_file_mapping(&meta, 2).unwrap(), vec![(1, 3, 4)]);
     }
 
     #[tokio::test]

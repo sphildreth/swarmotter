@@ -23,14 +23,10 @@ use std::net::SocketAddr;
 
 use async_trait::async_trait;
 
-use crate::error::{CoreError, Result};
-
-/// A minimal HTTP response from a tracker announce.
-#[derive(Debug, Clone)]
-pub struct HttpResponse {
-    pub status: u16,
-    pub body: Vec<u8>,
-}
+use super::http::{ContainedHttpClient, HttpResponse};
+#[cfg(any(test, feature = "test-binder"))]
+use crate::error::CoreError;
+use crate::error::Result;
 
 /// A contained, fail-closed UDP datagram socket for torrent data-plane traffic
 /// (UDP trackers, DHT, and future uTP). All send/receive goes through the
@@ -86,7 +82,9 @@ pub trait NetworkBinder: Send + Sync {
     /// supported; hostnames needing DNS resolution are handled by the binder
     /// implementation subject to DNS containment (see
     /// `vpn-network-containment.md`).
-    async fn http_get(&self, url: &str) -> Result<HttpResponse>;
+    async fn http_get(&self, url: &str) -> Result<HttpResponse> {
+        ContainedHttpClient::new(self).get_tracker(url).await
+    }
 
     /// Issue an HTTP/1.1 byte-range GET through the contained path. `start`
     /// is inclusive and `end_exclusive` is exclusive, matching torrent piece
@@ -97,7 +95,11 @@ pub trait NetworkBinder: Send + Sync {
         url: &str,
         start: u64,
         end_exclusive: u64,
-    ) -> Result<HttpResponse>;
+    ) -> Result<HttpResponse> {
+        ContainedHttpClient::new(self)
+            .get_webseed_range(url, start, end_exclusive)
+            .await
+    }
 
     /// Resolve a torrent data-plane hostname through the contained path's DNS
     /// policy. IP literals return directly; hostnames must not be resolved
@@ -157,20 +159,6 @@ impl NetworkBinder for LoopbackBinder {
             .map_err(CoreError::from)
     }
 
-    async fn http_get(&self, url: &str) -> Result<HttpResponse> {
-        loopback_http_get(url, None).await
-    }
-
-    async fn http_get_range(
-        &self,
-        url: &str,
-        start: u64,
-        end_exclusive: u64,
-    ) -> Result<HttpResponse> {
-        validate_http_range(start, end_exclusive)?;
-        loopback_http_get(url, Some((start, end_exclusive))).await
-    }
-
     async fn resolve_host(&self, host: &str, port: u16) -> Result<SocketAddr> {
         match host.parse() {
             Ok(ip) => Ok(SocketAddr::new(ip, port)),
@@ -218,58 +206,6 @@ impl NetworkBinder for LoopbackBinder {
     fn traffic_allowed(&self) -> bool {
         true
     }
-}
-
-#[cfg(any(test, feature = "test-binder"))]
-async fn loopback_http_get(url: &str, range: Option<(u64, u64)>) -> Result<HttpResponse> {
-    let parsed =
-        url::Url::parse(url).map_err(|e| CoreError::Internal(format!("bad tracker url: {e}")))?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| CoreError::Internal(format!("tracker url missing host: {url}")))?;
-    let port = parsed.port_or_known_default().unwrap_or(80);
-    let addr: SocketAddr = format!("{}:{}", host, port)
-        .parse()
-        .map_err(|e| CoreError::Internal(format!("bad tracker addr: {e}")))?;
-    let mut stream = tokio::net::TcpStream::connect(addr)
-        .await
-        .map_err(CoreError::from)?;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let path = parsed.path();
-    let query = parsed.query().map(|q| format!("?{q}")).unwrap_or_default();
-    let mut req = format!(
-        "GET {path}{query} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: SwarmOtter/1.0\r\n"
-    );
-    if let Some((start, end_exclusive)) = range {
-        req.push_str(&http_range_header(start, end_exclusive)?);
-    }
-    req.push_str("\r\n");
-    stream
-        .write_all(req.as_bytes())
-        .await
-        .map_err(CoreError::from)?;
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .await
-        .map_err(CoreError::from)?;
-    parse_http_response(&buf)
-}
-
-#[cfg(any(test, feature = "test-binder"))]
-fn validate_http_range(start: u64, end_exclusive: u64) -> Result<()> {
-    if end_exclusive <= start {
-        return Err(CoreError::InvalidArgument(
-            "HTTP byte range end must be greater than start".into(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(any(test, feature = "test-binder"))]
-fn http_range_header(start: u64, end_exclusive: u64) -> Result<String> {
-    validate_http_range(start, end_exclusive)?;
-    Ok(format!("Range: bytes={}-{}\r\n", start, end_exclusive - 1))
 }
 
 #[cfg(any(test, feature = "test-binder"))]
@@ -333,23 +269,6 @@ impl NetworkBinder for BlockedBinder {
         ))
     }
 
-    async fn http_get(&self, _url: &str) -> Result<HttpResponse> {
-        Err(CoreError::NetworkBlocked(
-            "torrent data plane blocked".into(),
-        ))
-    }
-
-    async fn http_get_range(
-        &self,
-        _url: &str,
-        _start: u64,
-        _end_exclusive: u64,
-    ) -> Result<HttpResponse> {
-        Err(CoreError::NetworkBlocked(
-            "torrent data plane blocked".into(),
-        ))
-    }
-
     async fn resolve_host(&self, _host: &str, _port: u16) -> Result<SocketAddr> {
         Err(CoreError::NetworkBlocked(
             "torrent data plane blocked".into(),
@@ -373,48 +292,9 @@ impl NetworkBinder for BlockedBinder {
     }
 }
 
-/// Parse a raw HTTP/1.x response into a [`HttpResponse`].
-pub fn parse_http_response(raw: &[u8]) -> Result<HttpResponse> {
-    let sep = find_subslice(raw, b"\r\n\r\n").ok_or_else(|| {
-        CoreError::Internal("tracker response has no header/body separator".into())
-    })?;
-    let head = &raw[..sep];
-    let body = raw[sep + 4..].to_vec();
-    let head_str = std::str::from_utf8(head)
-        .map_err(|e| CoreError::Internal(format!("tracker response non-utf8 header: {e}")))?;
-    let mut lines = head_str.split("\r\n");
-    let status_line = lines
-        .next()
-        .ok_or_else(|| CoreError::Internal("tracker response empty status line".into()))?;
-    let mut parts = status_line.split_whitespace();
-    let _version = parts.next();
-    let status: u16 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    Ok(HttpResponse { status, body })
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_http_response_body() {
-        let raw = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nbody bytes here";
-        let r = parse_http_response(raw).unwrap();
-        assert_eq!(r.status, 200);
-        assert_eq!(r.body, b"body bytes here");
-    }
-
-    #[test]
-    fn parse_http_response_rejects_malformed() {
-        assert!(parse_http_response(b"no headers here").is_err());
-    }
 
     #[tokio::test]
     async fn loopback_udp_socket_send_recv_roundtrip() {
@@ -490,10 +370,12 @@ mod tests {
             let n = stream.read(&mut req).await.unwrap();
             let req = std::str::from_utf8(&req[..n]).unwrap();
             assert!(req.starts_with("GET /file.bin?token=local HTTP/1.1\r\n"));
-            assert!(req.contains("\r\nRange: bytes=5-10\r\n"));
+            assert!(req
+                .to_ascii_lowercase()
+                .contains("\r\nrange: bytes=5-10\r\n"));
 
             stream
-                .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 6\r\n\r\nabcdef")
+                .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 6\r\nContent-Range: bytes 5-10/100\r\n\r\nabcdef")
                 .await
                 .unwrap();
         });

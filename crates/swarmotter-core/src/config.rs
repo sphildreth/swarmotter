@@ -14,6 +14,32 @@ use crate::net::NetworkConfig;
 use crate::queue::QueueLimits;
 use crate::ratio::SeedingPolicy;
 use serde::{Deserialize, Serialize};
+use std::path::{Component, Path, PathBuf};
+
+/// Lexically normalize a path into an absolute path without resolving any
+/// symlink. Parent components cannot escape the filesystem root.
+pub fn lexical_absolute_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(CoreError::from)?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                }
+            }
+        }
+    }
+    Ok(normalized)
+}
 
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -402,6 +428,27 @@ impl Config {
     /// Validate the full configuration.
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
+        if self
+            .seeding
+            .global_ratio_limit
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(CoreError::InvalidConfig(
+                "seeding.global_ratio_limit must be a finite non-negative number or omitted".into(),
+            ));
+        }
+        if self.bandwidth.max_peers > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(CoreError::InvalidConfig(format!(
+                "bandwidth.max_peers must be <= {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
+        }
+        if self.bandwidth.max_peers_per_torrent > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(CoreError::InvalidConfig(format!(
+                "bandwidth.max_peers_per_torrent must be <= {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
+        }
         if self.api.bind_address.is_empty() {
             return Err(CoreError::InvalidConfig(
                 "api.bind_address must not be empty".into(),
@@ -458,10 +505,40 @@ impl Config {
             ));
         }
         for w in &self.watch {
-            if w.path.is_empty() {
+            if w.path.trim().is_empty() {
                 return Err(CoreError::InvalidConfig(
                     "watch folder path must not be empty".into(),
                 ));
+            }
+            let root = lexical_absolute_path(Path::new(&w.path)).map_err(|error| {
+                CoreError::InvalidConfig(format!(
+                    "watch folder path could not be normalized: {error}"
+                ))
+            })?;
+            for (field, configured_destination) in [
+                ("archive_dir", w.archive_dir.as_deref()),
+                ("failure_dir", w.failure_dir.as_deref()),
+            ] {
+                let Some(configured_destination) = configured_destination else {
+                    continue;
+                };
+                if configured_destination.trim().is_empty() {
+                    return Err(CoreError::InvalidConfig(format!(
+                        "watch folder {field} must not be empty when set"
+                    )));
+                }
+                let destination = lexical_absolute_path(Path::new(configured_destination))
+                    .map_err(|error| {
+                        CoreError::InvalidConfig(format!(
+                            "watch folder {field} could not be normalized: {error}"
+                        ))
+                    })?;
+                if destination == root {
+                    return Err(CoreError::InvalidConfig(format!(
+                        "watch folder {field} must not normalize to its watch root: {}",
+                        root.display()
+                    )));
+                }
             }
         }
         Ok(())
@@ -527,6 +604,85 @@ mod tests {
         let mut cfg = Config::default();
         cfg.network.mode = crate::models::network::NetworkContainmentMode::Disabled;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn watch_paths_reject_whitespace_and_action_destination_equal_to_root() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("config-watch-validation-root");
+        let mut cfg = Config::default();
+        cfg.network.mode = crate::models::network::NetworkContainmentMode::Disabled;
+        cfg.watch = vec![WatchFolderConfig {
+            path: root.display().to_string(),
+            recursive: true,
+            download_dir: None,
+            label: None,
+            start_behavior: StartBehavior::Paused,
+            archive_dir: Some(root.join("archive").display().to_string()),
+            failure_dir: Some(root.join("failure").display().to_string()),
+            delete_after_import: false,
+        }];
+        assert!(cfg.validate().is_ok(), "distinct descendants are valid");
+
+        let root_string = root.display().to_string();
+        let equivalent_root = root.join("child").join("..").display().to_string();
+        for (path, archive_dir, failure_dir, expected) in [
+            (" \t".to_string(), None, None, "watch folder path"),
+            (
+                root_string.clone(),
+                Some(" \t".to_string()),
+                None,
+                "archive_dir",
+            ),
+            (
+                root_string.clone(),
+                None,
+                Some(" \t".to_string()),
+                "failure_dir",
+            ),
+            (
+                root_string.clone(),
+                Some(equivalent_root),
+                None,
+                "archive_dir",
+            ),
+            (root_string.clone(), None, Some(root_string), "failure_dir"),
+        ] {
+            cfg.watch[0].path = path;
+            cfg.watch[0].archive_dir = archive_dir;
+            cfg.watch[0].failure_dir = failure_dir;
+            let error = cfg.validate().unwrap_err();
+            assert_eq!(error.code().as_str(), "invalid_config");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_negative_and_non_finite_global_ratio_limits() {
+        for invalid in [-1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let mut cfg = Config::default();
+            cfg.network.mode = crate::models::network::NetworkContainmentMode::Disabled;
+            cfg.seeding.global_ratio_limit = Some(invalid);
+            let error = cfg.validate().unwrap_err();
+            assert_eq!(error.code().as_str(), "invalid_config");
+            assert!(error.to_string().contains("global_ratio_limit"));
+        }
+    }
+
+    #[test]
+    fn peer_limits_accept_runtime_boundary_and_reject_one_over() {
+        let mut cfg = Config::default();
+        cfg.network.mode = crate::models::network::NetworkContainmentMode::Disabled;
+        cfg.bandwidth.max_peers = tokio::sync::Semaphore::MAX_PERMITS;
+        cfg.bandwidth.max_peers_per_torrent = tokio::sync::Semaphore::MAX_PERMITS;
+        assert!(cfg.validate().is_ok());
+
+        cfg.bandwidth.max_peers = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        assert!(matches!(cfg.validate(), Err(CoreError::InvalidConfig(_))));
+        cfg.bandwidth.max_peers = 0;
+        cfg.bandwidth.max_peers_per_torrent = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        assert!(matches!(cfg.validate(), Err(CoreError::InvalidConfig(_))));
     }
 
     #[test]

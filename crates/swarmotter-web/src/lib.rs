@@ -23,6 +23,8 @@ use axum::{
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const APP_JS: &str = include_str!("../assets/app.js");
+const SEEDING_POLICY_JS: &str = include_str!("../assets/seeding-policy.js");
+const WATCH_HISTORY_JS: &str = include_str!("../assets/watch-history.js");
 const THEME_BOOTSTRAP_JS: &str = include_str!("../assets/theme-bootstrap.js");
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 const TABULATOR_JS: &str = include_str!("../assets/vendor/tabulator/tabulator.min.js");
@@ -52,6 +54,8 @@ pub fn web_router() -> Router {
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
+        .route("/seeding-policy.js", get(seeding_policy_js))
+        .route("/watch-history.js", get(watch_history_js))
         .route("/theme-bootstrap.js", get(theme_bootstrap_js))
         .route("/style.css", get(style_css))
         .route("/vendor/tabulator/tabulator.min.js", get(tabulator_js))
@@ -86,6 +90,28 @@ async fn app_js() -> Response {
             "application/javascript; charset=utf-8",
         )],
         APP_JS,
+    )
+        .into_response()
+}
+
+async fn seeding_policy_js() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        SEEDING_POLICY_JS,
+    )
+        .into_response()
+}
+
+async fn watch_history_js() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        WATCH_HISTORY_JS,
     )
         .into_response()
 }
@@ -699,6 +725,13 @@ mod tests {
             "details-download-limit",
             "details-upload-limit",
             "details-limits-btn",
+            "details-ratio-inherit",
+            "details-ratio-limit",
+            "details-idle-inherit",
+            "details-idle-limit",
+            "details-seed-forever",
+            "details-seeding-save-btn",
+            "details-seeding-error",
             "tracker-add-btn",
         ] {
             assert!(
@@ -714,15 +747,103 @@ mod tests {
             "\"/move\"",
             "\"/labels\"",
             "\"/limits\"",
+            "/seeding`",
             "/trackers/edit",
             "/files/${fi}/rename",
             "function renderDetailsActivity(",
         ] {
             assert!(
-                APP_JS.contains(needle),
+                APP_JS.contains(needle) || SEEDING_POLICY_JS.contains(needle),
                 "Web UI operation wiring is missing {needle}"
             );
         }
+    }
+
+    #[test]
+    fn web_ui_renders_and_replaces_seeding_policy_without_optimistic_drift() {
+        for needle in [
+            "[\"Ratio\", finiteNumber(t.ratio)",
+            "[\"Uploaded\", fmtBytes(t.uploaded)]",
+            "[\"Seeding status\"",
+            "[\"Stored ratio target\"",
+            "[\"Effective ratio target\"",
+            "[\"Stored idle target\"",
+            "[\"Effective idle target\"",
+            "ratio_limit: ratio",
+            "idle_limit: idle",
+            "seed_forever: field(document, \"details-seed-forever\").checked",
+            "method: \"PUT\"",
+            "Number.isSafeInteger(idle)",
+            "errorPanel.textContent = error?.message",
+            "await openDetails(hash);",
+        ] {
+            assert!(
+                APP_JS.contains(needle) || SEEDING_POLICY_JS.contains(needle),
+                "Seeding policy UI behavior is missing {needle}"
+            );
+        }
+        assert!(INDEX_HTML.contains("0 stops immediately"));
+        assert!(INDEX_HTML.contains("Inherit global ratio limit"));
+        assert!(INDEX_HTML.contains("Inherit global idle limit"));
+    }
+
+    #[test]
+    fn executable_seeding_policy_dom_state_harness_passes() {
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/seeding-policy.test.js");
+        let output = std::process::Command::new("node")
+            .arg(script)
+            .output()
+            .expect("Node.js is required by the Web UI quality gate");
+        assert!(
+            output.status.success(),
+            "seeding policy DOM harness failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn web_ui_renders_stable_watch_outcomes_and_post_action_errors() {
+        for needle in [
+            "src=\"/watch-history.js\"",
+            "<th>Outcome</th>",
+            "watchHistoryUi.outcomeLabel(item)",
+            "watchHistoryUi.statusKey(item)",
+            "watchHistoryUi.detail(item)",
+        ] {
+            assert!(
+                INDEX_HTML.contains(needle) || APP_JS.contains(needle),
+                "watch history renderer is missing {needle}"
+            );
+        }
+        for needle in [
+            "permanent_failure",
+            "transient_failure",
+            "item?.post_action_error",
+            "Existing torrent retained; success action applied.",
+        ] {
+            assert!(
+                WATCH_HISTORY_JS.contains(needle),
+                "watch history outcome module is missing {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_watch_history_renderer_harness_passes() {
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/watch-history.test.js");
+        let output = std::process::Command::new("node")
+            .arg(script)
+            .output()
+            .expect("Node.js is required by the Web UI quality gate");
+        assert!(
+            output.status.success(),
+            "watch history renderer harness failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -1070,6 +1191,11 @@ mod tests {
                 "/theme-bootstrap.js",
                 "application/javascript; charset=utf-8",
             ),
+            (
+                "/seeding-policy.js",
+                "application/javascript; charset=utf-8",
+            ),
+            ("/watch-history.js", "application/javascript; charset=utf-8"),
             (
                 "/vendor/tabulator/tabulator_midnight.min.css",
                 "text/css; charset=utf-8",

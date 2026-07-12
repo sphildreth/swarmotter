@@ -25,5 +25,5 @@ pub use stats::{
     TorrentStats,
 };
 pub use storage::{StorageDiagnostics, StorageRootDiagnostics, StorageRootRole};
-pub use torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
+pub use torrent::{FilePriority, SeedingStatus, TorrentFile, TorrentState, TorrentSummary};
 pub use tracker::{TrackerId, TrackerInfo, TrackerKind, TrackerStatus, TrackerTier};

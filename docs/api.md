@@ -52,23 +52,50 @@ including on a configured LAN listener. Every client that can reach such a
 listener can control SwarmOtter, so authenticated mode is strongly recommended
 unless the reachable network is the intended trust boundary.
 
-Browser requests to `/api/v1` must be same-origin: `Origin` must match `Host`,
-and Fetch Metadata marked as cross-site or same-site is rejected. This includes
-WebSocket handshakes. CLI and automation clients that do not send browser origin
-metadata are unaffected. Authenticated reverse proxies must preserve `Host`.
+Browser requests to every control route (`/api/v1`, `/transmission/rpc`, and
+`/api/v2`) must be same-origin. An Origin-bearing request must provide exactly
+one valid UTF-8 `Origin` and `Host`; the Origin must be only
+`scheme://authority`, its normalized host and explicit port must match Host, and
+it may not contain user information, a path, query, or fragment. `Origin: null`,
+opaque, foreign, malformed, duplicate, multi-value, and invalid-byte headers are
+rejected. Scheme is intentionally not compared, so a TLS-terminating reverse
+proxy is supported when it preserves the public Host authority.
+
+`Sec-Fetch-Site` permits only `same-origin`, `none`, or an absent header.
+`same-site`, `cross-site`, unknown, duplicated, and invalid-byte values are
+rejected. This includes WebSocket and SSE requests. The shared
+`browser_origin_guard` is the outermost control-route layer, before native
+authentication, Transmission session negotiation, qBittorrent SID handling,
+compatibility-enabled checks, request extraction, and daemon operations. The
+policy is identical whether `api.require_auth` is true or false. CLI and
+automation clients with neither Origin nor `Sec-Fetch-Site` are unaffected.
+
+An origin rejection always uses HTTP 403 but preserves the selected surface's
+error format: the native API returns its JSON error envelope with
+`cross_origin_forbidden`, Transmission returns a JSON `error` object, and
+qBittorrent returns plain-text `Forbidden`. Rejections are never redirected to
+the Web UI.
 
 API request bodies are capped by `api.max_request_body_bytes`; this applies to
 JSON requests and raw `.torrent` uploads. The root `/health` alias remains a
 control-plane health endpoint outside `/api/v1`.
 
-Torrent metadata (`.torrent` uploads, bulk base64 `metainfo`, magnet `info`
-dicts fetched via BEP 9, watch-folder files, and restored durable state) is
-additionally bounded by a shared 16 MiB metadata limit
-(`MAX_TORRENT_METADATA_BYTES`) enforced by the core parser before any
-piece-sized allocation. A `.torrent` body or assembled magnet `info` dict that
-exceeds the limit is rejected with `malformed_torrent` (or `bencode_error` for
-raw decoder overruns) regardless of `api.max_request_body_bytes`, which may be
-higher for other request payloads. See ADR-0050.
+Bencoded torrent metadata (`.torrent` uploads, bulk base64 `metainfo`, magnet
+`info` dicts fetched via BEP 9, and watch-folder files) is additionally bounded
+by a shared 16 MiB limit (`MAX_TORRENT_METADATA_BYTES`) enforced by the core
+parser before any piece-sized allocation. A `.torrent` body or assembled magnet
+`info` dict that exceeds the metadata limit is rejected with
+`malformed_torrent` (or `bencode_error` for raw decoder overruns). Raw torrent
+uploads are streamed and stop at the lower of the configured request limit and
+16 MiB: when `api.max_request_body_bytes` is lower, crossing that configured
+limit returns HTTP 413 with `payload_too_large` before the metadata-specific
+error. Bulk and Transmission base64 metainfo decoding stops before decoded
+output can exceed 16 MiB.
+
+Restored daemon state is JSON, not bencode. Its piece-hash sequence is capped at
+`MAX_TORRENT_PIECES`; each hash must encode exactly 20 bytes before hex
+decoding/copying, and restored metainfo must pass `TorrentMeta::validate()`
+before runtime use. See ADR-0050.
 
 ## Health, version, and stats
 
@@ -88,6 +115,20 @@ counts, running engine counts, requested and granted download/metadata slots,
 retry-backoff counts, active queue limits, peer-worker budget fields, and
 boolean saturation flags for download slots, metadata fetch slots, and peer
 worker budget.
+
+The authoritative process-wide peer-session fields are:
+
+- `peer_limit`: configured process-wide limit; `0` means unlimited.
+- `peer_permits_in_use`: observed live inbound plus outbound peer sessions.
+- `peer_permits_available`: remaining bounded capacity, or `null` when
+  unlimited.
+- `peer_sessions_denied`: inbound sockets rejected by the global or routed
+  per-torrent cap before a session starts.
+
+The older `peer_worker_global_limit`, `peer_worker_per_torrent_limit`,
+`effective_peer_worker_limit`, `peer_worker_budget`, and saturation values are
+retained compatibility diagnostics for engine worker scheduling. They are not
+the process-wide connection-limit authority.
 
 ## Torrent management
 
@@ -112,6 +153,38 @@ worker budget.
 | POST | `/torrents/:hash/move` | Move data: `{ path }`. |
 | POST | `/torrents/:hash/labels` | Set labels: `{ labels }`. |
 | POST | `/torrents/:hash/limits` | Set per-torrent bandwidth limits: `{ download_limit, upload_limit }`, bytes/sec, `0` = unlimited. |
+| PUT | `/torrents/:hash/seeding` | Replace the persisted per-torrent ratio/idle/forever policy. |
+
+Torrent list/detail rows include `uploaded`, `ratio`, `seeding`,
+`seeding_status`, `effective_ratio_limit`, and `effective_idle_limit`. The
+persisted `seeding` object has nullable `ratio_limit` and `idle_limit` fields
+plus `seed_forever`. Nullable targets inherit `[seeding]` globals; explicit
+zero is an immediate target. `seed_forever: true` makes both effective fields
+`null` without erasing stored overrides.
+
+The replacement request requires exactly these keys:
+
+```json
+{
+  "ratio_limit": 1.5,
+  "idle_limit": 1800,
+  "seed_forever": false
+}
+```
+
+`ratio_limit` must be a finite non-negative number or `null`; `idle_limit`
+must be a non-negative integer number of seconds or `null`; and
+`seed_forever` must be boolean. Missing, unknown, negative, non-finite,
+fractional-idle, or numeric-overflow input returns `invalid_argument`. The
+daemon persists before success, then immediately re-evaluates active or
+automatically stopped complete content. It never auto-resumes a manual pause.
+
+`seeding_status` is one of `not_eligible`, `queued`, `active`,
+`stopped_ratio`, `stopped_idle`, or `stopped_manual`. Fully verified queued
+content is `completed` + `queued`; a live registered seeder is `seeding` +
+`active`; automatic stops return to `completed`; and a complete operator pause
+is `paused` + `stopped_manual`. During containment failure the coarse state is
+`network_blocked` and the fine status is preserved for recovery.
 
 Add requests can start paused while still inserting the torrent into queue
 order. For JSON magnet adds, set either `paused: true` or
@@ -328,6 +401,29 @@ data needed by operators and automation. Typical fields include:
 | GET | `/watch/history` | Import history. |
 | GET | `/watch/status` | Watch-folder status, folder readiness, and recent imports. |
 
+Watch `recent_imports`, history rows, and each folder's `last_result` retain the
+compatibility fields `path`, `success`, `info_hash_hex`, `error`, and
+`duplicate`, and add:
+
+- `outcome`: `imported`, `duplicate`, `permanent_failure`, or
+  `transient_failure`.
+- `post_action_error`: `null` or the archive/delete/failure-move error. A
+  post-action error does not replace the primary outcome.
+
+History is insertion ordered, in-memory only, and capped at the newest 10,000
+rows. Unstable first/changed observations produce no row. `pending_torrent_files`
+counts unseen, changed, stabilizing, and transient-retry files, but excludes an
+unchanged fingerprint already processed in this daemon run. Calling status does
+not advance stability.
+
+Watch `duplicate` is a successful operational outcome: the existing torrent
+and queue entry remain byte-for-byte/position-for-position unchanged, and the
+configured success file action runs. This does not change the native torrent-
+add compatibility contract; an API duplicate still returns HTTP 409 with
+`duplicate_torrent`. New API/watch adds share a durable registry/queue
+transaction, so persistence failure returns the existing typed error envelope
+without a visible torrent, queue entry, add event, or scheduled start.
+
 ## Logs and doctor
 
 | Method | Path | Description |
@@ -361,6 +457,12 @@ Current event kinds include `torrent_added`, `torrent_changed`,
 `torrent_peers_changed`, `stats_updated`, `network_status_changed`,
 `watch_folder_imported`, `watch_folder_failed`, `settings_changed`, and
 `daemon_health_changed`.
+
+`watch_folder_imported` covers both `imported` and successful `duplicate`.
+`watch_folder_failed` covers permanent and transient attempts. Their payloads
+contain `path`, `outcome`, `success`, `duplicate`, `info_hash`, `error`, and
+`post_action_error`; the top-level event `info_hash` is present when parsing
+produced one. A changing/unstable observation emits neither event.
 
 ## Per-torrent health
 
@@ -454,6 +556,11 @@ Authentication follows `api.require_auth`:
 - The endpoint enforces `X-Transmission-Session-Id` and returns a new session
   ID header on session mismatch.
 
+The browser-origin policy in [Authentication and limits](#authentication-and-limits)
+runs before the enabled check, authentication, and session negotiation. An
+origin rejection returns HTTP 403 with the Transmission JSON `error` object and
+does not issue a session ID or dispatch an RPC method.
+
 The adapter currently supports common session, torrent lifecycle, queue, and
 helper calls:
 
@@ -464,6 +571,11 @@ helper calls:
   `torrent-rename-path`
 - `queue-move-top`, `queue-move-up`, `queue-move-down`, `queue-move-bottom`
 - `free-space`, `port-test`, `blocklist-update`
+
+Per-torrent seeding policy does not add Transmission adapter options. Existing
+`torrent-get` fields `uploadRatio`/`upload_ratio` and
+`uploadedEver`/`uploaded_ever` use the same truthful native accounting; an
+unsupported per-torrent `seedRatioLimit` request remains `null`.
 
 `torrent-remove` maps `delete-local-data` and `delete_local_data` to the native
 delete-data option.
@@ -490,6 +602,11 @@ Authentication follows `api.require_auth`:
 - qBittorrent-style `SID` flow via `POST /api/v2/auth/login` and a returned `SID`
   cookie.
 
+The browser-origin policy in [Authentication and limits](#authentication-and-limits)
+runs before the enabled check, login/SID handling, form extraction, and daemon
+operations. An origin rejection returns HTTP 403 with plain-text `Forbidden`;
+it does not create a SID or dispatch the requested operation.
+
 Representative automation endpoints:
 
 - `GET /api/v2/app/version`
@@ -502,3 +619,7 @@ Representative automation endpoints:
 - `POST /api/v2/torrents/start`
 - `POST /api/v2/torrents/stop`
 - `POST /api/v2/torrents/setCategory`
+
+The qBittorrent torrent-info response continues to expose its documented
+`ratio` and `uploaded` counters from the native summary. It does not claim
+`ratio_limit` or `seeding_time_limit` policy options.

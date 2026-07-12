@@ -4,6 +4,7 @@
 
 use crate::autopilot::AutopilotMode;
 use crate::hash::InfoHash;
+use crate::ratio::TorrentSeeding;
 use serde::{Deserialize, Serialize};
 
 /// Torrent lifecycle state.
@@ -66,6 +67,33 @@ impl TorrentState {
 impl std::fmt::Display for TorrentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// Fine-grained seeding lifecycle persisted independently of the coarse
+/// torrent state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SeedingStatus {
+    #[default]
+    NotEligible,
+    Queued,
+    Active,
+    StoppedRatio,
+    StoppedIdle,
+    StoppedManual,
+}
+
+impl SeedingStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotEligible => "not_eligible",
+            Self::Queued => "queued",
+            Self::Active => "active",
+            Self::StoppedRatio => "stopped_ratio",
+            Self::StoppedIdle => "stopped_idle",
+            Self::StoppedManual => "stopped_manual",
+        }
     }
 }
 
@@ -185,6 +213,12 @@ pub struct TorrentSummary {
     pub bytes_completed: u64,
     pub uploaded: u64,
     pub downloaded: u64,
+    /// Durable per-torrent policy. `None` targets inherit global settings.
+    pub seeding: TorrentSeeding,
+    pub seeding_status: SeedingStatus,
+    /// Resolved targets after inheritance and seed-forever precedence.
+    pub effective_ratio_limit: Option<f64>,
+    pub effective_idle_limit: Option<u64>,
     pub piece_count: usize,
     pub pieces_have: usize,
     pub piece_length: u64,
@@ -239,5 +273,27 @@ mod tests {
     fn priority_weights() {
         assert!(FilePriority::High.weight() > FilePriority::Normal.weight());
         assert_eq!(FilePriority::Unwanted.weight(), -1);
+    }
+
+    #[test]
+    fn seeding_statuses_serialize_with_exact_wire_values() {
+        let cases = [
+            (SeedingStatus::NotEligible, "not_eligible"),
+            (SeedingStatus::Queued, "queued"),
+            (SeedingStatus::Active, "active"),
+            (SeedingStatus::StoppedRatio, "stopped_ratio"),
+            (SeedingStatus::StoppedIdle, "stopped_idle"),
+            (SeedingStatus::StoppedManual, "stopped_manual"),
+        ];
+        for (status, wire) in cases {
+            assert_eq!(
+                serde_json::to_string(&status).unwrap(),
+                format!("\"{wire}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<SeedingStatus>(&format!("\"{wire}\"")).unwrap(),
+                status
+            );
+        }
     }
 }

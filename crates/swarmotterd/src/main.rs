@@ -13,6 +13,7 @@ mod engine;
 mod logging;
 mod metadata;
 mod netbinder;
+mod peer_permits;
 mod runtime;
 mod seeder;
 mod state_store;

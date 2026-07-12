@@ -7,7 +7,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as _, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::queue::QueueState;
 use swarmotter_core::torrent::Torrent;
@@ -32,21 +33,89 @@ impl DaemonState {
     }
 }
 
+#[derive(Deserialize)]
+struct StoredDaemonState {
+    version: u32,
+    torrents: TorrentRecords,
+    queue: QueueState,
+}
+
+struct TorrentRecords(Vec<Torrent>);
+
+impl<'de> Deserialize<'de> for TorrentRecords {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RecordsVisitor;
+
+        impl<'de> Visitor<'de> for RecordsVisitor {
+            type Value = TorrentRecords;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an array of durable torrent records")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut records = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+                loop {
+                    let record_index = records.len();
+                    let value = match sequence.next_element::<serde_json::Value>() {
+                        Ok(Some(value)) => value,
+                        Ok(None) => break,
+                        Err(error) => {
+                            return Err(A::Error::custom(format!(
+                                "torrent record {record_index}: {error}"
+                            )));
+                        }
+                    };
+                    let hash = value
+                        .get("meta")
+                        .and_then(|meta| meta.get("info_hash"))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|hash| swarmotter_core::hash::InfoHash::from_hex(hash).ok())
+                        .map(|hash| hash.to_hex());
+                    match serde_json::from_value::<Torrent>(value) {
+                        Ok(torrent) => records.push(torrent),
+                        Err(error) => {
+                            let record = hash.map_or_else(
+                                || format!("torrent record {record_index}"),
+                                |hash| format!("torrent record {record_index} (info hash {hash})"),
+                            );
+                            return Err(A::Error::custom(format!("{record}: {error}")));
+                        }
+                    }
+                }
+                Ok(TorrentRecords(records))
+            }
+        }
+
+        deserializer.deserialize_seq(RecordsVisitor)
+    }
+}
+
 pub fn load(path: &Path) -> Result<Option<DaemonState>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(CoreError::Storage(format!("read daemon state: {error}"))),
     };
-    let state: DaemonState = serde_json::from_slice(&bytes)
+    let stored: StoredDaemonState = serde_json::from_slice(&bytes)
         .map_err(|error| CoreError::Storage(format!("parse daemon state: {error}")))?;
-    if state.version != STATE_VERSION {
+    if stored.version != STATE_VERSION {
         return Err(CoreError::Storage(format!(
             "unsupported daemon state version {}; expected {STATE_VERSION}",
-            state.version
+            stored.version
         )));
     }
-    Ok(Some(state))
+    Ok(Some(DaemonState {
+        version: stored.version,
+        torrents: stored.torrents.0,
+        queue: stored.queue,
+    }))
 }
 
 pub fn save(path: &Path, state: &DaemonState) -> Result<()> {
@@ -99,7 +168,10 @@ fn write_and_replace(temp: &Path, path: &Path, parent: &Path, bytes: &[u8]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use swarmotter_core::meta::{build_single_file_torrent, parse_torrent};
+    use swarmotter_core::models::torrent::SeedingStatus;
     use swarmotter_core::queue::QueueLimits;
+    use swarmotter_core::ratio::TorrentSeeding;
 
     fn unique_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -121,10 +193,145 @@ mod tests {
     }
 
     #[test]
+    fn contextual_torrent_record_deserializer_round_trips_valid_state() {
+        let path = unique_path("daemon-state-torrent-record");
+        let bytes = build_single_file_torrent(
+            "state.bin",
+            b"generated lawful state payload",
+            8,
+            None,
+            false,
+        );
+        let torrent = Torrent::new(parse_torrent(&bytes).unwrap(), 1);
+        let expected_hash = torrent.info_hash();
+        let state = DaemonState::new(vec![torrent], QueueState::new(QueueLimits::default()));
+        save(&path, &state).unwrap();
+
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.torrents.len(), 1);
+        assert_eq!(loaded.torrents[0].info_hash(), expected_hash);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_state_defaults_absent_seeding_fields_without_version_bump() {
+        let path = unique_path("daemon-state-legacy-seeding");
+        let bytes = build_single_file_torrent("state.bin", b"generated payload", 8, None, false);
+        let torrent = Torrent::new(parse_torrent(&bytes).unwrap(), 1);
+        let state = DaemonState::new(vec![torrent], QueueState::new(QueueLimits::default()));
+        let mut json = serde_json::to_value(&state).unwrap();
+        json["torrents"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("seeding");
+        json["torrents"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("seeding_status");
+        fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let loaded = load(&path).unwrap().unwrap();
+        assert_eq!(loaded.torrents[0].seeding, TorrentSeeding::default());
+        assert_eq!(
+            loaded.torrents[0].seeding_status,
+            SeedingStatus::NotEligible
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn every_seeding_status_round_trips_in_version_one_state() {
+        let path = unique_path("daemon-state-seeding-statuses");
+        let statuses = [
+            SeedingStatus::NotEligible,
+            SeedingStatus::Queued,
+            SeedingStatus::Active,
+            SeedingStatus::StoppedRatio,
+            SeedingStatus::StoppedIdle,
+            SeedingStatus::StoppedManual,
+        ];
+        for status in statuses {
+            let bytes = build_single_file_torrent(
+                &format!("state-{}.bin", status.as_str()),
+                b"generated payload",
+                8,
+                None,
+                false,
+            );
+            let mut torrent = Torrent::new(parse_torrent(&bytes).unwrap(), 1);
+            torrent.seeding = TorrentSeeding {
+                ratio_limit: Some(1.25),
+                idle_limit: Some(42),
+                seed_forever: false,
+            };
+            torrent.seeding_status = status;
+            let state = DaemonState::new(vec![torrent], QueueState::new(QueueLimits::default()));
+            save(&path, &state).unwrap();
+            let loaded = load(&path).unwrap().unwrap();
+            assert_eq!(loaded.torrents[0].seeding_status, status);
+            assert_eq!(loaded.torrents[0].seeding.ratio_limit, Some(1.25));
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    #[test]
     fn corrupt_state_is_not_silently_discarded() {
         let path = unique_path("daemon-state-corrupt");
         fs::write(&path, b"not json").unwrap();
         assert!(load(&path).is_err());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn durable_piece_hash_lengths_are_checked_with_record_and_piece_context() {
+        let bytes =
+            build_single_file_torrent("state.bin", b"two generated lawful pieces", 8, None, false);
+        let torrent = Torrent::new(parse_torrent(&bytes).unwrap(), 1);
+        let expected_hash = torrent.info_hash().to_hex();
+        let state = DaemonState::new(vec![torrent], QueueState::new(QueueLimits::default()));
+
+        for decoded_len in [0usize, 19, 20, 21] {
+            let path = unique_path(&format!("daemon-state-piece-hash-{decoded_len}"));
+            let encoded_payload = "ab".repeat(decoded_len);
+            let mut json = serde_json::to_value(&state).unwrap();
+            json["torrents"][0]["meta"]["pieces"][1] =
+                serde_json::Value::String(encoded_payload.clone());
+            fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+            if decoded_len == 20 {
+                let loaded = load(&path).unwrap().unwrap();
+                assert_eq!(loaded.torrents.len(), 1);
+                assert_eq!(loaded.torrents[0].meta.pieces[1], [0xabu8; 20]);
+            } else {
+                let error = load(&path).unwrap_err().to_string();
+                assert!(
+                    error.contains("torrent record 0"),
+                    "record context for decoded length {decoded_len}: {error}"
+                );
+                assert!(
+                    error.contains(&expected_hash),
+                    "hash context for decoded length {decoded_len}: {error}"
+                );
+                assert!(
+                    error.contains("piece hash 1"),
+                    "piece context for decoded length {decoded_len}: {error}"
+                );
+                assert!(
+                    error.contains(&format!("length {decoded_len}")),
+                    "decoded length context for {decoded_len}: {error}"
+                );
+                assert!(
+                    !error.contains("state.bin"),
+                    "content path leaked for decoded length {decoded_len}: {error}"
+                );
+                if !encoded_payload.is_empty() {
+                    assert!(
+                        !error.contains(&encoded_payload),
+                        "piece-hash payload leaked for decoded length {decoded_len}: {error}"
+                    );
+                }
+            }
+            let _ = fs::remove_file(path);
+        }
     }
 }

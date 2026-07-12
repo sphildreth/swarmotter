@@ -83,6 +83,22 @@ impl Value {
 /// Exactly one top-level value must be followed by EOF; trailing bytes are an
 /// error. No malformed input may panic.
 pub fn decode(bytes: &[u8]) -> Result<Value> {
+    let (value, consumed) = decode_prefix(bytes)?;
+    if consumed != bytes.len() {
+        return Err(CoreError::Bencode(format!(
+            "trailing bytes after top-level value at position {consumed}"
+        )));
+    }
+    Ok(value)
+}
+
+/// Decode exactly one bencoded value from the beginning of `bytes`.
+///
+/// This uses the same byte, depth, node, grammar, duplicate-key, and checked
+/// arithmetic rules as [`decode`], but returns the number of consumed bytes so
+/// protocols such as BEP 9 can preserve a trailing binary payload. Callers that
+/// require a complete bencoded document should use [`decode`].
+pub fn decode_prefix(bytes: &[u8]) -> Result<(Value, usize)> {
     if bytes.len() > MAX_TORRENT_METADATA_BYTES {
         return Err(CoreError::Bencode(format!(
             "input length {} exceeds maximum {MAX_TORRENT_METADATA_BYTES}",
@@ -95,14 +111,8 @@ pub fn decode(bytes: &[u8]) -> Result<Value> {
         depth: 0,
         nodes: 0,
     };
-    let v = p.parse()?;
-    if p.pos != bytes.len() {
-        return Err(CoreError::Bencode(format!(
-            "trailing bytes after top-level value at position {}",
-            p.pos
-        )));
-    }
-    Ok(v)
+    let value = p.parse()?;
+    Ok((value, p.pos))
 }
 
 struct Parser<'a> {
@@ -122,7 +132,10 @@ impl<'a> Parser<'a> {
 
     fn bump(&mut self) -> Result<u8> {
         let b = self.peek()?;
-        self.pos += 1;
+        self.pos = self
+            .pos
+            .checked_add(1)
+            .ok_or_else(|| CoreError::Bencode("cursor overflow".into()))?;
         Ok(b)
     }
 
@@ -155,8 +168,12 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn leave(&mut self) {
-        self.depth -= 1;
+    fn leave(&mut self) -> Result<()> {
+        self.depth = self
+            .depth
+            .checked_sub(1)
+            .ok_or_else(|| CoreError::Bencode("nesting depth underflow".into()))?;
+        Ok(())
     }
 
     fn parse(&mut self) -> Result<Value> {
@@ -178,7 +195,10 @@ impl<'a> Parser<'a> {
             if b == b'e' {
                 break;
             }
-            self.pos += 1;
+            self.pos = self
+                .pos
+                .checked_add(1)
+                .ok_or_else(|| CoreError::Bencode("integer cursor overflow".into()))?;
         }
         if start == self.pos {
             return Err(CoreError::Bencode("empty integer".into()));
@@ -227,7 +247,11 @@ impl<'a> Parser<'a> {
             .iter()
             .position(|&b| b == b':')
             .ok_or_else(|| CoreError::Bencode("missing ':' in string".into()))?;
-        let len_bytes = &self.bytes[self.pos..self.pos + colon];
+        let after_len = self
+            .pos
+            .checked_add(colon)
+            .ok_or_else(|| CoreError::Bencode("string length prefix overflows cursor".into()))?;
+        let len_bytes = &self.bytes[self.pos..after_len];
         // Validate length prefix: optional... bencode requires ASCII digits with
         // no leading zero unless the length is exactly zero.
         if colon == 0 {
@@ -244,10 +268,6 @@ impl<'a> Parser<'a> {
             .parse()
             .map_err(|_| CoreError::Bencode("string length is not a valid usize".into()))?;
         // checked_add for the colon and length to avoid overflow past input end.
-        let after_len = self
-            .pos
-            .checked_add(colon)
-            .ok_or_else(|| CoreError::Bencode("string length prefix overflows cursor".into()))?;
         let data_start = after_len
             .checked_add(1)
             .ok_or_else(|| CoreError::Bencode("string colon offset overflows cursor".into()))?;
@@ -273,7 +293,7 @@ impl<'a> Parser<'a> {
             items.push(self.parse()?);
         }
         self.bump()?; // 'e'
-        self.leave();
+        self.leave()?;
         Ok(Value::List(items))
     }
 
@@ -291,6 +311,9 @@ impl<'a> Parser<'a> {
             if !first.is_ascii_digit() {
                 return Err(CoreError::Bencode("dictionary key is not a string".into()));
             }
+            // Dictionary keys are byte-string values and consume the same node
+            // budget as byte strings in lists or dictionary values.
+            self.count_node()?;
             let key = self.parse_str()?;
             if !seen.insert(key.clone()) {
                 return Err(CoreError::Bencode(format!(
@@ -302,7 +325,7 @@ impl<'a> Parser<'a> {
             entries.push((key, val));
         }
         self.bump()?; // 'e'
-        self.leave();
+        self.leave()?;
         Ok(Value::Dict(entries))
     }
 }
@@ -319,7 +342,7 @@ pub fn extract_value_bytes<'a>(bytes: &'a [u8], key: &[u8]) -> Option<&'a [u8]> 
     if bytes.first()? != &b'd' {
         return None;
     }
-    p += 1;
+    p = p.checked_add(1)?;
     while p < bytes.len() {
         if bytes[p] == b'e' {
             break;
@@ -336,7 +359,8 @@ pub fn extract_value_bytes<'a>(bytes: &'a [u8], key: &[u8]) -> Option<&'a [u8]> 
 
 fn read_str(bytes: &[u8], p: &mut usize) -> Option<Vec<u8>> {
     let colon = bytes[*p..].iter().position(|&b| b == b':')?;
-    let len_bytes = &bytes[*p..*p + colon];
+    let after_len = (*p).checked_add(colon)?;
+    let len_bytes = &bytes[*p..after_len];
     if colon == 0 || !len_bytes.iter().all(|c| c.is_ascii_digit()) {
         return None;
     }
@@ -344,7 +368,6 @@ fn read_str(bytes: &[u8], p: &mut usize) -> Option<Vec<u8>> {
         return None;
     }
     let len: usize = std::str::from_utf8(len_bytes).ok()?.parse().ok()?;
-    let after_len = (*p).checked_add(colon)?;
     let data_start = after_len.checked_add(1)?;
     let data_end = data_start.checked_add(len)?;
     if data_end > bytes.len() {
@@ -360,10 +383,10 @@ fn skip_value(bytes: &[u8], p: &mut usize) -> Option<()> {
         b'i' => {
             // Scan to the matching terminator; bencode integers contain only
             // digits and an optional leading sign.
-            *p += 1;
+            advance(p, 1)?;
             let body_start = *p;
             while *p < bytes.len() && bytes[*p] != b'e' {
-                *p += 1;
+                advance(p, 1)?;
             }
             if *p >= bytes.len() {
                 return None;
@@ -371,34 +394,34 @@ fn skip_value(bytes: &[u8], p: &mut usize) -> Option<()> {
             if *p == body_start {
                 return None; // empty integer
             }
-            *p += 1; // consume 'e'
+            advance(p, 1)?; // consume 'e'
             Some(())
         }
         b'l' | b'd' => {
-            *p += 1;
+            advance(p, 1)?;
             let mut depth = 1usize;
             while *p < bytes.len() && depth > 0 {
                 match bytes[*p] {
                     b'l' | b'd' => {
-                        depth += 1;
-                        *p += 1;
+                        depth = depth.checked_add(1)?;
+                        advance(p, 1)?;
                     }
                     b'e' => {
-                        depth -= 1;
-                        *p += 1;
+                        depth = depth.checked_sub(1)?;
+                        advance(p, 1)?;
                     }
                     b'0'..=b'9' => {
                         read_str(bytes, p)?;
                     }
                     b'i' => {
-                        *p += 1;
+                        advance(p, 1)?;
                         while *p < bytes.len() && bytes[*p] != b'e' {
-                            *p += 1;
+                            advance(p, 1)?;
                         }
                         if *p >= bytes.len() {
                             return None;
                         }
-                        *p += 1;
+                        advance(p, 1)?;
                     }
                     _ => return None,
                 }
@@ -411,6 +434,11 @@ fn skip_value(bytes: &[u8], p: &mut usize) -> Option<()> {
         }
         _ => None,
     }
+}
+
+fn advance(cursor: &mut usize, amount: usize) -> Option<()> {
+    *cursor = cursor.checked_add(amount)?;
+    Some(())
 }
 
 /// Encode a serializable value to bencode using canonical ordering.
@@ -562,8 +590,86 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_node_limit_counts_keys_at_exact_boundary() {
+        // A dictionary contributes one node. Each entry contributes one key
+        // byte-string node and one value node. With 124_999 entries that is
+        // 249_999 nodes; placing one additional integer inside the first list
+        // value makes the accepted document exactly MAX_BENCODE_NODES.
+        let entry_count = (MAX_BENCODE_NODES - 2) / 2;
+        assert_eq!(1 + entry_count * 2 + 1, MAX_BENCODE_NODES);
+
+        let dictionary = |extra_list_integer: bool| {
+            let mut encoded = Vec::new();
+            encoded.push(b'd');
+            for index in 0..entry_count {
+                let key = index.to_string();
+                encoded.extend_from_slice(key.len().to_string().as_bytes());
+                encoded.push(b':');
+                encoded.extend_from_slice(key.as_bytes());
+                if index == 0 {
+                    encoded.extend_from_slice(b"li1e");
+                    if extra_list_integer {
+                        encoded.extend_from_slice(b"i2e");
+                    }
+                    encoded.push(b'e');
+                } else {
+                    encoded.extend_from_slice(b"i1e");
+                }
+            }
+            encoded.push(b'e');
+            encoded
+        };
+
+        let exact = dictionary(false);
+        assert!(
+            decode(&exact).is_ok(),
+            "dictionary at the exact node boundary must parse"
+        );
+
+        let one_over = dictionary(true);
+        let err = decode(&one_over).unwrap_err();
+        assert!(err.to_string().contains("node"), "node error: {err}");
+    }
+
+    #[test]
+    fn dictionary_key_itself_consumes_node_budget() {
+        // Root dictionary + key string + value integer = three nodes. Lower
+        // the parser's observed budget indirectly by filling a surrounding
+        // list to MAX-3 nodes, then ensure the dictionary fits exactly and an
+        // additional list value does not.
+        let mut exact = Vec::new();
+        exact.push(b'l');
+        for _ in 0..(MAX_BENCODE_NODES - 4) {
+            exact.extend_from_slice(b"i1e");
+        }
+        exact.extend_from_slice(b"d1:ai1ee");
+        exact.push(b'e');
+        assert!(decode(&exact).is_ok());
+
+        let mut one_over = Vec::new();
+        one_over.push(b'l');
+        for _ in 0..(MAX_BENCODE_NODES - 3) {
+            one_over.extend_from_slice(b"i1e");
+        }
+        one_over.extend_from_slice(b"d1:ai1ee");
+        one_over.push(b'e');
+        let err = decode(&one_over).unwrap_err();
+        assert!(err.to_string().contains("node"), "node error: {err}");
+    }
+
+    #[test]
     fn rejects_overflowing_and_truncated_strings() {
-        // String length prefix far exceeds input.
+        // The parsed length fits in usize, but adding the data start overflows.
+        let overflowing_end = format!("{}:x", usize::MAX);
+        let result = std::panic::catch_unwind(|| decode(overflowing_end.as_bytes()));
+        assert!(result.is_ok(), "overflowing length must not panic");
+        assert!(result.unwrap().is_err());
+        // The length itself does not fit in usize.
+        let overflowing_length = format!("{}0:x", usize::MAX);
+        let result = std::panic::catch_unwind(|| decode(overflowing_length.as_bytes()));
+        assert!(result.is_ok(), "out-of-range length must not panic");
+        assert!(result.unwrap().is_err());
+        // String length prefix far exceeds the remaining input.
         assert!(decode(b"9999999999999:x").is_err());
         // Length prefix within usize but past input end.
         assert!(decode(b"100:ab").is_err());
@@ -684,7 +790,9 @@ mod tests {
 
     #[test]
     fn malformed_corpus_cases_do_not_panic() {
-        let corpus: &[&[u8]] = &[
+        let overflowing_end = format!("{}:x", usize::MAX);
+        let overflowing_length = format!("{}0:x", usize::MAX);
+        let corpus: Vec<&[u8]> = vec![
             b"",
             b"d",
             b"l",
@@ -696,7 +804,7 @@ mod tests {
             b"d1:ai1e",
             b"d1:ai1ei2ee",
             b"d1:ai1e1:ai2ee",
-            b"l1:ae",
+            b"l1:a",
             b"9999:ab",
             b"100:ab",
             b":ab",
@@ -705,6 +813,8 @@ mod tests {
             b"i1eX",
             b"llllllllllllllllllllllllllllllllllllllllllllllllllllle",
             b"d1:xi1e1:xX",
+            overflowing_end.as_bytes(),
+            overflowing_length.as_bytes(),
         ];
         for case in corpus {
             let result = std::panic::catch_unwind(|| decode(case));
@@ -713,9 +823,57 @@ mod tests {
                 "decode panicked on malformed input {:?}",
                 std::str::from_utf8(case).unwrap_or("<binary>")
             );
-            // It is fine for the decoder to return Ok or Err, but it must not
-            // panic and must not leave the cursor in a slicing state that panics.
-            let _ = result.unwrap();
+            assert!(
+                result.unwrap().is_err(),
+                "malformed corpus case unexpectedly decoded: {:?}",
+                std::str::from_utf8(case).unwrap_or("<binary>")
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_decode_preserves_trailing_payload_and_full_decode_rejects_it() {
+        let input = b"d8:msg_typei1e5:piecei0ee\x00binary";
+        let (value, consumed) = decode_prefix(input).unwrap();
+        assert!(value.as_dict().is_some());
+        assert_eq!(&input[consumed..], b"\x00binary");
+        assert!(decode(input).is_err());
+    }
+
+    #[test]
+    fn prefix_decode_enforces_depth_node_and_duplicate_key_budgets() {
+        let too_deep = nested_lists(MAX_BENCODE_DEPTH + 1, "i1e");
+        let depth = std::panic::catch_unwind(|| decode_prefix(&too_deep));
+        assert!(depth.is_ok(), "prefix depth rejection must not panic");
+        let depth = depth.unwrap().unwrap_err();
+        assert!(depth.to_string().contains("depth"));
+
+        let mut too_many = Vec::new();
+        too_many.push(b'l');
+        for _ in 0..MAX_BENCODE_NODES {
+            too_many.extend_from_slice(b"i1e");
+        }
+        too_many.push(b'e');
+        let nodes = std::panic::catch_unwind(|| decode_prefix(&too_many));
+        assert!(nodes.is_ok(), "prefix node rejection must not panic");
+        let nodes = nodes.unwrap().unwrap_err();
+        assert!(nodes.to_string().contains("node"));
+
+        let duplicate = std::panic::catch_unwind(|| decode_prefix(b"d1:ai1e1:ai2ee"));
+        assert!(
+            duplicate.is_ok(),
+            "prefix duplicate rejection must not panic"
+        );
+        assert!(duplicate.unwrap().is_err());
+    }
+
+    #[test]
+    fn prefix_decode_malformed_lengths_do_not_panic() {
+        let overflowing_end = format!("{}:x", usize::MAX);
+        for case in [overflowing_end.as_bytes(), b"100:ab".as_slice()] {
+            let result = std::panic::catch_unwind(|| decode_prefix(case));
+            assert!(result.is_ok(), "prefix length rejection must not panic");
+            assert!(result.unwrap().is_err());
         }
     }
 

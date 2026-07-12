@@ -19,9 +19,11 @@ ADR-0009 and ADR-0010.
 - Suitable for scripts, browser integrations, and the built-in Web UI.
 - The Web UI uses the same API as external automation; it does not have a
   privileged internal channel.
-- Browser requests are same-origin in both authentication modes; configured
-  unauthenticated LAN listeners trust their network boundary, and non-browser
-  clients remain compatible without browser Origin headers. See ADR-0049.
+- Browser requests to `/api/v1`, `/transmission/rpc`, and `/api/v2` are guarded
+  by one outer same-origin policy in both authentication modes. Configured
+  unauthenticated LAN listeners still trust their network boundary, and
+  non-browser clients remain compatible when both Origin and
+  `Sec-Fetch-Site` are absent. See ADR-0044 and ADR-0049.
 
 ## Compatibility contract
 
@@ -36,9 +38,11 @@ ADR-0009 and ADR-0010.
   fall behind the broker buffer receive an `events_dropped` notice.
 - Native torrent add requests support add-time options such as paused start
   behavior without requiring add-then-pause sequencing; see ADR-0029.
-- Add requests return after registration and queue insertion; expensive queue
-  reconciliation and engine startup are asynchronous and coalesced for rapid
-  add bursts; see ADR-0030.
+- Add requests return after registration, queue insertion, and durable state
+  persistence; persistence failure restores exact hash-specific snapshots and
+  emits/schedules nothing. Expensive queue reconciliation and engine startup
+  remain asynchronous and coalesced for rapid add bursts; see ADR-0030 and
+  ADR-0054.
 - Batch add and remove endpoints are part of the native `/api/v1` compatibility
   contract for clients that submit or operate on many torrents at once; see
   ADR-0031.
@@ -51,12 +55,34 @@ ADR-0009 and ADR-0010.
   running engine counts, retry-backoff counts, peer-worker budget, and
   saturation booleans. These fields are additive to the `/api/v1` stats shape;
   see ADR-0042.
+- The scheduler's authoritative peer-session fields are `peer_limit`,
+  `peer_permits_in_use`, `peer_permits_available`, and
+  `peer_sessions_denied` (ADR-0053). Unlimited global mode reports limit `0`
+  and available `null` while in-use still counts observed sessions. Retained
+  `peer_worker_global_limit`, `peer_worker_per_torrent_limit`,
+  `effective_peer_worker_limit`, `peer_worker_budget`, and worker-saturation
+  fields are additive compatibility telemetry for engine worker pressure; they
+  do not enforce or measure the process-wide connection cap.
+- A peer-limit PATCH or full PUT returns success only after transactional
+  data-plane reconstruction succeeds. Full PUT persists only after eligible
+  ownership is verified; failures restore prior runtime/config/state files.
 - Storage add-time preflight is part of `/api/v1` compatibility: when
   configured reserves are not met on the target storage root, add requests reject
   before data write.
 - Optional compatibility endpoints, currently `/transmission/rpc` and `/api/v2`,
   are isolated from the native API and delegate to native daemon operations
   rather than a separate engine.
+- Origin protection is not compatibility-specific authentication. The shared
+  guard runs before native auth, Transmission session negotiation, qBittorrent
+  SID handling, compatibility-enabled checks, request extraction, and daemon
+  operations. It rejects with HTTP 403 using the native JSON envelope,
+  Transmission JSON error object, or qBittorrent plain-text error as appropriate.
+- An Origin-bearing request must contain exactly one UTF-8 Origin and Host. The
+  Origin must be a serialized `scheme://authority` without user information,
+  path, query, or fragment and must match the normalized Host authority. Scheme
+  is intentionally ignored for TLS termination. `Sec-Fetch-Site` accepts only
+  one `same-origin` or `none` value, or no value; every other or duplicate value
+  fails closed.
 - Authentication policy is shared: when API auth is enabled, compatibility
   adapters must map their auth mechanism back to `api.auth_token`, including
   `/api/v2` Bearer and SID-cookie flows.
@@ -65,16 +91,28 @@ ADR-0009 and ADR-0010.
 
 ## Metadata trust boundary
 
-- All torrent metadata ingress paths — `.torrent` uploads to `/api/v1/torrents`,
-  bulk base64 `metainfo`, magnet `info` dicts fetched via BEP 9, watch-folder
-  files, and restored durable daemon state — share one bounded bencode parser
-  in `swarmotter-core` (see ADR-0050).
-- The shared metadata limit `MAX_TORRENT_METADATA_BYTES` (16 MiB) is enforced by
-  the core parser before any piece-sized allocation, independent of
-  `api.max_request_body_bytes` (which may be higher for other request payloads).
-- Oversized or malformed metadata is rejected with `malformed_torrent` (or
-  `bencode_error` for raw decoder overruns). No malformed input may panic the
-  daemon or allocate attacker-controlled memory.
+- Bencoded torrent metadata ingress — `.torrent` uploads to
+  `/api/v1/torrents`, bulk base64 `metainfo`, magnet `info` dicts fetched via
+  BEP 9, and watch-folder files — shares one bounded parser in
+  `swarmotter-core` (see ADR-0050).
+- The shared bencoded metadata limit `MAX_TORRENT_METADATA_BYTES` (16 MiB) is
+  enforced by the core parser before any piece-sized allocation, independent
+  of `api.max_request_body_bytes` (which may be higher for other request
+  payloads).
+- Raw torrent uploads are streamed into a bounded accumulator capped at the
+  lower of `api.max_request_body_bytes` and 16 MiB. If the configured API limit
+  is lower, crossing it returns HTTP 413 `payload_too_large`; otherwise crossing
+  16 MiB returns `malformed_torrent`. Bulk and Transmission base64 metainfo use
+  a decoder that stops before its decoded output can exceed 16 MiB.
+- Restored daemon state is JSON rather than bencode. Its piece hashes are
+  decoded through a sequence capped at `MAX_TORRENT_PIECES`, each hash is
+  required to encode exactly 20 bytes before hex decoding/copying, and each
+  restored `TorrentMeta` is checked with `TorrentMeta::validate()` before
+  runtime use.
+- Oversized or malformed bencoded metadata is rejected with
+  `malformed_torrent` (or `bencode_error` for raw decoder overruns). No
+  malformed input may panic the daemon or cause an unbounded or piece-sized
+  allocation outside the documented limits.
 
 ## Storage API contract
 
@@ -113,6 +151,42 @@ ADR-0009 and ADR-0010.
 
 `PATCH /api/v1/settings` remains constrained to runtime-safe settings and does
 not accept restart-required fields.
+
+## Per-torrent seeding contract
+
+- Native list and detail summaries expose the persisted `seeding` object,
+  `seeding_status`, ratio/uploaded counters, and resolved
+  `effective_ratio_limit` / `effective_idle_limit`.
+- `PUT /api/v1/torrents/:hash/seeding` replaces all three policy fields. The
+  body must contain exactly `ratio_limit`, `idle_limit`, and `seed_forever`.
+  Limits are non-negative (`ratio_limit` must also be finite); `null` inherits
+  the global setting and zero remains an explicit target.
+- The daemon persists the replacement before reporting success. Persistence
+  failure restores the previous policy while leaving the truthful live
+  lifecycle unchanged. Successful replacement immediately stops a newly-met
+  target or requeues a complete automatic stop, but never resumes
+  `stopped_manual`.
+- Transmission and qBittorrent retain their documented compatibility shapes.
+  Existing ratio/uploaded fields use native truthful accounting; no new
+  compatibility policy controls are implied by this endpoint.
+
+## Watch-folder API and event contract
+
+- `ImportResult` retains `path`, `success`, `info_hash_hex`, `error`, and
+  `duplicate`. Additive fields are `outcome` (`imported`, `duplicate`,
+  `permanent_failure`, `transient_failure`) and nullable
+  `post_action_error`. History is insertion ordered, capped at 10,000, and not
+  persisted.
+- Status calls are observational: they do not advance stability. Pending counts
+  include unseen/changed/stabilizing/transient-retry files and exclude unchanged
+  processed fingerprints.
+- Watch duplicate is a successful import result with the existing hash and no
+  torrent/queue/settings mutation. Native API duplicate behavior remains the
+  established `duplicate_torrent` conflict.
+- `watch_folder_imported` covers imported and duplicate outcomes;
+  `watch_folder_failed` covers permanent and transient attempts. Payloads carry
+  path, outcome, compatibility flags, hash, primary error, and post-action
+  error. Unstable or changed-during-read files emit no result/event (ADR-0054).
 
 ## Implementation ownership
 

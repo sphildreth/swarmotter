@@ -22,6 +22,11 @@ umask 077
 ./target/release/swarmotterd --config "$HOME/.config/swarmotter/swarmotter.toml"
 ```
 
+Do not omit `[network]`: omission selects strict mode without a path and fails
+startup validation. Configure the intended interface/source/namespace, or use
+explicit `mode = "disabled"` only when another boundary provides fail-closed
+containment.
+
 Logs are written to stderr and to the configured daemon log file. With default
 logging, the per-user file is `~/.local/state/swarmotter/swarmotterd.log`
 unless `XDG_STATE_HOME` is set.
@@ -87,20 +92,27 @@ storage directories.
 
 ## File descriptor requirements
 
-SwarmOtter opens many file descriptors during operation. Each active torrent
-requires:
+SwarmOtter opens file descriptors for peer sessions, payload files, tracker
+requests, and contained UDP work:
 
-- **Peer connections:** up to 50 TCP sockets per torrent (configurable via
-  `max_peers_per_torrent`)
-- **Tracker connections:** 1-3 TCP sockets per announce cycle (no connection
-  pooling)
-- **File handles:** 1 per file in the torrent (cached, not evicted)
-- **uTP UDP sockets:** 1 per uTP connection (if enabled)
-- **Seeder listener:** 1 TCP listener per torrent
+- **Peer sessions:** bounded process-wide by `bandwidth.max_peers` when it is
+  nonzero, with `max_peers_per_torrent` as an additional cap (zero selects 64).
+  TCP uses a stream socket; uTP uses a contained UDP socket for that session.
+- **Tracker connections:** transient TCP sockets during HTTP/HTTPS announces;
+  UDP trackers use contained UDP sockets.
+- **File handles:** payload layout and active storage work can retain handles,
+  especially for multi-file torrents.
+- **Inbound listener:** one shared contained TCP listener routes all registered
+  seeding torrents, rather than one listener per torrent.
+- **Other contained work:** DHT, DNS, webseeds, and health validation add
+  bounded transient overhead but are intentionally outside the peer-session
+  permit count.
 
-For 1,000 concurrent torrents with 50 peers each, expect **50,000+ concurrent
-file descriptors**. The default `ulimit -n` on most Linux systems is 1,024,
-which is insufficient.
+Set a nonzero process-wide `max_peers` when a hard peer descriptor bound is
+required, then reserve additional headroom for files, trackers, the shared
+listener, and control-plane descriptors. Measure `/proc/$PID/fd` under the
+intended workload; the default `ulimit -n` of 1,024 on many systems is commonly
+insufficient for a busy daemon.
 
 ### Configuring file descriptor limits
 
@@ -191,6 +203,12 @@ deploy/compose.yml
 The SwarmOtter container config used by this stack disables in-app network
 containment because all SwarmOtter traffic shares Gluetun's VPN namespace and
 firewall.
+
+That explicit `mode = "disabled"` is specific to this shared-namespace design;
+it is not a general container default. Gluetun owns the VPN route, firewall,
+and kill switch, and `network_mode: service:vpn` prevents SwarmOtter from
+acquiring a separate Docker bridge path. A standalone container must instead
+configure a strict in-app path or use an equivalently enforced namespace.
 
 The traffic layout looks like this:
 
@@ -392,6 +410,17 @@ and atomically rename a mode-`0600` config file.
 
 Attach the container to the intended contained network instead of the default
 bridge when strict data-plane containment is required.
+
+## Recovering a latched bind failure
+
+If network health reports `socket_bind_failed` or `blocked_fail_closed`, fixing
+the interface alone does not reopen torrent traffic. Correct the full
+configuration and submit it through `PUT /api/v1/settings` (or restart with an
+already-correct file). A live replacement clears the latch only after both an
+ephemeral contained UDP bind and the configured peer-listener bind validate.
+Failed validation leaves the old configuration and blocked gate in place. Use
+`GET /api/v1/network/health` and `/api/v1/network/diagnostics` to verify the
+result; do not switch strict mode to disabled as a recovery shortcut.
 
 ## Reverse proxy
 
