@@ -44,7 +44,9 @@ use swarmotter_core::models::storage::{
 use swarmotter_core::models::torrent::{
     FilePriority, SeedingStatus, TorrentFile, TorrentState, TorrentSummary,
 };
-use swarmotter_core::models::tracker::{TrackerId, TrackerInfo, TrackerKind, TrackerStatus};
+use swarmotter_core::models::tracker::{
+    TrackerId, TrackerInfo, TrackerKind, TrackerScrapeStatus, TrackerStatus,
+};
 use swarmotter_core::models::{
     ConfigUpdateResult, DiagnosticLevel, DoctorCheck, DoctorReport, LogSnapshot,
     NetworkDiagnostics, NetworkInterfaceDiagnostic, NetworkPathCheck, ResetResult,
@@ -2788,7 +2790,7 @@ impl DaemonRuntime {
             meta.clone(),
             storage,
             complete_storage,
-            state,
+            state.clone(),
             peer_id,
             limiter,
             Some(self.global_limiter.clone()),
@@ -2809,6 +2811,7 @@ impl DaemonRuntime {
                 meta.clone(),
                 peer_id,
                 listen_port,
+                state,
                 shutdown_tx.subscribe(),
             )
             .await;
@@ -3301,6 +3304,7 @@ impl DaemonRuntime {
         meta: swarmotter_core::meta::TorrentMeta,
         peer_id: [u8; 20],
         listen_port: u16,
+        state: Arc<Mutex<EngineState>>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Option<JoinHandle<()>> {
         let tracker_tiers = tracker::announce_tiers(meta.announce.as_deref(), &meta.announce_list);
@@ -3329,7 +3333,8 @@ impl DaemonRuntime {
                         hash,
                         peer_id,
                         listen_port,
-                        binder.as_ref(),
+                        binder.clone(),
+                        state.clone(),
                         AnnounceEvent::Started,
                     ) => Duration::from_secs(interval)
                 };
@@ -3344,7 +3349,8 @@ impl DaemonRuntime {
                                     hash,
                                     peer_id,
                                     listen_port,
-                                    binder.as_ref(),
+                                    binder.clone(),
+                                    state.clone(),
                                     AnnounceEvent::Stopped,
                                 )
                                 .await;
@@ -3357,7 +3363,8 @@ impl DaemonRuntime {
                                 hash,
                                 peer_id,
                                 listen_port,
-                                binder.as_ref(),
+                                binder.clone(),
+                                state.clone(),
                                 AnnounceEvent::Empty,
                             )
                             .await;
@@ -3409,10 +3416,13 @@ impl DaemonRuntime {
         hash: InfoHash,
         peer_id: [u8; 20],
         port: u16,
-        binder: &dyn swarmotter_core::net::NetworkBinder,
+        binder: Arc<dyn swarmotter_core::net::NetworkBinder>,
+        state: Arc<Mutex<EngineState>>,
         event: AnnounceEvent,
     ) -> u64 {
         let mut interval_seconds = 0u64;
+        let scrape_urls = tracker_tiers.iter().flatten().cloned().collect::<Vec<_>>();
+        let mut any_success = false;
         'tiers: for tier in tracker_tiers {
             for url in tier {
                 let req = AnnounceRequest {
@@ -3430,17 +3440,18 @@ impl DaemonRuntime {
                 let outcome = if url.starts_with("udp://") {
                     tokio::time::timeout(
                         Duration::from_secs(10),
-                        udp_tracker::udp_announce(binder, &req),
+                        udp_tracker::udp_announce(binder.as_ref(), &req),
                     )
                     .await
                 } else {
                     tokio::time::timeout(
                         Duration::from_secs(10),
-                        tracker::http_announce(binder, &req),
+                        tracker::http_announce(binder.as_ref(), &req),
                     )
                     .await
                 };
-                let succeeded = match outcome {
+                let announce_at = now();
+                let (succeeded, snapshot) = match outcome {
                     Ok(Ok(response)) if response.failure_reason.is_none() => {
                         let interval = response
                             .interval
@@ -3453,27 +3464,64 @@ impl DaemonRuntime {
                             event = event.as_str(),
                             "seeder announce ok"
                         );
-                        true
+                        (
+                            true,
+                            crate::engine::TrackerAnnounceSnapshot {
+                                status: TrackerStatus::Ok,
+                                seeders: response.seeders,
+                                leechers: response.leechers,
+                                downloads: 0,
+                                last_error: None,
+                                last_message: Some("seeder announce ok".into()),
+                                last_announce: Some(announce_at),
+                            },
+                        )
                     }
                     Ok(Ok(response)) => {
+                        let error = response
+                            .failure_reason
+                            .unwrap_or_else(|| "tracker failure".into());
                         tracing::debug!(
                             info_hash = %hash,
                             tracker = %url,
                             event = event.as_str(),
-                            error = %response.failure_reason.unwrap_or_else(|| "tracker failure".into()),
+                            error = %error,
                             "seeder announce failed"
                         );
-                        false
+                        (
+                            false,
+                            crate::engine::TrackerAnnounceSnapshot {
+                                status: TrackerStatus::Error,
+                                seeders: response.seeders,
+                                leechers: response.leechers,
+                                downloads: 0,
+                                last_error: Some(error),
+                                last_message: None,
+                                last_announce: Some(announce_at),
+                            },
+                        )
                     }
                     Ok(Err(e)) => {
+                        let error = e.to_string();
                         tracing::debug!(
                             info_hash = %hash,
                             tracker = %url,
                             event = event.as_str(),
-                            error = %e,
+                            error = %error,
                             "seeder announce failed"
                         );
-                        false
+                        (
+                            false,
+                            crate::engine::TrackerAnnounceSnapshot {
+                                status: TrackerStatus::Error,
+                                seeders: 0,
+                                leechers: 0,
+                                downloads: 0,
+                                last_error: Some(error),
+                                last_message: None,
+                                last_announce: Some(announce_at),
+                            },
+                        )
                     }
                     Err(_) => {
                         tracing::debug!(
@@ -3482,13 +3530,42 @@ impl DaemonRuntime {
                             event = event.as_str(),
                             "seeder announce timed out"
                         );
-                        false
+                        (
+                            false,
+                            crate::engine::TrackerAnnounceSnapshot {
+                                status: TrackerStatus::Error,
+                                seeders: 0,
+                                leechers: 0,
+                                downloads: 0,
+                                last_error: Some("seeder announce timed out".into()),
+                                last_message: None,
+                                last_announce: Some(announce_at),
+                            },
+                        )
                     }
                 };
+                {
+                    let mut engine = state.lock().await;
+                    engine.tracker_announces.insert(url.clone(), snapshot);
+                    engine.last_announce = Some(announce_at);
+                    if succeeded {
+                        engine.tracker_ok = true;
+                        engine.tracker_last_ok = Some(Instant::now());
+                        engine.tracker_interval_seconds = interval_seconds;
+                    } else {
+                        engine.tracker_failures_recent =
+                            engine.tracker_failures_recent.saturating_add(1);
+                    }
+                }
+                any_success |= succeeded;
                 if succeeded {
                     break 'tiers;
                 }
             }
+        }
+        state.lock().await.tracker_ok = any_success;
+        if event != AnnounceEvent::Stopped {
+            crate::engine::run_tracker_scrapes(state, binder, hash, scrape_urls).await;
         }
         if interval_seconds == 0 {
             300
@@ -6624,13 +6701,19 @@ impl DaemonOps for DaemonRuntime {
         // Reflect real per-tracker announce results from the live engine, if
         // present. Success text is kept separate from last_error so the UI and
         // Transmission emulation do not report successful announces as errors.
-        let (engine_trackers, tracker_interval_seconds) = self
+        let (engine_trackers, engine_scrapes, tracker_interval_seconds) = self
             .engine_states
             .read()
             .await
             .get(hash)
             .and_then(|s| s.try_lock().ok())
-            .map(|s| (s.tracker_announces.clone(), s.tracker_interval_seconds))
+            .map(|s| {
+                (
+                    s.tracker_announces.clone(),
+                    s.tracker_scrapes.clone(),
+                    s.tracker_interval_seconds,
+                )
+            })
             .unwrap_or_default();
         self.registry.lock().await.get(hash).map(|t| {
             let mut out = Vec::new();
@@ -6649,6 +6732,22 @@ impl DaemonOps for DaemonRuntime {
                         info.next_announce = snapshot
                             .last_announce
                             .map(|last| last.saturating_add(tracker_interval_seconds.max(30)));
+                    }
+                    if let Some(scrape) = engine_scrapes.get(url) {
+                        info.scrape_status = scrape.status;
+                        info.last_scrape = scrape.last_scrape;
+                        info.scrape_seeders = scrape.seeders;
+                        info.scrape_leechers = scrape.leechers;
+                        info.scrape_downloads = scrape.downloads;
+                        info.last_scrape_error = scrape.last_error.clone();
+                        // Preserve successful announce counts as the primary
+                        // compatibility view. When announce has not succeeded,
+                        // fall back to the separately retained scrape counts.
+                        if !matches!(info.status, TrackerStatus::Working | TrackerStatus::Ok) {
+                            info.seeders = scrape.seeders.unwrap_or(info.seeders);
+                            info.leechers = scrape.leechers.unwrap_or(info.leechers);
+                        }
+                        info.downloads = scrape.downloads.unwrap_or(info.downloads);
                     }
                     out.push(info);
                 }
@@ -7517,6 +7616,12 @@ fn make_tracker(url: &str, tier: usize) -> TrackerInfo {
         last_message: None,
         next_announce: None,
         last_announce: None,
+        scrape_status: TrackerScrapeStatus::NotContacted,
+        last_scrape: None,
+        scrape_seeders: None,
+        scrape_leechers: None,
+        scrape_downloads: None,
+        last_scrape_error: None,
     }
 }
 
@@ -8184,6 +8289,7 @@ mod tests {
     use super::*;
     use futures_util::StreamExt as _;
     use swarmotter_api::state::DaemonOps;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn unique_dir(label: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -12977,7 +13083,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_trackers_uses_per_tracker_live_announce_results() {
+    async fn list_trackers_exposes_scrape_state_and_falls_back_without_announce_success() {
         let cfg = Config::default();
         let health = NetworkHealth::blocked(
             NetworkContainmentMode::Disabled,
@@ -12986,7 +13092,7 @@ mod tests {
         );
         let runtime = DaemonRuntime::new(cfg, health);
         let primary = "http://tracker.example/announce";
-        let secondary = "udp://tracker.example:6969/announce";
+        let secondary = "http://backup.example/announce.php";
         let bytes = swarmotter_core::meta::build_single_file_torrent(
             "trackers.bin",
             b"0123456789abcdef",
@@ -13029,6 +13135,28 @@ mod tests {
                 last_announce: Some(1235),
             },
         );
+        state.tracker_scrapes.insert(
+            primary.into(),
+            crate::engine::TrackerScrapeSnapshot {
+                status: TrackerScrapeStatus::Ok,
+                seeders: Some(300),
+                leechers: Some(20),
+                downloads: Some(99),
+                last_error: None,
+                last_scrape: Some(1240),
+            },
+        );
+        state.tracker_scrapes.insert(
+            secondary.into(),
+            crate::engine::TrackerScrapeSnapshot {
+                status: TrackerScrapeStatus::Error,
+                seeders: Some(40),
+                leechers: Some(5),
+                downloads: Some(6),
+                last_error: Some("latest scrape was malformed".into()),
+                last_scrape: Some(1241),
+            },
+        );
         runtime
             .engine_states
             .write()
@@ -13040,12 +13168,18 @@ mod tests {
         assert_eq!(primary_row.status, TrackerStatus::Ok);
         assert_eq!(primary_row.seeders, 256);
         assert_eq!(primary_row.leechers, 12);
+        assert_eq!(primary_row.downloads, 99);
         assert_eq!(primary_row.last_error, None);
         assert_eq!(
             primary_row.last_message.as_deref(),
             Some("announce returned 64 peers")
         );
         assert_eq!(primary_row.last_announce, Some(1234));
+        assert_eq!(primary_row.scrape_status, TrackerScrapeStatus::Ok);
+        assert_eq!(primary_row.last_scrape, Some(1240));
+        assert_eq!(primary_row.scrape_seeders, Some(300));
+        assert_eq!(primary_row.scrape_leechers, Some(20));
+        assert_eq!(primary_row.scrape_downloads, Some(99));
         assert_eq!(primary_row.tier, 0);
 
         let secondary_row = trackers.iter().find(|t| t.url == secondary).unwrap();
@@ -13055,7 +13189,166 @@ mod tests {
             Some("tracker announce timed out")
         );
         assert_eq!(secondary_row.last_message, None);
+        assert_eq!(secondary_row.seeders, 40);
+        assert_eq!(secondary_row.leechers, 5);
+        assert_eq!(secondary_row.downloads, 6);
+        assert_eq!(secondary_row.scrape_status, TrackerScrapeStatus::Error);
+        assert_eq!(secondary_row.last_scrape, Some(1241));
+        assert_eq!(secondary_row.scrape_seeders, Some(40));
+        assert_eq!(secondary_row.scrape_leechers, Some(5));
+        assert_eq!(secondary_row.scrape_downloads, Some(6));
+        assert_eq!(
+            secondary_row.last_scrape_error.as_deref(),
+            Some("latest scrape was malformed")
+        );
         assert_eq!(secondary_row.tier, 0);
+    }
+
+    #[tokio::test]
+    async fn seeder_announce_schedules_scrape_into_the_shared_engine_state() {
+        let hash = InfoHash::from_bytes([0x73; 20]);
+        let announce_body = b"d8:completei5e10:incompletei6e8:intervali30e5:peers0:e".to_vec();
+        let mut scrape_body = b"d5:filesd20:".to_vec();
+        scrape_body.extend_from_slice(hash.as_bytes());
+        scrape_body.extend_from_slice(b"d8:completei15e10:downloadedi17e10:incompletei16eeee");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                let body = if request.starts_with("GET /scrape?") {
+                    &scrape_body
+                } else {
+                    assert!(request.starts_with("GET /announce?"));
+                    &announce_body
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+
+        let url = format!("http://{address}/announce");
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let interval = DaemonRuntime::seeder_announce_once(
+            &[vec![url.clone()]],
+            hash,
+            [0u8; 20],
+            6881,
+            Arc::new(swarmotter_core::net::binder::LoopbackBinder),
+            state.clone(),
+            AnnounceEvent::Started,
+        )
+        .await;
+        server.await.unwrap();
+
+        assert_eq!(interval, 30);
+        let engine = state.lock().await;
+        assert_eq!(
+            engine.tracker_announces.get(&url).unwrap().status,
+            TrackerStatus::Ok
+        );
+        let scrape = engine.tracker_scrapes.get(&url).unwrap();
+        assert_eq!(scrape.status, TrackerScrapeStatus::Ok);
+        assert_eq!(scrape.seeders, Some(15));
+        assert_eq!(scrape.leechers, Some(16));
+        assert_eq!(scrape.downloads, Some(17));
+    }
+
+    #[tokio::test]
+    async fn tracker_scrape_snapshot_serializes_through_the_real_native_router() {
+        use axum::body::Body;
+        use swarmotter_api::state::{
+            AppState, BuildInfo, QbittorrentCompatState, TransmissionCompatState,
+        };
+        use tower::ServiceExt as _;
+
+        let config = Config::default();
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = Arc::new(DaemonRuntime::new(config.clone(), health));
+        let tracker_url = "http://tracker.example/announce";
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "router-scrape.bin",
+            b"generated router scrape payload",
+            8,
+            Some(tracker_url),
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let hash = meta.info_hash;
+        runtime
+            .registry
+            .lock()
+            .await
+            .add(Torrent::new(meta, 1))
+            .unwrap();
+        let mut engine = EngineState::default();
+        engine.tracker_scrapes.insert(
+            tracker_url.into(),
+            crate::engine::TrackerScrapeSnapshot {
+                status: TrackerScrapeStatus::Ok,
+                seeders: Some(31),
+                leechers: Some(32),
+                downloads: Some(33),
+                last_error: None,
+                last_scrape: Some(34),
+            },
+        );
+        runtime
+            .engine_states
+            .write()
+            .await
+            .insert(hash, Arc::new(Mutex::new(engine)));
+
+        let app_state = Arc::new(AppState {
+            daemon: runtime,
+            config: Arc::new(Mutex::new(config)),
+            build: BuildInfo::default(),
+            broker: EventBroker::default(),
+            transmission: TransmissionCompatState::default(),
+            qbittorrent: QbittorrentCompatState::default(),
+        });
+        let response = swarmotter_api::app_router(app_state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/torrents/{hash}/trackers"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let row = &envelope["data"][0];
+        assert_eq!(row["scrape_status"], "ok");
+        assert_eq!(row["last_scrape"], 34);
+        assert_eq!(row["scrape_seeders"], 31);
+        assert_eq!(row["scrape_leechers"], 32);
+        assert_eq!(row["scrape_downloads"], 33);
+        assert_eq!(row["last_scrape_error"], serde_json::Value::Null);
+        assert_eq!(row["seeders"], 31);
+        assert_eq!(row["leechers"], 32);
+        assert_eq!(row["downloads"], 33);
     }
 
     #[tokio::test]

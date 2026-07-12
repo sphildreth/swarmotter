@@ -4,10 +4,9 @@
 //!
 //! Builds announce requests from torrent metadata, encodes the info hash and
 //! peer id, parses compact peer responses, respects tracker tiers and private
-//! torrent restrictions, and routes all HTTP traffic through the network
-//! containment layer (`NetworkBinder`). UDP trackers are modeled but only the
-//! HTTP path is implemented in this slice; the live UDP engine is tracked as
-//! remaining work.
+//! torrent restrictions, and routes HTTP announce/scrape through the contained
+//! HTTP client over `NetworkBinder`. Live UDP announce is implemented in
+//! `udp_tracker`; UDP scrape is explicitly unsupported.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

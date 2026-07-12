@@ -362,6 +362,15 @@ Linux, route and DNS path validation invoke `ip route get`; direct and tarball
 installs must provide the `ip` utility from the distribution's `iproute2` or
 `iproute` package.
 
+Tracker announce, supported HTTP/HTTPS BEP 48 scrape, and webseed ranges use a
+framed HTTP/1 client only over binder-provided streams. Redirects repeat
+contained resolution/connect, follow at most five hops, allow HTTP-to-HTTPS,
+and reject HTTPS-to-HTTP. Tracker decoded bodies are capped at 2 MiB; webseed
+responses must be exact 206 ranges and are capped at the requested byte count.
+No cookies, authorization, or connection pool are retained. Scrape is derived
+only from an HTTP(S) tracker whose final path component begins `announce`;
+other paths and UDP scrape report `unsupported` without disabling announce.
+
 ### `[autopilot]`
 
 | Option | Default | Meaning |

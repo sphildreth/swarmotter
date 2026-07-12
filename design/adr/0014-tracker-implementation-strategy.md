@@ -48,6 +48,10 @@ contained `http_get` path and fail-closed blocks HTTPS.
 - HTTPS trackers over the contained socket were subsequently implemented
   (tokio-rustls + rustls + webpki-roots); see ADR-0018, which supersedes the
   earlier "HTTPS as future work" note in this ADR.
+- HTTP/HTTPS announce and real BEP 48 scrape now use the shared bounded
+  `ContainedHttpClient`; scrape scheduling and retained API/UI snapshots are
+  defined by ADR-0055. UDP announce remains implemented, while UDP scrape is
+  explicitly unsupported.
 
 ## Consequences
 
@@ -56,6 +60,8 @@ contained `http_get` path and fail-closed blocks HTTPS.
 - All tracker HTTP and UDP traffic is containment-gated.
 - UDP trackers use the binder `udp_socket()` method, not a bypass.
 - HTTPS trackers reuse the contained socket path with TLS (see ADR-0018).
+- Supported HTTP/HTTPS scrape shares that contained path, bounded framing, and
+  redirect policy; failed scrapes do not erase prior successful counts.
 
 ## Related Documents
 
@@ -63,3 +69,4 @@ contained `http_get` path and fail-closed blocks HTTPS.
 - `crates/swarmotter-core/src/udp_tracker.rs`
 - ADR-0012 (network binder)
 - ADR-0013 (peer protocol)
+- [ADR-0055: Contained HTTP/1 Client Framing and Redirect Policy](0055-contained-http1-client-framing-and-redirect-policy.md)

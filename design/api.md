@@ -124,6 +124,23 @@ ADR-0009 and ADR-0010.
   malformed input may panic the daemon or cause an unbounded or piece-sized
   allocation outside the documented limits.
 
+## Tracker API contract
+
+- `GET /api/v1/torrents/:hash/trackers` retains the existing announce fields
+  and adds `scrape_status`, `last_scrape`, nullable `scrape_seeders`,
+  `scrape_leechers`, `scrape_downloads`, and `last_scrape_error` (ADR-0055).
+  Status values are `not_contacted`, `updating`, `ok`, `error`, or
+  `unsupported`.
+- Scrape attempt state and last-success counts are separate. A failed or
+  task-aborted attempt updates status/time/error without erasing prior counts.
+  Unsupported UDP/non-derivable trackers report `unsupported` without a
+  network call.
+- Existing numeric `seeders` and `leechers` prefer a successful announce and
+  fall back to retained scrape counts when announce has not succeeded.
+  `downloads` uses the retained scrape value when available. This is additive;
+  Transmission/qBittorrent mappings keep their existing fields and consume the
+  same compatibility counts without new native scrape objects.
+
 ## Storage API contract
 
 - `GET /api/v1/storage/roots` exposes storage-root diagnostics used for

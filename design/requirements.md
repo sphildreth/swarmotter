@@ -31,7 +31,13 @@ time or duration estimates.
   rollback before any event or scheduling side effect (ADR-0054).
 - **Peer discovery and alternate data sources:** HTTP trackers, HTTPS
   trackers, UDP trackers, HTTP/HTTPS webseeds (`url-list`), DHT, PEX, tracker
-  tiers, manual tracker lists.
+  tiers, manual tracker lists. HTTP(S) announce and supported BEP 48 scrape,
+  plus webseed range reads, use one framed and bounded HTTP/1 client over
+  binder-provided contained streams. Scrape is derived only from an
+  `announce*` final path component; UDP scrape is explicitly unsupported.
+  Download, magnet, reannounce, completion, and seeder announce paths schedule
+  scrape attempts. The latest attempt status/time is separate from retained
+  last-success counts so a failed scrape cannot erase useful data.
 - **Peer protocol:** TCP peers, uTP/UDP peers where practical, handshake,
   metadata exchange, piece availability, piece scheduling, choking, endgame,
   bad-peer handling, IPv4/IPv6 controls.
@@ -99,6 +105,12 @@ for `v1.0.0` only when every item in the `v1.0.0` completion checklist (see
   events/scheduling.
 - Magnet metadata fetch, DHT, PEX, HTTP/HTTPS/UDP trackers, HTTP/HTTPS
   webseeds, and peer protocol download/upload work.
+- Contained HTTP acceptance covers framed Content-Length, chunked and legal
+  close-delimited bodies; malformed/truncated/over-limit failures; bounded
+  redirects with containment repeated on every hop; HTTPS upgrade and
+  downgrade rejection; exact webseed 206 ranges; HTTP/HTTPS BEP 48 scrape
+  derivation/parsing/scheduling; retained last-success counts; and explicit
+  unsupported UDP scrape.
 - Fast resume, forced recheck, watch folders, browser magnet submission, file
   selection/priorities, queueing, ratio/seeding limits, bandwidth limits, and
   the authoritative process-wide plus composing per-torrent peer-session caps

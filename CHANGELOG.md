@@ -11,6 +11,19 @@ date or duration estimates.
 
 ### Added
 
+- **Contained framed tracker/webseed HTTP and real HTTP(S) scrape:** tracker
+  announce, supported BEP 48 scrape, and webseed range reads now share one
+  bounded HTTP/1 codec over binder-provided TCP/TLS streams. Redirects repeat
+  contained resolution/connect, enforce a five-hop/loop limit, allow HTTPS
+  upgrade, reject downgrade, preserve exact authorities and Range, and never
+  construct a connector, resolver, pool, or general client. Scrape is scheduled
+  by download, magnet real-hash, reannounce/completion, and seeder activity.
+  Native tracker rows expose separate attempt status/time/error and retained
+  last-success counts; failed/task-aborted scrapes preserve those counts, and
+  compatibility counts fall back when announce has not succeeded. UDP and
+  non-derivable scrape are explicitly unsupported. See
+  [ADR-0055](design/adr/0055-contained-http1-client-framing-and-redirect-policy.md).
+
 - **Durable per-torrent seeding lifecycle:** each torrent now persists nullable
   ratio and idle overrides plus seed-forever policy, exposes stored/effective
   targets and exact seeding status through the native API, and provides a strict

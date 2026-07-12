@@ -1676,7 +1676,14 @@ async function loadTrackers(hash) {
     tbody.innerHTML = "";
     trackers.forEach(t => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${escapeHtml(t.url)}</td><td>${fmtCount(t.tier)}</td><td>${escapeHtml(t.status)}</td><td>${fmtCount(t.seeders)}</td><td>${fmtCount(t.leechers)}</td><td><div class="tracker-edit-row"><input type="url" class="tracker-edit-url" value="${escapeHtml(t.url)}" aria-label="Edit tracker ${escapeHtml(t.url)}"><button type="button" class="tracker-save secondary" data-url="${escapeHtml(t.url)}">Save</button><button type="button" class="tracker-remove danger" data-url="${escapeHtml(t.url)}">Remove</button></div></td>`;
+      const scrapeStatus = t.scrape_status || "not_contacted";
+      const scrapeDetail = t.last_scrape_error
+        ? `${scrapeStatus}: ${t.last_scrape_error}`
+        : scrapeStatus;
+      const scrapeCounts = [t.scrape_seeders, t.scrape_leechers, t.scrape_downloads]
+        .map(value => fmtCount(value) || "–")
+        .join(" / ");
+      tr.innerHTML = `<td>${escapeHtml(t.url)}</td><td>${fmtCount(t.tier)}</td><td>${escapeHtml(t.status)}</td><td>${escapeHtml(scrapeDetail)}</td><td>${escapeHtml(fmtUnixSeconds(t.last_scrape))}</td><td>${escapeHtml(scrapeCounts)}</td><td>${fmtCount(t.seeders)}</td><td>${fmtCount(t.leechers)}</td><td>${fmtCount(t.downloads)}</td><td><div class="tracker-edit-row"><input type="url" class="tracker-edit-url" value="${escapeHtml(t.url)}" aria-label="Edit tracker ${escapeHtml(t.url)}"><button type="button" class="tracker-save secondary" data-url="${escapeHtml(t.url)}">Save</button><button type="button" class="tracker-remove danger" data-url="${escapeHtml(t.url)}">Remove</button></div></td>`;
       tbody.appendChild(tr);
     });
     $$("#trackers-table .tracker-save").forEach(button => button.addEventListener("click", async () => {

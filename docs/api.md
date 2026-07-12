@@ -317,9 +317,23 @@ live signal yet.
 
 Tracker rows expose per-URL announce status. `last_error` is populated only for
 failed announces, while `last_message` carries the latest successful announce
-message. `seeders`, `leechers`, `downloads`, and `last_announce` are populated
-from the last live announce result for that tracker URL when the engine has
-reported one.
+message. They also expose:
+
+- `scrape_status`: `not_contacted`, `updating`, `ok`, `error`, or
+  `unsupported`.
+- `last_scrape`: Unix seconds for the latest attempt.
+- `scrape_seeders`, `scrape_leechers`, and `scrape_downloads`: nullable counts
+  retained from the latest successful exact-key BEP 48 response.
+- `last_scrape_error`: the latest failed-attempt or task-failure detail without
+  erasing retained counts.
+
+Initial download discovery, magnet discovery, explicit/periodic reannounce,
+completion, and active seeder announces schedule supported HTTP/HTTPS scrape.
+Only tracker paths whose final component begins with `announce` are derivable;
+UDP scrape is `unsupported`. `seeders` and `leechers` prefer a successful live
+announce, then fall back to retained scrape counts. `downloads` uses retained
+scrape data when available. Existing compatibility adapters keep their prior
+field shapes.
 
 ## Peers
 

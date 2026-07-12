@@ -2789,12 +2789,36 @@ async fn watch_scan_and_history_endpoints() {
 async fn trackers_crud_and_bad_hash() {
     let state = fake_daemon::fake_state();
     let app = swarmotter_api::app_router(state);
-    let hash = add_named_test_magnet(&app, 300, "trackers-1", true, "/tmp/dl").await;
+    let (status, added) = post_json(
+        &app,
+        "/api/v1/torrents/magnet",
+        serde_json::json!({
+            "magnet": format!(
+                "{}&tr=http%3A%2F%2Ftracker.example.com%2Fannounce",
+                named_magnet(300, "trackers-1")
+            ),
+            "paused": true,
+            "download_dir": "/tmp/dl",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hash = added["data"].as_str().unwrap().to_string();
 
     let (status, v) = get_json(&app, &format!("/api/v1/torrents/{hash}/trackers")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["success"], true);
     assert!(v["data"].is_array());
+    let tracker = v["data"]
+        .as_array()
+        .and_then(|rows| rows.first())
+        .expect("magnet tracker row");
+    assert_eq!(tracker["scrape_status"], "not_contacted");
+    assert_eq!(tracker["last_scrape"], serde_json::Value::Null);
+    assert_eq!(tracker["scrape_seeders"], serde_json::Value::Null);
+    assert_eq!(tracker["scrape_leechers"], serde_json::Value::Null);
+    assert_eq!(tracker["scrape_downloads"], serde_json::Value::Null);
+    assert_eq!(tracker["last_scrape_error"], serde_json::Value::Null);
 
     let (status, v) = post_empty(
         &app,

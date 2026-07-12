@@ -38,7 +38,7 @@ use swarmotter_core::meta::TorrentMeta;
 use swarmotter_core::models::peer::EnginePeerHealth;
 use swarmotter_core::models::stats::PeerSchedulerDiagnostics;
 use swarmotter_core::models::torrent::FilePriority;
-use swarmotter_core::models::tracker::TrackerStatus;
+use swarmotter_core::models::tracker::{TrackerScrapeStatus, TrackerStatus};
 use swarmotter_core::net::NetworkBinder;
 use swarmotter_core::peer::{
     self, block_requests, Bitfield, Handshake, Message, PeerAddr, PeerReader,
@@ -182,6 +182,18 @@ pub struct TrackerAnnounceSnapshot {
     pub last_announce: Option<u64>,
 }
 
+/// Most recent scrape attempt plus the separately retained last-success
+/// counts. A failed attempt changes status/time/error without erasing counts.
+#[derive(Debug, Clone, Default)]
+pub struct TrackerScrapeSnapshot {
+    pub status: TrackerScrapeStatus,
+    pub seeders: Option<u64>,
+    pub leechers: Option<u64>,
+    pub downloads: Option<u64>,
+    pub last_error: Option<String>,
+    pub last_scrape: Option<u64>,
+}
+
 /// Live engine state, shared between the engine task and the daemon so the
 /// API/UI can observe real progress, speeds, peers, and tracker status.
 #[derive(Debug, Clone, Default)]
@@ -204,6 +216,7 @@ pub struct EngineState {
     pub tracker_ok: bool,
     pub tracker_message: Option<String>,
     pub tracker_announces: HashMap<String, TrackerAnnounceSnapshot>,
+    pub tracker_scrapes: HashMap<String, TrackerScrapeSnapshot>,
     pub last_announce: Option<u64>,
     pub tracker_interval_seconds: u64,
     pub peer_scheduler: PeerSchedulerDiagnostics,
@@ -1735,6 +1748,7 @@ impl TorrentEngine {
     async fn announce(&self, event: AnnounceEvent) -> Vec<PeerAddr> {
         let tiers =
             tracker::announce_tiers(self.meta.announce.as_deref(), &self.meta.announce_list);
+        let scrape_urls = tiers.iter().flatten().cloned().collect::<Vec<_>>();
         let (uploaded, downloaded, left) = {
             let s = self.state.lock().await;
             (
@@ -1753,7 +1767,8 @@ impl TorrentEngine {
                 event,
             )
             .await;
-        self.record_tracker_announce_outcome(&outcome).await;
+        self.record_tracker_activity(self.meta.info_hash, &outcome, scrape_urls)
+            .await;
         outcome.peers
     }
 
@@ -1880,6 +1895,26 @@ impl TorrentEngine {
         }
     }
 
+    /// Retain announce state, then schedule one scrape for every configured
+    /// tracker. This shared path is used by initial download
+    /// discovery, explicit/periodic reannounce, completion, and magnet
+    /// metadata discovery.
+    async fn record_tracker_activity(
+        &self,
+        info_hash: InfoHash,
+        outcome: &TrackerAnnounceOutcome,
+        scrape_urls: Vec<String>,
+    ) {
+        self.record_tracker_announce_outcome(outcome).await;
+        run_tracker_scrapes(
+            self.state.clone(),
+            self.binder.clone(),
+            info_hash,
+            scrape_urls,
+        )
+        .await;
+    }
+
     async fn discover_magnet_dht_peers(&self, info_hash: InfoHash) -> Vec<PeerAddr> {
         let Some(dht) = &self.dht else {
             return Vec::new();
@@ -1968,7 +2003,8 @@ impl TorrentEngine {
                     },
                 )
                 .await;
-            self.record_tracker_announce_outcome(&outcome).await;
+            self.record_tracker_activity(magnet.info_hash, &outcome, magnet.trackers.clone())
+                .await;
             merge_unique_peers(&mut candidates, self.filter_allowed_peers(outcome.peers));
 
             for p in &self.seed_peers {
@@ -2305,6 +2341,99 @@ fn merge_tracker_outcome(
     }
     if outcome.ok || aggregate.message.is_none() {
         aggregate.message = outcome.message;
+    }
+}
+
+/// Run supported HTTP(S) scrapes concurrently through the same contained
+/// binder used for announce traffic. Join failures retain the URL by task ID,
+/// so a panic/cancellation is visible instead of silently disappearing.
+pub(crate) async fn run_tracker_scrapes(
+    state: Arc<Mutex<EngineState>>,
+    binder: Arc<dyn NetworkBinder>,
+    info_hash: InfoHash,
+    tracker_urls: Vec<String>,
+) {
+    let mut unique = HashSet::new();
+    let tracker_urls = tracker_urls
+        .into_iter()
+        .filter(|url| unique.insert(url.clone()))
+        .collect::<Vec<_>>();
+    if tracker_urls.is_empty() {
+        return;
+    }
+
+    {
+        let mut engine = state.lock().await;
+        for url in &tracker_urls {
+            let snapshot = engine.tracker_scrapes.entry(url.clone()).or_default();
+            snapshot.status = TrackerScrapeStatus::Updating;
+            snapshot.last_error = None;
+        }
+    }
+
+    let attempted_at = now_secs();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut task_urls = HashMap::new();
+    for url in tracker_urls {
+        let task_url = url.clone();
+        let task_binder = binder.clone();
+        let handle = tasks.spawn(async move {
+            tracker::http_scrape(task_binder.as_ref(), &task_url, &[info_hash]).await
+        });
+        task_urls.insert(handle.id(), url);
+    }
+
+    while let Some(joined) = tasks.join_next_with_id().await {
+        match joined {
+            Ok((task_id, result)) => {
+                let Some(url) = task_urls.remove(&task_id) else {
+                    continue;
+                };
+                let mut engine = state.lock().await;
+                let snapshot = engine.tracker_scrapes.entry(url).or_default();
+                snapshot.last_scrape = Some(attempted_at);
+                match result {
+                    Ok(tracker::ScrapeOutcome::Unsupported) => {
+                        snapshot.status = TrackerScrapeStatus::Unsupported;
+                        snapshot.last_error = None;
+                    }
+                    Ok(tracker::ScrapeOutcome::Success(mut counts)) => {
+                        if let Some(counts) = counts.remove(&info_hash) {
+                            snapshot.status = TrackerScrapeStatus::Ok;
+                            snapshot.seeders = Some(counts.seeders);
+                            snapshot.leechers = Some(counts.leechers);
+                            snapshot.downloads = Some(counts.downloads);
+                            snapshot.last_error = None;
+                        } else {
+                            snapshot.status = TrackerScrapeStatus::Error;
+                            snapshot.last_error = Some(format!(
+                                "tracker scrape omitted requested info hash {}",
+                                info_hash.to_hex()
+                            ));
+                            engine.tracker_failures_recent =
+                                engine.tracker_failures_recent.saturating_add(1);
+                        }
+                    }
+                    Err(error) => {
+                        snapshot.status = TrackerScrapeStatus::Error;
+                        snapshot.last_error = Some(error.to_string());
+                        engine.tracker_failures_recent =
+                            engine.tracker_failures_recent.saturating_add(1);
+                    }
+                }
+            }
+            Err(error) => {
+                let url = task_urls
+                    .remove(&error.id())
+                    .unwrap_or_else(|| "unknown tracker scrape task".into());
+                let mut engine = state.lock().await;
+                let snapshot = engine.tracker_scrapes.entry(url).or_default();
+                snapshot.status = TrackerScrapeStatus::Error;
+                snapshot.last_scrape = Some(attempted_at);
+                snapshot.last_error = Some(format!("tracker scrape task failed: {error}"));
+                engine.tracker_failures_recent = engine.tracker_failures_recent.saturating_add(1);
+            }
+        }
     }
 }
 
@@ -4336,7 +4465,10 @@ async fn update_progress_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use swarmotter_core::meta::{build_multi_file_torrent, build_single_file_torrent};
+    use swarmotter_core::net::{ContainedUdpSocket, PeerListener};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn unique_dir(label: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -4487,6 +4619,269 @@ mod tests {
         assert!(!engine.tracker_announce_due().await);
         state.lock().await.last_announce = Some(now_secs().saturating_sub(3_601));
         assert!(engine.tracker_announce_due().await);
+    }
+
+    fn scrape_body(hash: InfoHash, seeders: i64, leechers: i64, downloads: i64) -> Vec<u8> {
+        let mut body = b"d5:filesd20:".to_vec();
+        body.extend_from_slice(hash.as_bytes());
+        body.extend_from_slice(
+            format!("d8:completei{seeders}e10:downloadedi{downloads}e10:incompletei{leechers}eeee")
+                .as_bytes(),
+        );
+        body
+    }
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    #[tokio::test]
+    async fn scrape_failure_retains_last_success_counts_and_is_accounted() {
+        let hash = InfoHash::from_bytes([0x71; 20]);
+        let good = scrape_body(hash, 7, 8, 9);
+        let malformed = b"d5:filesdee".to_vec();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for body in [good, malformed] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                assert!(request.starts_with("GET /scrape?info_hash="));
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        });
+
+        let url = format!("http://{address}/announce");
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let binder: Arc<dyn NetworkBinder> = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+        run_tracker_scrapes(state.clone(), binder.clone(), hash, vec![url.clone()]).await;
+        {
+            let engine = state.lock().await;
+            let snapshot = engine.tracker_scrapes.get(&url).unwrap();
+            assert_eq!(snapshot.status, TrackerScrapeStatus::Ok);
+            assert_eq!(snapshot.seeders, Some(7));
+            assert_eq!(snapshot.leechers, Some(8));
+            assert_eq!(snapshot.downloads, Some(9));
+            assert_eq!(engine.tracker_failures_recent, 0);
+        }
+
+        run_tracker_scrapes(state.clone(), binder, hash, vec![url.clone()]).await;
+        server.await.unwrap();
+        let engine = state.lock().await;
+        let snapshot = engine.tracker_scrapes.get(&url).unwrap();
+        assert_eq!(snapshot.status, TrackerScrapeStatus::Error);
+        assert_eq!(snapshot.seeders, Some(7));
+        assert_eq!(snapshot.leechers, Some(8));
+        assert_eq!(snapshot.downloads, Some(9));
+        assert!(snapshot.last_error.is_some());
+        assert_eq!(engine.tracker_failures_recent, 1);
+    }
+
+    #[tokio::test]
+    async fn started_and_reannounce_paths_schedule_contained_scrapes() {
+        let payload = b"generated tracker scrape scheduling payload";
+        let placeholder = build_single_file_torrent("scrape-schedule.bin", payload, 8, None, false);
+        let hash = swarmotter_core::meta::parse_torrent(&placeholder)
+            .unwrap()
+            .info_hash;
+        let announce_body = b"d8:completei3e10:incompletei4e8:intervali30e5:peers0:e".to_vec();
+        let scraped = scrape_body(hash, 11, 12, 13);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let scrape_requests = Arc::new(AtomicUsize::new(0));
+        let server_scrapes = scrape_requests.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                let body = if request.starts_with("GET /scrape?") {
+                    server_scrapes.fetch_add(1, Ordering::SeqCst);
+                    &scraped
+                } else {
+                    assert!(request.starts_with("GET /announce?"));
+                    &announce_body
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.write_all(body).await.unwrap();
+            }
+        });
+
+        let http_tracker = format!("http://{address}/announce");
+        let bytes = build_single_file_torrent(
+            "scrape-schedule.bin",
+            payload,
+            8,
+            Some(&http_tracker),
+            false,
+        );
+        let mut meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let udp_tracker = "udp://127.0.0.1:6969/announce".to_string();
+        meta.announce_list = vec![vec![http_tracker.clone()], vec![udp_tracker.clone()]];
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let engine = TorrentEngine::new(
+            meta,
+            PathBuf::from("/tmp"),
+            [0u8; 20],
+            Arc::new(swarmotter_core::net::binder::LoopbackBinder),
+            state.clone(),
+            rx,
+            vec![],
+            6881,
+        );
+
+        engine.announce(AnnounceEvent::Started).await;
+        engine.announce(AnnounceEvent::Empty).await;
+        server.await.unwrap();
+        assert_eq!(scrape_requests.load(Ordering::SeqCst), 2);
+        let engine_state = state.lock().await;
+        let snapshot = engine_state
+            .tracker_scrapes
+            .get(&http_tracker)
+            .expect("scrape snapshot");
+        assert_eq!(snapshot.status, TrackerScrapeStatus::Ok);
+        assert_eq!(snapshot.downloads, Some(13));
+        assert_eq!(
+            engine_state
+                .tracker_scrapes
+                .get(&udp_tracker)
+                .unwrap()
+                .status,
+            TrackerScrapeStatus::Unsupported
+        );
+    }
+
+    #[tokio::test]
+    async fn magnet_tracker_activity_scrapes_the_real_magnet_info_hash() {
+        let magnet_hash = InfoHash::from_bytes([0x74; 20]);
+        let body = scrape_body(magnet_hash, 21, 22, 23);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            assert!(request.starts_with("GET /scrape.php?info_hash="));
+            let expected = tracker::bytes_escape(magnet_hash.as_bytes());
+            assert!(request.contains(&format!("info_hash={expected}")));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+
+        let bytes = build_single_file_torrent(
+            "magnet-placeholder.bin",
+            b"generated placeholder payload",
+            8,
+            None,
+            false,
+        );
+        let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        let engine = TorrentEngine::new(
+            meta,
+            PathBuf::from("/tmp"),
+            [0u8; 20],
+            Arc::new(swarmotter_core::net::binder::LoopbackBinder),
+            state.clone(),
+            rx,
+            vec![],
+            6881,
+        );
+        let url = format!("http://{address}/announce.php");
+        let mut outcome = TrackerAnnounceOutcome::default();
+        outcome.tracker_results.insert(
+            url.clone(),
+            TrackerAnnounceSnapshot {
+                status: TrackerStatus::Ok,
+                seeders: 1,
+                leechers: 2,
+                downloads: 0,
+                last_error: None,
+                last_message: Some("magnet announce ok".into()),
+                last_announce: Some(now_secs()),
+            },
+        );
+        engine
+            .record_tracker_activity(magnet_hash, &outcome, vec![url.clone()])
+            .await;
+        server.await.unwrap();
+
+        let engine_state = state.lock().await;
+        let snapshot = engine_state.tracker_scrapes.get(&url).unwrap();
+        assert_eq!(snapshot.status, TrackerScrapeStatus::Ok);
+        assert_eq!(snapshot.seeders, Some(21));
+        assert_eq!(snapshot.leechers, Some(22));
+        assert_eq!(snapshot.downloads, Some(23));
+    }
+
+    struct PanickingScrapeBinder;
+
+    #[async_trait]
+    impl NetworkBinder for PanickingScrapeBinder {
+        async fn connect_peer(&self, _addr: SocketAddr) -> Result<tokio::net::TcpStream> {
+            panic!("generated scrape task panic");
+        }
+
+        async fn resolve_host(&self, _host: &str, _port: u16) -> Result<SocketAddr> {
+            Ok("127.0.0.1:9".parse().unwrap())
+        }
+
+        async fn udp_socket(&self) -> Result<Box<dyn ContainedUdpSocket>> {
+            Err(CoreError::Internal("unused in scrape test".into()))
+        }
+
+        async fn bind_peer_listener(&self, _port: u16) -> Result<Box<dyn PeerListener>> {
+            Err(CoreError::Internal("unused in scrape test".into()))
+        }
+
+        fn traffic_allowed(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn scrape_task_panic_is_retained_for_the_exact_tracker() {
+        let hash = InfoHash::from_bytes([0x72; 20]);
+        let url = "http://panic.test/announce".to_string();
+        let state = Arc::new(Mutex::new(EngineState::default()));
+        run_tracker_scrapes(
+            state.clone(),
+            Arc::new(PanickingScrapeBinder),
+            hash,
+            vec![url.clone()],
+        )
+        .await;
+
+        let engine = state.lock().await;
+        let snapshot = engine.tracker_scrapes.get(&url).unwrap();
+        assert_eq!(snapshot.status, TrackerScrapeStatus::Error);
+        assert!(snapshot
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("task failed")));
+        assert_eq!(engine.tracker_failures_recent, 1);
     }
 
     #[test]

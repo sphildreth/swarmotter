@@ -847,6 +847,43 @@ mod tests {
     }
 
     #[test]
+    fn web_ui_renders_and_escapes_tracker_scrape_state() {
+        for heading in [
+            "<th>Scrape</th>",
+            "<th>Last scrape</th>",
+            "Scrape counts (S/L/D)",
+        ] {
+            assert!(
+                INDEX_HTML.contains(heading),
+                "tracker table is missing {heading}"
+            );
+        }
+        for field in [
+            "t.scrape_status",
+            "t.last_scrape_error",
+            "t.last_scrape",
+            "t.scrape_seeders",
+            "t.scrape_leechers",
+            "t.scrape_downloads",
+        ] {
+            assert!(
+                APP_JS.contains(field),
+                "tracker renderer is missing {field}"
+            );
+        }
+        for escaped in [
+            "escapeHtml(scrapeDetail)",
+            "escapeHtml(fmtUnixSeconds(t.last_scrape))",
+            "escapeHtml(scrapeCounts)",
+        ] {
+            assert!(
+                APP_JS.contains(escaped),
+                "tracker renderer does not safely escape {escaped}"
+            );
+        }
+    }
+
+    #[test]
     fn web_ui_removal_has_explicit_cancel_keep_and_delete_choices() {
         for value in ["cancel", "keep", "delete"] {
             assert!(

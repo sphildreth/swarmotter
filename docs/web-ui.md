@@ -61,6 +61,20 @@ all currently visible rows, clear the current selection, and remove all selected
 torrents. Bulk removal removes torrent records through `POST
 /api/v1/torrents/remove` and keeps downloaded data.
 
+## Tracker details
+
+Torrent Details → Trackers keeps announce status separate from scrape status.
+The table shows the last scrape time, retained seeders/leechers/downloads in
+`S / L / D` order, and the compatibility counts used elsewhere. A scrape error
+is displayed beside `error` while the last successful counts remain visible;
+`unsupported` means the tracker is UDP or its final path is not derivable from
+`announce*`. UDP announce remains supported—only UDP scrape is unsupported.
+
+All tracker URL, status, time, count, and error values are escaped before being
+inserted into the table. Scrape is operational telemetry scheduled by download,
+magnet, reannounce, completion, and active seeder tracker activity; it is not a
+separate user mutation.
+
 ## Per-torrent seeding policy
 
 Torrent Details includes a Seeding Policy card. Its read-only summary reports

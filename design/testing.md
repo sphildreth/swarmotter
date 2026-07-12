@@ -133,6 +133,20 @@ Run the watch renderer harness directly with the other Web checks:
 node crates/swarmotter-web/tests/watch-history.test.js
 ```
 
+### Contained HTTP, webseed, and tracker scrape acceptance matrix
+
+ADR-0055 is complete only when local generated fixtures cross the shared
+contained transport and the live scheduling/API/UI boundaries.
+
+| Capability | Required assertions | Acceptance evidence |
+| --- | --- | --- |
+| HTTP/1 framing and bounds | Content-Length and chunked finish before EOF; legal close-delimited bodies finish on EOF; truncated/malformed chunks, excessive decoded bytes, header bytes/counts, and driver/body errors retain typed context and close the connection. | All 15 `net::http::tests`, including `content_length_and_chunked_complete_without_waiting_for_eof`, `legal_close_delimited_body_is_decoded`, `truncated_and_malformed_chunk_bodies_are_typed_protocol_errors`, `decoded_tracker_cap_fails_on_first_excess_and_closes_connection`, and both logical-timeout cases. |
+| Redirect, authority, and containment | Follow at most five redirects, reject the sixth/loops/bad Location/status/downgrade, allow HTTPS upgrade and cross-host hops, repeat binder resolution/connect for every hop, preserve origin-form and exact non-default/IPv6 Host authority, and construct no general client/raw socket. | `tracker_redirect_loop_and_five_follow_boundary_have_exact_request_counts`, `tracker_redirect_validation_and_status_errors_keep_status_context`, `relative_and_cross_host_redirects_repeat_binder_resolution_and_connect`, `https_upgrade_uses_injected_trust_and_downgrade_is_rejected`, `origin_form_and_host_authority_keep_nondefault_port_and_ipv6_brackets`, `production_http_path_has_no_general_client_resolver_pool_or_raw_socket`. |
+| Exact webseed ranges | Preserve Range across redirects; require final 206, one exact Content-Range, exact decoded length, and immediate rejection of short/excess/200/missing/wrong responses for both framed forms. | `net::http::tests::webseed_range_policy_covers_exact_redirect_and_all_mismatch_cases`, plus generated local swarm webseed download. |
+| Bounded scrape protocol | Derive `announce`, `announce.php`, and suffix paths; preserve unrelated query text; send one binary hash pair; make no call for unsupported/UDP; require every exact 20-byte key and all nonnegative counts; use the same contained HTTP and injected-trust HTTPS client. | All seven core scrape tests in `tracker::tests`, including `contained_http_scrape_returns_only_exact_matching_counts` and `injected_trust_https_scrape_uses_the_same_contained_client`. |
+| Runtime retention and scheduling | Initial/explicit reannounce, magnet real-hash discovery, and seeder activity schedule scrape. Failure preserves prior success counts; task panic is attributed and counted; list rows retain announce priority with scrape fallback. | `engine::tests::started_and_reannounce_paths_schedule_contained_scrapes`, `engine::tests::magnet_tracker_activity_scrapes_the_real_magnet_info_hash`, `daemon::tests::seeder_announce_schedules_scrape_into_the_shared_engine_state`, `engine::tests::scrape_failure_retains_last_success_counts_and_is_accounted`, `engine::tests::scrape_task_panic_is_retained_for_the_exact_tracker`, `daemon::tests::list_trackers_exposes_scrape_state_and_falls_back_without_announce_success`. |
+| API and Web UI | Native rows expose stable additive status/time/count/error fields through the real router; compatibility fields remain; the tracker table shows and escapes status, time, counts, and errors. | `daemon::tests::tracker_scrape_snapshot_serializes_through_the_real_native_router`, `trackers_crud_and_bad_hash` in API integration, and `swarmotter_web::tests::web_ui_renders_and_escapes_tracker_scrape_state`. |
+
 ### Seeding policy, lifecycle, and accounting acceptance matrix
 
 ADR-0052 is complete only when every row below passes through the named

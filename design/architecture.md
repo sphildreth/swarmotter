@@ -88,6 +88,35 @@ daemon evaluates network containment at startup and periodically; in strict
 fail-closed mode, torrents enter `network_blocked` state when the path is
 unavailable while the control plane stays available.
 
+## Contained HTTP and tracker scrape
+
+`swarmotter-core::net::ContainedHttpClient` is the shared tracker announce,
+supported HTTP/HTTPS scrape, and webseed range transport (ADR-0055). Each hop
+uses `NetworkBinder::resolve_host` and `connect_peer`; TLS is layered over that
+stream, and Hyper is only an HTTP/1 codec through its Tokio I/O adapter. There
+is no Hyper connector, resolver, pool, or general client capable of creating a
+socket. Requests use origin-form targets and exact Host authorities. One
+logical timeout spans redirects and the decoded body, while decoded tracker
+bodies and exact webseed ranges have independent hard caps.
+
+Only the bounded redirect set is followed, every hop reconnects through the
+binder, HTTPS downgrade is rejected, and webseed Range survives redirects.
+Tracker announce/scrape require a final 2xx; webseed requires an exact 206 and
+matching Content-Range/body length. HTTP(S) scrape is derived only from a final
+`announce*` path component and parses BEP 48 through the bounded bencode
+decoder. UDP and non-derivable paths are recorded as unsupported without a
+network call.
+
+Engine announce activity schedules scrape for initial downloads, magnet
+metadata discovery using the real hash, explicit/periodic reannounce, and
+completion. The owned seeder announce loop does the same for active seeds.
+Each tracker has a separate scrape snapshot: the newest attempt updates
+status/time/error, while only a successful exact-key response replaces retained
+counts. Join failures are attributed to the tracker and included in recent
+tracker-failure accounting. API compatibility counts prefer a successful
+announce and fall back to retained scrape counts when announce has not
+succeeded; downloaded count uses scrape when available.
+
 ## Request flow
 
 1. A client (Web UI or external script) calls `/api/v1/...`.

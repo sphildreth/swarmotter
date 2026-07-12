@@ -9,7 +9,7 @@ It applies to torrent-related traffic:
 - DHT UDP.
 - PEX-discovered peers.
 - UDP tracker announces.
-- HTTP and HTTPS tracker announces.
+- HTTP and HTTPS tracker announces and supported scrape.
 - Webseeds.
 - Magnet metadata fetching.
 - DNS used by torrent operations.
@@ -113,6 +113,14 @@ is therefore cancelled even if recovery follows before it next polls, and a
 connected stream cannot bridge a fail-closed interval. The API/Web UI listener
 is outside this data-plane gate and remains available for diagnostics and
 repair.
+
+HTTP(S) tracker announce/scrape and webseed range reads use one contained
+HTTP/1 codec. The binder resolves and connects every redirect hop; TLS wraps
+only that stream. No connector, independent resolver, or pool can open a data-
+plane socket. HTTPS-to-HTTP redirects are rejected, decoded bodies are bounded,
+and exact webseed Range/Content-Range semantics are enforced. UDP scrape is
+unsupported and makes no network call; UDP announce remains contained and
+supported.
 
 Only work demonstrably live at the block edge receives durable recovery intent.
 After recovery, SwarmOtter consumes that intent and resumes those downloads,

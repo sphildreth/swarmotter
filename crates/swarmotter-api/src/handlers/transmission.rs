@@ -1489,6 +1489,12 @@ mod tests {
             last_message: Some("announce returned 12 peers".into()),
             next_announce: None,
             last_announce: Some(1234),
+            scrape_status: swarmotter_core::models::tracker::TrackerScrapeStatus::NotContacted,
+            last_scrape: None,
+            scrape_seeders: None,
+            scrape_leechers: None,
+            scrape_downloads: None,
+            last_scrape_error: None,
         }]);
 
         assert_eq!(rows[0]["seeder_count"], json!(42));

@@ -281,7 +281,7 @@ Useful fields:
 - `choked_peers`: reserved for explicit choke-state telemetry; currently
   `null` until the engine records positive per-peer choke state.
 - `recent_peer_failures`, `recent_tracker_failures`: recent failed peer
-  sessions and tracker announce failures reported by the live engine.
+  sessions and tracker announce/scrape failures reported by the live engine.
 - `tracker_ok`, `tracker_message`, `last_announce`: last tracker announce
   status from the live engine.
 - `tracker_last_ok_seconds_ago`, `dht_last_seen_seconds_ago`,
@@ -291,15 +291,21 @@ Useful fields:
   succeeded recently in the live engine.
 
 Tracker rows from `/api/v1/torrents/<info_hash>/trackers` report per-tracker
-announce results. `seeders` and `leechers` come from the last announce response,
-`last_error` is set only for failed announces, and `last_message` carries the
-latest successful announce result.
+announce and scrape results. `last_error`/`last_message` remain announce-only.
+`scrape_status`, `last_scrape`, nullable `scrape_seeders`/`scrape_leechers`/
+`scrape_downloads`, and `last_scrape_error` describe scrape. A failed scrape
+retains the previous successful counts. `unsupported` is expected for UDP and
+HTTP(S) URLs whose final path does not begin with `announce`; it does not mean
+UDP announce failed. If announce is not successful, compatibility seed/leech
+counts fall back to retained scrape data.
 
 Common causes:
 
 - The torrent has no live seeders.
 - The tracker hostnames cannot resolve under strict DNS containment.
 - UDP tracker traffic is blocked by the network path.
+- A supported HTTP(S) scrape is redirected to an HTTPS-to-HTTP downgrade,
+  returns malformed/missing exact-key BEP 48 data, or exceeds the decoded cap.
 - Only WebTorrent `wss://` trackers are present; those are not BitTorrent TCP
   or UDP trackers.
 

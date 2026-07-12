@@ -22,7 +22,7 @@ use swarmotter_core::models::stats::{
 };
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{
-    TrackerId, TrackerInfo, TrackerKind, TrackerStatus, TrackerTier,
+    TrackerId, TrackerInfo, TrackerKind, TrackerScrapeStatus, TrackerStatus, TrackerTier,
 };
 use swarmotter_core::models::{
     ConfigUpdateResult, DiagnosticLevel, DoctorCheck, DoctorReport, LogSnapshot,
@@ -362,6 +362,12 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
                     last_message: None,
                     next_announce: None,
                     last_announce: None,
+                    scrape_status: TrackerScrapeStatus::NotContacted,
+                    last_scrape: None,
+                    scrape_seeders: None,
+                    scrape_leechers: None,
+                    scrape_downloads: None,
+                    last_scrape_error: None,
                 });
                 tier += 1;
             }
@@ -380,6 +386,12 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
                         last_message: None,
                         next_announce: None,
                         last_announce: None,
+                        scrape_status: TrackerScrapeStatus::NotContacted,
+                        last_scrape: None,
+                        scrape_seeders: None,
+                        scrape_leechers: None,
+                        scrape_downloads: None,
+                        last_scrape_error: None,
                     });
                 }
                 tier += 1;

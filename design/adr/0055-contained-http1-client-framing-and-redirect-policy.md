@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed
+Accepted
 
 ## Context
 
@@ -58,6 +58,17 @@ sockets could bypass fail-closed torrent data-plane containment.
   decoding updates counts only for exact 20-byte requested keys. Failed or
   missing data never overwrites a separate last-success snapshot. UDP scrape is
   explicitly unsupported.
+- Initial download announce, explicit/periodic reannounce, completion, magnet
+  discovery using the real info hash, and the owned active-seeder announce loop
+  schedule scrape for every configured tracker. Scrape tasks are owned and
+  joined; a task failure retains its tracker URL, sets an error snapshot, and
+  increments recent tracker-failure accounting.
+- Native tracker rows add `scrape_status`, `last_scrape`, nullable retained
+  `scrape_seeders`/`scrape_leechers`/`scrape_downloads`, and
+  `last_scrape_error`. Existing announce fields are unchanged. Successful
+  announce counts remain primary; when announce has not succeeded, the
+  compatibility count view falls back to retained scrape counts, and downloads
+  use scrape when present.
 
 Direct dependencies are Hyper 1.x with its client codec, `hyper-util` 0.1 with
 the Tokio adapter, and `http-body-util` 0.1. Existing `tokio-rustls`, `rustls`,

@@ -93,7 +93,21 @@ UDP socket (see ADR-0020).
 - [x] HTTP/HTTPS tracker announce/scrape — announce URL construction, compact
       peer parsing, tiers, private handling, and live announce through the
       `NetworkBinder`; HTTPS is performed as TLS over the contained TCP socket
-      with system-root certificate validation (fail-closed blocks HTTPS)
+      with system-root certificate validation (fail-closed blocks HTTPS).
+      ADR-0055 adds a bounded framed HTTP/1 codec over only binder-provided
+      TCP/TLS streams, redirect/downgrade/authority policy, and real BEP 48
+      HTTP/HTTPS scrape. Download, magnet real-hash, reannounce/completion, and
+      seeder paths schedule scrape; failed attempts retain last-success counts,
+      task failures are counted, native API/Web UI rows expose the snapshot,
+      and UDP scrape is explicitly unsupported. Evidence:
+      `net::http::tests` (15), the seven `tracker::tests` scrape cases,
+      `engine::tests::started_and_reannounce_paths_schedule_contained_scrapes`,
+      `engine::tests::magnet_tracker_activity_scrapes_the_real_magnet_info_hash`,
+      `daemon::tests::seeder_announce_schedules_scrape_into_the_shared_engine_state`,
+      `daemon::tests::list_trackers_exposes_scrape_state_and_falls_back_without_announce_success`,
+      `daemon::tests::tracker_scrape_snapshot_serializes_through_the_real_native_router`,
+      `trackers_crud_and_bad_hash`, and
+      `web_ui_renders_and_escapes_tracker_scrape_state`.
 - [x] UDP tracker announce — live BEP 15 connect + announce through the
       binder's contained UDP socket, compact IPv4 peer parsing, transaction
       IDs, error response handling, tier integration, and local UDP tracker

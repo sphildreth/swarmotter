@@ -127,11 +127,15 @@ DNS only when the OS probe can tie DNS to the configured interface, such as
 systemd-resolved link DNS from `resolvectl dns br0`, or when static resolver
 routes go through the required interface.
 
-Tracker HTTP GETs are issued through the same binder, and tracker responses are
-bounded before buffering. HTTPS trackers (`https://`) perform TLS over the
-binder's contained TCP socket (`tokio-rustls` + `rustls` with system-root
-certificate validation); the TLS layer never creates an independent network
-path. UDP data-plane traffic (UDP trackers, DHT, and uTP) goes through the
+Tracker announce and supported HTTP/HTTPS scrape, plus webseed range GETs, use
+`ContainedHttpClient` through the same binder. Every redirect repeats contained
+resolution/connect, TLS is layered only over that stream, and Hyper supplies
+HTTP/1 framing without a connector, resolver, pool, or socket path. Decoded
+bodies are bounded before accumulation; HTTPS downgrade is rejected. UDP
+scrape is explicitly unsupported and makes no HTTP or UDP call. HTTPS
+(`https://`) performs TLS with system-root certificate validation over the
+binder-provided TCP stream; the TLS layer never creates an independent network
+path. UDP data-plane traffic (UDP tracker announce, DHT, and uTP) goes through the
 binder's `udp_socket()` / `udp_socket_for()` methods, which return contained
 UDP sockets for the requested address family. uTP (BEP 29) is a live peer
 transport selected by the engine alongside TCP; all uTP peer traffic - SYN,
