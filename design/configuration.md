@@ -27,6 +27,10 @@ updates use two API paths:
   source address, or current namespace is configured; only explicit
   `mode = "disabled"` disables in-process containment (ADR-0051).
 - API auth must require a non-empty token when enabled.
+- Chrome extension API access requires authenticated mode plus the configured
+  API token at the outer browser-origin guard. Merely retaining `auth_token`
+  while `require_auth = false` never authorizes an extension Origin; no separate
+  extension allowlist is implied (ADR-0044/ADR-0049).
 - Non-loopback control-plane listeners should use API auth by default; an
   operator may deliberately trust the reachable network and disable it
   (ADR-0049).

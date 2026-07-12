@@ -53,8 +53,9 @@ listener can control SwarmOtter, so authenticated mode is strongly recommended
 unless the reachable network is the intended trust boundary.
 
 Browser requests to every control route (`/api/v1`, `/transmission/rpc`, and
-`/api/v2`) must be same-origin. An Origin-bearing request must provide exactly
-one valid UTF-8 `Origin` and `Host`; the Origin must be only
+`/api/v2`) must be same-origin, except for the authenticated Chrome extension
+client described below. An Origin-bearing request must provide exactly one
+valid UTF-8 `Origin` and `Host`; an ordinary browser Origin must be only
 `scheme://authority`, its normalized host and explicit port must match Host, and
 it may not contain user information, a path, query, or fragment. `Origin: null`,
 opaque, foreign, malformed, duplicate, multi-value, and invalid-byte headers are
@@ -67,14 +68,34 @@ rejected. This includes WebSocket and SSE requests. The shared
 `browser_origin_guard` is the outermost control-route layer, before native
 authentication, Transmission session negotiation, qBittorrent SID handling,
 compatibility-enabled checks, request extraction, and daemon operations. The
-policy is identical whether `api.require_auth` is true or false. CLI and
-automation clients with neither Origin nor `Sec-Fetch-Site` are unaffected.
+same-origin and headerless-client policy is identical whether
+`api.require_auth` is true or false. CLI and automation clients with neither
+Origin nor `Sec-Fetch-Site` are unaffected.
+
+A Chrome Manifest V3 extension service worker with host permission sends an
+Origin such as `chrome-extension://abcdefghijklmnopabcdefghijklmnop`; Chromium
+uses `Sec-Fetch-Site: none` for this privileged request. SwarmOtter accepts this
+cross-origin shape only when all of these conditions hold:
+
+- the Origin contains exactly one valid Chrome extension ID: 32 lowercase
+  characters from `a` through `p`, with no port, path, query, or fragment;
+- `Host` is one valid authority and Fetch Metadata is otherwise permitted;
+- `api.require_auth = true`; and
+- exactly one `Authorization: Bearer <token>` or `X-SwarmOtter-Auth: <token>`
+  value matches `api.auth_token`.
+
+Auth-disabled mode always rejects extension Origins, even if an `auth_token`
+value is present. A valid token never permits a foreign HTTP(S), `null`, opaque,
+or malformed Origin. This is token-authenticated extension access, not a broad
+extension-origin allowlist.
 
 An origin rejection always uses HTTP 403 but preserves the selected surface's
 error format: the native API returns its JSON error envelope with
-`cross_origin_forbidden`, Transmission returns a JSON `error` object, and
-qBittorrent returns plain-text `Forbidden`. Rejections are never redirected to
-the Web UI.
+`cross_origin_forbidden` or the extension-specific
+`extension_origin_forbidden`, Transmission returns a JSON `error` object, and
+qBittorrent returns plain-text `Forbidden`. The native extension error explains
+that authenticated mode and a valid configured token are required. Rejections
+are never redirected to the Web UI.
 
 API request bodies are capped by `api.max_request_body_bytes`; this applies to
 JSON requests and raw `.torrent` uploads. The root `/health` alias remains a
@@ -561,6 +582,11 @@ runs before the enabled check, authentication, and session negotiation. An
 origin rejection returns HTTP 403 with the Transmission JSON `error` object and
 does not issue a session ID or dispatch an RPC method.
 
+A Chrome extension calling this compatibility route must satisfy the shared
+extension rule before Transmission authentication: enable API auth and send the
+configured token as Bearer or `X-SwarmOtter-Auth`. Transmission Basic auth by
+itself does not identify an allowed extension Origin at the outer guard.
+
 The adapter currently supports common session, torrent lifecycle, queue, and
 helper calls:
 
@@ -606,6 +632,11 @@ The browser-origin policy in [Authentication and limits](#authentication-and-lim
 runs before the enabled check, login/SID handling, form extraction, and daemon
 operations. An origin rejection returns HTTP 403 with plain-text `Forbidden`;
 it does not create a SID or dispatch the requested operation.
+
+A Chrome extension must send the configured Bearer or `X-SwarmOtter-Auth`
+token on every `/api/v2` request. A qBittorrent `SID` cookie alone does not
+authorize the cross-origin exception because the shared guard runs before SID
+handling.
 
 Representative automation endpoints:
 

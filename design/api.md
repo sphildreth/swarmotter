@@ -20,10 +20,12 @@ ADR-0009 and ADR-0010.
 - The Web UI uses the same API as external automation; it does not have a
   privileged internal channel.
 - Browser requests to `/api/v1`, `/transmission/rpc`, and `/api/v2` are guarded
-  by one outer same-origin policy in both authentication modes. Configured
-  unauthenticated LAN listeners still trust their network boundary, and
-  non-browser clients remain compatible when both Origin and
-  `Sec-Fetch-Site` are absent. See ADR-0044 and ADR-0049.
+  by one outer origin policy. Same-origin Web UI behavior is identical in both
+  authentication modes. Configured unauthenticated LAN listeners still trust
+  their network boundary, and non-browser clients remain compatible when both
+  Origin and `Sec-Fetch-Site` are absent. A valid Chrome extension Origin is a
+  narrow cross-origin exception only in authenticated mode with a valid API
+  token. See ADR-0044 and ADR-0049.
 
 ## Compatibility contract
 
@@ -83,6 +85,14 @@ ADR-0009 and ADR-0010.
   is intentionally ignored for TLS termination. `Sec-Fetch-Site` accepts only
   one `same-origin` or `none` value, or no value; every other or duplicate value
   fails closed.
+- A `chrome-extension://` Origin is classified separately instead of compared
+  to Host. Its authority must be exactly one Chromium extension ID (32 lowercase
+  `a`-`p` characters) without port or suffix, and Host must still be one valid
+  authority. The outer guard permits it only when `api.require_auth = true` and
+  one unambiguous Bearer or `X-SwarmOtter-Auth` value matches `api.auth_token`.
+  Auth-disabled mode and missing/invalid/duplicate credentials return 403 before
+  extraction or mutation. A token never exempts an HTTP(S) Origin from the
+  same-origin rule.
 - Authentication policy is shared: when API auth is enabled, compatibility
   adapters must map their auth mechanism back to `api.auth_token`, including
   `/api/v2` Bearer and SID-cookie flows.

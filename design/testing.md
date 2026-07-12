@@ -71,16 +71,27 @@ feature completion and acceptance criteria, not by time estimates.
 - Reject cross-origin native API mutations and WebSocket handshakes while
   preserving same-origin browser requests and non-browser API clients.
 - Route matrix (ADR-0044/ADR-0049, Phase 3): a table-driven real-router matrix
-  for authentication enabled/disabled covering native add/pause/remove/settings
-  mutation/WebSocket/SSE, Transmission session negotiation and a mutating RPC
-  method, and qBittorrent login/add/pause/resume/delete form endpoints. It
-  accepts same-origin (including scheme-changing TLS termination),
-  `Sec-Fetch-Site: none`, and absent browser headers. It rejects same-site,
-  cross-site, unknown, duplicate, and invalid-byte Fetch Metadata plus foreign,
-  malformed, opaque/`null`, duplicate/multi-value, invalid-byte, path, query,
-  fragment, and userinfo origins and duplicate/invalid Hosts. Every rejection
-  returns the surface-specific 403 shape before auth/session/compatibility
-  checks and leaves fake-daemon calls and state unchanged.
+  for authentication enabled/disabled covering native single/bulk
+  add/pause/remove/settings mutation/WebSocket/SSE, Transmission session
+  negotiation and a mutating RPC method, and qBittorrent
+  login/add/pause/resume/delete form endpoints. It accepts same-origin
+  (including scheme-changing TLS termination), `Sec-Fetch-Site: none`, and
+  absent browser headers. It rejects same-site, cross-site, unknown, duplicate,
+  and invalid-byte Fetch Metadata plus foreign, malformed, opaque/`null`,
+  duplicate/multi-value, invalid-byte, path, query, fragment, and userinfo
+  origins and duplicate/invalid Hosts. Every rejection returns the
+  surface-specific 403 shape before auth/session/compatibility checks and leaves
+  fake-daemon calls and state unchanged.
+- Chrome extension matrix (ADR-0044/ADR-0049, Phase 3): a realistic Manifest V3
+  service-worker Origin with a 32-character `a`-`p` extension ID and
+  `Sec-Fetch-Site: none` reaches every named native/Transmission/qBittorrent
+  route only in authenticated mode with a valid Bearer or
+  `X-SwarmOtter-Auth` token. Native bulk add must mutate through the real router.
+  Auth-disabled mode and missing, invalid, or duplicated credentials return the
+  surface-specific 403 before body extraction or mutation. Short IDs, invalid
+  ID alphabet, extension ports, missing/malformed/duplicate Host, and ordinary
+  foreign HTTP(S) Origins remain rejected; snapshots prove rejected requests do
+  not change daemon state.
 - Start the real local HTTP control server and complete a same-origin,
   authenticated WebSocket handshake with HTTP 101, proving the accepted path
   reaches Hyper's production upgrade extension rather than only a Tower

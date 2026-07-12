@@ -6,7 +6,7 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, State},
     http::{header, HeaderMap, Request, StatusCode},
-    middleware::{from_fn, from_fn_with_state, Next},
+    middleware::{from_fn_with_state, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
     Extension, Router,
@@ -81,12 +81,14 @@ pub fn app_router_with_body_limit(state: SharedState, max_request_body_bytes: us
     // surfaces makes it the single outermost layer. It therefore rejects an
     // unsafe browser request before native auth, Transmission auth/session
     // negotiation, qBittorrent auth, compatibility-enabled checks, body
-    // extraction, or any daemon operation. See ADR-0044/ADR-0049.
+    // extraction, or any mutation. The injected state is consulted only for a
+    // syntactically valid Chrome extension origin, which must authenticate at
+    // this outer boundary. See ADR-0044/ADR-0049.
     let controls = Router::new()
         .merge(transmission)
         .merge(qbittorrent)
         .nest("/api/v1", v1)
-        .layer(from_fn(browser_origin_guard));
+        .layer(from_fn_with_state(state.clone(), browser_origin_guard));
 
     Router::new()
         // Public health route that neither mutates nor reveals torrent data.
@@ -231,16 +233,39 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
 }
 
 /// Shared browser-origin guard applied to every control route (`/api/v1`,
-/// `/transmission/rpc`, `/api/v2`) before authentication/session checks and
-/// before compatibility-enabled checks. Rejects cross-site/same-site Fetch
-/// Metadata and mismatched/malformed Origin headers with 403. When both browser
-/// headers are absent the request continues as a non-browser client to normal
-/// authentication. See ADR-0044/ADR-0049 (Phase 3).
-pub async fn browser_origin_guard(req: Request<Body>, next: Next) -> Response {
-    if let Some(response) = reject_unsafe_browser_request(&req) {
-        return response;
+/// `/transmission/rpc`, `/api/v2`) before surface authentication/session checks
+/// and compatibility-enabled checks. Same-origin and headerless requests retain
+/// their normal behavior. A valid `chrome-extension://` origin is deliberately
+/// cross-origin and may continue only when API authentication is enabled and
+/// the request presents the configured API token at this outer boundary.
+/// See ADR-0044/ADR-0049 (Phase 3).
+pub async fn browser_origin_guard(
+    State(state): State<SharedState>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    match classify_browser_request(&req) {
+        Ok(BrowserRequestKind::SameOriginOrAutomation) => next.run(req).await,
+        Ok(BrowserRequestKind::ChromeExtension) => {
+            let cfg = state.daemon.get_config().await;
+            let authenticated = cfg.api.require_auth
+                && cfg
+                    .api
+                    .auth_token
+                    .as_deref()
+                    .is_some_and(|expected| extension_request_has_token(&req, expected));
+            if authenticated {
+                next.run(req).await
+            } else {
+                browser_security_error(
+                    &req,
+                    "extension_origin_forbidden",
+                    "Chrome extension API access requires api.require_auth = true and a valid configured API token",
+                )
+            }
+        }
+        Err((code, message)) => browser_security_error(&req, code, message),
     }
-    next.run(req).await
 }
 
 async fn require_api_auth(
@@ -264,13 +289,20 @@ async fn require_api_auth(
     auth_error(StatusCode::UNAUTHORIZED, "missing or invalid API token")
 }
 
-fn reject_unsafe_browser_request(req: &Request<Body>) -> Option<Response> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserRequestKind {
+    SameOriginOrAutomation,
+    ChromeExtension,
+}
+
+fn classify_browser_request(
+    req: &Request<Body>,
+) -> Result<BrowserRequestKind, (&'static str, &'static str)> {
     let headers = req.headers();
     let origin = match single_header(headers, header::ORIGIN.as_str()) {
         Ok(origin) => origin,
         Err(()) => {
-            return Some(browser_security_error(
-                req,
+            return Err((
                 "cross_origin_forbidden",
                 "Origin must be one valid UTF-8 header value",
             ));
@@ -279,8 +311,7 @@ fn reject_unsafe_browser_request(req: &Request<Body>) -> Option<Response> {
     let fetch_site = match single_header(headers, "sec-fetch-site") {
         Ok(fetch_site) => fetch_site,
         Err(()) => {
-            return Some(browser_security_error(
-                req,
+            return Err((
                 "cross_origin_forbidden",
                 "Sec-Fetch-Site must be one valid UTF-8 header value",
             ));
@@ -290,8 +321,7 @@ fn reject_unsafe_browser_request(req: &Request<Body>) -> Option<Response> {
     // Fetch Metadata is an allowlist. Unknown, malformed, and differently
     // cased values are rejected rather than treated as non-browser traffic.
     if !matches!(fetch_site, None | Some("same-origin") | Some("none")) {
-        return Some(browser_security_error(
-            req,
+        return Err((
             "cross_origin_forbidden",
             "cross-origin browser requests are not allowed",
         ));
@@ -303,25 +333,16 @@ fn reject_unsafe_browser_request(req: &Request<Body>) -> Option<Response> {
         // a fragment. The scheme is deliberately not compared with the request
         // because TLS-terminating reverse proxies are supported by ADR-0044.
         if origin.eq_ignore_ascii_case("null") {
-            return Some(browser_security_error(
-                req,
+            return Err((
                 "cross_origin_forbidden",
                 "opaque browser Origin is not allowed",
             ));
         }
         if origin.contains(',') || origin.bytes().any(|byte| byte.is_ascii_whitespace()) {
-            return Some(browser_security_error(
-                req,
-                "cross_origin_forbidden",
-                "malformed browser Origin header",
-            ));
+            return Err(("cross_origin_forbidden", "malformed browser Origin header"));
         }
         let Some(parsed) = origin.parse::<axum::http::Uri>().ok() else {
-            return Some(browser_security_error(
-                req,
-                "cross_origin_forbidden",
-                "malformed browser Origin header",
-            ));
+            return Err(("cross_origin_forbidden", "malformed browser Origin header"));
         };
         let origin_authority = parsed.authority();
         // `http::Uri` normalizes an authority-only absolute URI to path `/`, so
@@ -338,12 +359,9 @@ fn reject_unsafe_browser_request(req: &Request<Body>) -> Option<Response> {
             || !authority_only
             || origin_authority.is_some_and(|authority| authority.as_str().contains('@'))
         {
-            return Some(browser_security_error(
-                req,
-                "cross_origin_forbidden",
-                "malformed browser Origin header",
-            ));
+            return Err(("cross_origin_forbidden", "malformed browser Origin header"));
         }
+
         let request_authority = match single_header(headers, header::HOST.as_str()) {
             Ok(Some(host)) => host
                 .parse::<axum::http::uri::Authority>()
@@ -351,19 +369,40 @@ fn reject_unsafe_browser_request(req: &Request<Body>) -> Option<Response> {
                 .filter(|authority| !authority.as_str().contains('@')),
             Ok(None) | Err(()) => None,
         };
-        let same_authority = origin_authority
-            .zip(request_authority.as_ref())
-            .is_some_and(|(origin, request)| authority_matches(origin, request));
+        let Some(request_authority) = request_authority else {
+            return Err((
+                "cross_origin_forbidden",
+                "Host must be one valid authority header value",
+            ));
+        };
+
+        if parsed.scheme_str() == Some("chrome-extension") {
+            let Some(authority) = origin_authority else {
+                return Err(("cross_origin_forbidden", "malformed browser Origin header"));
+            };
+            let extension_id = authority.host();
+            let valid_extension_id = authority.port_u16().is_none()
+                && extension_id.len() == 32
+                && extension_id.bytes().all(|byte| matches!(byte, b'a'..=b'p'));
+            if !valid_extension_id {
+                return Err((
+                    "cross_origin_forbidden",
+                    "malformed Chrome extension Origin",
+                ));
+            }
+            return Ok(BrowserRequestKind::ChromeExtension);
+        }
+        let same_authority =
+            origin_authority.is_some_and(|origin| authority_matches(origin, &request_authority));
         if !same_authority {
-            return Some(browser_security_error(
-                req,
+            return Err((
                 "cross_origin_forbidden",
                 "browser Origin must match the request Host",
             ));
         }
     }
 
-    None
+    Ok(BrowserRequestKind::SameOriginOrAutomation)
 }
 
 /// Read an origin-policy header without HeaderMap's first-value collapsing.
@@ -403,6 +442,22 @@ pub(crate) fn request_has_token(req: &Request<Body>, expected: &str) -> bool {
         .into_iter()
         .chain(direct)
         .any(|candidate| constant_time_eq(candidate.as_bytes(), expected.as_bytes()))
+}
+
+fn extension_request_has_token(req: &Request<Body>, expected: &str) -> bool {
+    let headers = req.headers();
+    let Ok(authorization) = single_header(headers, header::AUTHORIZATION.as_str()) else {
+        return false;
+    };
+    let Ok(direct) = single_header(headers, "x-swarmotter-auth") else {
+        return false;
+    };
+    let candidate = match (authorization, direct) {
+        (Some(value), None) => value.strip_prefix("Bearer "),
+        (None, Some(value)) => Some(value),
+        (None, None) | (Some(_), Some(_)) => None,
+    };
+    candidate.is_some_and(|candidate| constant_time_eq(candidate.as_bytes(), expected.as_bytes()))
 }
 
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {

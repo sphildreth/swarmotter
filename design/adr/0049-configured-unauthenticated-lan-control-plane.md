@@ -33,6 +33,14 @@ that an automatically privileged Web UI is authenticated.
   invalid values are rejected. `Sec-Fetch-Site` permits only `same-origin`,
   `none`, or absence. Scheme is not compared so a TLS-terminating proxy remains
   supported when it preserves the public Host.
+- A syntactically valid `chrome-extension://<32-character a-p extension ID>`
+  Origin is the only deliberate cross-origin integration. The outer guard
+  permits it only when `api.require_auth = true` and the request supplies the
+  valid configured API token. It still requires one valid Host and permitted
+  Fetch Metadata; Chromium's privileged extension service-worker request uses
+  `Sec-Fetch-Site: none`. Auth-disabled mode rejects every extension Origin,
+  even when a token value remains configured. Ordinary foreign HTTP(S) Origins
+  remain rejected even with a token.
 - The built-in Web UI continues to use the public API without a privileged
   internal channel. It requests a token only when the API returns `401`.
 - Container examples continue to enable authentication by default. Operators
@@ -51,6 +59,9 @@ default and the recommended choice for networks that are not fully trusted.
 Origin checks reduce browser cross-site request risk but are not authentication
 and do not protect an unauthenticated listener from clients that can reach it
 directly. Operators choosing unauthenticated LAN access accept that boundary.
+Chrome extension access deliberately composes the origin classification with
+API authentication and therefore is unavailable on that unauthenticated
+boundary.
 
 The shared middleware preserves each API surface's rejection format at HTTP
 403: the native envelope, the Transmission JSON error object, and qBittorrent's

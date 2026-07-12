@@ -177,6 +177,55 @@ If a trusted-LAN deployment should not require a token, set
 listeners log a warning because every reachable client can then control
 SwarmOtter.
 
+## Chrome extension POST returns `extension_origin_forbidden`
+
+Chrome Manifest V3 service workers are cross-origin clients. A privileged
+extension request normally carries both:
+
+```text
+Origin: chrome-extension://<32-character-extension-id>
+Sec-Fetch-Site: none
+```
+
+SwarmOtter accepts that Origin only with authenticated API mode and a valid API
+token. Configure:
+
+```toml
+[api]
+require_auth = true
+auth_token = "replace-with-a-long-random-token"
+```
+
+Then send the same token on the extension service worker's request:
+
+```text
+Authorization: Bearer <token>
+```
+
+or:
+
+```text
+X-SwarmOtter-Auth: <token>
+```
+
+Also grant the exact SwarmOtter API origin in the extension manifest's
+`host_permissions`; HTTP and HTTPS permissions are separate. Do not try to set
+`Origin` or `Sec-Fetch-Site` in extension code—the browser owns those headers.
+
+Check the native JSON error code and message:
+
+- `extension_origin_forbidden`: authenticated mode is off, the token is absent
+  or invalid, an authentication header is duplicated, or both supported token
+  header forms were sent together.
+- `cross_origin_forbidden`: Fetch Metadata, Origin, or Host failed the ordinary
+  browser-origin policy. `same-site`/`cross-site`, foreign HTTP(S), `null`,
+  opaque, malformed (including an invalid extension ID), and multi-value
+  Origins remain intentionally rejected.
+
+Setting only `auth_token` while `require_auth = false` does not enable extension
+access. SwarmOtter does not broadly trust all installed extensions on an
+unauthenticated listener.
+
 ## Update helper health check reports connection resets
 
 If `deploy/update-swarmotter.sh` reports repeated `curl: (56) Recv failure:

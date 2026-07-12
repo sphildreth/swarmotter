@@ -228,6 +228,15 @@ mode = "act"  # optional; defaults to act
 | `auth_token` | unset | Required when `require_auth = true`. |
 | `max_request_body_bytes` | `16777216` | Maximum API request body size, including `.torrent` uploads. |
 
+Chrome Manifest V3 extension service workers are deliberate cross-origin API
+clients. Extension access requires `require_auth = true` and a valid configured
+token sent as `Authorization: Bearer <token>` or `X-SwarmOtter-Auth: <token>`.
+An extension Origin is rejected when auth is disabled, even if `auth_token`
+remains populated. No extension ID allowlist is inferred from configuration;
+the token is mandatory, and ordinary foreign HTTP(S) browser Origins remain
+forbidden even when they send it. The extension manifest must separately grant
+host permission for the exact SwarmOtter HTTP and/or HTTPS API origin.
+
 ### `[compatibility.qbittorrent]`
 
 | Option | Default | Meaning |

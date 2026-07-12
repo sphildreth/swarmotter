@@ -70,6 +70,17 @@ date or duration estimates.
   auth. See
   [ADR-0044](design/adr/0044-browser-origin-and-loopback-api-security.md),
   [ADR-0049](design/adr/0049-configured-unauthenticated-lan-control-plane.md).
+- **Authenticated Chrome extension API access:** Manifest V3 extension service
+  workers with a valid `chrome-extension://<extension-id>` Origin and realistic
+  `Sec-Fetch-Site: none` can now call native bulk-add and every guarded control
+  surface when API authentication is enabled and the request supplies the
+  configured Bearer or `X-SwarmOtter-Auth` token. Auth-disabled mode and
+  missing, invalid, or duplicated credentials fail with 403 before mutation;
+  ordinary foreign HTTP(S), malformed/opaque/`null`, and invalid extension
+  Origins remain rejected. Native failures use the actionable
+  `extension_origin_forbidden` envelope. See
+  [ADR-0044](design/adr/0044-browser-origin-and-loopback-api-security.md) and
+  [ADR-0049](design/adr/0049-configured-unauthenticated-lan-control-plane.md).
 
 - **Strict containment is the default (breaking):** `NetworkConfig::default()`
   now selects strict mode, matching the Serde default. An omitted `[network]`

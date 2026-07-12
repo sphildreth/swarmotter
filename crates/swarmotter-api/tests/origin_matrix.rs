@@ -25,6 +25,7 @@ const SEEDED_MAGNET: &str =
     "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=origin-seeded";
 const ADDED_MAGNET: &str =
     "magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef&dn=origin-added";
+const EXTENSION_ID: &str = "abcdefghijklmnopabcdefghijklmnop";
 const QBIT_ADDED_MAGNET_FORM: &str = concat!(
     "urls=magnet%3A%3Fxt%3Durn%3Abtih%3A89abcdef0123456789abcdef0123456789abcdef",
     "%26dn%3Dorigin-qbit-added"
@@ -57,6 +58,7 @@ enum Surface {
 #[derive(Clone, Copy, Debug)]
 enum ControlRoute {
     NativeAdd,
+    NativeBulkAdd,
     NativePause,
     NativeRemove,
     NativeSettings,
@@ -72,8 +74,9 @@ enum ControlRoute {
 }
 
 impl ControlRoute {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::NativeAdd,
+        Self::NativeBulkAdd,
         Self::NativePause,
         Self::NativeRemove,
         Self::NativeSettings,
@@ -91,6 +94,7 @@ impl ControlRoute {
     fn label(self) -> &'static str {
         match self {
             Self::NativeAdd => "native add",
+            Self::NativeBulkAdd => "native bulk add",
             Self::NativePause => "native pause",
             Self::NativeRemove => "native remove",
             Self::NativeSettings => "native settings",
@@ -109,6 +113,7 @@ impl ControlRoute {
     fn surface(self) -> Surface {
         match self {
             Self::NativeAdd
+            | Self::NativeBulkAdd
             | Self::NativePause
             | Self::NativeRemove
             | Self::NativeSettings
@@ -136,7 +141,7 @@ impl ControlRoute {
 
     fn expected_daemon_call(self) -> &'static str {
         match self {
-            Self::NativeAdd | Self::QbittorrentAdd => "add_magnet",
+            Self::NativeAdd | Self::NativeBulkAdd | Self::QbittorrentAdd => "add_magnet",
             Self::NativePause | Self::QbittorrentPause => "pause",
             Self::NativeRemove | Self::QbittorrentDelete => "remove_torrent",
             Self::NativeSettings | Self::TransmissionMutation => "update_settings",
@@ -156,6 +161,12 @@ impl ControlRoute {
                 "/api/v1/torrents/magnet".to_string(),
                 "application/json",
                 format!(r#"{{"magnet":"{ADDED_MAGNET}"}}"#),
+            ),
+            Self::NativeBulkAdd => (
+                "POST",
+                "/api/v1/torrents/bulk".to_string(),
+                "application/json",
+                serde_json::json!({ "magnets": [ADDED_MAGNET] }).to_string(),
             ),
             Self::NativePause => (
                 "POST",
@@ -284,12 +295,15 @@ enum RejectedHeaders {
     OriginQuery,
     OriginFragment,
     OriginUserInfo,
+    ChromeExtensionShortId,
+    ChromeExtensionInvalidId,
+    ChromeExtensionPort,
     DuplicateHost,
     InvalidHostBytes,
 }
 
 impl RejectedHeaders {
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 20] = [
         Self::SameSite,
         Self::CrossSite,
         Self::ForeignOrigin,
@@ -305,6 +319,9 @@ impl RejectedHeaders {
         Self::OriginQuery,
         Self::OriginFragment,
         Self::OriginUserInfo,
+        Self::ChromeExtensionShortId,
+        Self::ChromeExtensionInvalidId,
+        Self::ChromeExtensionPort,
         Self::DuplicateHost,
         Self::InvalidHostBytes,
     ];
@@ -326,6 +343,9 @@ impl RejectedHeaders {
             Self::OriginQuery => "Origin query",
             Self::OriginFragment => "Origin fragment",
             Self::OriginUserInfo => "Origin userinfo",
+            Self::ChromeExtensionShortId => "short Chrome extension ID",
+            Self::ChromeExtensionInvalidId => "invalid Chrome extension ID alphabet",
+            Self::ChromeExtensionPort => "Chrome extension Origin with a port",
             Self::DuplicateHost => "duplicate Host fields",
             Self::InvalidHostBytes => "invalid UTF-8 Host",
         }
@@ -411,6 +431,29 @@ impl RejectedHeaders {
                     HeaderValue::from_static("http://user@127.0.0.1:9091"),
                 );
             }
+            Self::ChromeExtensionShortId => {
+                headers.insert(
+                    header::ORIGIN,
+                    HeaderValue::from_static("chrome-extension://abcdefghijklmnop"),
+                );
+                headers.insert("sec-fetch-site", HeaderValue::from_static("none"));
+            }
+            Self::ChromeExtensionInvalidId => {
+                headers.insert(
+                    header::ORIGIN,
+                    HeaderValue::from_static("chrome-extension://abcdefghijklmnopabcdefghijklmnoq"),
+                );
+                headers.insert("sec-fetch-site", HeaderValue::from_static("none"));
+            }
+            Self::ChromeExtensionPort => {
+                headers.insert(
+                    header::ORIGIN,
+                    HeaderValue::from_static(
+                        "chrome-extension://abcdefghijklmnopabcdefghijklmnop:443",
+                    ),
+                );
+                headers.insert("sec-fetch-site", HeaderValue::from_static("none"));
+            }
             Self::DuplicateHost => {
                 headers.insert(header::ORIGIN, same_origin);
                 headers.append(header::HOST, HeaderValue::from_static(HOST));
@@ -467,6 +510,17 @@ impl AcceptedHeaders {
     }
 }
 
+fn apply_chrome_extension_origin(request: &mut Request<Body>) {
+    request.headers_mut().insert(
+        header::ORIGIN,
+        HeaderValue::from_str(&format!("chrome-extension://{EXTENSION_ID}"))
+            .expect("fixed extension Origin must be a header value"),
+    );
+    request
+        .headers_mut()
+        .insert("sec-fetch-site", HeaderValue::from_static("none"));
+}
+
 async fn test_context(auth_mode: AuthMode) -> (SharedState, std::sync::Arc<FakeDaemon>, InfoHash) {
     let mut config = Config::default();
     config.network.mode = NetworkContainmentMode::Disabled;
@@ -508,6 +562,56 @@ async fn assert_rejection_shape(surface: Surface, response: Response<Body>, cont
                 serde_json::from_slice(&body).expect("Transmission error must be JSON");
             assert!(json["error"].is_string(), "{context}: {json}");
             assert!(json.get("success").is_none(), "{context}: {json}");
+        }
+        Surface::Qbittorrent => {
+            assert_eq!(content_type, "text/plain; charset=utf-8", "{context}");
+            assert_eq!(&body[..], b"Forbidden", "{context}");
+        }
+    }
+}
+
+async fn assert_extension_rejection_shape(
+    surface: Surface,
+    response: Response<Body>,
+    context: &str,
+) {
+    assert_eq!(response.status(), StatusCode::FORBIDDEN, "{context}");
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .expect("extension rejection body must be readable");
+    match surface {
+        Surface::Native => {
+            assert_eq!(content_type, "application/json", "{context}");
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("native error must be JSON");
+            assert_eq!(json["success"], false, "{context}");
+            assert_eq!(
+                json["error"]["code"], "extension_origin_forbidden",
+                "{context}"
+            );
+            assert!(
+                json["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("api.require_auth = true")),
+                "{context}: {json}"
+            );
+        }
+        Surface::Transmission => {
+            assert_eq!(content_type, "application/json", "{context}");
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("Transmission error must be JSON");
+            assert!(
+                json["error"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("api.require_auth = true")),
+                "{context}: {json}"
+            );
         }
         Surface::Qbittorrent => {
             assert_eq!(content_type, "text/plain; charset=utf-8", "{context}");
@@ -582,6 +686,175 @@ async fn real_router_origin_matrix_covers_all_control_routes_and_auth_modes() {
                 );
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn authenticated_chrome_extension_origin_reaches_every_control_surface() {
+    for route in ControlRoute::ALL {
+        let (state, daemon, hash) = test_context(AuthMode::Enabled).await;
+        let app = app_router(state.clone());
+        let mut request = route.request(&state, &hash);
+        apply_chrome_extension_origin(&mut request);
+        let context = format!("authenticated Chrome extension / {}", route.label());
+        let response = app.oneshot(request).await.expect("real router must answer");
+        assert_eq!(response.status(), route.accepted_status(), "{context}");
+        let calls = daemon.observed_calls().await;
+        assert!(
+            calls.contains(&route.expected_daemon_call()),
+            "{context}: expected production-boundary call {:?}, got {calls:?}",
+            route.expected_daemon_call()
+        );
+    }
+
+    // The direct API-token header is equivalent to Bearer authentication for
+    // extension clients and must reach the reported bulk-add regression path.
+    let (state, daemon, hash) = test_context(AuthMode::Enabled).await;
+    let app = app_router(state.clone());
+    let mut request = ControlRoute::NativeBulkAdd.request(&state, &hash);
+    request.headers_mut().remove(header::AUTHORIZATION);
+    request
+        .headers_mut()
+        .insert("x-swarmotter-auth", HeaderValue::from_static(TOKEN));
+    apply_chrome_extension_origin(&mut request);
+    let response = app.oneshot(request).await.expect("real router must answer");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(daemon.observed_calls().await.contains(&"add_magnet"));
+}
+
+#[tokio::test]
+async fn chrome_extension_origin_requires_authenticated_mode_and_one_valid_token() {
+    #[derive(Clone, Copy)]
+    enum Rejection {
+        AuthenticationDisabled,
+        MissingToken,
+        InvalidToken,
+        DuplicateAuthorization,
+        MultipleCredentialHeaders,
+    }
+
+    for rejection in [
+        Rejection::AuthenticationDisabled,
+        Rejection::MissingToken,
+        Rejection::InvalidToken,
+        Rejection::DuplicateAuthorization,
+        Rejection::MultipleCredentialHeaders,
+    ] {
+        for route in ControlRoute::ALL {
+            let auth_mode = if matches!(rejection, Rejection::AuthenticationDisabled) {
+                AuthMode::Disabled
+            } else {
+                AuthMode::Enabled
+            };
+            let (state, daemon, hash) = test_context(auth_mode).await;
+            let app = app_router(state.clone());
+            let mut request = route.request(&state, &hash);
+            let credential_label = match rejection {
+                Rejection::AuthenticationDisabled => "authentication disabled",
+                Rejection::MissingToken => {
+                    request.headers_mut().remove(header::AUTHORIZATION);
+                    "missing token"
+                }
+                Rejection::InvalidToken => {
+                    request.headers_mut().insert(
+                        header::AUTHORIZATION,
+                        HeaderValue::from_static("Bearer invalid-token"),
+                    );
+                    "invalid token"
+                }
+                Rejection::DuplicateAuthorization => {
+                    request.headers_mut().append(
+                        header::AUTHORIZATION,
+                        HeaderValue::from_static("Bearer invalid-token"),
+                    );
+                    "duplicate Authorization"
+                }
+                Rejection::MultipleCredentialHeaders => {
+                    request
+                        .headers_mut()
+                        .insert("x-swarmotter-auth", HeaderValue::from_static(TOKEN));
+                    "multiple credential headers"
+                }
+            };
+            apply_chrome_extension_origin(&mut request);
+            let before = daemon.state_snapshot().await;
+            daemon.clear_calls().await;
+            let context = format!("Chrome extension / {} / {credential_label}", route.label());
+            let response = app.oneshot(request).await.expect("real router must answer");
+            assert_extension_rejection_shape(route.surface(), response, &context).await;
+            assert_eq!(
+                daemon.observed_calls().await,
+                vec!["get_config"],
+                "{context}: only the outer extension credential check may run"
+            );
+            assert_eq!(
+                daemon.state_snapshot().await,
+                before,
+                "{context}: rejected extension request changed daemon state"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn chrome_extension_origin_still_requires_valid_host_and_fetch_metadata() {
+    #[derive(Clone, Copy)]
+    enum Rejection {
+        MissingHost,
+        DuplicateHost,
+        InvalidHostBytes,
+        CrossSite,
+    }
+
+    for rejection in [
+        Rejection::MissingHost,
+        Rejection::DuplicateHost,
+        Rejection::InvalidHostBytes,
+        Rejection::CrossSite,
+    ] {
+        let (state, daemon, hash) = test_context(AuthMode::Enabled).await;
+        let app = app_router(state.clone());
+        let mut request = ControlRoute::NativeBulkAdd.request(&state, &hash);
+        apply_chrome_extension_origin(&mut request);
+        let rejection_label = match rejection {
+            Rejection::MissingHost => {
+                request.headers_mut().remove(header::HOST);
+                "missing Host"
+            }
+            Rejection::DuplicateHost => {
+                request
+                    .headers_mut()
+                    .append(header::HOST, HeaderValue::from_static(HOST));
+                "duplicate Host"
+            }
+            Rejection::InvalidHostBytes => {
+                request.headers_mut().insert(
+                    header::HOST,
+                    HeaderValue::from_bytes(&[0x80]).expect("obs-text is a valid header byte"),
+                );
+                "invalid Host bytes"
+            }
+            Rejection::CrossSite => {
+                request
+                    .headers_mut()
+                    .insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+                "cross-site Fetch Metadata"
+            }
+        };
+        let before = daemon.state_snapshot().await;
+        daemon.clear_calls().await;
+        let context = format!("Chrome extension bulk add / {rejection_label}");
+        let response = app.oneshot(request).await.expect("real router must answer");
+        assert_rejection_shape(Surface::Native, response, &context).await;
+        assert!(
+            daemon.observed_calls().await.is_empty(),
+            "{context}: malformed request reached the extension credential lookup"
+        );
+        assert_eq!(
+            daemon.state_snapshot().await,
+            before,
+            "{context}: rejected extension request changed daemon state"
+        );
     }
 }
 
