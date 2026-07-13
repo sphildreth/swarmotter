@@ -14,6 +14,8 @@ mod diagnostics;
 mod lifecycle;
 mod persistence;
 mod policy_runtime;
+mod port_mapping;
+mod port_test;
 mod scheduler;
 mod seeding;
 mod settings;
@@ -194,6 +196,13 @@ pub struct DaemonRuntime {
     /// One compiled immutable peer-admission policy shared by every active
     /// engine, magnet metadata fetch, and inbound listener generation.
     peer_filter: Arc<RwLock<Arc<swarmotter_core::peer_filter::PeerFilter>>>,
+    /// Runtime-only cached, opt-in listen-port reachability diagnostics. It is
+    /// deliberately separate from containment health and port mapping.
+    port_test: port_test::PortTestRuntime,
+    /// Process-local, opt-in UPnP/NAT-PMP lifecycle state. Every mapping
+    /// request retains the binder generation that created it, so teardown
+    /// cannot silently migrate to a different network path.
+    port_mapping: Arc<port_mapping::PortMappingRuntime>,
     pub network_health: Arc<RwLock<NetworkHealth>>,
     pub watch_imports: Arc<Mutex<VecDeque<watch::ImportResult>>>,
     watch_observations: Arc<Mutex<HashMap<watch::ObservationKey, WatchObservation>>>,

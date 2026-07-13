@@ -11,10 +11,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Empty};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::client::conn::http1;
-use hyper::header::{CONNECTION, CONTENT_RANGE, HOST, LOCATION, RANGE, USER_AGENT};
+use hyper::header::{CONNECTION, CONTENT_RANGE, CONTENT_TYPE, HOST, LOCATION, RANGE, USER_AGENT};
 use hyper::{Method, Request, StatusCode, Version};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -24,6 +24,8 @@ use crate::error::{CoreError, Result};
 
 /// Maximum decoded tracker announce/scrape body size.
 pub const MAX_TRACKER_HTTP_BODY_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum decoded body accepted from a local UPnP IGD control action.
+pub const MAX_UPNP_SOAP_BODY_BYTES: usize = 256 * 1024;
 
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: usize = 5;
@@ -43,6 +45,7 @@ pub struct HttpResponse {
 enum RequestPolicy {
     Tracker,
     WebseedRange { start: u64, end_exclusive: u64 },
+    UpnpSoap,
 }
 
 impl RequestPolicy {
@@ -53,6 +56,7 @@ impl RequestPolicy {
                 start,
                 end_exclusive,
             } => range_length(start, end_exclusive),
+            Self::UpnpSoap => Ok(MAX_UPNP_SOAP_BODY_BYTES),
         }
     }
 
@@ -63,6 +67,7 @@ impl RequestPolicy {
                 start,
                 end_exclusive,
             } => Some(format!("bytes={start}-{}", end_exclusive - 1)),
+            Self::UpnpSoap => None,
         }
     }
 
@@ -70,6 +75,7 @@ impl RequestPolicy {
         match self {
             Self::Tracker => status.is_success(),
             Self::WebseedRange { .. } => status == StatusCode::PARTIAL_CONTENT,
+            Self::UpnpSoap => status.is_success(),
         }
     }
 }
@@ -181,6 +187,89 @@ impl<'a, B: NetworkBinder + ?Sized> ContainedHttpClient<'a, B> {
         Ok(response)
     }
 
+    /// Fetch one UPnP device description through the contained binder without
+    /// following redirects. Discovery responses are unauthenticated local
+    /// multicast input, so this narrow helper deliberately rejects every
+    /// non-2xx status rather than reusing tracker redirect behavior.
+    pub async fn get_upnp_description(&self, url: &str) -> Result<HttpResponse> {
+        let parsed = parse_http_url(url)?;
+        if parsed.scheme() != "http" {
+            return Err(CoreError::InvalidArgument(
+                "UPnP device description URLs must use http".into(),
+            ));
+        }
+        let response = tokio::time::timeout(
+            self.request_timeout,
+            self.request_one(&parsed, RequestPolicy::UpnpSoap, MAX_UPNP_SOAP_BODY_BYTES),
+        )
+        .await??;
+        if !response.status.is_success() {
+            return Err(CoreError::HttpStatus(format!(
+                "UPnP device description {} returned HTTP {}",
+                parsed, response.status
+            )));
+        }
+        Ok(HttpResponse {
+            status: response.status.as_u16(),
+            body: response.body,
+            final_url: parsed.to_string(),
+            content_range: None,
+        })
+    }
+
+    /// POST one bounded UPnP Internet Gateway Device SOAP action. The URL is
+    /// resolved and connected through the supplied binder, exactly like a
+    /// tracker request. UPnP control URLs do not follow redirects: accepting
+    /// a redirect from a multicast-advertised local device would weaken the
+    /// narrow, auditable router-control surface.
+    pub async fn post_upnp_soap(
+        &self,
+        url: &str,
+        soap_action: &str,
+        body: &[u8],
+    ) -> Result<HttpResponse> {
+        if body.len() > MAX_UPNP_SOAP_BODY_BYTES {
+            return Err(CoreError::InvalidArgument(format!(
+                "UPnP SOAP request body exceeds {MAX_UPNP_SOAP_BODY_BYTES} bytes"
+            )));
+        }
+        if soap_action.trim().is_empty() || soap_action.contains('\r') || soap_action.contains('\n')
+        {
+            return Err(CoreError::InvalidArgument(
+                "UPnP SOAP action must be a non-empty single header value".into(),
+            ));
+        }
+        let parsed = parse_http_url(url)?;
+        if parsed.scheme() != "http" {
+            return Err(CoreError::InvalidArgument(
+                "UPnP SOAP control URLs must use http".into(),
+            ));
+        }
+        let request = build_upnp_soap_request(&parsed, soap_action, body)?;
+        let response = tokio::time::timeout(
+            self.request_timeout,
+            self.request_one_with_request(
+                &parsed,
+                RequestPolicy::UpnpSoap,
+                MAX_UPNP_SOAP_BODY_BYTES,
+                request,
+            ),
+        )
+        .await??;
+        if !response.status.is_success() {
+            return Err(CoreError::HttpStatus(format!(
+                "UPnP SOAP {} returned HTTP {}",
+                parsed, response.status
+            )));
+        }
+        Ok(HttpResponse {
+            status: response.status.as_u16(),
+            body: response.body,
+            final_url: parsed.to_string(),
+            content_range: None,
+        })
+    }
+
     async fn request(&self, url: &str, policy: RequestPolicy) -> Result<HttpResponse> {
         tokio::time::timeout(
             self.request_timeout,
@@ -252,13 +341,24 @@ impl<'a, B: NetworkBinder + ?Sized> ContainedHttpClient<'a, B> {
         policy: RequestPolicy,
         body_limit: usize,
     ) -> Result<RawResponse> {
+        let request = build_request(url, policy)?;
+        self.request_one_with_request(url, policy, body_limit, request)
+            .await
+    }
+
+    async fn request_one_with_request(
+        &self,
+        url: &url::Url,
+        policy: RequestPolicy,
+        body_limit: usize,
+        request: Request<Full<Bytes>>,
+    ) -> Result<RawResponse> {
         let host = connection_host(url)?;
         let port = url.port_or_known_default().ok_or_else(|| {
             CoreError::InvalidArgument(format!("HTTP URL has no known port: {url}"))
         })?;
         let address = self.binder.resolve_host(&host, port).await?;
         let stream = self.binder.connect_peer(address).await?;
-        let request = build_request(url, policy)?;
 
         if url.scheme() == "https" {
             let connector = tokio_rustls::TlsConnector::from(self.tls_config.clone());
@@ -329,7 +429,7 @@ fn resolve_redirect(current: &url::Url, location: &str) -> Result<url::Url> {
     })
 }
 
-fn build_request(url: &url::Url, policy: RequestPolicy) -> Result<Request<Empty<Bytes>>> {
+fn build_request(url: &url::Url, policy: RequestPolicy) -> Result<Request<Full<Bytes>>> {
     let path = if url.path().is_empty() {
         "/"
     } else {
@@ -350,9 +450,41 @@ fn build_request(url: &url::Url, policy: RequestPolicy) -> Result<Request<Empty<
     if let Some(range) = policy.range_header() {
         builder = builder.header(RANGE, range);
     }
-    builder.body(Empty::<Bytes>::new()).map_err(|error| {
+    builder.body(Full::new(Bytes::new())).map_err(|error| {
         CoreError::HttpProtocol(format!("could not build contained HTTP request: {error}"))
     })
+}
+
+fn build_upnp_soap_request(
+    url: &url::Url,
+    soap_action: &str,
+    body: &[u8],
+) -> Result<Request<Full<Bytes>>> {
+    let path = if url.path().is_empty() {
+        "/"
+    } else {
+        url.path()
+    };
+    let target = match url.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_string(),
+    };
+    let authority = host_authority(url)?;
+    Request::builder()
+        .method(Method::POST)
+        .version(Version::HTTP_11)
+        .uri(target)
+        .header(HOST, authority)
+        .header(CONNECTION, "close")
+        .header(USER_AGENT, "SwarmOtter/1.0")
+        .header(CONTENT_TYPE, "text/xml; charset=\"utf-8\"")
+        .header("SOAPACTION", format!("\"{soap_action}\""))
+        .body(Full::new(Bytes::copy_from_slice(body)))
+        .map_err(|error| {
+            CoreError::HttpProtocol(format!(
+                "could not build contained UPnP SOAP request: {error}"
+            ))
+        })
 }
 
 fn host_authority(url: &url::Url) -> Result<String> {
@@ -394,7 +526,7 @@ fn connection_host(url: &url::Url) -> Result<String> {
 
 async fn request_over_stream<S>(
     stream: S,
-    request: Request<Empty<Bytes>>,
+    request: Request<Full<Bytes>>,
     policy: RequestPolicy,
     body_limit: usize,
     url: &url::Url,
@@ -944,6 +1076,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.body, b"close-delimited");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upnp_soap_post_uses_the_contained_binder_and_does_not_follow_redirects() {
+        let scripts = vec![
+            ScriptedResponse::close(content_length_response("200 OK", "", b"ok")),
+            ScriptedResponse::close(redirect_response("302 Found", Some("/other"))),
+            ScriptedResponse::close(redirect_response("302 Found", Some("/other"))),
+        ];
+        let (address, requests, server) = spawn_http_scripts(scripts).await;
+        let binder = SpyBinder::new([(("router.test".into(), 49000), address)]);
+        let client = ContainedHttpClient::new(&binder);
+
+        let response = client
+            .post_upnp_soap(
+                "http://router.test:49000/control",
+                "urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping",
+                b"<soap />",
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let request = requests.lock().unwrap()[0].clone();
+        assert!(request.starts_with("POST /control HTTP/1.1"));
+        assert!(request.to_ascii_lowercase().contains(
+            "soapaction: \"urn:schemas-upnp-org:service:wanipconnection:1#addportmapping\""
+        ));
+        assert_eq!(binder.resolve_calls(), vec![("router.test".into(), 49000)]);
+        assert_eq!(binder.connect_count(), 1);
+
+        let error = client
+            .post_upnp_soap(
+                "http://router.test:49000/control",
+                "urn:schemas-upnp-org:service:WANIPConnection:1#AddPortMapping",
+                b"<soap />",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoreError::HttpStatus(_)));
+        assert_eq!(binder.connect_count(), 2);
+
+        let error = client
+            .get_upnp_description("http://router.test:49000/root.xml")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoreError::HttpStatus(_)));
+        assert_eq!(binder.connect_count(), 3);
         server.await.unwrap();
     }
 

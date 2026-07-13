@@ -65,6 +65,17 @@ updates use two API paths:
   the old policy active, and construction failures deny rather than silently
   admitting peers. The policy applies before contained peer connection/service
   but never changes route binding or fail-closed containment (ADR-0058).
+- `[port_mapping]` is disabled by default and controls NAT-PMP/UPnP forwarding
+  of the TCP peer listener. It is valid only with strict fail-closed
+  containment and an explicit required interface. Gateway discovery, mapping,
+  renewal, and best-effort deletion all use `NetworkBinder`; an unavailable
+  router or blocked path is observable but never causes a default-route
+  fallback or changes healthy torrent scheduling (ADR-0059).
+- `[port_test]` is disabled by default and requires an operator-owned HTTP(S)
+  endpoint before it performs any outbound diagnostic. Requests run through
+  `NetworkBinder`, have bounded timeout/cache behavior, never expose the
+  configured endpoint in routine status, and record informational results
+  without changing the containment gate (ADR-0060).
 - `[[storage.root_controls]]` is a repeatable local-storage scheduling surface.
   Controls use the most-specific matching lexical active-write root; duplicate
   normalized paths are invalid while nested paths are intentional. Each root
@@ -131,6 +142,14 @@ adapter surfaces remain isolated from native daemon configuration.
 Compatibility adapters, including `[compatibility.qbittorrent]`, are contract
 surfaces that do not change torrent transport behavior. They must route through
 the native API and keep containment and socket policy unchanged.
+
+qBittorrent categories remain labels in durable native state. An exact category
+match to a configured named profile may select that profile at registration;
+otherwise regular deterministic label mapping applies. Transmission's optional
+`profile` compatibility field is translated to the same assignment and accepts
+explicit `null` to clear it. Compatibility status, lifecycle, location, file,
+and tracker operations delegate to native durable operations rather than a
+parallel state store (ADR-0061).
 
 `[torrent].encryption_mode` is the protocol-transport compatibility option for
 peer-wire negotiation:

@@ -148,6 +148,79 @@ impl ContainedBinder {
             *cfg = config;
         }
     }
+
+    /// Bind a contained peer listener. Ordinary operational listeners report
+    /// local bind failures to the live containment gate; short-lived
+    /// diagnostics still fail closed but return their local bind outcome to
+    /// the caller without disrupting unrelated torrent work.
+    async fn bind_peer_listener_inner(
+        &self,
+        port: u16,
+        report_bind_failure: bool,
+    ) -> Result<Box<dyn PeerListener>> {
+        self.guard().await?;
+        let cfg = self.config_snapshot()?;
+        let iface = cfg.required_interface.as_deref();
+        let v4_addr = cfg
+            .required_source_ipv4
+            .as_deref()
+            .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let v6_addr = cfg
+            .required_source_ipv6
+            .as_deref()
+            .and_then(|s| s.parse::<Ipv6Addr>().ok())
+            .map(IpAddr::V6)
+            .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+
+        let namespace_only = cfg.required_network_namespace.is_some()
+            && cfg.required_interface.is_none()
+            && cfg.required_source_ipv4.is_none()
+            && cfg.required_source_ipv6.is_none();
+        let has_interface = cfg.required_interface.is_some();
+        let v4 = if cfg.required_source_ipv6.is_some()
+            && cfg.required_source_ipv4.is_none()
+            && !has_interface
+            && !namespace_only
+        {
+            None
+        } else {
+            match create_tcp_listener(SocketAddr::new(v4_addr, port), iface) {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    if report_bind_failure {
+                        self.report_bind_failure(format!(
+                            "bind peer listener v4 on port {port}: {error}"
+                        ));
+                    }
+                    return Err(error);
+                }
+            }
+        };
+        let v6 = if cfg.allow_ipv6
+            && (has_interface || namespace_only || cfg.required_source_ipv6.is_some())
+        {
+            match create_tcp_listener(SocketAddr::new(v6_addr, port), iface) {
+                Ok(listener) => Some(listener),
+                Err(error) => {
+                    if report_bind_failure {
+                        self.report_bind_failure(format!(
+                            "bind peer listener v6 on port {port}: {error}"
+                        ));
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        Ok(Box::new(ContainedPeerListener {
+            v4,
+            v6,
+            gate: self.gate.clone(),
+        }))
+    }
 }
 
 #[async_trait]
@@ -280,64 +353,11 @@ impl NetworkBinder for ContainedBinder {
     }
 
     async fn bind_peer_listener(&self, port: u16) -> Result<Box<dyn PeerListener>> {
-        self.guard().await?;
-        let cfg = self.config_snapshot()?;
-        let iface = cfg.required_interface.as_deref();
-        let v4_addr = cfg
-            .required_source_ipv4
-            .as_deref()
-            .and_then(|s| s.parse::<Ipv4Addr>().ok())
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        let v6_addr = cfg
-            .required_source_ipv6
-            .as_deref()
-            .and_then(|s| s.parse::<Ipv6Addr>().ok())
-            .map(IpAddr::V6)
-            .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        self.bind_peer_listener_inner(port, true).await
+    }
 
-        let namespace_only = cfg.required_network_namespace.is_some()
-            && cfg.required_interface.is_none()
-            && cfg.required_source_ipv4.is_none()
-            && cfg.required_source_ipv6.is_none();
-        let has_interface = cfg.required_interface.is_some();
-        let v4 = if cfg.required_source_ipv6.is_some()
-            && cfg.required_source_ipv4.is_none()
-            && !has_interface
-            && !namespace_only
-        {
-            None
-        } else {
-            match create_tcp_listener(SocketAddr::new(v4_addr, port), iface) {
-                Ok(listener) => Some(listener),
-                Err(error) => {
-                    self.report_bind_failure(format!(
-                        "bind peer listener v4 on port {port}: {error}"
-                    ));
-                    return Err(error);
-                }
-            }
-        };
-        let v6 = if cfg.allow_ipv6
-            && (has_interface || namespace_only || cfg.required_source_ipv6.is_some())
-        {
-            match create_tcp_listener(SocketAddr::new(v6_addr, port), iface) {
-                Ok(listener) => Some(listener),
-                Err(error) => {
-                    self.report_bind_failure(format!(
-                        "bind peer listener v6 on port {port}: {error}"
-                    ));
-                    return Err(error);
-                }
-            }
-        } else {
-            None
-        };
-        Ok(Box::new(ContainedPeerListener {
-            v4,
-            v6,
-            gate: self.gate.clone(),
-        }))
+    async fn bind_diagnostic_listener(&self, port: u16) -> Result<Box<dyn PeerListener>> {
+        self.bind_peer_listener_inner(port, false).await
     }
 
     fn traffic_allowed(&self) -> bool {
@@ -706,6 +726,34 @@ mod tests {
             Err(err) => err,
         };
         assert!(err.is_network_blocked());
+    }
+
+    #[tokio::test]
+    async fn diagnostic_listener_bind_failure_does_not_latch_containment() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let cfg = NetworkConfig {
+            mode: NetworkContainmentMode::Strict,
+            required_source_ipv4: Some("127.0.0.1".into()),
+            fail_closed: true,
+            validate_dns: false,
+            ..Default::default()
+        };
+        let gate = ContainmentGate::new(true);
+        let (reports, mut report_rx) = tokio::sync::mpsc::unbounded_channel();
+        let binder = ContainedBinder::new(
+            cfg,
+            Arc::new(FakeProbe {
+                dns_ok: false,
+                source_ok: true,
+                namespace_ok: false,
+            }),
+        )
+        .with_gate_and_health(gate.clone(), reports);
+
+        assert!(binder.bind_diagnostic_listener(port).await.is_err());
+        assert!(gate.traffic_allowed());
+        assert!(report_rx.try_recv().is_err());
     }
 
     #[test]

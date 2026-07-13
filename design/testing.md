@@ -35,6 +35,14 @@ feature completion and acceptance criteria, not by time estimates.
   parsing; bounded local eMule/PeerGuardian imports; manual-ban and peer-ID
   prefix decisions; and fail-closed compile failure behavior.
 - Network containment validation logic.
+- Router port-mapping and listener-reachability configuration: opt-in defaults,
+  strict fail-closed/interface requirements for mapping, protocol ordering,
+  bounded leases/cache/timeout values, endpoint syntax, and status snapshots
+  that do not disclose an operator's reachability endpoint.
+- Contained NAT-PMP and UPnP protocol handling: request/response framing,
+  response-source and size bounds, gateway/control authority validation, and
+  contained HTTP/SOAP policy validation without a general-purpose client or a
+  default-route socket.
 - Per-torrent health calculation: complete / network-blocked / paused /
   missing pieces with zero sources / good active swarm / many connected but
   useless peers / slow-but-completable / private torrent (no DHT/PEX
@@ -121,6 +129,14 @@ feature completion and acceptance criteria, not by time estimates.
   sources.
 - Native peer-filter replacement and manual ban/unban routes, including a
   blocked candidate that never reaches a binder connection attempt.
+- Native router-mapping status/refresh and listener-port-test routes, including
+  their additive network-health snapshots, enabled/disabled behavior, and
+  endpoint-redaction contract.
+- Compatibility-adapter flows: qBittorrent category/profile selection and
+  lifecycle/inspection operations, plus Transmission profile, status, and
+  listener-port-test RPC flows. Each route must preserve the native auth,
+  authorization, persistence, and containment boundary rather than creating a
+  compatibility-only mutation path.
 - Concurrent atomic configuration replacement.
 - Durable torrent and queue restoration after daemon reconstruction.
 - WebSocket/SSE event delivery.
@@ -207,6 +223,21 @@ must keep `design/requirements.md`, architecture/API/configuration design,
 operator API/configuration/Web UI guides, the completion tracker, changelog,
 and affected ADRs (including ADR-0052 and ADR-0054) aligned with the tested
 behavior.
+
+### Contained router mapping, listener reachability, and compatibility acceptance matrix
+
+ADR-0059, ADR-0060, and ADR-0061 require production-boundary coverage. A
+successful router response or reachability result is operational information;
+it must never be treated as a containment override or a torrent-lifecycle
+transition.
+
+| Capability | Required assertions | Acceptance evidence |
+| --- | --- | --- |
+| Opt-in configuration and status privacy | Both features default to disabled. Enabling mapping requires strict, fail-closed containment with one required interface; it validates ordered unique protocols and bounded lease/renewal values. Enabling the listener test requires a bounded HTTP(S) operator endpoint. Routine health/status data omits both a test endpoint and an explicit UPnP control URL. | Core configuration/status tests, including `mapping_defaults_are_opt_in_and_bounded`, `enabled_mapping_requires_a_strict_fail_closed_interface_path`, `status_does_not_expose_an_upnp_control_url`, and `status_keeps_endpoint_private_and_open_is_detectable`. |
+| Contained NAT-PMP and UPnP | Every discovery, mapping, renewal, deletion, description, and SOAP operation uses `NetworkBinder`. NAT-PMP accepts only a bounded, correlated response; automatic gateway discovery is limited to the configured interface. SSDP discovery accepts an HTTP literal-IP `LOCATION` only from its responder, and the description control URL remains on that IP and origin without redirects. A configured direct control URL remains explicit and contained. | `nat_pmp_wire_messages_require_matching_confirmed_ports`, `nat_pmp_exchange_uses_only_the_contained_udp_binder`, `ssdp_location_and_soap_body_are_bounded_and_protocol_specific`, and `ssdp_discovery_rejects_location_and_control_url_ssrf_targets`. |
+| Mapping lifecycle | A confirmed TCP mapping reports protocol, ports, gateway diagnostic, attempt and lease timestamps; the daemon renews before expiry and performs best-effort release only through the binder that established it. Configuration changes, a closed containment gate, or a router failure must not create a fallback route or alter torrent scheduling. | `mapping_status_is_blocked_without_a_contained_path`, `runtime_refuses_mapping_before_any_uncontained_binder_operation`, daemon lifecycle tests with a controlled binder, and native status/refresh integration coverage. |
+| Listener reachability | The operator endpoint receives the documented listener parameters through the contained HTTP path; compatible response variants map to open/closed/error/timeout, a fresh result is cached, and the endpoint is never contacted through a default route. A failed, timed-out, or blocked test remains informational. An enabled test is forced after mapping success without making either result authoritative for the other. | `endpoint_parameters_preserve_operator_query_and_parse_compatible_results`, `uses_contained_binder_and_caches_operator_endpoint_result`, `blocked_containment_is_informational_and_never_falls_back`, and `native_health_and_port_test_routes_expose_opt_in_unknown_result`. |
+| API, Web UI, and automation adapters | Network health carries additive mapping and test snapshots; native refresh/test controls and their live events update the Network view without exposing endpoint URLs. qBittorrent category/profile, lifecycle, and inspection operations plus Transmission profile/status and `port-test` RPC flows reuse native authentication, authorization, persistence, and containment boundaries. | `native_router_mapping_routes_expose_opt_in_pending_status`, `node crates/swarmotter-web/tests/port-mapping.test.mjs`, `node crates/swarmotter-web/tests/port-test.test.mjs`, `qbittorrent_categories_profiles_and_lifecycle_inspection_flow`, and `transmission_profile_add_set_and_status_flow`. |
 
 ### Network containment tests
 

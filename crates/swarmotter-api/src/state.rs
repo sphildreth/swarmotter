@@ -26,6 +26,8 @@ use swarmotter_core::models::torrent::TorrentFile;
 use swarmotter_core::models::torrent::TorrentSummary;
 use swarmotter_core::models::tracker::TrackerInfo;
 use swarmotter_core::peer_filter::{ManualPeerBan, PeerFilterConfig, PeerFilterStatus};
+use swarmotter_core::port_mapping::PortMappingStatus;
+use swarmotter_core::port_test::PortTestStatus;
 use tokio::sync::Mutex;
 
 /// Options applied when registering a newly added torrent.
@@ -226,6 +228,38 @@ pub trait DaemonOps: Send + Sync + 'static {
 
     /// Network containment health.
     async fn network_health(&self) -> NetworkHealth;
+    /// Last known opt-in listen-port reachability result. This is
+    /// informational and never changes torrent lifecycle behavior.
+    async fn port_test_status(&self) -> PortTestStatus {
+        let config = self.get_config().await;
+        if !config.port_test.enabled {
+            PortTestStatus::disabled(config.torrent.listen_port)
+        } else if config.port_test.endpoint.is_none() {
+            PortTestStatus::unconfigured(config.torrent.listen_port)
+        } else {
+            PortTestStatus::unknown(config.torrent.listen_port)
+        }
+    }
+    /// Run an opt-in reachability test. Implementations must use the
+    /// contained data-plane path; the default preserves a no-I/O fake daemon.
+    async fn run_port_test(&self) -> PortTestStatus {
+        self.port_test_status().await
+    }
+    /// Current opt-in router port-mapping lifecycle snapshot. It is
+    /// informational: a mapping failure never changes torrent scheduling.
+    async fn port_mapping_status(&self) -> PortMappingStatus {
+        let config = self.get_config().await;
+        if config.port_mapping.enabled {
+            PortMappingStatus::pending(&config.port_mapping, config.torrent.listen_port)
+        } else {
+            PortMappingStatus::disabled(config.torrent.listen_port)
+        }
+    }
+    /// Force an immediate contained router mapping reconciliation. The
+    /// default remains no-I/O for API test fakes.
+    async fn refresh_port_mapping(&self) -> PortMappingStatus {
+        self.port_mapping_status().await
+    }
     /// Rich network diagnostics for API dashboards.
     async fn network_diagnostics(&self) -> NetworkDiagnostics;
     /// Storage root diagnostics for API dashboards.

@@ -11,8 +11,13 @@ export function setEventsDependencies(dependencies) { eventsDependencies = { ...
 
 export async function refreshNetwork() {
   try {
-    const d = await api("/network/diagnostics");
+    const [d, healthPayload] = await Promise.all([
+      api("/network/diagnostics"),
+      api("/network/health"),
+    ]);
     const h = d.health || {};
+    const portMapping = healthPayload?.port_mapping || d.port_mapping || {};
+    const portTest = healthPayload?.port_test || d.port_test || {};
     $("#network-summary").innerHTML = `
       <h3>Network summary</h3>
       ${renderKv([
@@ -20,6 +25,8 @@ export async function refreshNetwork() {
         ["Status", h.status],
         ["Traffic allowed", String(!!h.traffic_allowed)],
         ["Listen port", d.listen_port],
+        ["Router mapping", portMappingStateLabel(portMapping)],
+        ["Listen-port reachability", portTestStateLabel(portTest)],
         ["DHT port", d.dht_port],
         ["Peer transports", `${d.utp_enabled ? "TCP + uTP" : "TCP only"} (${d.utp_prefer_tcp ? "TCP first" : "uTP first"})`],
       ])}
@@ -35,6 +42,8 @@ export async function refreshNetwork() {
         ["Torrent IPv6", String(!!d.torrent_allow_ipv6)],
         ["Fail closed", String(!!h.fail_closed)],
       ])}`;
+    renderPortMapping(portMapping);
+    renderPortTest(portTest);
     $("#network-interfaces").innerHTML = `
       <h3>Interfaces</h3>
       <table><thead><tr><th>Name</th><th>Status</th><th>Families</th><th>Addresses</th></tr></thead>
@@ -51,6 +60,128 @@ export async function refreshNetwork() {
       <h3>Checks</h3>
       ${renderCheckList(d.checks || [])}`;
   } catch (e) { log("network error: " + e.message); }
+}
+
+export function portMappingStateLabel(status = {}) {
+  if (!status.enabled) return "Disabled";
+  switch (status.state) {
+    case "active": return "Active";
+    case "pending": return "Pending";
+    case "unavailable": return "Unavailable";
+    case "blocked": return "Blocked";
+    case "error": return "Error";
+    default: return "Unknown";
+  }
+}
+
+export function portMappingTone(status = {}) {
+  if (!status.enabled || status.state === "pending") return "unknown";
+  if (status.state === "active") return "active";
+  return "unavailable";
+}
+
+export function renderPortMapping(status = {}) {
+  const container = $("#network-port-mapping");
+  if (!container) return;
+  const enabled = !!status.enabled;
+  const protocols = Array.isArray(status.protocols) && status.protocols.length
+    ? status.protocols.map(String).join(", ")
+    : "none";
+  const actionTitle = enabled
+    ? "Reconcile the configured router mapping through the contained network path"
+    : "Enable router port mapping in Network settings first";
+  container.innerHTML = `
+    <h3>Router port mapping</h3>
+    <p><span class="port-mapping-indicator ${cssToken(portMappingTone(status))}">${escapeHtml(portMappingStateLabel(status))}</span></p>
+    ${renderKv([
+      ["TCP listen port", status.listen_port ?? ""],
+      ["Mapping", enabled ? "enabled" : "disabled"],
+      ["Protocols", protocols],
+      ["Active protocol", status.active_protocol || "none"],
+      ["External port", status.external_port ?? "not mapped"],
+      ["Gateway", status.gateway || "not reported"],
+      ["Last attempted", fmtUnixSeconds(status.attempted_at) || "not attempted"],
+      ["Lease expires", fmtUnixSeconds(status.lease_expires_at) || "n/a"],
+    ])}
+    ${status.detail ? `<p class="muted">${escapeHtml(status.detail)}</p>` : ""}
+    <button id="network-port-mapping-refresh-btn" type="button" class="secondary" ${enabled ? "" : "disabled"} title="${escapeHtml(actionTitle)}">Refresh mapping</button>`;
+  const button = $("#network-port-mapping-refresh-btn");
+  if (button) button.addEventListener("click", () => refreshPortMapping(button));
+}
+
+export async function refreshPortMapping(button = null) {
+  if (button) button.disabled = true;
+  try {
+    const status = await api("/network/port-mapping/refresh", { method: "POST" });
+    renderPortMapping(status);
+    const mappingState = portMappingStateLabel(status);
+    showToast("Router mapping refreshed", `Mapping is ${mappingState.toLowerCase()}`, status?.state === "active" ? "success" : "info");
+    return status;
+  } catch (error) {
+    showError("Router mapping refresh failed", error);
+    return null;
+  } finally {
+    if (button?.isConnected) button.disabled = false;
+  }
+}
+
+export function portTestStateLabel(status = {}) {
+  if (!status.enabled) return "Disabled";
+  switch (status.state) {
+    case "open": return "Open";
+    case "closed": return "Closed";
+    case "error": return "Error";
+    case "timeout": return "Timed out";
+    default: return "Unknown";
+  }
+}
+
+export function portTestTone(status = {}) {
+  if (!status.enabled || status.state === "unknown") return "unknown";
+  return status.state === "open" ? "open" : "closed";
+}
+
+export function renderPortTest(status = {}) {
+  const container = $("#network-port-test");
+  if (!container) return;
+  const enabled = !!status.enabled;
+  const endpointConfigured = !!status.endpoint_configured;
+  const actionDisabled = !enabled || !endpointConfigured;
+  const actionTitle = !enabled
+    ? "Enable the reachability test in Network settings first"
+    : !endpointConfigured
+      ? "Configure an operator endpoint in Network settings first"
+      : "Run the contained reachability check (fresh cached results are reused)";
+  container.innerHTML = `
+    <h3>Listen-port reachability</h3>
+    <p><span class="port-test-indicator ${cssToken(portTestTone(status))}">${escapeHtml(portTestStateLabel(status))}</span></p>
+    ${renderKv([
+      ["TCP listen port", status.listen_port ?? ""],
+      ["Testing", enabled ? "enabled" : "disabled"],
+      ["Endpoint", endpointConfigured ? "configured" : "not configured"],
+      ["Last checked", fmtUnixSeconds(status.checked_at) || "not tested"],
+      ["Cache valid until", fmtUnixSeconds(status.cache_expires_at) || "n/a"],
+    ])}
+    ${status.detail ? `<p class="muted">${escapeHtml(status.detail)}</p>` : ""}
+    <button id="network-port-test-btn" type="button" class="secondary" ${actionDisabled ? "disabled" : ""} title="${escapeHtml(actionTitle)}">Run port test</button>`;
+  const button = $("#network-port-test-btn");
+  if (button) button.addEventListener("click", () => runPortTest(button));
+}
+
+export async function runPortTest(button = null) {
+  if (button) button.disabled = true;
+  try {
+    const status = await api("/network/port-test", { method: "POST" });
+    renderPortTest(status);
+    const state = portTestStateLabel(status);
+    showToast("Port test complete", `Listen port is ${state.toLowerCase()}`, status?.state === "open" ? "success" : "info");
+    return status;
+  } catch (error) {
+    showError("Port test failed", error);
+    return null;
+  } finally {
+    if (button?.isConnected) button.disabled = false;
+  }
 }
 export async function refreshWatch() {
   try {
@@ -226,7 +357,7 @@ export function appendEventLine(kind, raw) {
     : "";
   appendLogLine(`[event] ${kind}${hash}${payload}`);
   if (kind === "daemon_health_changed") refreshDoctorBadge();
-  if (kind === "network_status_changed" && !$("#view-network").classList.contains("hidden")) refreshNetwork();
+  if ((kind === "network_status_changed" || kind === "port_mapping_changed" || kind === "port_test_changed") && !$("#view-network").classList.contains("hidden")) refreshNetwork();
   if ((kind === "watch_folder_imported" || kind === "watch_folder_failed") && !$("#view-watch").classList.contains("hidden")) refreshWatch();
   if (kind === "settings_changed" && !$("#view-settings").classList.contains("hidden")) eventsDependencies.refreshSettings();
 }

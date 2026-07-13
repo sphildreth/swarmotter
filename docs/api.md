@@ -449,12 +449,30 @@ and reports fields that require restart.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/network/health` | Network containment health. |
+| GET | `/network/health` | Network containment health plus non-sensitive port-mapping and listen-port-test status. |
+| GET | `/network/port-mapping` | Read the current opt-in router mapping status without sending router traffic. |
+| POST | `/network/port-mapping/refresh` | Immediately reconcile the configured router mapping through the contained path. |
+| POST | `/network/port-test` | Run or return the fresh cached operator-configured listen-port test. |
 | GET | `/network/diagnostics` | Detailed network/path diagnostics. |
 
 `/network/diagnostics` includes transport settings such as `utp_enabled`,
 `utp_prefer_tcp`, and `peer_encryption_mode`. See
 [Network Containment](network-containment.md) for health state meanings.
+
+The `port_test` object returned by `/network/health` is informational and
+contains `enabled`, `endpoint_configured`, the TCP listener port, state,
+timestamps, and bounded detail—but never the configured endpoint URL. States
+are `unknown`, `open`, `closed`, `error`, or `timeout`. A POST only sends a
+request when testing is enabled and an endpoint is configured; a fresh cached
+result is reused. See [Configuration](configuration.md#router-port-mapping-and-listener-reachability).
+
+The `port_mapping` object returned by `/network/health` and
+`/network/port-mapping` contains its enabled flag, configured protocol order,
+listener/external port, active protocol, local gateway diagnostic, attempt and
+lease timestamps, state, and bounded detail. States are `disabled`, `pending`,
+`active`, `unavailable`, `blocked`, or `error`. `POST /network/port-mapping/refresh`
+does not bypass strict containment: it returns an informational blocked or
+unavailable status if the contained path or router cannot complete the request.
 
 ## Storage
 
@@ -567,8 +585,8 @@ Current event kinds include `torrent_added`, `torrent_changed`,
 `torrent_removed`, `torrent_error`, `torrent_metadata_received`,
 `torrent_completed`, `torrent_files_changed`, `torrent_trackers_changed`,
 `torrent_peers_changed`, `stats_updated`, `network_status_changed`,
-`watch_folder_imported`, `watch_folder_failed`, `settings_changed`, and
-`daemon_health_changed`.
+`port_mapping_changed`, `port_test_changed`, `watch_folder_imported`,
+`watch_folder_failed`, `settings_changed`, and `daemon_health_changed`.
 
 `watch_folder_imported` covers both `imported` and successful `duplicate`.
 `watch_folder_failed` covers permanent and transient attempts. Their payloads
@@ -700,6 +718,15 @@ delete-data option.
 `torrent-add` accepts magnet links via `filename` and base64 torrent metadata
 via `metainfo`. Remote HTTP/HTTPS torrent metadata URLs are rejected.
 
+`torrent-add` and `torrent-set` additionally accept an optional native
+compatibility extension `profile`. A string selects a configured profile during
+the same durable add/assignment path used by the native API; explicit `null` in
+`torrent-set` clears an existing assignment. Labels are present before profile
+resolution. Add and list responses include truthful state, completion,
+directory, labels, and terminal error data where their established field names
+allow it. Transmission `port-test` maps to the latest configured listener-test
+result and returns `port_is_open: true` only for an `open` result.
+
 ## qBittorrent-compatible API compatibility
 
 When enabled, `/api/v2` is a compatibility adapter over native daemon
@@ -734,13 +761,29 @@ Representative automation endpoints:
 - `GET /api/v2/app/version`
 - `GET /api/v2/app/webapiVersion`
 - `GET /api/v2/torrents/info`
+- `GET /api/v2/torrents/categories`
 - `POST /api/v2/torrents/add`
 - `POST /api/v2/torrents/delete`
 - `POST /api/v2/torrents/pause`
 - `POST /api/v2/torrents/resume`
 - `POST /api/v2/torrents/start`
 - `POST /api/v2/torrents/stop`
+- `POST /api/v2/torrents/recheck`
+- `POST /api/v2/torrents/reannounce`
 - `POST /api/v2/torrents/setCategory`
+- `POST /api/v2/torrents/setLocation`
+- `POST /api/v2/torrents/renameFile`
+- `GET /api/v2/torrents/properties?hash=...`
+- `GET /api/v2/torrents/trackers?hash=...`
+- `GET /api/v2/torrents/files?hash=...`
+
+qBittorrent categories are derived from native labels, profile names, and
+label-to-profile mappings; there is no second category store. Supplying a
+category at add time always records the label. If it exactly matches a named
+profile, it also selects that profile before registration so its add-time
+storage and start policy apply. Category mutation continues to use native label
+and profile-assignment transactions. The new lifecycle, location, rename,
+tracker, and file endpoints delegate to their native operations.
 
 The qBittorrent torrent-info response continues to expose its documented
 `ratio` and `uploaded` counters from the native summary. It does not claim

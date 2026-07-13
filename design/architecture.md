@@ -31,7 +31,10 @@ SwarmOtter is a Rust async daemon with these layers:
   (BEP 29, with LEDBAT congestion control, SACK, and the full connection
   lifecycle) is implemented in `swarmotter-core::utp`, both over the binder's
   contained UDP socket. The engine selects TCP/uTP peer transports per config
-  (see `configuration.md` and ADR-0020).
+  (see `configuration.md` and ADR-0020). Opt-in NAT-PMP/UPnP router mapping,
+  UPnP SOAP control, and operator-configured listener reachability tests use
+  the same binder boundary; none can create a default-route diagnostic or
+  router-control socket (ADR-0059, ADR-0060).
 - **Storage layer** (`swarmotter-core::storage`): file layout, partial/sparse
   files, piece read/write and verification, fast resume, forced recheck,
   move/rename, missing/changed file detection logic. Runtime storage I/O reuses
@@ -50,7 +53,8 @@ SwarmOtter is a Rust async daemon with these layers:
 - **Daemon** (`swarmotterd`): owns torrent state, networking, disk I/O,
   queueing, settings, durable registry state, and lifecycle. Implements
   `DaemonOps`, wires the API + Web UI into a single `axum::serve`, runs the
-  network health monitor and watch-folder scanner, compiles immutable
+  network health monitor, opt-in router-mapping lease lifecycle, listener
+  reachability diagnostics, and watch-folder scanner, compiles immutable
   peer-admission policy generations, resolves live profile values, and spawns the live
   `TorrentEngine` task per active torrent (`swarmotterd::engine`). A single
   process-wide `SeederHub` (`swarmotterd::seeder`) owns the contained inbound

@@ -48,6 +48,10 @@ pub fn app_router_with_body_limit(state: SharedState, max_request_body_bytes: us
             get(handlers::qbittorrent::torrents_info),
         )
         .route(
+            "/api/v2/torrents/categories",
+            get(handlers::qbittorrent::torrents_categories),
+        )
+        .route(
             "/api/v2/torrents/add",
             post(handlers::qbittorrent::torrents_add),
         )
@@ -74,6 +78,34 @@ pub fn app_router_with_body_limit(state: SharedState, max_request_body_bytes: us
         .route(
             "/api/v2/torrents/setCategory",
             post(handlers::qbittorrent::torrents_set_category),
+        )
+        .route(
+            "/api/v2/torrents/recheck",
+            post(handlers::qbittorrent::torrents_recheck),
+        )
+        .route(
+            "/api/v2/torrents/reannounce",
+            post(handlers::qbittorrent::torrents_reannounce),
+        )
+        .route(
+            "/api/v2/torrents/setLocation",
+            post(handlers::qbittorrent::torrents_set_location),
+        )
+        .route(
+            "/api/v2/torrents/renameFile",
+            post(handlers::qbittorrent::torrents_rename_file),
+        )
+        .route(
+            "/api/v2/torrents/properties",
+            get(handlers::qbittorrent::torrents_properties),
+        )
+        .route(
+            "/api/v2/torrents/trackers",
+            get(handlers::qbittorrent::torrents_trackers),
+        )
+        .route(
+            "/api/v2/torrents/files",
+            get(handlers::qbittorrent::torrents_files),
         )
         .layer(DefaultBodyLimit::max(max_request_body_bytes));
 
@@ -234,6 +266,15 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
         )
         // Network
         .route("/network/health", get(handlers::network::network_health))
+        .route(
+            "/network/port-mapping",
+            get(handlers::network::port_mapping_status),
+        )
+        .route(
+            "/network/port-mapping/refresh",
+            post(handlers::network::refresh_port_mapping),
+        )
+        .route("/network/port-test", post(handlers::network::port_test))
         .route(
             "/network/diagnostics",
             get(handlers::diagnostics::network_diagnostics),

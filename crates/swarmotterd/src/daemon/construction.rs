@@ -89,6 +89,7 @@ impl DaemonRuntime {
             }
         };
         let peer_sessions_denied = Arc::new(AtomicU64::new(0));
+        let port_mapping = Arc::new(port_mapping::PortMappingRuntime::new(&config));
         let peer_permit_pool =
             PeerPermitPool::new(config.bandwidth.max_peers, peer_sessions_denied.clone())
                 .unwrap_or_else(|_| {
@@ -107,6 +108,8 @@ impl DaemonRuntime {
             queue: Arc::new(Mutex::new(QueueState::new(config.queue.clone()))),
             config: Arc::new(RwLock::new(config)),
             peer_filter: Arc::new(RwLock::new(peer_filter)),
+            port_mapping,
+            port_test: port_test::PortTestRuntime::default(),
             network_health: Arc::new(RwLock::new(startup_health)),
             watch_imports: Arc::new(Mutex::new(VecDeque::new())),
             watch_observations: Arc::new(Mutex::new(HashMap::new())),

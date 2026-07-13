@@ -253,6 +253,14 @@
           <h3>Configuration</h3>
           <p class="muted">Configured interface and bind targets populate here.</p>
         </div>
+        <div id="network-port-mapping" class="card">
+          <h3>Router port mapping</h3>
+          <p class="muted">No router mapping status is available.</p>
+        </div>
+        <div id="network-port-test" class="card">
+          <h3>Listen-port reachability</h3>
+          <p class="muted">No reachability test has run.</p>
+        </div>
         <div id="network-interfaces" class="card">
           <h3>Interfaces</h3>
           <p class="muted">Observed routing interfaces populate here.</p>
@@ -364,6 +372,25 @@
             <label class="settings-check"><input id="cfg-network-fail-closed" type="checkbox"><span>Fail closed</span></label>
             <label class="settings-check"><input id="cfg-network-validate-route" type="checkbox"><span>Validate route</span></label>
             <label class="settings-check"><input id="cfg-network-validate-dns" type="checkbox"><span>Validate DNS</span></label>
+          </div>
+          <div class="settings-card-heading"><h4>Listen-port reachability test</h4></div>
+          <p class="muted">Off by default. Configure an HTTP(S) endpoint you operate; the request is made through the contained torrent network path and only reports an informational result.</p>
+          <div class="settings-form-grid">
+            <label class="settings-check"><input id="cfg-port-test-enabled" type="checkbox"><span>Enable reachability testing</span></label>
+            <label class="settings-field"><span>Operator endpoint</span><input id="cfg-port-test-endpoint" type="url" placeholder="https://port-test.example/check"></label>
+            <label class="settings-field"><span>Cache TTL seconds</span><input id="cfg-port-test-cache-ttl-seconds" type="number" min="1" max="86400" step="1"></label>
+            <label class="settings-field"><span>Request timeout seconds</span><input id="cfg-port-test-timeout-seconds" type="number" min="1" max="30" step="1"></label>
+          </div>
+          <div class="settings-card-heading"><h4>Router port mapping</h4></div>
+          <p class="muted">Off by default. Requires strict, fail-closed containment and a required interface. Discovery and lease requests use that same contained path; an unavailable router never changes torrent operation.</p>
+          <div class="settings-form-grid">
+            <label class="settings-check"><input id="cfg-port-mapping-enabled" type="checkbox"><span>Enable router port mapping</span></label>
+            <label class="settings-check"><input id="cfg-port-mapping-nat-pmp" type="checkbox"><span>Try NAT-PMP</span></label>
+            <label class="settings-check"><input id="cfg-port-mapping-upnp" type="checkbox"><span>Try UPnP IGD</span></label>
+            <label class="settings-field"><span>NAT-PMP gateway (optional IPv4)</span><input id="cfg-port-mapping-nat-pmp-gateway" type="text" placeholder="192.168.1.1"></label>
+            <label class="settings-field"><span>UPnP control URL (optional)</span><input id="cfg-port-mapping-upnp-service-url" type="url" placeholder="http://192.168.1.1:49000/control"></label>
+            <label class="settings-field"><span>Requested lease seconds</span><input id="cfg-port-mapping-lease-seconds" type="number" min="2" max="604800" step="1"></label>
+            <label class="settings-field"><span>Renew before expiry seconds</span><input id="cfg-port-mapping-refresh-before-expiry-seconds" type="number" min="1" max="604799" step="1"></label>
           </div>
         </div>
 

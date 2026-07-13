@@ -50,7 +50,7 @@ required for ecosystem tooling.
 
 ## Related Documents
 
-- [Feature backlog: Ecosystem Compatibility API](../BACKLOG.md#ecosystem-compatibility-api)
+- [ADR-0061: Compatible Automation Profile and Lifecycle Parity](0061-compatible-automation-profile-and-lifecycle-parity.md)
 - [API design notes](../api.md)
 - [Configuration design notes](../configuration.md)
 - [API reference](../../docs/api.md)

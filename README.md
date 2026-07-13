@@ -90,6 +90,10 @@ infringement.
   `GET /api/v1/storage/roots`.
 - Settings two-panel layout for dense configuration in the Web UI.
 - Strict VPN/NIC traffic containment with fail-closed behavior.
+- Opt-in NAT-PMP/UPnP TCP listener mapping and operator-hosted reachability
+  checks, both constrained to the same data-plane path.
+- Expanded qBittorrent and Transmission automation compatibility for profiles,
+  categories, lifecycle, location, file, and tracker workflows.
 - Container and homelab-friendly deployment.
 - Lawful-use project posture.
 
@@ -111,6 +115,7 @@ NIC), including:
 - Webseeds
 - Magnet metadata fetching
 - DNS used by torrent operations
+- Opt-in NAT-PMP/UPnP router mapping and listener reachability diagnostics
 
 The daemon **fails closed** and never silently falls back to the default route
 if the configured path is unavailable. The Web UI/API control plane is separate

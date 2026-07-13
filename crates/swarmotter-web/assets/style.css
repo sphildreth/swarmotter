@@ -909,6 +909,26 @@ pre#log-stream {
 .status-ok { border-color: var(--status-ok-border); color: var(--status-ok-fg); }
 .status-warning { border-color: var(--status-warning-border); color: var(--status-warning-fg); }
 .status-invalid { border-color: var(--status-invalid-border); color: var(--status-invalid-fg); }
+.port-test-indicator {
+  display: inline-block;
+  border: 1px solid var(--muted-border);
+  border-radius: 999px;
+  padding: 0.16rem 0.56rem;
+  font-weight: 600;
+}
+.port-test-indicator.open { border-color: var(--status-ok-border); color: var(--status-ok-fg); }
+.port-test-indicator.closed { border-color: var(--status-invalid-border); color: var(--status-invalid-fg); }
+.port-test-indicator.unknown { border-color: var(--muted-border); color: var(--muted); }
+.port-mapping-indicator {
+  display: inline-block;
+  border: 1px solid var(--muted-border);
+  border-radius: 999px;
+  padding: 0.16rem 0.56rem;
+  font-weight: 600;
+}
+.port-mapping-indicator.active { border-color: var(--status-ok-border); color: var(--status-ok-fg); }
+.port-mapping-indicator.unavailable { border-color: var(--status-warning-border); color: var(--status-warning-fg); }
+.port-mapping-indicator.unknown { border-color: var(--muted-border); color: var(--muted); }
 .compact-list {
   display: grid;
   gap: 0.45rem;

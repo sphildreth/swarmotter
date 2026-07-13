@@ -465,6 +465,52 @@ No cookies, authorization, or connection pool are retained. Scrape is derived
 only from an HTTP(S) tracker whose final path component begins `announce`;
 other paths and UDP scrape report `unsupported` without disabling announce.
 
+## Router port mapping and listener reachability
+
+Router port mapping is optional and disabled by default. When enabled,
+`[port_mapping]` maps the configured TCP `[torrent].listen_port` through a
+local NAT-PMP or UPnP IGD gateway, refreshes its lease before expiry, and
+reports the result through the network API and Web UI.
+
+Mapping is intentionally stricter than ordinary torrent operation: it requires
+`network.mode = "strict"`, `network.fail_closed = true`, and a concrete
+`network.required_interface`. NAT-PMP discovery/UDP, UPnP SSDP discovery, and
+UPnP SOAP control traffic all use that contained interface. If the path is
+blocked or the router rejects a mapping, SwarmOtter does not fall back to the
+default route; it reports the mapping as unavailable or blocked while leaving
+an otherwise healthy torrent data plane unchanged.
+
+```toml
+[port_mapping]
+enabled = true
+protocols = ["nat_pmp", "upnp"]
+# Optional overrides for constrained environments:
+# nat_pmp_gateway = "192.0.2.1"
+# upnp_service_url = "http://192.0.2.1:49000/control/WANIPConn1"
+lease_seconds = 3600
+refresh_before_expiry_seconds = 300
+```
+
+`[port_test]` is a separate, opt-in diagnostic. SwarmOtter never contacts a
+hardcoded public service. Configure an HTTP(S) endpoint you operate; a request
+through the same data-plane binder appends `listen_port`, `protocol=tcp`, and
+`format=swarmotter-port-test-v1`. The endpoint may return plain `open` or
+`closed`, or JSON with `reachable`/`open` boolean or `status: "open" | "closed"`.
+
+```toml
+[port_test]
+enabled = true
+endpoint = "https://reachability.example.invalid/check"
+cache_ttl_seconds = 900
+timeout_seconds = 10
+```
+
+Results are cached, serialized, and informational (`unknown`, `open`,
+`closed`, `error`, or `timeout`). A failed request or negative result never
+changes containment health or starts an uncontained retry. The API status does
+not repeat the configured endpoint URL. A successful mapping lease can refresh
+this diagnostic through the same contained runtime path.
+
 ### `[autopilot]`
 
 | Option | Default | Meaning |
@@ -481,6 +527,26 @@ other paths and UDP scrape report `unsupported` without disabling announce.
 | `utp_prefer_tcp` | `true` | Tries TCP first, with uTP fallback. |
 | `encryption_mode` | `preferred` | TCP MSE/PE peer wire mode. `disabled` permits plaintext handshakes. `preferred` enables MSE/PE with plaintext fallback for TCP attempts while preserving the configured TCP/uTP preference. `required` refuses plaintext and requires encrypted TCP stream negotiation. Changing this setting rebuilds active data-plane tasks before it is reported as applied. |
 | `selfish` | `false` | Removes a torrent after verified completion and does not seed it; already-completed managed records are also removed on runtime reconciliation while preserving downloaded data. |
+
+### `[port_mapping]`
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Opts into router mapping of the TCP peer listener. Requires strict fail-closed containment and `network.required_interface`. |
+| `protocols` | `["nat_pmp", "upnp"]` | Deterministic NAT-PMP/UPnP attempt order. |
+| `nat_pmp_gateway` | unset | Optional IPv4 NAT-PMP gateway. Without it, Linux discovery is limited to the configured interface. |
+| `upnp_service_url` | unset | Optional HTTP WANIP/WANPPP control URL; credentials and fragments are rejected. Without it, contained SSDP discovery is used. |
+| `lease_seconds` | `3600` | Requested mapping lifetime, bounded to seven days. |
+| `refresh_before_expiry_seconds` | `300` | Lead time for renewal; must be positive and shorter than the lease. |
+
+### `[port_test]`
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Opts into an operator-configured external TCP listener test. |
+| `endpoint` | unset | Required HTTP(S) URL when enabled. It is contacted only through the data-plane binder and is not shown in status responses. |
+| `cache_ttl_seconds` | `900` | Reuse window for the latest result, from 1 through 86,400 seconds. |
+| `timeout_seconds` | `10` | Per-request bound, from 1 through 30 seconds. |
 
 ### `[bandwidth]`
 

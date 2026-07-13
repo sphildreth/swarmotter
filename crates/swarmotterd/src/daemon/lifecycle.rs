@@ -1242,6 +1242,7 @@ impl DaemonOps for DaemonRuntime {
             *self.config.write().await = next;
             self.apply_runtime_config_fields().await;
         }
+        self.notify_port_mapping_reconcile();
         self.publish_event(Event::new("settings_changed", json!({})));
         self.publish_event(stats_updated_event());
         Ok(())
@@ -1476,6 +1477,7 @@ impl DaemonOps for DaemonRuntime {
             }
             self.apply_runtime_config_fields().await;
         }
+        self.notify_port_mapping_reconcile();
         self.publish_event(Event::new("settings_changed", json!({})));
         self.publish_event(stats_updated_event());
 
@@ -1496,6 +1498,7 @@ impl DaemonOps for DaemonRuntime {
                 "torrent.encryption_mode".into(),
                 "torrent.selfish".into(),
                 "peer_filter".into(),
+                "port_mapping".into(),
                 "dht".into(),
                 "storage".into(),
                 "watch".into(),
@@ -1587,6 +1590,25 @@ impl DaemonOps for DaemonRuntime {
 
     async fn network_health(&self) -> NetworkHealth {
         self.network_health.read().await.clone()
+    }
+
+    async fn port_test_status(&self) -> swarmotter_core::port_test::PortTestStatus {
+        self.listen_port_test_status().await
+    }
+
+    async fn run_port_test(&self) -> swarmotter_core::port_test::PortTestStatus {
+        // Native callers intentionally honor the runtime cache. Mapping
+        // lifecycle integration may use the crate-visible forced method after
+        // a successful renewal without exposing a bypass to API callers.
+        self.run_listen_port_test(false).await
+    }
+
+    async fn port_mapping_status(&self) -> swarmotter_core::port_mapping::PortMappingStatus {
+        DaemonRuntime::port_mapping_status(self).await
+    }
+
+    async fn refresh_port_mapping(&self) -> swarmotter_core::port_mapping::PortMappingStatus {
+        DaemonRuntime::refresh_port_mapping(self).await
     }
 
     async fn network_diagnostics(&self) -> NetworkDiagnostics {

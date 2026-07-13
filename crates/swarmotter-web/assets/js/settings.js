@@ -106,6 +106,8 @@ export function renderSettingsEditor(cfg) {
   const autopilot = cfg.autopilot || {};
   const storage = cfg.storage || {};
   const network = cfg.network || {};
+  const portMapping = cfg.port_mapping || {};
+  const portTest = cfg.port_test || {};
   const torrent = cfg.torrent || {};
   const bandwidth = cfg.bandwidth || {};
   const queue = cfg.queue || {};
@@ -143,6 +145,22 @@ export function renderSettingsEditor(cfg) {
   setSettingsChecked("cfg-network-fail-closed", network.fail_closed);
   setSettingsChecked("cfg-network-validate-route", network.validate_route);
   setSettingsChecked("cfg-network-validate-dns", network.validate_dns);
+
+  const mappingProtocols = Array.isArray(portMapping.protocols)
+    ? portMapping.protocols
+    : ["nat_pmp", "upnp"];
+  setSettingsChecked("cfg-port-mapping-enabled", portMapping.enabled);
+  setSettingsChecked("cfg-port-mapping-nat-pmp", mappingProtocols.includes("nat_pmp"));
+  setSettingsChecked("cfg-port-mapping-upnp", mappingProtocols.includes("upnp"));
+  setSettingsValue("cfg-port-mapping-nat-pmp-gateway", portMapping.nat_pmp_gateway);
+  setSettingsValue("cfg-port-mapping-upnp-service-url", portMapping.upnp_service_url);
+  setSettingsValue("cfg-port-mapping-lease-seconds", portMapping.lease_seconds);
+  setSettingsValue("cfg-port-mapping-refresh-before-expiry-seconds", portMapping.refresh_before_expiry_seconds);
+
+  setSettingsChecked("cfg-port-test-enabled", portTest.enabled);
+  setSettingsValue("cfg-port-test-endpoint", portTest.endpoint);
+  setSettingsValue("cfg-port-test-cache-ttl-seconds", portTest.cache_ttl_seconds);
+  setSettingsValue("cfg-port-test-timeout-seconds", portTest.timeout_seconds);
 
   setSettingsValue("cfg-torrent-encryption-mode", torrent.encryption_mode || "preferred");
   setSettingsValue("cfg-torrent-listen-port", torrent.listen_port);
@@ -360,6 +378,23 @@ export function collectSettingsConfig() {
       fail_closed: settingsField("cfg-network-fail-closed").checked,
       validate_route: settingsField("cfg-network-validate-route").checked,
       validate_dns: settingsField("cfg-network-validate-dns").checked,
+    },
+    port_test: {
+      enabled: settingsField("cfg-port-test-enabled").checked,
+      endpoint: settingsOptionalString("cfg-port-test-endpoint"),
+      cache_ttl_seconds: settingsInteger("cfg-port-test-cache-ttl-seconds", 900),
+      timeout_seconds: settingsInteger("cfg-port-test-timeout-seconds", 10),
+    },
+    port_mapping: {
+      enabled: settingsField("cfg-port-mapping-enabled").checked,
+      protocols: [
+        ...(settingsField("cfg-port-mapping-nat-pmp").checked ? ["nat_pmp"] : []),
+        ...(settingsField("cfg-port-mapping-upnp").checked ? ["upnp"] : []),
+      ],
+      nat_pmp_gateway: settingsOptionalString("cfg-port-mapping-nat-pmp-gateway"),
+      upnp_service_url: settingsOptionalString("cfg-port-mapping-upnp-service-url"),
+      lease_seconds: settingsInteger("cfg-port-mapping-lease-seconds", 3600),
+      refresh_before_expiry_seconds: settingsInteger("cfg-port-mapping-refresh-before-expiry-seconds", 300),
     },
     torrent: {
       encryption_mode: settingsString("cfg-torrent-encryption-mode"),

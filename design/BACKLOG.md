@@ -28,13 +28,10 @@ project.
 
 | Priority | Feature | User Value | Source Signals |
 | --- | --- | --- | --- |
-| P0 | UPnP / NAT-PMP Port Forwarding | Automatic port mapping for reachability behind NAT; every major client ships this as table stakes | qBittorrent UPnP/NAT-PMP, Transmission port forwarding, Deluge UPnP/NAT-PMP |
 | P0 | SOCKS5 Proxy Support | Route torrent traffic through a SOCKS5 proxy; shipped by every major client for seedbox and restricted-network deployments | Transmission [#1250](https://github.com/transmission/transmission/issues/1250), qBittorrent SOCKS5, Deluge proxy support |
-| P0 | Listen Port Reachability Test | Active test of whether the configured peer listen port is reachable; basic diagnostic every client provides | qBittorrent port test, Transmission port test, Deluge port check, µTorrent port status indicator |
 | P0 | Protocol Encryption / MSE-PE | Interoperate with peers that refuse plaintext handshakes and reduce plaintext peer-wire exposure | Transmission, qBittorrent, Deluge, BiglyBT all ship MSE/PE; private trackers commonly require it |
 | P0 | Filesystem-aware storage strategy and state placement | Extend shipped root resource controls with filesystem-aware write behavior, observability, and state-path placement | qBittorrent [#23683](https://github.com/qbittorrent/qBittorrent/issues/23683), [#22949](https://github.com/qbittorrent/qBittorrent/issues/22949), Transmission [#5594](https://github.com/transmission/transmission/issues/5594), [#1060](https://github.com/transmission/transmission/issues/1060) |
 | P0 | Advanced policy-profile rules | Extend shipped named profiles with tracker, file-selection, and completion-action policy dimensions | qBittorrent [#24500](https://github.com/qbittorrent/qBittorrent/issues/24500), [#23722](https://github.com/qbittorrent/qBittorrent/issues/23722), Transmission [#1461](https://github.com/transmission/transmission/issues/1461), [#6425](https://github.com/transmission/transmission/issues/6425) |
-| P0 | Ecosystem Compatibility API | Operate alongside Sonarr/Radarr/Flood via qBittorrent-compatible and Transmission-compatible API shims | Deluge API parity requests, Flood UI, Sonarr/Radarr integration, self-hosting ecosystem (2026) |
 | P0 | Per-Profile / Per-Torrent Network-Path Binding | Assign a contained network path (namespace/VPN endpoint/interface) per profile, label, or torrent; fail-closed per path | rTorrent/Flood multi-user isolation, Deluge multi-profile routing, self-hosting VPN routing patterns |
 | P0 | Multi-User / Multi-Tenant Support | Role-based access control, per-user torrent isolation, per-user quotas, and shared-server deployments | qBittorrent [#3327](https://github.com/qbittorrent/qBittorrent/issues/3327), Flood multi-user, rTorrent+ruTorrent multi-user, Deluge thin-client auth |
 | P1 | Metadata-first magnet preview and intake rules | Let users inspect/select files before starting data transfer and enforce file exclusion rules | Transmission [#1611](https://github.com/transmission/transmission/issues/1611), [#2366](https://github.com/transmission/transmission/issues/2366), [#7330](https://github.com/transmission/transmission/issues/7330), [#7399](https://github.com/transmission/transmission/issues/7399), [#2399](https://github.com/transmission/transmission/issues/2399), [#5582](https://github.com/transmission/transmission/issues/5582), [#8793](https://github.com/transmission/transmission/issues/8793), qBittorrent [#23674](https://github.com/qbittorrent/qBittorrent/issues/23674) |
@@ -86,34 +83,6 @@ project.
 
 ## P0 Features
 
-### UPnP / NAT-PMP Port Forwarding
-
-Problem: users behind NAT routers cannot accept inbound peer connections without
-manual port forwarding configuration. This cripples seeding and swarm contribution
-for non-VPN users. Every major client ships this as table-stakes functionality.
-
-Requested elsewhere:
-
-- qBittorrent, Transmission, and Deluge all ship UPnP and NAT-PMP support.
-- libtorrent-rasterbar (qBittorrent's backend) has mature UPnP/NAT-PMP
-  implementation.
-- This is expected baseline functionality, not a differentiator.
-
-SwarmOtter feature shape:
-
-- Add UPnP (Universal Plug and Play) and NAT-PMP (NAT Port Mapping Protocol)
-  support for automatic port mapping on supported routers.
-- Map the configured peer listen port; refresh mappings on lease expiry.
-- Surface mapping status in the API and network health UI.
-- Respect network containment: port mappings must only be requested on the
-  contained network interface, not the default route.
-
-Acceptance direction:
-
-- Port mapping must be opt-in and clearly surfaced.
-- Mapping must respect network containment; no mappings on uncontained interfaces.
-- UPnP/NAT-PMP traffic must go through the contained network path.
-
 ### SOCKS5 Proxy Support
 
 Problem: seedbox and restricted-network users rely on SOCKS5 proxies as a
@@ -144,55 +113,6 @@ Acceptance direction:
 - When both SOCKS5 and network containment are configured, containment takes
   precedence; proxy traffic must still go through the contained path.
 - DNS resolution for proxy hostname must respect containment.
-
-### Listen Port Reachability Test
-
-Problem: users behind NAT or firewalls need to know whether their configured
-peer listen port is reachable from the internet. An unreachable port means
-the client cannot accept inbound connections, severely limiting seeding
-capability and swarm contribution. Every mainstream client provides a port
-test feature or at minimum a port status indicator. SwarmOtter configures a
-listen port but provides no feedback on whether it is actually reachable.
-
-Requested elsewhere:
-
-- qBittorrent provides a port status indicator in the connection status bar
-  and an active port test via the Web API.
-- Transmission provides a port test via the RPC `port-test` method that
-  checks reachability from an external service.
-- Deluge shows port status in the connection manager and supports port
-  testing.
-- µTorrent displays a green/red status light indicating port reachability.
-- BiglyBT includes NAT traversal status and port testing.
-
-SwarmOtter feature shape:
-
-- Add an active port reachability test: the daemon initiates an outbound
-  connection to a configurable external echo service (or uses a STUN-like
-  check) to verify whether the configured listen port accepts inbound
-  connections.
-- Add a `POST /api/v1/network/port-test` endpoint that triggers the test
-  and returns the result (open, closed, error, timeout).
-- Surface the last-known port status in the network health API (`GET
-  /api/v1/network/health`) alongside the existing containment state.
-- Add a port status indicator in the Web UI (green for open, red for
-  closed, grey for unknown/untested).
-- Support configurable test endpoint: operators can point the test at their
-  own infrastructure rather than a third-party service.
-- Integrate with UPnP/NAT-PMP (existing P0): after a successful port
-  mapping, automatically trigger a port test to verify the mapping works.
-
-Acceptance direction:
-
-- The port test is opt-in and does not phone home to any hardcoded
-  third-party service by default.
-- The test respects network containment: the outbound check connection
-  goes through the same contained network path as torrent traffic.
-- A failed test does not block torrent operations; it is informational.
-- The test result is cached with a configurable TTL to avoid excessive
-  external requests.
-- When UPnP/NAT-PMP (existing P0) is implemented, the port test
-  integrates with the mapping lifecycle.
 
 ### Protocol Encryption / MSE-PE
 
@@ -313,50 +233,6 @@ Acceptance direction:
   snapshots.
 - Further persistent policy or runtime-scheduling decisions require an ADR
   update.
-
-### Ecosystem Compatibility API
-
-Problem: the Sonarr/Radarr/Flood ecosystem and self-hosting automation pipelines
-expect qBittorrent-compatible or Transmission-compatible API surfaces. SwarmOtter's
-native API cannot be adopted by those tools without a compatibility shim layer.
-
-Requested elsewhere:
-
-- Deluge, rTorrent/Flood, and aria2 are used in multi-tool pipelines that
-  require API compatibility with mainstream clients.
-- Sonarr and Radarr (as of 2026) support qBittorrent-compatible API with Bearer
-  API-key auth mode alongside the classic session-cookie flow.
-- Flood UI targets rTorrent's RPC interface.
-- The `amutorrent`/`got3nks` project demonstrates a pattern of supporting both
-  Bearer API-key and session-cookie auth as compatibility shims.
-
-SwarmOtter compatibility shape currently implemented in v1.1.0:
-
-- Added opt-in qBittorrent `/api/v2` and Transmission RPC compatibility shims
-  layered over the native API.
-- Supported auth for this phase is Bearer token auth plus `/api/v2/auth/login`
-  SID-cookie auth.
-- Exposed endpoints target automation and lifecycle interoperability, including
-  core version and `torrents` operations.
-
-Remaining roadmap work not included in this v1.1.0 shim slice:
-
-- Broader category/profile semantics beyond the implemented single
-  category-to-label mapping.
-- Completion/import semantics mapping to match broader ecosystem expectations.
-- Deep parity on transfer states beyond the focused automation endpoints.
-- No indexer, search, or content-discovery surface is exposed through
-  compatibility endpoints.
-
-Acceptance direction:
-
-- Compatibility endpoints reuse native permissions and network containment;
-  no bypass paths are introduced.
-- Auth mode support documented; parity matrix published.
-- Integration tests run against representative *arr/Flood flows.
-- No bundled infringing trackers, indexers, or discovery integrations.
-- Further compatibility parity phases require ADR updates when they change the
-  compatibility surface or auth model.
 
 ### Per-Profile / Per-Torrent Network-Path Binding
 
@@ -685,7 +561,7 @@ Acceptance direction:
 
 ### OpenAPI Specification & Interactive API Docs
 
-Problem: the Ecosystem Compatibility API (P0) and native API need clear,
+Problem: the native API and its bounded compatibility adapters need clear,
 machine-readable documentation for automation and integration. Flood's
 auto-generated Swagger UI is the gold standard for torrent client APIs.
 

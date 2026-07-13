@@ -19,6 +19,31 @@ date or duration estimates.
 
 ### Added
 
+- **Contained router port mapping:** opt-in NAT-PMP and UPnP mapping now
+  creates, refreshes, reports, and best-effort removes the TCP peer-listener
+  lease only through the configured strict, fail-closed interface path. Router
+  discovery, UDP exchange, and SOAP control requests never create a default
+  route socket; mapping failure is a visible reachability condition rather
+  than a containment bypass. See
+  [ADR-0059](design/adr/0059-contained-opt-in-router-port-mapping.md).
+
+- **Operator-configured listen-port reachability tests:** an optional bounded
+  HTTP(S) test endpoint can report whether the TCP peer listener is externally
+  open. Runs are contained, serialized, cached, surfaced in the native API,
+  Transmission compatibility response, and Web UI, and remain informational
+  when the endpoint or network path fails. No third-party endpoint is bundled.
+  See
+  [ADR-0060](design/adr/0060-contained-listener-reachability-testing.md).
+
+- **Broader automation compatibility:** qBittorrent-compatible categories,
+  properties, tracker/file inspection, recheck/reannounce, location, and
+  rename workflows now delegate to native durable operations. Transmission
+  add/set accepts explicit named profiles and reports truthful status,
+  completion, labels, and errors. Both adapters retain native authorization,
+  origin protection, and network containment, without adding search, indexers,
+  or discovery APIs. See
+  [ADR-0061](design/adr/0061-compatible-automation-profile-and-lifecycle-parity.md).
+
 - **Storage-root resource controls:** repeatable
   `[[storage.root_controls]]` entries now provide independently observable,
   longest-path-matched active-download, declared-byte, verified-write, and

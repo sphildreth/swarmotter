@@ -13,6 +13,8 @@ use crate::error::{CoreError, Result};
 use crate::net::NetworkConfig;
 use crate::peer_filter::PeerFilterConfig;
 use crate::policy::{validate_profiles, PolicyProfilesConfig};
+use crate::port_mapping::PortMappingConfig;
+use crate::port_test::PortTestConfig;
 use crate::queue::QueueLimits;
 use crate::ratio::SeedingPolicy;
 use serde::{Deserialize, Serialize};
@@ -79,6 +81,14 @@ pub struct Config {
     /// from, and never relaxes, the contained torrent network path.
     #[serde(default)]
     pub peer_filter: PeerFilterConfig,
+    /// Opt-in router forwarding for the contained TCP peer listener. Mapping
+    /// traffic is never allowed to use an uncontained interface.
+    #[serde(default)]
+    pub port_mapping: PortMappingConfig,
+    /// Opt-in, operator-configured diagnostic for the TCP peer listen port.
+    /// Requests always use the contained data-plane binder at runtime.
+    #[serde(default)]
+    pub port_test: PortTestConfig,
     #[serde(default)]
     pub watch: Vec<WatchFolderConfig>,
     #[serde(default)]
@@ -501,6 +511,20 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
         self.peer_filter.validate()?;
+        self.port_mapping.validate()?;
+        self.port_test.validate()?;
+        if self.port_mapping.enabled
+            && (self.network.mode != crate::models::network::NetworkContainmentMode::Strict
+                || !self.network.fail_closed
+                || self.network.required_interface.is_none())
+        {
+            // NAT-PMP gateway discovery and SSDP multicast must be scoped to
+            // one concrete device. Source-only, preferred, and disabled modes
+            // cannot prove that a router request avoids the default route.
+            return Err(CoreError::InvalidConfig(
+                "port_mapping.enabled requires network.mode = \"strict\", network.fail_closed = true, and network.required_interface".into(),
+            ));
+        }
         if self
             .seeding
             .global_ratio_limit

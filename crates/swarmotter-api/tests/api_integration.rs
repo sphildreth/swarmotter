@@ -2239,6 +2239,329 @@ async fn compatibility_omitted_paused_uses_label_profile_admission() {
 }
 
 #[tokio::test]
+async fn qbittorrent_categories_profiles_and_lifecycle_inspection_flow() {
+    let mut cfg = Config::default();
+    cfg.compatibility.qbittorrent.enabled = true;
+    cfg.storage.download_dir = Some("/global/downloads".into());
+    cfg.profiles.profiles.insert(
+        "archive".into(),
+        PolicyProfile {
+            storage: PolicyStorage {
+                download_dir: Some("/profiles/archive".into()),
+                ..Default::default()
+            },
+            queue: PolicyQueue {
+                start_behavior: Some(StartBehavior::Paused),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    cfg.profiles
+        .labels
+        .insert("release".into(), "archive".into());
+    let app = swarmotter_api::app_router(fake_daemon::fake_state_with_config(cfg));
+
+    let (status, body) = qb_get(app.clone(), "/api/v2/torrents/categories", None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let categories: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(categories["release"]["savePath"], "/profiles/archive");
+    assert_eq!(categories["archive"]["savePath"], "/profiles/archive");
+
+    let release_magnet =
+        "magnet%3A%3Fxt%3Durn%3Abtih%3Add8255ecdc7ca55fb0bbf81323d87062ba1f7a4e%26dn%3Dqb-compatible-release";
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/add",
+        &format!("urls={release_magnet}&category=release&savepath=%2Farr%2Fincoming"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+
+    let (status, body) = qb_get(
+        app.clone(),
+        "/api/v2/torrents/info?category=release",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let release = &rows.as_array().unwrap()[0];
+    assert_eq!(release["state"], "pausedDL");
+    assert_eq!(
+        release["content_path"],
+        "/arr/incoming/qb-compatible-release"
+    );
+    assert_eq!(release["dl_limit"], 0);
+    let release_hash = release["hash"].as_str().unwrap().to_string();
+
+    let (status, policy) = get_json(&app, &format!("/api/v1/torrents/{release_hash}/policy")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(policy["data"]["profile"]["name"], "archive");
+    assert_eq!(policy["data"]["profile"]["source"]["kind"], "label");
+
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/setCategory",
+        &format!("hashes={release_hash}&category=archive"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+    let (status, policy) = get_json(&app, &format!("/api/v1/torrents/{release_hash}/policy")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(policy["data"]["profile"]["name"], "archive");
+    assert_eq!(policy["data"]["profile"]["source"]["kind"], "profile");
+
+    let (status, body) = qb_get(
+        app.clone(),
+        &format!("/api/v2/torrents/properties?hash={release_hash}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let properties: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(properties["save_path"], "/arr/incoming");
+    assert_eq!(properties["completion_date"], 0);
+    assert_eq!(properties["private"], false);
+
+    let (status, body) = qb_get(
+        app.clone(),
+        &format!("/api/v2/torrents/files?hash={release_hash}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let files: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(files.as_array().unwrap().len(), 1);
+    assert_eq!(files[0]["priority"], 4);
+
+    let (status, body) = qb_get(
+        app.clone(),
+        &format!("/api/v2/torrents/trackers?hash={release_hash}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let trackers: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(trackers.as_array().unwrap().is_empty());
+
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/setLocation",
+        &format!("hashes={release_hash}&location=%2Farr%2Fcomplete"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+    let (status, body) = qb_get(
+        app.clone(),
+        &format!("/api/v2/torrents/properties?hash={release_hash}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let moved: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(moved["save_path"], "/arr/complete");
+
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/recheck",
+        &format!("hashes={release_hash}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+    let (status, body) = qb_get(
+        app.clone(),
+        &format!("/api/v2/torrents/info?hashes={release_hash}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let checked: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(checked[0]["state"], "checkingDL");
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/reannounce",
+        &format!("hashes={release_hash}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+
+    // A category whose name is a configured profile becomes an explicit add
+    // profile, while regular categories remain label-driven.
+    let direct_magnet =
+        "magnet%3A%3Fxt%3Durn%3Abtih%3A1111111111111111111111111111111111111111%26dn%3Dqb-direct-profile";
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/add",
+        &format!("urls={direct_magnet}&category=archive"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+    let (status, body) = qb_get(
+        app.clone(),
+        "/api/v2/torrents/info?category=archive",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let direct = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "qb-direct-profile")
+        .unwrap();
+    let direct_hash = direct["hash"].as_str().unwrap();
+    let (status, policy) = get_json(&app, &format!("/api/v1/torrents/{direct_hash}/policy")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(policy["data"]["profile"]["name"], "archive");
+    assert_eq!(policy["data"]["profile"]["source"]["kind"], "profile");
+}
+
+#[tokio::test]
+async fn transmission_profile_add_set_and_status_flow() {
+    let mut cfg = Config::default();
+    cfg.compatibility.transmission.enabled = true;
+    cfg.profiles.profiles.insert(
+        "automation".into(),
+        PolicyProfile {
+            queue: PolicyQueue {
+                start_behavior: Some(StartBehavior::Paused),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    let app = swarmotter_api::app_router(fake_daemon::fake_state_with_config(cfg));
+    let session = transmission_session(app.clone(), None).await;
+
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "method": "torrent-add",
+            "arguments": {
+                "filename": named_magnet(9_301, "transmission-profile-flow"),
+                "download-dir": "/arr/incoming",
+                "labels": ["arr", "import"],
+                "profile": "automation"
+            }
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let added = &body["arguments"]["torrent-added"];
+    assert_eq!(added["status"], 0);
+    assert_eq!(added["downloadDir"], "/arr/incoming");
+    assert_eq!(added["labels"], serde_json::json!(["arr", "import"]));
+    let id = added["id"].as_i64().unwrap();
+    let hash = added["hashString"].as_str().unwrap().to_string();
+
+    let (status, policy) = get_json(&app, &format!("/api/v1/torrents/{hash}/policy")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(policy["data"]["profile"]["name"], "automation");
+
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "method": "torrent-get",
+            "arguments": {
+                "ids": [id],
+                "fields": ["status", "isFinished", "doneDate", "errorString", "labels", "downloadDir"]
+            }
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let row = &body["arguments"]["torrents"][0];
+    assert_eq!(row["status"], 0);
+    assert_eq!(row["isFinished"], false);
+    assert_eq!(row["doneDate"], 0);
+    assert_eq!(row["errorString"], "");
+    assert_eq!(row["labels"], serde_json::json!(["arr", "import"]));
+    assert_eq!(row["downloadDir"], "/arr/incoming");
+
+    // `profile: null` deliberately clears the compatibility profile extension
+    // while normal labels and location mutations still use native operations.
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "method": "torrent-set",
+            "arguments": {
+                "ids": [id],
+                "profile": null,
+                "labels": ["arr", "complete"],
+                "location": "/arr/complete"
+            }
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"], "success");
+    let (status, policy) = get_json(&app, &format!("/api/v1/torrents/{hash}/policy")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(policy["data"]["profile"].is_null());
+
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "method": "torrent-start-now",
+            "arguments": { "ids": [id] }
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"], "success");
+    let (status, body) = transmission_rpc(
+        app,
+        &session,
+        serde_json::json!({
+            "method": "torrent-get",
+            "arguments": { "ids": [id], "fields": ["status", "labels", "downloadDir"] }
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let row = &body["arguments"]["torrents"][0];
+    assert_eq!(row["status"], 4);
+    assert_eq!(row["labels"], serde_json::json!(["arr", "complete"]));
+    assert_eq!(row["downloadDir"], "/arr/complete");
+}
+
+#[tokio::test]
 async fn transmission_rpc_add_get_action_and_remove_torrent() {
     let mut cfg = Config::default();
     cfg.compatibility.transmission.enabled = true;

@@ -382,6 +382,10 @@ impl DaemonRuntime {
         // shutdown ahead of the gate block or a state mutation ahead of progress
         // reconciliation.
         self.containment_gate.block(status, detail.clone());
+        // Mapping traffic shares the live containment gate. Wake its loop so
+        // an active lease is marked blocked immediately without attempting a
+        // router delete over an unavailable path.
+        self.notify_port_mapping_reconcile();
         let recovery_intents = self.live_containment_recovery_intents().await;
         let preserved_seeding_statuses = {
             let _lifecycle = self.seeder_lifecycle_lock.lock().await;
@@ -437,6 +441,7 @@ impl DaemonRuntime {
         let _transition = self.data_plane_transition_lock.lock().await;
         *self.network_health.write().await = health.clone();
         self.containment_gate.allow();
+        self.notify_port_mapping_reconcile();
 
         let mut changed = Vec::new();
         let mut downloads = Vec::new();

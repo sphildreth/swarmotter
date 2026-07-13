@@ -53,6 +53,22 @@ utp_prefer_tcp = true
 encryption_mode = "preferred"
 selfish = false
 
+# Router port mapping cannot be enabled in this example because `[network]`
+# deliberately uses disabled mode and relies on the VPN sidecar boundary.
+# SwarmOtter requires strict fail-closed mode plus `required_interface` before
+# it will issue NAT-PMP or UPnP requests.
+[port_mapping]
+enabled = false
+
+# Optional operator-hosted TCP listen-port diagnostic. No endpoint is bundled.
+# In this shared-namespace deployment, any enabled request follows the same
+# data-plane path supplied by the VPN sidecar.
+[port_test]
+enabled = false
+# endpoint = "https://reachability.example.invalid/check"
+cache_ttl_seconds = 900
+timeout_seconds = 10
+
 [bandwidth]
 global_download = 0
 global_upload = 0

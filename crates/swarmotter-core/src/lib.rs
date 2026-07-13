@@ -24,6 +24,8 @@ pub mod net;
 pub mod peer;
 pub mod peer_filter;
 pub mod policy;
+pub mod port_mapping;
+pub mod port_test;
 pub mod queue;
 pub mod ratio;
 pub mod storage;

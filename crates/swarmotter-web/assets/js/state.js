@@ -70,6 +70,8 @@ export const EVENT_KINDS = [
   "torrent_peers_changed",
   "stats_updated",
   "network_status_changed",
+  "port_mapping_changed",
+  "port_test_changed",
   "watch_folder_imported",
   "watch_folder_failed",
   "settings_changed",

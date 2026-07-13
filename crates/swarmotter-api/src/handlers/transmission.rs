@@ -493,6 +493,7 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
     let args = request.args();
     let download_dir = string_arg(&args, &["download_dir", "download-dir"]);
     let labels = string_array_arg(&args, &["labels"]).unwrap_or_default();
+    let profile = optional_profile_arg(&args)?.unwrap_or(None);
     let paused = bool_arg(&args, &["paused"]);
     // Transmission omits `paused` when it delegates initial admission to the
     // daemon. Preserve that distinction so a label-mapped profile can decide
@@ -502,7 +503,7 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
         download_dir.clone(),
         paused.unwrap_or(false),
         paused.is_some(),
-        None,
+        profile,
         // Labels must be present during registration so a label-mapped profile
         // can capture its storage paths before any payload is created.
         labels.clone(),
@@ -575,6 +576,12 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
         "name": summary.name,
         "hash_string": summary.info_hash.to_hex(),
         "hashString": summary.info_hash.to_hex(),
+        "status": transmission_status(summary.state),
+        "download_dir": summary.download_dir.clone().unwrap_or_default(),
+        "downloadDir": summary.download_dir.clone().unwrap_or_default(),
+        "percent_done": clamped_progress(&summary),
+        "percentDone": clamped_progress(&summary),
+        "labels": summary.labels,
     });
     let mut out = Map::new();
     let key = if duplicate {
@@ -646,6 +653,7 @@ async fn torrent_action(
 
 async fn torrent_set(state: &SharedState, request: &RpcRequest) -> RpcResult<Value> {
     let args = request.args();
+    let profile = optional_profile_arg(&args)?;
     let summaries = selected_summaries(state, &args).await?;
     for summary in summaries {
         let hash = summary.info_hash;
@@ -653,6 +661,13 @@ async fn torrent_set(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
             state
                 .daemon
                 .set_labels(&hash, labels)
+                .await
+                .map_err(RpcFailure::from_core)?;
+        }
+        if let Some(profile) = profile.clone() {
+            state
+                .daemon
+                .set_torrent_profile(&hash, profile)
                 .await
                 .map_err(RpcFailure::from_core)?;
         }
@@ -760,11 +775,13 @@ async fn port_test(state: &SharedState, request: &RpcRequest) -> RpcResult<Value
     let args = request.args();
     let ip_protocol = string_arg(&args, &["ip_protocol", "ip-protocol"]);
     let health = state.daemon.network_health().await;
+    let port_test = state.daemon.run_port_test().await;
     Ok(json!({
-        "port_is_open": false,
+        "port_is_open": port_test.state.is_open(),
         "ip_protocol": ip_protocol.unwrap_or_else(|| {
             if health.allow_ipv6 { "ipv6".into() } else { "ipv4".into() }
         }),
+        "port_test_state": port_test.state,
     }))
 }
 
@@ -939,9 +956,12 @@ fn torrent_field_value(
         "is_stalled" => json!(summary.state.is_error()),
         "error" => json!(if summary.state.is_error() { 1 } else { 0 }),
         "error_string" => json!(if summary.state.is_error() {
-            summary.state.as_str()
+            summary
+                .error
+                .clone()
+                .unwrap_or_else(|| summary.state.as_str().into())
         } else {
-            ""
+            String::new()
         }),
         "labels" => json!(summary.labels),
         "download_dir" => json!(summary.download_dir.clone().unwrap_or_default()),
@@ -1350,6 +1370,25 @@ fn string_array_arg(args: &Value, keys: &[&str]) -> Option<Vec<String>> {
                 .collect()
         })
     })
+}
+
+/// Distinguish an omitted compatibility extension from an explicit `null`,
+/// which clears a previously assigned native profile.
+fn optional_profile_arg(args: &Value) -> RpcResult<Option<Option<String>>> {
+    let Some(value) = value_arg(args, &["profile"]) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(None));
+    }
+    let Some(profile) = value.as_str() else {
+        return Err(RpcFailure::invalid("profile must be a string or null"));
+    };
+    let profile = profile.trim();
+    if profile.is_empty() {
+        return Err(RpcFailure::invalid("profile must not be empty when set"));
+    }
+    Ok(Some(Some(profile.to_string())))
 }
 
 fn default_session_fields(request: &RpcRequest, fields: &[&str]) -> Vec<String> {

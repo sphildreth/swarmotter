@@ -156,6 +156,15 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Router mapping is opt-in and every discovery/renewal request is issued
+    // through the same contained data-plane binder as peer traffic.
+    {
+        let rt = runtime.clone();
+        tokio::spawn(async move {
+            rt.port_mapping_loop().await;
+        });
+    }
+
     // Spawn the adaptive swarm autopilot. Observe mode only records decisions;
     // act mode applies bounded engine/queue commands from contained telemetry.
     {

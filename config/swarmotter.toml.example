@@ -85,6 +85,29 @@ encryption_mode = "preferred"
 # and seeding behavior).
 selfish = false
 
+# --- Optional contained router port mapping ---
+# This is disabled by default. Enabling it requires strict fail-closed
+# containment and network.required_interface above. NAT-PMP, SSDP discovery,
+# and UPnP SOAP requests use that same contained interface; no default-route
+# router traffic is attempted.
+[port_mapping]
+enabled = false
+protocols = ["nat_pmp", "upnp"]
+# nat_pmp_gateway = "192.0.2.1"
+# upnp_service_url = "http://192.0.2.1:49000/control/WANIPConn1"
+lease_seconds = 3600
+refresh_before_expiry_seconds = 300
+
+# --- Optional operator-hosted TCP listen-port test ---
+# No public endpoint is bundled. When enabled, SwarmOtter appends
+# listen_port, protocol=tcp, and format=swarmotter-port-test-v1 to this URL
+# and calls it through the contained data-plane path.
+[port_test]
+enabled = false
+# endpoint = "https://reachability.example.invalid/check"
+cache_ttl_seconds = 900
+timeout_seconds = 10
+
 # --- Bandwidth ---
 [bandwidth]
 global_download = 0       # bytes/sec, 0 = unlimited

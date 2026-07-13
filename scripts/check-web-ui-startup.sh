@@ -9,3 +9,5 @@ cd "$repo_root"
 node crates/swarmotter-web/tests/app-startup.test.mjs
 node crates/swarmotter-web/tests/peer-filter.test.mjs
 node crates/swarmotter-web/tests/policy-source-labels.test.mjs
+node crates/swarmotter-web/tests/port-mapping.test.mjs
+node crates/swarmotter-web/tests/port-test.test.mjs

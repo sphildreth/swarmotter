@@ -101,6 +101,34 @@ pub trait NetworkBinder: Send + Sync {
             .await
     }
 
+    /// Issue one bounded UPnP IGD SOAP action through the contained path.
+    ///
+    /// Router discovery hands the daemon a local control URL, but that URL is
+    /// still resolved and connected only through this binder. Implementations
+    /// must therefore apply the same live fail-closed checks as tracker and
+    /// webseed HTTP traffic; a port-mapping request may never open a separate
+    /// default-route client.
+    async fn http_post_upnp_soap(
+        &self,
+        url: &str,
+        soap_action: &str,
+        body: &[u8],
+    ) -> Result<HttpResponse> {
+        ContainedHttpClient::new(self)
+            .post_upnp_soap(url, soap_action, body)
+            .await
+    }
+
+    /// Fetch a discovered UPnP device description through the contained path
+    /// without following redirects. SSDP advertisements are untrusted local
+    /// input, so a redirect must not turn router discovery into a general
+    /// contained HTTP client.
+    async fn http_get_upnp_description(&self, url: &str) -> Result<HttpResponse> {
+        ContainedHttpClient::new(self)
+            .get_upnp_description(url)
+            .await
+    }
+
     /// Resolve a torrent data-plane hostname through the contained path's DNS
     /// policy. IP literals return directly; hostnames must not be resolved
     /// before this binder has enforced containment.
@@ -136,6 +164,16 @@ pub trait NetworkBinder: Send + Sync {
     /// (and the configured source address/interface in the real binder). Used
     /// for seeding/upload. Never bypasses containment.
     async fn bind_peer_listener(&self, port: u16) -> Result<Box<dyn PeerListener>>;
+
+    /// Bind a short-lived contained listener for an informational diagnostic
+    /// such as a listen-port reachability check. It must enforce the same
+    /// route/interface/source policy as [`Self::bind_peer_listener`], but an
+    /// ordinary local bind failure must not itself change the daemon's global
+    /// containment state. The default preserves the normal listener behavior
+    /// for simple test binders.
+    async fn bind_diagnostic_listener(&self, port: u16) -> Result<Box<dyn PeerListener>> {
+        self.bind_peer_listener(port).await
+    }
 
     /// Re-evaluate whether torrent data-plane traffic is currently permitted.
     /// Used by the engine to decide whether to start/continue peer activity.

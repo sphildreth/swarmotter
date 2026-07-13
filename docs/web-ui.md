@@ -250,6 +250,37 @@ Detailed network checks and path diagnostics use:
 GET /api/v1/network/diagnostics
 ```
 
+### Router port mapping and listener reachability
+
+The Network view has separate cards for **Router port mapping** and
+**Listen-port reachability**. Both are opt-in diagnostics and controls for the
+configured TCP peer listener; neither a failed mapping nor a failed
+reachability result pauses, resumes, or otherwise changes torrent lifecycle.
+
+Router mapping is disabled by default. In Settings > Network, enable it only
+when the daemon uses `strict` network containment with fail-closed behavior and
+a required interface. The same settings card chooses NAT-PMP and/or UPnP IGD,
+optionally supplies a NAT-PMP gateway or UPnP control URL, and sets the
+requested lease and renewal lead time. Saving Settings preserves these values
+in the full configuration snapshot.
+
+The mapping card shows the current state, configured protocols, local and
+external ports, active protocol, local gateway diagnostic, last attempt, lease
+expiry, and bounded detail. **Refresh mapping** requests an immediate
+reconciliation through the contained network path. The daemon renews successful
+leases and attempts a best-effort deletion during graceful shutdown; it never
+falls back to a default-route socket when a contained path or router is
+unavailable.
+
+The reachability test is configured separately with an HTTP(S) endpoint the
+operator controls, a cache lifetime, and a request timeout. The Network card
+shows only whether an endpoint is configured—not its URL—alongside the
+open/closed/unknown/error result and cache timing. **Run port test** uses the
+same contained path and reuses a fresh cached result. A successful router
+mapping asks an enabled reachability test to run, but the two results remain
+independent: router acceptance does not prove external reachability, and a
+test failure does not invalidate a mapping.
+
 If the UI shows `interface_missing`, the daemon cannot see the configured
 interface name in its current network namespace. See
 [Troubleshooting](troubleshooting.md).

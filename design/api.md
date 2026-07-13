@@ -73,7 +73,18 @@ ADR-0009 and ADR-0010.
   before data write.
 - Optional compatibility endpoints, currently `/transmission/rpc` and `/api/v2`,
   are isolated from the native API and delegate to native daemon operations
-  rather than a separate engine.
+  rather than a separate engine. qBittorrent category catalogs derive from
+  native labels/profiles and category/profile changes use the native durable
+  label and profile-assignment transactions. qBittorrent lifecycle, location, file, tracker, and
+  property endpoints plus Transmission's optional `profile` add/set field are
+  translations over the same `DaemonOps` behavior; neither surface maintains
+  a second torrent store or routing path (ADR-0061).
+- `/api/v1/network/health` preserves the flattened containment health shape
+  and additively returns non-sensitive `port_mapping` and `port_test` status.
+  Dedicated mapping-status/refresh and port-test routes delegate only to the
+  daemon's contained runtime operations. Mapping and test results are
+  informational and cannot change the containment gate or torrent lifecycle
+  (ADR-0059, ADR-0060).
 - Origin protection is not compatibility-specific authentication. The shared
   guard runs before native auth, Transmission session negotiation, qBittorrent
   SID handling, compatibility-enabled checks, request extraction, and daemon
@@ -96,7 +107,7 @@ ADR-0009 and ADR-0010.
 - Authentication policy is shared: when API auth is enabled, compatibility
   adapters must map their auth mechanism back to `api.auth_token`, including
   `/api/v2` Bearer and SID-cookie flows.
-- Optional qBittorrent compatibility is intentionally limited to core
+- Optional qBittorrent compatibility is intentionally limited to bounded
   automation endpoints and does not include indexer/search/discovery APIs.
 
 ## Metadata trust boundary

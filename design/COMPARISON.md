@@ -43,10 +43,10 @@ This comparison distinguishes between two classes of features:
   expect these by default; their absence disqualifies a client from
   consideration regardless of other strengths. Examples include UPnP/NAT-PMP
   port forwarding, SOCKS5 proxy support, IP filtering/blocklists, peer
-  encryption (MSE/PE), and listen port reachability testing. In the
-  Roadmap Gap Map, table-stakes items are marked with `(table stakes)` and
-  are prioritized at P0 because they are baseline expectations, not
-  differentiators.
+  encryption (MSE/PE), and listen port reachability testing. SwarmOtter closes
+  the port-mapping and reachability gaps with contained, opt-in controls; the
+  remaining roadmap gaps are marked with `(table stakes)` and prioritized at
+  P0 because they are baseline expectations, not differentiators.
 
 - **Differentiators**: features where SwarmOtter offers something no
   mainstream client provides, or offers it in a meaningfully better way.
@@ -93,7 +93,7 @@ differentiators.
 
 | Project | Best Fit | Main Surfaces | Notable Strengths | Important Trade-Offs |
 | --- | --- | --- | --- | --- |
-| SwarmOtter | Linux/server and homelab torrent daemon with strong operational controls | Daemon, REST API, WebSocket/SSE events, Web UI, Transmission RPC compatibility | Fail-closed VPN/NIC containment, API-first design, doctor/health checks, performance diagnostics, lawful-use posture | No desktop-native UI; no built-in search/indexer by policy; some ecosystem and large-library features are roadmap items |
+| SwarmOtter | Linux/server and homelab torrent daemon with strong operational controls | Daemon, REST API, WebSocket/SSE events, Web UI, bounded qBittorrent and Transmission automation adapters | Fail-closed VPN/NIC containment, API-first design, doctor/health checks, performance diagnostics, lawful-use posture | No desktop-native UI; no built-in search/indexer by policy; some ecosystem and large-library features are roadmap items |
 | Transmission | Simple, lightweight desktop/server torrenting | Native desktop UIs, daemon, Web UI, `transmission-remote`, Transmission RPC | Low resource use, mature native UIs, straightforward remote control | Smaller feature surface than qBittorrent/BiglyBT; limited policy/profile model |
 | qBittorrent | Full-featured desktop and Web UI client | Qt desktop UI, Web UI, WebUI API | Broad core feature coverage, RSS, search plugins, categories/tags, sequential download, bandwidth scheduler | Desktop-first architecture; no SwarmOtter-style fail-closed data-plane containment |
 | Deluge | Daemon/client model with plugin-friendly operation | Daemon, GTK UI, Web UI, Console UI, Deluge RPC/Web API | Thin-client architecture, libtorrent core, plugins, multiple official UIs | Feature depth often depends on plugins; no SwarmOtter-style containment model |
@@ -110,7 +110,7 @@ differentiators.
 | Headless/server mode | ✅ | ✅ | ✅ | ✅ | Partial | ✅ | ✅ |
 | CLI/TUI | Roadmap P1 CLI, Roadmap P3 TUI | `transmission-remote` and tools | Partial server binary | Console UI | ❌ primary CLI/TUI | ✅ | ✅ |
 | Native API/RPC | REST, WebSocket, SSE | Transmission RPC | WebUI API | Deluge RPC/Web API | Plugin/remote APIs | JSON-RPC, XML-RPC | XMLRPC |
-| Compatibility API | Transmission RPC; qBittorrent API Roadmap P0 | Native Transmission RPC | Native qBittorrent WebUI API | ❌ | Transmission-style remote control support | ❌ | ❌ |
+| Compatibility API | Partial (Transmission RPC and bounded qBittorrent WebUI automation adapters) | Native Transmission RPC | Native qBittorrent WebUI API | ❌ | Transmission-style remote control support | ❌ | ❌ |
 | Plugin/extension model | Roadmap P3 | Limited add-ons | Search plugins | ✅ | ✅ | ❌ | ruTorrent plugins and scripts |
 | License | Apache-2.0 | GPLv2/GPLv3 family | GPLv2+ source, GPLv3+ binaries | GPLv3 with OpenSSL exception | GPLv2 | GPLv2 | rTorrent GPLv2, ruTorrent GPLv3+ |
 
@@ -147,10 +147,10 @@ differentiators.
 | Torrent creation | Roadmap P1 | ✅ | ✅ | Plugin | ✅ | ❌ | Plugin/scripts |
 | Superseeding/initial seeding | Roadmap P1 | Partial | ✅ | ✅ | ✅ | ❌ | ✅ |
 | IP filtering/blocklists | ✅ | ✅ | ✅ | Plugin | ✅ | ❌ | Partial |
-| UPnP/NAT-PMP | Roadmap P0 (table stakes) | ✅ | ✅ | ✅ | ✅ | ❌ | Partial |
+| UPnP/NAT-PMP | ✅ (opt-in, contained) | ✅ | ✅ | ✅ | ✅ | ❌ | Partial |
 | SOCKS/proxy support | Roadmap P0 (table stakes) | ❌ | ✅ | ✅ | ✅ | ✅ | Partial |
 | HTTP/HTTPS proxy support | Roadmap P1 | ❌ | ✅ | ❌ | ❌ | ✅ | Partial |
-| Listen port reachability test | Roadmap P0 (table stakes) | ✅ | ✅ | ✅ | ✅ | ❌ | Partial |
+| Listen port reachability test | ✅ (opt-in, contained operator endpoint) | ✅ | ✅ | ✅ | ✅ | ❌ | Partial |
 | Anonymous mode | Roadmap P1 | ❌ | ✅ | ✅ | ✅ | ❌ | Partial |
 | Torrent metadata display (comment, creator, date) | Roadmap P1 | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
 | Magnet link generation from added torrents | Roadmap P1 | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
@@ -174,7 +174,7 @@ differentiators.
 | Peak throughput performance logging | ✅ | ❌ | ❌ | ❌ | Plugin/stat views | ❌ | Scripts/plugins |
 | Native REST API plus event streams | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Transmission API emulation | ✅ | Native API | ❌ | ❌ | Partial remote support | ❌ | ❌ |
-| qBittorrent API emulation | Partial (v1.1.0 shim; deeper parity is Roadmap P0) | ❌ | Native API | ❌ | ❌ | ❌ | ❌ |
+| qBittorrent API emulation | Partial (opt-in bounded lifecycle, category/profile, and inspection adapter) | ❌ | Native API | ❌ | ❌ | ❌ | ❌ |
 | Adaptive swarm performance autopilot | Roadmap P0 | ❌ | ❌ | ❌ | Partial/plugin concepts | ❌ | Scripts/plugins |
 | Storage-root resource controls | ✅ | ❌ | ❌ | ❌ | Partial disk views | ❌ | Manual |
 | Filesystem-aware storage strategy and state placement | Roadmap P0 | ❌ | ❌ | ❌ | Partial disk views | ❌ | Manual |
@@ -191,15 +191,12 @@ usable, remove it from `design/BACKLOG.md` and update this comparison.
 
 | Priority | Backlog Feature | Comparison Impact |
 | --- | --- | --- |
-| P0 | UPnP / NAT-PMP Port Forwarding *(table stakes)* | Adds automatic port mapping for reachability behind NAT. Every major client ships this; its absence cripples seeding for non-VPN users. |
 | P0 | SOCKS5 Proxy Support *(table stakes)* | Adds a standard proxy deployment option for seedbox and restricted-network users. Shipped by qBittorrent, Deluge, and BiglyBT. |
-| P0 | Listen Port Reachability Test *(table stakes)* | Adds active port-open/closed diagnostic. Every major client provides a port status indicator or test. |
 | P0 | Protocol Encryption / MSE-PE *(table stakes)* | TCP MSE/PE is now implemented with configurable `required/preferred/disabled`; remaining work is uTP encryption and per-profile/per-torrent override policy. |
 | P0 | Adaptive swarm performance autopilot | Differentiates SwarmOtter on real-world throughput diagnosis and automatic swarm tuning. |
 | P0 | Filesystem-aware storage strategy and state placement | Builds on shipped storage-root resource controls with filesystem-aware behavior, richer diagnostics, and deliberate state placement. |
 | P0 | Advanced policy-profile rules | Extends shipped named profiles with tracker, file-selection, and completion-action policy dimensions. |
 | P0 | Large-library Web UI operations console | Closes operational gaps for hundreds or thousands of torrents through server-side filtering, sorting, grouping, pagination, and bulk actions. |
-| P0 | Ecosystem Compatibility API | Adds qBittorrent-compatible API support beside the existing Transmission RPC compatibility layer. |
 | P0 | Per-Profile / Per-Torrent Network-Path Binding | Extends containment from one daemon-wide path to contained network paths by profile or torrent. |
 | P0 | Multi-User / Multi-Tenant Support | Adds role-based access, isolation, quotas, and shared-server workflows. |
 | P1 | Metadata-first magnet preview and intake rules | Closes the gap with clients that let users inspect magnet metadata before data transfer. |

@@ -196,6 +196,26 @@ try {
   await new Promise(resolve => setImmediate(resolve));
 
   const { state } = await import(pathToFileURL(join(fixtureDirectory, "js", "state.js")));
+  const settings = await import(pathToFileURL(join(fixtureDirectory, "js", "settings.js")));
+  settings.renderSettingsEditor({
+    port_mapping: {
+      enabled: true,
+      protocols: ["upnp"],
+      nat_pmp_gateway: "192.168.1.1",
+      upnp_service_url: "http://192.168.1.1:49000/control",
+      lease_seconds: 7200,
+      refresh_before_expiry_seconds: 600,
+    },
+  });
+  const renderedMapping = settings.collectSettingsConfig().port_mapping;
+  assert.deepEqual(renderedMapping, {
+    enabled: true,
+    protocols: ["upnp"],
+    nat_pmp_gateway: "192.168.1.1",
+    upnp_service_url: "http://192.168.1.1:49000/control",
+    lease_seconds: 7200,
+    refresh_before_expiry_seconds: 600,
+  }, "a full Settings save must retain port-mapping configuration");
   process.off("unhandledRejection", recordUnhandledRejection);
   assert.deepEqual(apiCalls.sort(), [
     "/api/v1/doctor",

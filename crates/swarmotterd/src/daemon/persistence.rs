@@ -344,6 +344,11 @@ impl DaemonRuntime {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        // Release an opted-in router lease while its original contained binder
+        // is still alive. A failed release is non-fatal and never attempts a
+        // default-route fallback; the bounded router lease remains the final
+        // cleanup guard.
+        self.release_port_mapping_on_shutdown().await;
         self.reconcile_engine_progress().await;
         let hashes = self
             .registry
