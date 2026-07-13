@@ -124,8 +124,11 @@ exception, and the module routes retain the entry script's absence of an
 explicit cache header. Route tests assert status, content type, CSP, and cache
 policy for every module. Contributor checks run
 `scripts/check-web-js-modules.sh` so every JavaScript asset is parsed with ES
-module semantics; the executable watch-history and seeding-policy DOM harnesses
-remain part of the test surface.
+module semantics. `scripts/check-web-ui-startup.sh` then loads the production
+index markup and complete `app.js` import graph, supplies successful initial
+torrent, statistics, and doctor responses, and requires the table and health
+badge initialization to finish without an uncaught exception. The executable
+watch-history and seeding-policy DOM harnesses remain part of the test surface.
 
 ## Control plane vs data plane
 

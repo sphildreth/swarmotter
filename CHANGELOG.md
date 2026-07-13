@@ -46,11 +46,13 @@ date or duration estimates.
 
 ### Fixed
 
-- **Web UI ES-module startup validation:** corrected an invalid shared-state
-  redeclaration in `torrents.js` that prevented the UI module graph from
-  loading. CI, local prechecks, and the Web UI Rust suite now parse every
-  embedded JavaScript asset in ES-module mode so script-mode syntax checks
-  cannot miss imported-binding redeclarations.
+- **Web UI startup validation:** corrected an invalid shared-state
+  redeclaration, three stale bare query-state references, and two omitted UI
+  helper bindings that prevented the module graph, its first nonempty torrent
+  refresh, or Doctor badge from completing. CI, local prechecks, and the Web UI
+  Rust suite now parse every embedded JavaScript asset in ES-module mode and
+  execute the complete production module graph through its first API-driven
+  render.
 
 - **Reachable terminal tracker diagnostics:** a bounded engine attempt now
   enters `tracker_error` when every attempted configured tracker fails and no

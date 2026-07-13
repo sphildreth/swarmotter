@@ -31,6 +31,8 @@ jobs:
         run: cargo test --all --all-features
       - name: Validate Web UI JavaScript
         run: scripts/check-web-js-modules.sh
+      - name: Exercise Web UI startup
+        run: scripts/check-web-ui-startup.sh
       - name: Validate deployment manifests
         run: |
           cp deploy/gluetun.env.example deploy/gluetun.env

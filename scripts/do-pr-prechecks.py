@@ -60,6 +60,7 @@ PR_CHECKS = (
     "cargo clippy --workspace --all-targets --all-features -- -D warnings",
     "cargo test --all --all-features",
     "scripts/check-web-js-modules.sh",
+    "scripts/check-web-ui-startup.sh",
     "node crates/swarmotter-web/tests/watch-history.test.js && node crates/swarmotter-web/tests/seeding-policy.test.js",
     "GLUETUN_ENV_FILE=gluetun.env.example docker compose --env-file deploy/.env.example -f deploy/compose.yml config",
     "cargo +1.88.0 check --locked --workspace --all-targets --all-features",
@@ -191,14 +192,19 @@ def build_steps(args: argparse.Namespace) -> list[CheckStep]:
     steps.extend(
         [
             CheckStep(
+                "Exercise Web UI startup",
+                ["scripts/check-web-ui-startup.sh"],
+                PR_CHECKS[5],
+            ),
+            CheckStep(
                 "Validate watch-history DOM state",
                 ["node", "crates/swarmotter-web/tests/watch-history.test.js"],
-                PR_CHECKS[5],
+                PR_CHECKS[6],
             ),
             CheckStep(
                 "Validate seeding-policy DOM state",
                 ["node", "crates/swarmotter-web/tests/seeding-policy.test.js"],
-                PR_CHECKS[5],
+                PR_CHECKS[6],
             ),
             CheckStep(
                 "Validate deployment manifest",
@@ -211,7 +217,7 @@ def build_steps(args: argparse.Namespace) -> list[CheckStep]:
                     "deploy/compose.yml",
                     "config",
                 ],
-                PR_CHECKS[6],
+                PR_CHECKS[7],
                 (("GLUETUN_ENV_FILE", "gluetun.env.example"),),
             ),
         ]
@@ -240,7 +246,7 @@ def build_steps(args: argparse.Namespace) -> list[CheckStep]:
                 args.minimum_rust_toolchain,
                 ["check", "--locked", "--workspace", "--all-targets", "--all-features"],
             ),
-            PR_CHECKS[7],
+            PR_CHECKS[8],
         )
     )
 
@@ -278,7 +284,7 @@ def build_steps(args: argparse.Namespace) -> list[CheckStep]:
             CheckStep(
                 "Build mdBook",
                 ["mdbook", "build"],
-                PR_CHECKS[8],
+                PR_CHECKS[9],
             )
         )
 

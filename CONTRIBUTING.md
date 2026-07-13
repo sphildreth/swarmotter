@@ -60,6 +60,7 @@ module. Keep the feature import graph acyclic and preserve the `script-src
 
 ```bash
 scripts/check-web-js-modules.sh
+scripts/check-web-ui-startup.sh
 node crates/swarmotter-web/tests/watch-history.test.js
 node crates/swarmotter-web/tests/seeding-policy.test.js
 ```

@@ -188,7 +188,8 @@ The matrix definition of done also requires `cargo fmt --all -- --check`,
 `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`,
 `cargo test --locked --workspace --all-targets --all-features`, module-aware
 syntax checks through `scripts/check-web-js-modules.sh` for every file below
-`crates/swarmotter-web/assets`, both executable DOM
+`crates/swarmotter-web/assets`, the complete production-module startup check
+through `scripts/check-web-ui-startup.sh`, both executable DOM
 harnesses, `mdbook build`, and `git diff --check` to pass. Documentation
 must keep `design/requirements.md`, architecture/API/configuration design,
 operator API/configuration/Web UI guides, the completion tracker, changelog,

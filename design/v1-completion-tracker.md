@@ -328,6 +328,11 @@ UDP socket (see ADR-0020).
 - [x] Network/VPN health
 - [x] Watch-folder status
 - [x] Logs/errors
+- [x] Production Web UI startup: the complete `app.js` module graph runs
+      against the production index markup, completes the first torrent,
+      statistics, and doctor refresh, and builds the torrent table without an
+      uncaught exception. Evidence: `scripts/check-web-ui-startup.sh` and
+      `swarmotter_web::tests::production_module_graph_completes_initial_ui_refresh`.
 - [x] Per-torrent health indicator — a signal-bars style (0..5) display on
       each torrent list row and on the details header, computed from real
       engine state (availability, throughput, peers, stability, discovery),
@@ -439,6 +444,7 @@ documented below; no required capability remains marked in progress.
 | `cargo test --locked --workspace --all-targets --all-features` | pass (781 passed, 2 intentional opt-in scale tests ignored; includes 394 core, 54 API unit, 56 API integration, 6 origin-matrix, 33 Web, 195 daemon-library, containment, daemon-download, generated local-swarm, throughput, metadata-ingress, and public-path suites) |
 | `cargo +1.88.0 check --locked --workspace --all-targets --all-features` | pass |
 | `scripts/check-web-js-modules.sh` | pass for all 12 JavaScript assets in ES-module mode |
+| `scripts/check-web-ui-startup.sh` | pass for the production module graph and initial API-driven render |
 | `node crates/swarmotter-web/tests/watch-history.test.js` and `node crates/swarmotter-web/tests/seeding-policy.test.js` | pass |
 | `GLUETUN_ENV_FILE=gluetun.env.example docker compose --env-file deploy/.env.example -f deploy/compose.yml config` | pass |
 | `mdbook build` | pass |

@@ -1292,6 +1292,22 @@ mod tests {
     }
 
     #[test]
+    fn production_module_graph_completes_initial_ui_refresh() {
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/app-startup.test.mjs");
+        let output = std::process::Command::new("node")
+            .arg(script)
+            .output()
+            .expect("Node.js is required by the Web UI quality gate");
+        assert!(
+            output.status.success(),
+            "Web UI startup harness failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn torrent_details_exposes_terminal_error_diagnostics() {
         for needle in [
             "[\"Last error\", t.error || \"\"]",
