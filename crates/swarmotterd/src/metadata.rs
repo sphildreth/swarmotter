@@ -136,11 +136,8 @@ pub(crate) async fn fetch_metadata_with_transport(
 fn peer_transport_order(
     utp_enabled: bool,
     utp_prefer_tcp: bool,
-    encryption_mode: PeerEncryptionMode,
+    _encryption_mode: PeerEncryptionMode,
 ) -> Vec<PeerTransport> {
-    if matches!(encryption_mode, PeerEncryptionMode::Required) {
-        return vec![PeerTransport::Tcp];
-    }
     if !utp_enabled {
         return vec![PeerTransport::Tcp];
     }
@@ -160,17 +157,11 @@ async fn fetch_metadata_via_transport(
     encryption_mode: PeerEncryptionMode,
     peer_filter: &PeerFilter,
 ) -> Result<Vec<u8>> {
-    if transport == PeerTransport::Utp && matches!(encryption_mode, PeerEncryptionMode::Required) {
-        return Err(CoreError::Internal(
-            "uTP encrypted metadata peer wire is not implemented for required encryption mode"
-                .into(),
-        ));
-    }
     let (stream, selected) =
         utp::connect_peer_stream(binder.clone(), transport, peer.socket_addr()).await?;
-    let stream = match (selected, encryption_mode) {
-        (PeerTransport::Tcp, PeerEncryptionMode::Disabled) => stream,
-        (PeerTransport::Tcp, PeerEncryptionMode::Required) => {
+    let stream = match encryption_mode {
+        PeerEncryptionMode::Disabled => stream,
+        PeerEncryptionMode::Required => {
             let encrypted = timeout(
                 Duration::from_secs(10),
                 swarmotter_core::mse::connect(stream, info_hash),
@@ -178,7 +169,7 @@ async fn fetch_metadata_via_transport(
             .await??;
             Box::new(encrypted) as Box<dyn PeerDuplex>
         }
-        (PeerTransport::Tcp, PeerEncryptionMode::Preferred) => {
+        PeerEncryptionMode::Preferred => {
             match timeout(
                 Duration::from_secs(10),
                 swarmotter_core::mse::connect(stream, info_hash),
@@ -189,28 +180,27 @@ async fn fetch_metadata_via_transport(
                 Ok(Err(e)) => {
                     tracing::debug!(
                         peer = %peer.socket_addr(),
+                        transport = selected.as_str(),
                         error = %e,
-                        "MSE/PE metadata negotiation failed; retrying TCP metadata peer as plaintext"
+                        "MSE/PE metadata negotiation failed; retrying contained metadata transport as plaintext"
                     );
                     let (plain, _) =
-                        utp::connect_peer_stream(binder, PeerTransport::Tcp, peer.socket_addr())
-                            .await?;
+                        utp::connect_peer_stream(binder, selected, peer.socket_addr()).await?;
                     plain
                 }
                 Err(e) => {
                     tracing::debug!(
                         peer = %peer.socket_addr(),
+                        transport = selected.as_str(),
                         error = %e,
-                        "MSE/PE metadata negotiation timed out; retrying TCP metadata peer as plaintext"
+                        "MSE/PE metadata negotiation timed out; retrying contained metadata transport as plaintext"
                     );
                     let (plain, _) =
-                        utp::connect_peer_stream(binder, PeerTransport::Tcp, peer.socket_addr())
-                            .await?;
+                        utp::connect_peer_stream(binder, selected, peer.socket_addr()).await?;
                     plain
                 }
             }
         }
-        (PeerTransport::Utp, _) => stream,
     };
     fetch_metadata_over_stream(stream, info_hash, peer_id, peer_filter).await
 }
@@ -545,7 +535,7 @@ mod tests {
         );
         assert_eq!(
             peer_transport_order(true, false, PeerEncryptionMode::Required),
-            vec![PeerTransport::Tcp]
+            vec![PeerTransport::Utp, PeerTransport::Tcp]
         );
     }
 

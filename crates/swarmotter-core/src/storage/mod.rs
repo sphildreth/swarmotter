@@ -11,6 +11,7 @@
 pub mod diagnostics;
 pub mod io;
 pub mod layout;
+pub mod metrics;
 pub mod resume;
 
 pub use diagnostics::{
@@ -19,6 +20,7 @@ pub use diagnostics::{
 };
 pub use io::{StorageIo, StoragePathOwnership};
 pub use layout::{FileLayout, FileSlice, StorageLayout};
+pub use metrics::{StorageIoMetrics, StorageThroughput};
 pub use resume::{FastResume, PieceBitfield};
 
 use crate::error::{CoreError, Result};

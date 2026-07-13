@@ -40,6 +40,7 @@ fn strict_config() -> Config {
         fail_closed: true,
         validate_route: false,
         validate_dns: false,
+        socks5: Default::default(),
     };
     cfg
 }

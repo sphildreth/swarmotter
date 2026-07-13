@@ -19,6 +19,30 @@ date or duration estimates.
 
 ### Added
 
+- **Contained SOCKS5 TCP proxy:** optional SOCKS5 `CONNECT` support now routes
+  outbound peer TCP, HTTP(S) tracker/scrape, and webseed requests through the
+  existing fail-closed network path. It supports no-authentication and RFC 1929
+  credentials, resolves target hostnames remotely through the proxy, redacts
+  credentials from settings views, and never falls back to a direct target
+  connection. This initial TCP-only scope requires DHT and uTP to be disabled
+  and rejects UDP tracker traffic rather than bypassing the proxy. See
+  [ADR-0062](design/adr/0062-contained-socks5-tcp-proxy.md).
+
+- **Complete contained MSE/PE policy:** peer-wire encryption now works over
+  contained TCP and uTP streams, with global, named-profile, and durable
+  per-torrent modes. `required` mode never retries plaintext, while
+  `preferred` retries only the already-selected contained transport. The native
+  API and Web UI show the effective value and its inheritance source. See
+  [ADR-0063](design/adr/0063-contained-mse-utp-and-effective-encryption-policy.md).
+
+- **Filesystem-aware storage strategy and placement:** storage diagnostics now
+  report best-effort mount details and observed payload-write/verification
+  throughput. Operators can place resume metadata, daemon state, and fallback
+  payload storage deliberately, and may explicitly request Btrfs NOCOW only
+  for new files; unsupported requests fail instead of silently changing
+  strategy. See
+  [ADR-0064](design/adr/0064-filesystem-aware-storage-strategy-and-state-placement.md).
+
 - **Contained router port mapping:** opt-in NAT-PMP and UPnP mapping now
   creates, refreshes, reports, and best-effort removes the TCP peer-listener
   lease only through the configured strict, fail-closed interface path. Router

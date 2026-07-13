@@ -1975,11 +1975,23 @@ async fn serve_bittorrent_over_stream(
     }
 }
 
-/// Local swarm uTP download: a uTP-capable seed serves a generated payload, and
-/// the SwarmOtter engine downloads it over the contained uTP transport (uTP
-/// preferred, TCP fallback disabled by config), verifying every piece and the
-/// final file contents. All traffic goes through the `LoopbackBinder`'s
-/// contained UDP socket; no uncontrolled UDP sockets are created.
+/// Serve the same generated swarm fixture after negotiating MSE/PE over the
+/// already-established contained uTP byte stream. The MSE layer wraps the
+/// stream; it does not create a TCP or UDP socket of its own.
+async fn serve_encrypted_bittorrent_over_utp_stream(
+    stream: Box<dyn swarmotter_core::utp::PeerDuplex>,
+    seed: &UtpSeedPeer,
+) -> swarmotter_core::Result<()> {
+    let encrypted = swarmotter_core::mse::accept(stream, seed.info_hash).await?;
+    serve_bittorrent_over_stream(Box::new(encrypted), seed).await
+}
+
+/// Local swarm plaintext-uTP download: a uTP-capable seed serves a generated
+/// payload, and the SwarmOtter engine downloads it over the contained uTP
+/// transport (uTP preferred, TCP fallback disabled by config), verifying every
+/// piece and the final file contents. All traffic goes through the
+/// `LoopbackBinder`'s contained UDP socket; no uncontrolled UDP sockets are
+/// created.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_swarm_downloads_from_seed_via_utp() {
     let mut content = Vec::with_capacity(32 * 1024 + 9);
@@ -2038,8 +2050,9 @@ async fn local_swarm_downloads_from_seed_via_utp() {
     let state = Arc::new(Mutex::new(EngineState::default()));
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let seed_peer = PeerAddr::from_socket_addr(seed_addr);
-    // uTP preferred (utp_prefer_tcp = false), uTP enabled. TCP fallback remains
-    // available but should not be needed since the seed speaks uTP.
+    // uTP preferred (utp_prefer_tcp = false), uTP enabled. This fixture serves
+    // plaintext peer-wire, so disable MSE/PE explicitly; encrypted uTP is
+    // covered by the required-encryption fixture below.
     let engine = TorrentEngine::new(
         meta.clone(),
         dir.clone(),
@@ -2050,7 +2063,8 @@ async fn local_swarm_downloads_from_seed_via_utp() {
         vec![seed_peer],
         6881,
     )
-    .with_transport(true, false);
+    .with_transport(true, false)
+    .with_encryption_mode(swarmotter_core::config::PeerEncryptionMode::Disabled);
 
     let final_state = tokio::time::timeout(Duration::from_secs(60), engine.run())
         .await
@@ -2069,6 +2083,95 @@ async fn local_swarm_downloads_from_seed_via_utp() {
     assert_eq!(
         written, content,
         "uTP downloaded content mismatches original"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Required MSE/PE mode succeeds over uTP without opening a TCP fallback.
+/// Both the connection setup and the encrypted peer-wire bytes remain on the
+/// LoopbackBinder-provided contained UDP sockets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_swarm_downloads_from_encrypted_seed_via_utp_when_required() {
+    let mut content = Vec::with_capacity(16 * 1024 + 17);
+    for i in 0..16 * 1024 + 17 {
+        content.push((i % 239) as u8);
+    }
+    let piece_length: u64 = 8 * 1024;
+    let torrent_bytes =
+        build_single_file_torrent("encrypted-utp.bin", &content, piece_length, None, false);
+    let meta = parse_torrent(&torrent_bytes).unwrap();
+
+    let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+    use swarmotter_core::net::NetworkBinder;
+    let seed_sock = binder.udp_socket().await.unwrap();
+    let seed_addr = seed_sock.local_addr().unwrap();
+    let seed_sock: std::sync::Arc<dyn swarmotter_core::net::ContainedUdpSocket> = seed_sock.into();
+
+    let content_clone = content.clone();
+    let meta_clone = meta.clone();
+    let seed_sock_clone = seed_sock.clone();
+    tokio::spawn(async move {
+        use swarmotter_core::utp::{UtpConnection, UtpHeader, UtpStream, UtpType};
+        let mut buf = vec![0u8; 2048];
+        let (from, n) = match seed_sock_clone.recv_from(&mut buf).await {
+            Ok(packet) => packet,
+            Err(_) => return,
+        };
+        let (syn, _payload) = match UtpHeader::decode(&buf[..n]) {
+            Ok(packet) => packet,
+            Err(_) => return,
+        };
+        if syn.typ != UtpType::Syn {
+            return;
+        }
+        let conn = match UtpConnection::accept_from_syn(seed_sock_clone, from, &syn).await {
+            Ok(connection) => connection,
+            Err(_) => return,
+        };
+        let seed = UtpSeedPeer {
+            content: content_clone,
+            info_hash: meta_clone.info_hash,
+            meta: meta_clone,
+            peer_id: peer_id(b"-SDEUTP-"),
+        };
+        let _ = serve_encrypted_bittorrent_over_utp_stream(Box::new(UtpStream::spawn(conn)), &seed)
+            .await;
+    });
+
+    let dir = unique_dir("encrypted-utp-download");
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
+    let engine = TorrentEngine::new(
+        meta.clone(),
+        dir.clone(),
+        peer_id(b"-SWEUTP-"),
+        binder,
+        state,
+        cmd_rx,
+        vec![PeerAddr::from_socket_addr(seed_addr)],
+        6881,
+    )
+    .with_transport(true, false)
+    .with_encryption_mode(swarmotter_core::config::PeerEncryptionMode::Required);
+
+    let final_state = tokio::time::timeout(Duration::from_secs(60), engine.run())
+        .await
+        .expect("encrypted uTP engine did not finish in time")
+        .expect("encrypted uTP engine error");
+
+    assert!(
+        final_state.finished,
+        "required encrypted uTP download did not complete"
+    );
+    assert_eq!(
+        final_state.pieces_have.count(meta.piece_count()),
+        meta.piece_count(),
+        "required encrypted uTP download did not verify all pieces"
+    );
+    let storage = StorageIo::new(meta, dir.clone());
+    assert_eq!(
+        std::fs::read(storage.file_path(0).unwrap()).unwrap(),
+        content
     );
     std::fs::remove_dir_all(&dir).ok();
 }

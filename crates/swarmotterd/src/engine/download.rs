@@ -48,7 +48,10 @@ impl TorrentEngine {
 
         self.storage_preflight()?;
 
-        let complete_storage = StorageIo::new(self.meta.clone(), self.complete_dir.clone());
+        let complete_storage = StorageIo::new(self.meta.clone(), self.complete_dir.clone())
+            .with_resume_dir(self.resume_dir.clone())
+            .with_cow_strategy(self.cow_strategy)
+            .with_metrics(self.storage_metrics.clone());
         if self.download_dir != self.complete_dir {
             let complete_have = self.load_or_recheck(&complete_storage).await?;
             if self.piece_selection.complete(&complete_have) {
@@ -60,6 +63,9 @@ impl TorrentEngine {
         }
 
         let storage = StorageIo::new(self.meta.clone(), self.download_dir.clone())
+            .with_resume_dir(self.resume_dir.clone())
+            .with_cow_strategy(self.cow_strategy)
+            .with_metrics(self.storage_metrics.clone())
             .with_write_limiter(self.storage_write_limiter.clone());
         let selected_files = self
             .file_priorities
@@ -447,7 +453,10 @@ impl TorrentEngine {
         self.mark_finished().await;
         storage.remove_resume().await?;
         if self.download_dir != self.complete_dir {
-            let active_storage = StorageIo::new(self.meta.clone(), self.download_dir.clone());
+            let active_storage = StorageIo::new(self.meta.clone(), self.download_dir.clone())
+                .with_resume_dir(self.resume_dir.clone())
+                .with_cow_strategy(self.cow_strategy)
+                .with_metrics(self.storage_metrics.clone());
             active_storage.remove_resume().await?;
         }
         Ok(())

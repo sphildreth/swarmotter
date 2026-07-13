@@ -159,6 +159,15 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn set_torrent_profile(&self, _hash: &InfoHash, _profile: Option<String>) -> Result<()> {
         Err(CoreError::NotFound("torrent".into()))
     }
+    /// Set or clear a durable per-torrent peer-wire encryption override.
+    /// `None` restores profile/label/global inheritance.
+    async fn set_torrent_encryption_mode(
+        &self,
+        _hash: &InfoHash,
+        _encryption_mode: Option<swarmotter_core::config::PeerEncryptionMode>,
+    ) -> Result<()> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
 
     /// List files for a torrent.
     async fn list_files(&self, hash: &InfoHash) -> Option<Vec<TorrentFile>>;
@@ -265,20 +274,68 @@ pub trait DaemonOps: Send + Sync + 'static {
     /// Storage root diagnostics for API dashboards.
     async fn storage_roots(&self) -> StorageDiagnostics {
         let cfg = self.get_config().await;
-        let root = cfg.storage.download_dir.clone().unwrap_or_else(|| {
-            std::env::temp_dir()
+        let download_root = cfg.storage.download_dir.clone().unwrap_or_else(|| {
+            cfg.storage
+                .temp_dir
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
                 .join("swarmotter-downloads")
                 .display()
                 .to_string()
         });
-        let root = swarmotter_core::storage::inspect_storage_root(
-            std::path::Path::new(&root),
+        let mut configured_roots = BTreeMap::new();
+        configured_roots.insert(
+            download_root,
             vec![swarmotter_core::models::storage::StorageRootRole::Download],
-            &cfg.storage,
-            swarmotter_core::storage::StorageRootUsage::default(),
         );
+        for (path, role) in [
+            (
+                cfg.storage.resume_dir.as_ref(),
+                swarmotter_core::models::storage::StorageRootRole::Resume,
+            ),
+            (
+                cfg.storage.state_dir.as_ref(),
+                swarmotter_core::models::storage::StorageRootRole::State,
+            ),
+            (
+                cfg.storage.temp_dir.as_ref(),
+                swarmotter_core::models::storage::StorageRootRole::Temporary,
+            ),
+        ] {
+            if let Some(path) = path {
+                configured_roots
+                    .entry(path.clone())
+                    .or_insert_with(Vec::new)
+                    .push(role);
+            }
+        }
+        if cfg.logging.file {
+            if let Some(path) = cfg
+                .logging
+                .file_path
+                .as_deref()
+                .and_then(|path| std::path::Path::new(path).parent())
+            {
+                configured_roots
+                    .entry(path.display().to_string())
+                    .or_insert_with(Vec::new)
+                    .push(swarmotter_core::models::storage::StorageRootRole::Log);
+            }
+        }
+        let roots = configured_roots
+            .into_iter()
+            .map(|(root, roles)| {
+                swarmotter_core::storage::inspect_storage_root(
+                    std::path::Path::new(&root),
+                    roles,
+                    &cfg.storage,
+                    swarmotter_core::storage::StorageRootUsage::default(),
+                )
+            })
+            .collect();
         StorageDiagnostics {
-            roots: vec![root],
+            roots,
             minimum_free_space_bytes: cfg.storage.minimum_free_space_bytes,
             minimum_free_space_percent: cfg.storage.minimum_free_space_percent,
             generated_at: std::time::SystemTime::now()

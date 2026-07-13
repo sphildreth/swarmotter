@@ -44,9 +44,9 @@ This comparison distinguishes between two classes of features:
   consideration regardless of other strengths. Examples include UPnP/NAT-PMP
   port forwarding, SOCKS5 proxy support, IP filtering/blocklists, peer
   encryption (MSE/PE), and listen port reachability testing. SwarmOtter closes
-  the port-mapping and reachability gaps with contained, opt-in controls; the
-  remaining roadmap gaps are marked with `(table stakes)` and prioritized at
-  P0 because they are baseline expectations, not differentiators.
+  those gaps with contained, opt-in controls, including TCP-only SOCKS5 proxy
+  support (UDP is deliberately unavailable) and MSE/PE for TCP and uTP. The
+  remaining roadmap gaps are prioritized by product value and fit.
 
 - **Differentiators**: features where SwarmOtter offers something no
   mainstream client provides, or offers it in a meaningfully better way.
@@ -54,19 +54,17 @@ This comparison distinguishes between two classes of features:
   the explainability API, and the lawful-use posture. These are the
   reasons a user would choose SwarmOtter over an established client.
 
-The Roadmap Gap Map marks table-stakes items explicitly so the team can
-prioritize closing baseline parity gaps before investing in new
-differentiators.
+The Roadmap Gap Map records the remaining product gaps and differentiator
+candidates.
 
 ## Footnotes
 
 - **Peer encryption (SwarmOtter):** SwarmOtter implemented MSE/PE-style
-  Message Stream Encryption / Protocol Encryption for TCP peer connections in v1.1.0 with
-  configurable `torrent.encryption_mode` (`disabled` | `preferred` | `required`),
-  default `preferred`, and no separate socket paths.
-  Encryption runs on the contained peer transport and never bypasses network
-  containment. Remaining work is not yet complete for uTP and per-profile/per-torrent
-  overrides.
+  Message Stream Encryption / Protocol Encryption for contained TCP and uTP
+  peer streams. Global, profile, and durable per-torrent modes use
+  `disabled` | `preferred` | `required`, with `preferred` as the default and
+  no separate socket paths. Encryption remains under network containment;
+  required mode never silently retries plaintext.
 
 - **Local peer discovery (SwarmOtter ❌):** SwarmOtter deliberately does
   not implement local-network peer discovery. Local discovery is a
@@ -128,7 +126,7 @@ differentiators.
 | Webseeds | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Partial |
 | uTP | ✅ | ✅ | ✅ | ✅ | Plugin/core plugin | ❌ | ❌ |
 | IPv6 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Partial |
-| Peer encryption (MSE/PE) | Partial | Partial | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Peer encryption (MSE/PE) | ✅ | Partial | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Private torrent handling | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | File selection/priorities | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Queueing/priorities | ✅ | ✅ | ✅ | ✅ | ✅ | Partial | ✅ |
@@ -148,7 +146,7 @@ differentiators.
 | Superseeding/initial seeding | Roadmap P1 | Partial | ✅ | ✅ | ✅ | ❌ | ✅ |
 | IP filtering/blocklists | ✅ | ✅ | ✅ | Plugin | ✅ | ❌ | Partial |
 | UPnP/NAT-PMP | ✅ (opt-in, contained) | ✅ | ✅ | ✅ | ✅ | ❌ | Partial |
-| SOCKS/proxy support | Roadmap P0 (table stakes) | ❌ | ✅ | ✅ | ✅ | ✅ | Partial |
+| SOCKS/proxy support | ✅ (opt-in, contained TCP CONNECT; UDP unavailable) | ❌ | ✅ | ✅ | ✅ | ✅ | Partial |
 | HTTP/HTTPS proxy support | Roadmap P1 | ❌ | ✅ | ❌ | ❌ | ✅ | Partial |
 | Listen port reachability test | ✅ (opt-in, contained operator endpoint) | ✅ | ✅ | ✅ | ✅ | ❌ | Partial |
 | Anonymous mode | Roadmap P1 | ❌ | ✅ | ✅ | ✅ | ❌ | Partial |
@@ -177,7 +175,7 @@ differentiators.
 | qBittorrent API emulation | Partial (opt-in bounded lifecycle, category/profile, and inspection adapter) | ❌ | Native API | ❌ | ❌ | ❌ | ❌ |
 | Adaptive swarm performance autopilot | Roadmap P0 | ❌ | ❌ | ❌ | Partial/plugin concepts | ❌ | Scripts/plugins |
 | Storage-root resource controls | ✅ | ❌ | ❌ | ❌ | Partial disk views | ❌ | Manual |
-| Filesystem-aware storage strategy and state placement | Roadmap P0 | ❌ | ❌ | ❌ | Partial disk views | ❌ | Manual |
+| Filesystem-aware storage strategy and state placement | ✅ (mount/I/O diagnostics, placement, explicit Btrfs NOCOW) | ❌ | ❌ | ❌ | Partial disk views | ❌ | Manual |
 | Per-profile/per-torrent network path binding | Roadmap P0 | ❌ | ❌ | ❌ | Partial VPN helper | ❌ | Manual |
 | Multi-user/multi-tenant operation | Roadmap P0 | ❌ | ❌ | Partial auth | ❌ | RPC token only | Partial via deployment |
 | Permissioned extension system | Roadmap P3 | ❌ | Search plugins only | ✅ | ✅ | ❌ | ruTorrent plugins |
@@ -191,10 +189,7 @@ usable, remove it from `design/BACKLOG.md` and update this comparison.
 
 | Priority | Backlog Feature | Comparison Impact |
 | --- | --- | --- |
-| P0 | SOCKS5 Proxy Support *(table stakes)* | Adds a standard proxy deployment option for seedbox and restricted-network users. Shipped by qBittorrent, Deluge, and BiglyBT. |
-| P0 | Protocol Encryption / MSE-PE *(table stakes)* | TCP MSE/PE is now implemented with configurable `required/preferred/disabled`; remaining work is uTP encryption and per-profile/per-torrent override policy. |
 | P0 | Adaptive swarm performance autopilot | Differentiates SwarmOtter on real-world throughput diagnosis and automatic swarm tuning. |
-| P0 | Filesystem-aware storage strategy and state placement | Builds on shipped storage-root resource controls with filesystem-aware behavior, richer diagnostics, and deliberate state placement. |
 | P0 | Advanced policy-profile rules | Extends shipped named profiles with tracker, file-selection, and completion-action policy dimensions. |
 | P0 | Large-library Web UI operations console | Closes operational gaps for hundreds or thousands of torrents through server-side filtering, sorting, grouping, pagination, and bulk actions. |
 | P0 | Per-Profile / Per-Torrent Network-Path Binding | Extends containment from one daemon-wide path to contained network paths by profile or torrent. |
@@ -222,7 +217,7 @@ usable, remove it from `design/BACKLOG.md` and update this comparison.
 | P1 | Production Health / Availability Surface | Adds `/healthz/live` and `/healthz/ready` plus a synthetic end-to-end check torrent and SLO-style summaries, making SwarmOtter the first torrent daemon suitable as a Kubernetes/CI workload. |
 | P1 | Filesystem Snapshot Integration | Adds opt-in snapshot hooks for Btrfs subvolumes, ZFS, and Snapper so operators get rollback for torrent roots and state directories. No mainstream client offers this. |
 | P1 | Client-Identity Fingerprinting and Rollups | Adds per-torrent and per-tracker client composition rollups so operators of legal swarms can prioritize compatibility and understand their contribution. |
-| P1 | HTTP / HTTPS Proxy Support | Adds egress through corporate/filtered HTTP proxies alongside the existing SOCKS5 (P0) entry. |
+| P1 | HTTP / HTTPS Proxy Support | Adds egress through corporate/filtered HTTP proxies alongside contained SOCKS5 TCP support. |
 | P1 | Scriptable CLI (`swarmotterctl`) | Adds a scriptable, JSON-output CLI mirroring the API for SSH and automation workflows without a browser. |
 | P1 | Seedbox Pre-Seed Warm-Up | Adds first-peer serving optimization for new lawful releases; complements superseeding (P1). |
 | P1 | Idempotent Re-Add / Content-Addressed Import | Reduces re-add/re-verify friction for large libraries and cross-seed workflows. |

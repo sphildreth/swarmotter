@@ -177,6 +177,24 @@ try {
       data = { torrent_count: 1, download_rate: 0, upload_rate: 0 };
     } else if (path === "/api/v1/doctor") {
       data = { level: "ok", summary: "startup fixture healthy", checks: [] };
+    } else if (path === "/api/v1/network/diagnostics") {
+      data = {
+        health: {
+          mode: "disabled", status: "disabled", traffic_allowed: true,
+          required_interface: null, required_source_ipv4: null,
+          required_source_ipv6: null, allow_ipv6: true, fail_closed: true,
+          detail: "fixture contained path",
+        },
+        listen_port: 51413, dht_port: 6881, torrent_allow_ipv6: true,
+        utp_enabled: false, utp_prefer_tcp: true, peer_encryption_mode: "preferred",
+        socks5_enabled: true, socks5_udp_blocked: true,
+        interfaces: [], checks: [], containment_matrix: [],
+      };
+    } else if (path === "/api/v1/network/health") {
+      data = {
+        mode: "disabled", status: "disabled", traffic_allowed: true,
+        port_mapping: { enabled: false }, port_test: { enabled: false },
+      };
     } else {
       throw new Error(`unexpected startup API request: ${path}`);
     }
@@ -197,7 +215,25 @@ try {
 
   const { state } = await import(pathToFileURL(join(fixtureDirectory, "js", "state.js")));
   const settings = await import(pathToFileURL(join(fixtureDirectory, "js", "settings.js")));
+  const events = await import(pathToFileURL(join(fixtureDirectory, "js", "events.js")));
   settings.renderSettingsEditor({
+    storage: {
+      resume_dir: "/srv/swarmotter/resume",
+      state_dir: "/srv/swarmotter/state",
+      temp_dir: "/srv/swarmotter/scratch",
+      cow_strategy: "disable_for_new_files",
+    },
+    network: {
+      socks5: {
+        enabled: true,
+        host: "proxy.example",
+        port: 1081,
+        username: "operator",
+        password: "redacted-by-api",
+      },
+    },
+    torrent: { utp_enabled: false },
+    dht: { enabled: false },
     port_mapping: {
       enabled: true,
       protocols: ["upnp"],
@@ -208,6 +244,19 @@ try {
     },
   });
   const renderedMapping = settings.collectSettingsConfig().port_mapping;
+  assert.deepEqual(settings.collectSettingsConfig().storage, {
+    download_dir: null,
+    incomplete_dir: null,
+    resume_dir: "/srv/swarmotter/resume",
+    state_dir: "/srv/swarmotter/state",
+    temp_dir: "/srv/swarmotter/scratch",
+    minimum_free_space_bytes: 0,
+    minimum_free_space_percent: 0,
+    preallocate: false,
+    sparse: false,
+    cow_strategy: "disable_for_new_files",
+    root_controls: [],
+  }, "a full Settings save must retain storage placement and CoW strategy");
   assert.deepEqual(renderedMapping, {
     enabled: true,
     protocols: ["upnp"],
@@ -216,9 +265,34 @@ try {
     lease_seconds: 7200,
     refresh_before_expiry_seconds: 600,
   }, "a full Settings save must retain port-mapping configuration");
+  assert.deepEqual(settings.collectSettingsConfig().network.socks5, {
+    enabled: true,
+    host: "proxy.example",
+    port: 1081,
+    username: "operator",
+    password: null,
+  }, "a full Settings save must retain SOCKS5 settings without echoing a redacted password");
+
+  const socksToggle = elements.get("cfg-network-socks5-enabled");
+  elements.get("cfg-torrent-utp-enabled").checked = true;
+  elements.get("cfg-dht-enabled").checked = true;
+  socksToggle.checked = true;
+  for (const handler of socksToggle.listeners.get("change") || []) {
+    handler({ currentTarget: socksToggle });
+  }
+  assert.equal(elements.get("cfg-torrent-utp-enabled").checked, false,
+    "enabling SOCKS5 in the Settings UI disables unsupported uTP");
+  assert.equal(elements.get("cfg-dht-enabled").checked, false,
+    "enabling SOCKS5 in the Settings UI disables unsupported DHT");
+  await events.refreshNetwork();
+  assert.match(elements.get("network-summary").innerHTML, /SOCKS5 proxy/);
+  assert.match(elements.get("network-summary").innerHTML, /Enabled \(TCP only; UDP blocked\)/,
+    "Network diagnostics must expose SOCKS5 TCP-only mode without proxy details");
   process.off("unhandledRejection", recordUnhandledRejection);
   assert.deepEqual(apiCalls.sort(), [
     "/api/v1/doctor",
+    "/api/v1/network/diagnostics",
+    "/api/v1/network/health",
     "/api/v1/stats",
     "/api/v1/torrents/query",
   ]);

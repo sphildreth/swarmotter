@@ -357,8 +357,11 @@ impl<'a, B: NetworkBinder + ?Sized> ContainedHttpClient<'a, B> {
         let port = url.port_or_known_default().ok_or_else(|| {
             CoreError::InvalidArgument(format!("HTTP URL has no known port: {url}"))
         })?;
-        let address = self.binder.resolve_host(&host, port).await?;
-        let stream = self.binder.connect_peer(address).await?;
+        // Keep hostnames intact until the binder chooses its connection
+        // strategy. The ordinary contained binder resolves here through its
+        // default `connect_host` implementation; a SOCKS5 binder instead
+        // sends a domain-form CONNECT request so target DNS remains remote.
+        let stream = self.binder.connect_host(&host, port).await?;
 
         if url.scheme() == "https" {
             let connector = tokio_rustls::TlsConnector::from(self.tls_config.clone());

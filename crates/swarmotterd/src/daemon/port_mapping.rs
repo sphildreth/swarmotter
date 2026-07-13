@@ -277,7 +277,11 @@ impl DaemonRuntime {
         })
         .await;
 
-        let binder = self.make_binder().await;
+        // Router control must reach the local NAT-PMP/UPnP gateway on the
+        // selected contained interface. SOCKS5 CONNECT cannot express these
+        // UDP/multicast operations, so use the still-contained direct binder
+        // rather than treating it as a proxy fallback.
+        let binder = self.make_unproxied_contained_binder().await;
         if !binder.traffic_allowed() {
             self.set_port_mapping_status(blocked_mapping_status(&config))
                 .await;

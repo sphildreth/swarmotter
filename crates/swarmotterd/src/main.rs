@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
 
     let max_request_body_bytes = config.api.max_request_body_bytes;
     let broker = swarmotter_api::handlers::events::EventBroker::default();
-    let state_file = args.state_file.clone().unwrap_or_else(default_state_file);
+    let state_file = resolve_state_file(args.state_file.clone(), &config);
     let runtime = Arc::new(daemon::DaemonRuntime::with_paths_broker_and_state(
         config.clone(),
         health,
@@ -204,6 +204,23 @@ fn default_state_file() -> PathBuf {
     PathBuf::from("swarmotter-state.json")
 }
 
+/// Resolve durable state placement with deliberate precedence. A command-line
+/// or environment-supplied state file always wins; `storage.state_dir` is the
+/// configured default for the next daemon start; historical platform paths
+/// remain the compatibility fallback.
+fn resolve_state_file(explicit: Option<PathBuf>, config: &Config) -> PathBuf {
+    explicit
+        .or_else(|| {
+            config
+                .storage
+                .state_dir_path()
+                .ok()
+                .flatten()
+                .map(|directory| directory.join("state.json"))
+        })
+        .unwrap_or_else(default_state_file)
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -222,5 +239,24 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_state_file_wins_over_configured_state_directory() {
+        let mut config = Config::default();
+        config.storage.state_dir = Some("configured-state".into());
+        let explicit = PathBuf::from("explicit-state.json");
+        assert_eq!(
+            resolve_state_file(Some(explicit.clone()), &config),
+            explicit
+        );
+
+        let configured = resolve_state_file(None, &config);
+        assert!(configured.ends_with("configured-state/state.json"));
     }
 }

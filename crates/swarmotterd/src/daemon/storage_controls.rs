@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{Mutex, Notify};
 
 use swarmotter_core::bandwidth::{RateDirection, RateLimiter};
-use swarmotter_core::config::Config;
+use swarmotter_core::config::{lexical_absolute_path, Config};
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
-use swarmotter_core::storage::StorageIo;
+use swarmotter_core::storage::{StorageIo, StorageIoMetrics, StorageThroughput};
 
 use super::DaemonRuntime;
 
@@ -217,6 +217,39 @@ pub(super) struct StorageAdmissionController {
     reservations: Arc<Mutex<HashMap<InfoHash, StorageAdmissionReservation>>>,
     write_limiters: Arc<Mutex<HashMap<PathBuf, RateLimiter>>>,
     notify: Arc<Notify>,
+}
+
+/// Process-local actual-I/O accounting keyed by the same root boundary used
+/// for storage controls. It is intentionally separate from admission: metrics
+/// do not delay, reject, or alter any payload bytes.
+#[derive(Clone, Default)]
+pub(super) struct StorageMetricRegistry {
+    metrics: Arc<StdMutex<HashMap<PathBuf, StorageIoMetrics>>>,
+}
+
+impl StorageMetricRegistry {
+    pub(super) fn metrics_for_path(&self, config: &Config, path: &Path) -> StorageIoMetrics {
+        let root = metrics_root_for_path(config, path);
+        let mut metrics = lock_unpoisoned(&self.metrics);
+        metrics.entry(root).or_default().clone()
+    }
+
+    pub(super) fn throughput_for_path(&self, config: &Config, path: &Path) -> StorageThroughput {
+        let root = metrics_root_for_path(config, path);
+        lock_unpoisoned(&self.metrics)
+            .get(&root)
+            .map(StorageIoMetrics::throughput)
+            .unwrap_or_default()
+    }
+}
+
+fn metrics_root_for_path(config: &Config, path: &Path) -> PathBuf {
+    config
+        .storage
+        .root_control_for_path(path)
+        .and_then(|control| control.normalized_path().ok())
+        .or_else(|| lexical_absolute_path(path).ok())
+        .unwrap_or_else(|| path.to_path_buf())
 }
 
 impl StorageAdmissionController {

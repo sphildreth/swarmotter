@@ -3,12 +3,35 @@
 use super::*;
 
 impl DaemonRuntime {
-    pub(super) async fn make_binder(&self) -> Arc<dyn swarmotter_core::net::NetworkBinder> {
+    /// Build the base contained binder without a TCP proxy layer. This is
+    /// reserved for narrow local-router control operations (NAT-PMP/UPnP),
+    /// which must use the selected interface directly and cannot be expressed
+    /// through SOCKS5 CONNECT. It still has the exact same containment gate,
+    /// interface/source binding, and fail-closed behavior as the data plane.
+    pub(super) async fn make_unproxied_contained_binder(
+        &self,
+    ) -> Arc<dyn swarmotter_core::net::NetworkBinder> {
         let cfg = self.config.read().await.clone();
         Arc::new(
             ContainedBinder::new(cfg.network.clone(), self.interface_probe.clone())
                 .with_gate_and_health(self.containment_gate.clone(), self.health_report_tx.clone()),
         )
+    }
+
+    pub(super) async fn make_binder(&self) -> Arc<dyn swarmotter_core::net::NetworkBinder> {
+        let cfg = self.config.read().await.clone();
+        let contained: Arc<dyn swarmotter_core::net::NetworkBinder> = Arc::new(
+            ContainedBinder::new(cfg.network.clone(), self.interface_probe.clone())
+                .with_gate_and_health(self.containment_gate.clone(), self.health_report_tx.clone()),
+        );
+        if cfg.network.socks5.enabled {
+            Arc::new(swarmotter_core::net::Socks5Binder::new(
+                contained,
+                cfg.network.socks5.clone(),
+            ))
+        } else {
+            contained
+        }
     }
 
     /// Revalidate the concrete source/interface/listener bind operations before
@@ -21,12 +44,17 @@ impl DaemonRuntime {
             return Ok(());
         }
         let binder = ContainedBinder::new(config.network.clone(), self.interface_probe.clone());
-        let udp = binder.udp_socket().await.map_err(|error| {
-            CoreError::NetworkBlocked(format!(
-                "replacement containment UDP bind validation failed: {error}"
-            ))
-        })?;
-        drop(udp);
+        // SOCKS5 CONNECT has no UDP transport. Avoid even creating an
+        // otherwise-contained UDP validation socket in that mode so a repair
+        // check cannot be mistaken for an enabled direct UDP path.
+        if !config.network.socks5.enabled {
+            let udp = binder.udp_socket().await.map_err(|error| {
+                CoreError::NetworkBlocked(format!(
+                    "replacement containment UDP bind validation failed: {error}"
+                ))
+            })?;
+            drop(udp);
+        }
         let listener = binder
             .bind_peer_listener(config.torrent.listen_port)
             .await

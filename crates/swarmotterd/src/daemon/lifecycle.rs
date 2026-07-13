@@ -451,10 +451,16 @@ impl DaemonOps for DaemonRuntime {
         self.publish_event(stats_updated_event());
 
         // Run a real storage recheck on disk through the root-scoped executor.
-        let storage = swarmotter_core::storage::StorageIo::new(
+        let cfg = self.config.read().await.clone();
+        let metrics = self
+            .storage_metrics
+            .metrics_for_path(&cfg, Path::new(&storage_dir));
+        let storage = storage_io_with_config(
             torrent.meta.clone(),
             std::path::PathBuf::from(&storage_dir),
-        );
+            &cfg,
+        )
+        .with_metrics(Some(metrics));
         let cancellation = operation.cancellation();
         match self
             .recheck_storage_under_root_control(&storage, Some(&cancellation))
@@ -589,8 +595,7 @@ impl DaemonOps for DaemonRuntime {
             destination_active
         };
         let source_path = PathBuf::from(source);
-        let storage =
-            swarmotter_core::storage::StorageIo::new(torrent.meta.clone(), source_path.clone());
+        let storage = storage_io_with_config(torrent.meta.clone(), source_path.clone(), &cfg);
         let moved_storage = match storage.move_to(PathBuf::from(destination)).await {
             Ok(storage) => storage,
             Err(error) => {
@@ -676,15 +681,11 @@ impl DaemonOps for DaemonRuntime {
         } else {
             self.resolve_incomplete_dir_for(&torrent).await
         };
-        let old_storage = swarmotter_core::storage::StorageIo::new(
-            torrent.meta.clone(),
-            PathBuf::from(&storage_dir),
-        );
+        let old_storage =
+            storage_io_with_config(torrent.meta.clone(), PathBuf::from(&storage_dir), &cfg);
         let old_path = old_storage.file_path(file_index)?;
-        let new_storage = swarmotter_core::storage::StorageIo::new(
-            renamed_meta.clone(),
-            PathBuf::from(storage_dir),
-        );
+        let new_storage =
+            storage_io_with_config(renamed_meta.clone(), PathBuf::from(storage_dir), &cfg);
         let new_file_path = new_storage.file_path(file_index)?;
         if old_path == new_file_path {
             drop(storage_ownership);
@@ -740,18 +741,24 @@ impl DaemonOps for DaemonRuntime {
         // as profile replacement through the durable torrent-state write.
         let _config_transaction = self.config_write_lock.lock().await;
         let config = self.config.read().await.clone();
-        let previous = {
+        let (previous, mode_changed) = {
             let mut registry = self.registry.lock().await;
             let torrent = registry
                 .get_mut(hash)
                 .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
             let previous = torrent.clone();
+            let previous_mode = Self::effective_policy_with_config(&config, &previous)
+                .encryption_mode
+                .value;
             // Labels can select a profile. Snapshot before changing labels so
             // that selection can affect only live fields for existing data.
             Self::snapshot_initial_admission(&config, torrent);
             Self::snapshot_existing_storage(&config, torrent);
             torrent.labels = labels;
-            previous
+            let next_mode = Self::effective_policy_with_config(&config, torrent)
+                .encryption_mode
+                .value;
+            (previous, previous_mode != next_mode)
         };
         // Profile selection can change as a consequence of label updates.
         // Persist the record before applying its live queue, seeding, and
@@ -766,6 +773,10 @@ impl DaemonOps for DaemonRuntime {
         // torrents retain their resolved/snapshotted storage while these live
         // profile fields are re-evaluated.
         self.refresh_profile_runtime_fields().await;
+        if mode_changed {
+            self.restart_changed_encryption_policy_work(std::slice::from_ref(hash))
+                .await;
+        }
         self.schedule_reconcile_queue("torrent_labels_changed")
             .await;
         self.reconcile_seeders().await;
@@ -871,6 +882,15 @@ impl DaemonOps for DaemonRuntime {
 
     async fn set_torrent_profile(&self, hash: &InfoHash, profile: Option<String>) -> Result<()> {
         self.assign_torrent_profile(hash, profile).await
+    }
+
+    async fn set_torrent_encryption_mode(
+        &self,
+        hash: &InfoHash,
+        encryption_mode: Option<swarmotter_core::config::PeerEncryptionMode>,
+    ) -> Result<()> {
+        self.assign_torrent_encryption_mode(hash, encryption_mode)
+            .await
     }
 
     async fn list_files(&self, hash: &InfoHash) -> Option<Vec<TorrentFile>> {
@@ -1263,6 +1283,11 @@ impl DaemonOps for DaemonRuntime {
         if next.api.auth_token.is_none() {
             next.api.auth_token = previous.api.auth_token.clone();
         }
+        if next.network.socks5.password.is_none()
+            && next.network.socks5.username == previous.network.socks5.username
+        {
+            next.network.socks5.password = previous.network.socks5.password.clone();
+        }
         next.validate()?;
         // Compile the candidate before a config file write or live state
         // mutation. This turns a changed/deleted local blocklist into a
@@ -1303,6 +1328,12 @@ impl DaemonOps for DaemonRuntime {
             Self::prepare_legacy_policy_snapshot_migration(&previous, &next, &mut torrents);
         validate_explicit_profile_assignments(&next, &torrents)?;
         validate_storage_config_transition(&previous, &next, &torrents)?;
+        // A profile or label-map edit is a live encryption-policy update only
+        // for torrents whose resolved value changes. The global mode remains
+        // a full data-plane reconfiguration below, so do not rebuild those
+        // engines twice.
+        let encryption_mode_changes =
+            Self::effective_encryption_mode_changes(&previous, &next, &torrents);
 
         let peer_limits_changed = peer_limits_changed(&previous, &next);
         // A peer-policy replacement needs the same transactional lifecycle as
@@ -1476,6 +1507,10 @@ impl DaemonOps for DaemonRuntime {
                 }
             }
             self.apply_runtime_config_fields().await;
+            if !rebuild_data_plane {
+                self.restart_changed_encryption_policy_work(&encryption_mode_changes)
+                    .await;
+            }
         }
         self.notify_port_mapping_reconcile();
         self.publish_event(Event::new("settings_changed", json!({})));
@@ -1509,6 +1544,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn reset_downloads(&self) -> Result<ResetResult> {
+        let cfg = self.config.read().await.clone();
         let torrents: Vec<Torrent> = self
             .registry
             .lock()
@@ -1530,19 +1566,17 @@ impl DaemonOps for DaemonRuntime {
             let complete_dir = self.resolve_download_dir(torrent).await;
             let active_dir = self.resolve_incomplete_dir_for(torrent).await;
             for dir in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
-                let storage =
-                    swarmotter_core::storage::StorageIo::new(torrent.meta.clone(), dir.clone());
+                let storage = storage_io_with_config(torrent.meta.clone(), dir.clone(), &cfg);
                 storage.remove_all().await?;
                 push_display_path(&mut storage_paths, &dir);
             }
         }
 
-        let cfg = self.config.read().await.clone();
         let download_dir = cfg
             .storage
             .download_dir
             .clone()
-            .unwrap_or_else(default_download_dir_string);
+            .unwrap_or_else(|| default_download_dir_string(&cfg));
         let incomplete_dir = cfg
             .storage
             .incomplete_dir
@@ -1645,6 +1679,8 @@ impl DaemonOps for DaemonRuntime {
             utp_enabled: cfg.torrent.utp_enabled,
             utp_prefer_tcp: cfg.torrent.utp_prefer_tcp,
             peer_encryption_mode: cfg.torrent.encryption_mode,
+            socks5_enabled: cfg.network.socks5.enabled,
+            socks5_udp_blocked: cfg.network.socks5.enabled,
             interfaces,
             checks: vec![
                 NetworkPathCheck {
@@ -1700,6 +1736,16 @@ impl DaemonOps for DaemonRuntime {
                         cfg.torrent.encryption_mode.as_str()
                     ),
                 },
+                NetworkPathCheck {
+                    id: "socks5_proxy".into(),
+                    label: "SOCKS5 proxy transport".into(),
+                    level: DiagnosticLevel::Ok,
+                    detail: if cfg.network.socks5.enabled {
+                        "SOCKS5 TCP CONNECT is enabled; proxy DNS and connection use the contained path, target DNS is remote, and UDP tracker, DHT, and uTP are blocked".into()
+                    } else {
+                        "SOCKS5 TCP CONNECT is disabled".into()
+                    },
+                },
             ],
             containment_matrix: containment_matrix(&cfg, traffic_level),
         }
@@ -1720,6 +1766,22 @@ impl DaemonOps for DaemonRuntime {
                 path.display().to_string(),
                 StorageRootRole::Policy,
             );
+        }
+        if let Some(path) = cfg.storage.resume_dir.as_ref() {
+            add_storage_root_role(&mut roots, path.clone(), StorageRootRole::Resume);
+        }
+        if let Some(path) = cfg.storage.temp_dir.as_ref() {
+            add_storage_root_role(&mut roots, path.clone(), StorageRootRole::Temporary);
+        }
+        if let Some(path) = self.state_path.as_ref().and_then(|path| path.parent()) {
+            add_storage_root_role(
+                &mut roots,
+                path.display().to_string(),
+                StorageRootRole::State,
+            );
+        }
+        if let Some(path) = self.log_file_path.as_ref().and_then(|path| path.parent()) {
+            add_storage_root_role(&mut roots, path.display().to_string(), StorageRootRole::Log);
         }
         let admission_records = self.storage_admissions.records().await;
         let active_rechecks = self.storage_rechecks.active_counts();
@@ -1808,6 +1870,9 @@ impl DaemonOps for DaemonRuntime {
                     .and_then(|path| active_rechecks.get(path))
                     .copied()
                     .unwrap_or(0);
+                let throughput = self
+                    .storage_metrics
+                    .throughput_for_path(&cfg, Path::new(&path));
                 swarmotter_core::storage::inspect_storage_root(
                     Path::new(&path),
                     acc.roles,
@@ -1823,7 +1888,10 @@ impl DaemonOps for DaemonRuntime {
                         active_write_rate: controlled_usage
                             .map(|usage| usage.2)
                             .unwrap_or(acc.active_write_rate),
-                        active_recheck_rate: Some(0),
+                        active_recheck_rate: Some(throughput.verification_bytes_per_second),
+                        sustained_write_bytes_per_second: throughput.write_bytes_per_second,
+                        sustained_verification_bytes_per_second: throughput
+                            .verification_bytes_per_second,
                         active_rechecks,
                     },
                 )

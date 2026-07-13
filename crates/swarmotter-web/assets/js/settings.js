@@ -106,6 +106,7 @@ export function renderSettingsEditor(cfg) {
   const autopilot = cfg.autopilot || {};
   const storage = cfg.storage || {};
   const network = cfg.network || {};
+  const socks5 = network.socks5 || {};
   const portMapping = cfg.port_mapping || {};
   const portTest = cfg.port_test || {};
   const torrent = cfg.torrent || {};
@@ -130,8 +131,12 @@ export function renderSettingsEditor(cfg) {
 
   setSettingsValue("cfg-storage-download-dir", storage.download_dir);
   setSettingsValue("cfg-storage-incomplete-dir", storage.incomplete_dir);
+  setSettingsValue("cfg-storage-resume-dir", storage.resume_dir);
+  setSettingsValue("cfg-storage-state-dir", storage.state_dir);
+  setSettingsValue("cfg-storage-temp-dir", storage.temp_dir);
   setSettingsValue("cfg-storage-minimum-free-space-bytes", storage.minimum_free_space_bytes);
   setSettingsValue("cfg-storage-minimum-free-space-percent", storage.minimum_free_space_percent);
+  setSettingsValue("cfg-storage-cow-strategy", storage.cow_strategy || "conservative");
   setSettingsChecked("cfg-storage-preallocate", storage.preallocate);
   setSettingsChecked("cfg-storage-sparse", storage.sparse);
   renderStorageRootControlEditors(storage.root_controls || []);
@@ -145,6 +150,14 @@ export function renderSettingsEditor(cfg) {
   setSettingsChecked("cfg-network-fail-closed", network.fail_closed);
   setSettingsChecked("cfg-network-validate-route", network.validate_route);
   setSettingsChecked("cfg-network-validate-dns", network.validate_dns);
+  setSettingsChecked("cfg-network-socks5-enabled", socks5.enabled);
+  setSettingsValue("cfg-network-socks5-host", socks5.host);
+  setSettingsValue("cfg-network-socks5-port", socks5.port ?? 1080);
+  setSettingsValue("cfg-network-socks5-username", socks5.username);
+  // Passwords are intentionally redacted by the API and must never be
+  // echoed back into the DOM. A blank value preserves an unchanged username's
+  // credential during a full settings replacement.
+  setSettingsValue("cfg-network-socks5-password", "");
 
   const mappingProtocols = Array.isArray(portMapping.protocols)
     ? portMapping.protocols
@@ -362,10 +375,14 @@ export function collectSettingsConfig() {
     storage: {
       download_dir: settingsOptionalString("cfg-storage-download-dir"),
       incomplete_dir: settingsOptionalString("cfg-storage-incomplete-dir"),
+      resume_dir: settingsOptionalString("cfg-storage-resume-dir"),
+      state_dir: settingsOptionalString("cfg-storage-state-dir"),
+      temp_dir: settingsOptionalString("cfg-storage-temp-dir"),
       minimum_free_space_bytes: settingsInteger("cfg-storage-minimum-free-space-bytes", 0),
       minimum_free_space_percent: settingsInteger("cfg-storage-minimum-free-space-percent", 0),
       preallocate: settingsField("cfg-storage-preallocate").checked,
       sparse: settingsField("cfg-storage-sparse").checked,
+      cow_strategy: settingsString("cfg-storage-cow-strategy"),
       root_controls: collectStorageRootControlEditors(),
     },
     network: {
@@ -378,6 +395,13 @@ export function collectSettingsConfig() {
       fail_closed: settingsField("cfg-network-fail-closed").checked,
       validate_route: settingsField("cfg-network-validate-route").checked,
       validate_dns: settingsField("cfg-network-validate-dns").checked,
+      socks5: {
+        enabled: settingsField("cfg-network-socks5-enabled").checked,
+        host: settingsOptionalString("cfg-network-socks5-host"),
+        port: settingsInteger("cfg-network-socks5-port", 1080),
+        username: settingsOptionalString("cfg-network-socks5-username"),
+        password: settingsOptionalString("cfg-network-socks5-password"),
+      },
     },
     port_test: {
       enabled: settingsField("cfg-port-test-enabled").checked,
@@ -731,6 +755,15 @@ $("#settings-storage-root-controls").addEventListener("click", (event) => {
   if ($$("#settings-storage-root-controls .storage-root-control-editor").length === 0) {
     renderStorageRootControlEditors([]);
   }
+});
+
+$("#cfg-network-socks5-enabled")?.addEventListener("change", (event) => {
+  if (!event.currentTarget.checked) return;
+  // SOCKS5 support is deliberately TCP CONNECT only. Mirror the server-side
+  // configuration validation here so an operator does not accidentally leave
+  // uTP or DHT enabled and expect UDP to follow the proxy.
+  setSettingsChecked("cfg-torrent-utp-enabled", false);
+  setSettingsChecked("cfg-dht-enabled", false);
 });
 
 $("#save-toast-btn").addEventListener("click", () => {

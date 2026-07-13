@@ -122,6 +122,7 @@ impl DaemonRuntime {
             state_write_lock: Arc::new(Mutex::new(())),
             storage_ownership_lock: Arc::new(Mutex::new(())),
             storage_admissions: StorageAdmissionController::default(),
+            storage_metrics: StorageMetricRegistry::default(),
             storage_rechecks: StorageRecheckController::default(),
             engine_storage_cancellations: Arc::new(Mutex::new(HashMap::new())),
             explicit_rechecks: Arc::new(Mutex::new(HashMap::new())),

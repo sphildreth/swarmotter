@@ -236,6 +236,7 @@ Strict fail-closed network blocking can still put the new torrent in
 | --- | --- | --- |
 | GET | `/profiles` | Return the complete `{ profiles, labels }` configuration section. |
 | PUT | `/profiles` | Replace the complete `{ profiles, labels }` section after validation. |
+| PUT | `/torrents/:hash/encryption-mode` | Set a durable per-torrent peer-wire encryption override: `{ "encryption_mode": "disabled" \| "preferred" \| "required" }`; `{ "encryption_mode": null }` clears it. |
 
 Add requests may include `profile` and `labels`; labels are applied before
 resolution so a label mapping can select a profile. Bulk add accepts the same
@@ -244,7 +245,8 @@ profile is rejected. Compatibility adapters likewise attach their category or
 labels before registration.
 
 `GET /torrents/:hash/policy` returns the selected profile plus each effective
-storage, queue, seeding, and bandwidth value with a machine-readable source:
+storage, queue, seeding, bandwidth, and peer-encryption value with a
+machine-readable source:
 `global`, `profile`, `label`, `torrent`, `legacy_torrent`,
 `profile_storage_snapshot`, `registration_storage_snapshot`,
 `existing_storage_snapshot`, or `initial_admission_snapshot`. This lets
@@ -253,6 +255,8 @@ rules. `registration_storage_snapshot` means the resolved storage choice was
 fixed when the torrent was registered; `initial_admission_snapshot` means the
 one-time start-or-paused decision was captured for that torrent, so later
 profile, label, or global edits do not retroactively change its admission.
+The encryption override endpoint requires the `encryption_mode` key: omitting
+it is rejected, while explicit JSON `null` restores normal inheritance.
 
 Resolved storage is captured at registration, including a global/no-profile
 result. Assigning or clearing a profile, or changing labels later, preserves
@@ -421,21 +425,27 @@ successful replacement. It also reports any fail-closed loading detail.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/settings` | Get configuration with API auth token redacted. |
+| GET | `/settings` | Get configuration with API auth token and SOCKS5 password redacted. |
 | PATCH | `/settings` | Update live-safe runtime settings. |
 | PUT | `/settings` | Replace full configuration atomically after validation. |
 
 `PATCH /settings` updates live-safe bandwidth, queue, and seeding fields.
 
-`PUT /settings` includes `torrent.encryption_mode` and
-`[torrent].encryption_mode` values:
+`PUT /settings` accepts `[torrent].encryption_mode` with these values:
 
 - `disabled`
 - `preferred` (default)
 - `required`
 
-Changing this field is reported in `restart_required_fields` for already-running
-torrent tasks.
+The global mode applies MSE/PE to contained TCP and uTP peer streams. In
+`preferred` mode, failed negotiation may retry plaintext only on the same
+selected contained transport; `required` never retries plaintext. Changing the
+global field live-rebuilds existing data-plane tasks and does not require a
+process restart. A named profile may set `encryption_mode`, and the per-torrent
+endpoint overrides it durably. Profile or label-map changes restart only active
+download/metadata engines whose resolved mode changes after persistence. Future
+inbound TCP seeding sessions use the refreshed mode; existing negotiated
+sessions retain their established wire stream.
 
 Named profiles are part of the full settings configuration under `profiles`;
 the dedicated `/profiles` endpoints are preferred when only that section needs
@@ -443,7 +453,9 @@ to change.
 
 `PUT /settings` validates the full config before persistence, preserves the
 existing `api.auth_token` when omitted, applies live-safe fields immediately,
-and reports fields that require restart.
+and reports fields that require restart. It also preserves a redacted
+`network.socks5.password` only when the submitted SOCKS5 username is unchanged;
+clearing or changing the username requires a complete new credential pair.
 
 ## Network
 
@@ -456,7 +468,9 @@ and reports fields that require restart.
 | GET | `/network/diagnostics` | Detailed network/path diagnostics. |
 
 `/network/diagnostics` includes transport settings such as `utp_enabled`,
-`utp_prefer_tcp`, and `peer_encryption_mode`. See
+`utp_prefer_tcp`, `peer_encryption_mode`, `socks5_enabled`, and
+`socks5_udp_blocked`. SOCKS diagnostics reveal neither proxy host nor
+credentials. See
 [Network Containment](network-containment.md) for health state meanings.
 
 The `port_test` object returned by `/network/health` is informational and
@@ -478,7 +492,7 @@ unavailable status if the contained path or router cannot complete the request.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/storage/roots` | Return diagnostics for configured storage roots, including free space, active local work, and root controls. |
+| GET | `/storage/roots` | Return diagnostics for configured and state-placement roots, including free space, mount data, actual local I/O, and root controls. |
 
 The storage diagnostics response currently includes per-root identity and space
 data needed by operators and automation. Typical fields include:
@@ -493,6 +507,9 @@ data needed by operators and automation. Typical fields include:
       "is_directory": true,
       "writable": true,
       "filesystem_type": "ext",
+      "mount_point": "/mnt/media",
+      "mount_options": ["rw", "relatime"],
+      "mount_source": "/dev/sdb1",
       "total_space_bytes": 1024,
       "free_space_bytes": 128,
       "available_space_bytes": 120,
@@ -503,6 +520,10 @@ data needed by operators and automation. Typical fields include:
       "active_bytes": 67108864,
       "active_write_rate": 1048576,
       "active_recheck_rate": 0,
+      "sustained_write_bytes_per_second": 1048576,
+      "sustained_verification_bytes_per_second": 524288,
+      "cow_strategy": "conservative",
+      "cow_strategy_supported": true,
       "active_rechecks": 0,
       "root_control_path": "/mnt/media",
       "max_active_downloads": 2,
@@ -522,6 +543,14 @@ data needed by operators and automation. Typical fields include:
 engines, not free space consumed on the filesystem. A limit value of `0` means
 unlimited. `root_control_path` is `null` when no `[[storage.root_controls]]`
 entry applies; nested controls resolve to the most-specific lexical root.
+`sustained_write_bytes_per_second` and
+`sustained_verification_bytes_per_second` are observed local storage I/O, not
+peer transfer rates; verification excludes ordinary seeding reads. Mount fields
+are best-effort and may be `null` in restricted containers or on platforms that
+do not expose compatible mount metadata. Roles also identify configured
+resume/state/temporary/log placement roots. `cow_strategy_supported` is `null`
+when the host cannot determine support safely; an explicit unsupported NOCOW
+request fails before payload bytes are written.
 
 ## Watch folders
 

@@ -29,6 +29,7 @@ export async function refreshNetwork() {
         ["Listen-port reachability", portTestStateLabel(portTest)],
         ["DHT port", d.dht_port],
         ["Peer transports", `${d.utp_enabled ? "TCP + uTP" : "TCP only"} (${d.utp_prefer_tcp ? "TCP first" : "uTP first"})`],
+        ["SOCKS5 proxy", d.socks5_enabled ? "Enabled (TCP only; UDP blocked)" : "Disabled"],
       ])}
       <p class="muted">${escapeHtml(h.detail || "")}</p>`;
     $("#network-health").innerHTML = `<h3>Health payload</h3><pre class="health-payload">${escapeHtml(JSON.stringify(h, null, 2))}</pre>`;
@@ -448,6 +449,14 @@ export function renderDoctorStorageRoots(storageRoots = {}) {
       `rechecks ${limit(root.max_concurrent_rechecks, fmtCount)}`,
     ].join("; ") : "none";
     const warnings = renderStorageRootWarnings(root);
+    const mountOptions = Array.isArray(root.mount_options) ? root.mount_options.join(",") : "";
+    const filesystem = [root.filesystem_type, root.mount_point, mountOptions, root.mount_source]
+      .filter(Boolean)
+      .join("; ");
+    const observedRates = `${fmtRate(root.sustained_write_bytes_per_second)} / ${fmtRate(root.sustained_verification_bytes_per_second)}`;
+    const cowSupport = root.cow_strategy_supported === true ? "supported"
+      : root.cow_strategy_supported === false ? "unsupported" : "unknown";
+    const cow = `${root.cow_strategy || "conservative"}; ${cowSupport}`;
     const status = [
       root.exists ? "exists" : "missing",
       root.is_directory ? "dir" : "file",
@@ -458,14 +467,15 @@ export function renderDoctorStorageRoots(storageRoots = {}) {
         <td>${escapeHtml(root.path || "")}</td>
         <td>${escapeHtml(roles || "")}</td>
         <td>${escapeHtml(status)}</td>
-        <td>${escapeHtml(root.filesystem_type || "")}</td>
+        <td>${escapeHtml(filesystem)}</td>
         <td>${escapeHtml(total ? `${total}` : "")}</td>
         <td>free ${escapeHtml(free)}</td>
         <td>${escapeHtml(required || "")}</td>
         <td>${renderStatus(root.reserve_satisfied ? "ok" : "warning")}</td>
         <td>${fmtCount(root.torrent_count)}</td>
         <td>${escapeHtml(activeWork)}</td>
-        <td>${fmtRate(root.active_write_rate)} / ${fmtRate(root.active_recheck_rate)}</td>
+        <td>${escapeHtml(observedRates)}</td>
+        <td>${escapeHtml(cow)}</td>
         <td>${fmtCount(root.active_rechecks)}</td>
         <td>${escapeHtml(controls)}</td>
         <td>${warnings || ""}</td>
@@ -480,14 +490,15 @@ export function renderDoctorStorageRoots(storageRoots = {}) {
           <th>Path</th>
           <th>Roles</th>
           <th>State</th>
-          <th>Filesystem</th>
+          <th>Filesystem / mount</th>
           <th>Total</th>
           <th>Free / Available</th>
           <th>Required free</th>
           <th>Reserve</th>
           <th>Torrents</th>
           <th>Active / Declared</th>
-          <th>Rates</th>
+          <th>Observed write / verify</th>
+          <th>CoW strategy</th>
           <th>Rechecks</th>
           <th>Root controls</th>
           <th>Warnings</th>

@@ -82,8 +82,9 @@ Socket/source/listener bind errors block the gate synchronously before their
 health report is processed. `socket_bind_failed` and generic
 `blocked_fail_closed` reports are latched: a later healthy interface probe is
 insufficient to reopen traffic. Only an explicit full configuration replacement
-that validates an ephemeral contained UDP bind and peer-listener bind may clear
-the latch. Failed validation preserves the old configuration and blocked state.
+that validates the peer-listener bind and, outside SOCKS5 TCP-only mode, an
+ephemeral contained UDP bind may clear the latch. Failed validation preserves
+the old configuration and blocked state.
 
 ## Network health states
 
@@ -104,10 +105,12 @@ Required states include `healthy`, `disabled`, `interface_missing`,
   leaves `/health` reachable.
 - Peer, tracker, DHT, and webseed traffic cannot fall back to the default
   route.
-- Hostname resolution for tracker, UDP tracker, DHT, and other torrent
+- Hostname resolution for proxy, tracker, UDP tracker, DHT, and other torrent
   data-plane operations goes through the `NetworkBinder` after containment is
-  enforced. DNS behavior is either constrained by the current network path or
-  blocked in strict fail-closed mode.
+  enforced. With SOCKS5 enabled, the proxy hostname still uses that contained
+  resolution path while TCP target hostnames are sent as SOCKS remote-DNS
+  domain requests. DNS behavior is otherwise constrained by the current network
+  path or blocked in strict fail-closed mode.
 - API/Web UI traffic remains independently configurable.
 
 ## Binding abstraction
@@ -126,6 +129,15 @@ Hostname resolution remains fail-closed: on Linux, interface-bound mode allows
 DNS only when the OS probe can tie DNS to the configured interface, such as
 systemd-resolved link DNS from `resolvectl dns br0`, or when static resolver
 routes go through the required interface.
+
+`NetworkBinder::connect_host()` preserves a TCP target hostname until the
+binder chooses its connection strategy. When `[network.socks5]` is enabled,
+`Socks5Binder` wraps the contained binder: the inner binder resolves and opens
+the sole TCP connection to the proxy, then the wrapper issues SOCKS5 `CONNECT`.
+HTTP(S) tracker, scrape, and webseed hostnames use the SOCKS domain form for
+remote target DNS, while known peer IP addresses use SOCKS IP-address forms.
+Neither proxy lookup nor proxy failure can create a raw/default-route socket or
+a direct target retry.
 
 Tracker announce and supported HTTP/HTTPS scrape, plus webseed range GETs, use
 `ContainedHttpClient` through the same binder. Every redirect repeats contained
@@ -146,6 +158,15 @@ TCP listeners to the configured interface/source path. A `LoopbackBinder`
 (test feature) lets integration tests exercise the full engine over loopback
 without the default route, and a `BlockedBinder` proves fail-closed behavior
 for TCP, UDP, uTP, and the listener. See ADR-0012, ADR-0022, and ADR-0023.
+
+SOCKS5 support is deliberately TCP `CONNECT` only (ADR-0062). Configuration
+validation requires DHT and uTP to be disabled when it is enabled. The wrapper
+rejects every UDP socket and direct target-resolution request, so a UDP tracker
+attempt is blocked rather than sent directly; SOCKS5 UDP ASSOCIATE is not an
+implemented fallback. SOCKS5 does not supply inbound forwarding, so peer
+listeners remain separately bound to the configured contained path. NAT-PMP and
+UPnP router control likewise uses an unproxied but still contained binder for
+local multicast/gateway traffic; it is not a torrent-data fallback.
 
 The CI acceptance harness
 `scripts/test-network-containment-transition.sh` creates PID-qualified daemon

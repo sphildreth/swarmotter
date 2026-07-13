@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use swarmotter_core::autopilot::{AutopilotAnalyzer, AutopilotConfig, AutopilotMode};
-use swarmotter_core::config::{Config, StartBehavior};
+use swarmotter_core::config::{Config, PeerEncryptionMode, StartBehavior};
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
 use swarmotter_core::magnet::Magnet;
@@ -622,6 +622,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         *self.config.lock().await = config.clone();
         let mut redacted = config;
         redacted.api.auth_token = None;
+        redacted.network.socks5.password = None;
         Ok(ConfigUpdateResult {
             persisted: false,
             config_path: None,
@@ -677,6 +678,18 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             .map(|_| PolicyProfileOrigin::Torrent);
         Ok(())
     }
+    async fn set_torrent_encryption_mode(
+        &self,
+        hash: &InfoHash,
+        encryption_mode: Option<PeerEncryptionMode>,
+    ) -> Result<()> {
+        let mut registry = self.registry.lock().await;
+        let torrent = registry
+            .get_mut(hash)
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+        torrent.policy.overrides.encryption_mode = encryption_mode;
+        Ok(())
+    }
     async fn reset_downloads(&self) -> Result<ResetResult> {
         let removed = self.registry.lock().await.torrents.len();
         self.registry.lock().await.torrents.clear();
@@ -701,6 +714,8 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             utp_enabled: cfg.torrent.utp_enabled,
             utp_prefer_tcp: cfg.torrent.utp_prefer_tcp,
             peer_encryption_mode: cfg.torrent.encryption_mode,
+            socks5_enabled: cfg.network.socks5.enabled,
+            socks5_udp_blocked: cfg.network.socks5.enabled,
             interfaces: vec![NetworkInterfaceDiagnostic {
                 name: "lo".into(),
                 status: "up".into(),

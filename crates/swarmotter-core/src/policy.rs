@@ -6,7 +6,7 @@
 //! apply live settings safely while API and Web UI callers can show the value
 //! and layer that supplied it.
 
-use crate::config::{Config, StartBehavior};
+use crate::config::{Config, PeerEncryptionMode, StartBehavior};
 use crate::torrent::Torrent;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,6 +36,12 @@ pub struct PolicyProfile {
     pub seeding: PolicySeeding,
     #[serde(default)]
     pub bandwidth: PolicyBandwidth,
+    /// Optional peer-wire encryption policy. When omitted, torrents assigned
+    /// to this profile inherit the global `torrent.encryption_mode` setting.
+    /// This is a live transport policy: it does not affect storage placement
+    /// or the immutable creation-time policy snapshot.
+    #[serde(default)]
+    pub encryption_mode: Option<PeerEncryptionMode>,
 }
 
 /// Storage values selected at torrent creation.
@@ -157,6 +163,11 @@ pub struct TorrentPolicyOverrides {
     pub download_limit: Option<u64>,
     #[serde(default)]
     pub upload_limit: Option<u64>,
+    /// Explicit peer-wire encryption mode for this torrent. `None` retains
+    /// deterministic profile/label/global inheritance; a set value is
+    /// durably retained across daemon restarts.
+    #[serde(default)]
+    pub encryption_mode: Option<PeerEncryptionMode>,
 }
 
 /// Durable policy attachment for one torrent.
@@ -231,6 +242,9 @@ pub struct EffectiveTorrentPolicy {
     pub seed_forever: EffectivePolicyValue<bool>,
     pub download_limit: EffectivePolicyValue<u64>,
     pub upload_limit: EffectivePolicyValue<u64>,
+    /// Effective peer-wire encryption mode. This applies MSE/PE over both
+    /// contained TCP and contained uTP byte streams.
+    pub encryption_mode: EffectivePolicyValue<PeerEncryptionMode>,
     /// Profile fields that update existing inheriting torrents immediately.
     /// Start behavior is intentionally omitted: it controls admission when a
     /// torrent is created, and changing it never stops running work.
@@ -382,9 +396,15 @@ impl EffectiveTorrentPolicy {
                 None,
                 profile_value.and_then(|value| value.bandwidth.upload_limit),
                 0,
-                profile_source,
+                profile_source.clone(),
             )
         };
+        let encryption_mode = resolve_value(
+            torrent.policy.overrides.encryption_mode,
+            profile_value.and_then(|value| value.encryption_mode),
+            config.torrent.encryption_mode,
+            profile_source.clone(),
+        );
 
         Self {
             profile,
@@ -397,6 +417,7 @@ impl EffectiveTorrentPolicy {
             seed_forever,
             download_limit,
             upload_limit,
+            encryption_mode,
             live_inheritance_fields: vec![
                 "queue_priority",
                 "ratio_limit",
@@ -404,6 +425,7 @@ impl EffectiveTorrentPolicy {
                 "seed_forever",
                 "download_limit",
                 "upload_limit",
+                "encryption_mode",
             ],
             create_time_snapshot_fields: vec!["download_dir", "incomplete_dir", "start_behavior"],
         }
@@ -636,6 +658,7 @@ mod tests {
                     download_limit: Some(1_000),
                     upload_limit: Some(2_000),
                 },
+                encryption_mode: Some(PeerEncryptionMode::Required),
             },
         );
         config
@@ -659,6 +682,14 @@ mod tests {
         assert_eq!(effective.queue_priority.value, QueuePriority::High);
         assert_eq!(effective.ratio_limit.value, Some(3.0));
         assert_eq!(effective.download_limit.value, 1_000);
+        assert_eq!(
+            effective.encryption_mode.value,
+            PeerEncryptionMode::Required
+        );
+        assert!(matches!(
+            effective.encryption_mode.source,
+            PolicyValueSource::Label { .. }
+        ));
     }
 
     #[test]
@@ -679,6 +710,54 @@ mod tests {
         assert!(matches!(
             effective.download_limit.source,
             PolicyValueSource::Torrent
+        ));
+    }
+
+    #[test]
+    fn torrent_encryption_override_beats_profile_and_global() {
+        let mut config = config();
+        config.torrent.encryption_mode = PeerEncryptionMode::Disabled;
+        let mut torrent = torrent();
+        torrent.labels = vec!["linux".into()];
+        torrent.policy.overrides.encryption_mode = Some(PeerEncryptionMode::Preferred);
+
+        let effective = EffectiveTorrentPolicy::resolve(&config, &torrent);
+
+        assert_eq!(
+            effective.encryption_mode.value,
+            PeerEncryptionMode::Preferred
+        );
+        assert!(matches!(
+            effective.encryption_mode.source,
+            PolicyValueSource::Torrent
+        ));
+        assert!(effective
+            .live_inheritance_fields
+            .contains(&"encryption_mode"));
+    }
+
+    #[test]
+    fn encryption_mode_falls_back_to_global_when_profile_omits_it() {
+        let mut config = config();
+        config.torrent.encryption_mode = PeerEncryptionMode::Required;
+        config
+            .profiles
+            .profiles
+            .get_mut("linux")
+            .unwrap()
+            .encryption_mode = None;
+        let mut torrent = torrent();
+        torrent.labels = vec!["linux".into()];
+
+        let effective = EffectiveTorrentPolicy::resolve(&config, &torrent);
+
+        assert_eq!(
+            effective.encryption_mode.value,
+            PeerEncryptionMode::Required
+        );
+        assert!(matches!(
+            effective.encryption_mode.source,
+            PolicyValueSource::Global
         ));
     }
 

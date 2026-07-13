@@ -404,6 +404,165 @@ async fn profile_assignment_preserves_existing_storage_and_rolls_back_on_persist
     std::fs::remove_dir_all(root).ok();
 }
 
+#[test]
+fn profile_encryption_mode_changes_only_select_affected_effective_torrents() {
+    use swarmotter_core::config::PeerEncryptionMode;
+    use swarmotter_core::policy::{PolicyBandwidth, PolicyProfile};
+
+    let mut previous = Config::default();
+    previous.torrent.encryption_mode = PeerEncryptionMode::Preferred;
+    previous.profiles.profiles.insert(
+        "encrypted".into(),
+        PolicyProfile {
+            encryption_mode: Some(PeerEncryptionMode::Required),
+            ..Default::default()
+        },
+    );
+    previous
+        .profiles
+        .labels
+        .insert("encrypted".into(), "encrypted".into());
+
+    let make_torrent = |name: &str| {
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            name,
+            b"generated encryption policy fixture",
+            8,
+            None,
+            false,
+        );
+        Torrent::new(swarmotter_core::meta::parse_torrent(&bytes).unwrap(), now())
+    };
+    let mut inherited = make_torrent("inherited-encryption.bin");
+    inherited.labels = vec!["encrypted".into()];
+    let unchanged = make_torrent("global-encryption.bin");
+    let mut explicit = make_torrent("explicit-encryption.bin");
+    explicit.labels = vec!["encrypted".into()];
+    explicit.policy.overrides.encryption_mode = Some(PeerEncryptionMode::Disabled);
+    let torrents = vec![inherited.clone(), unchanged, explicit];
+
+    let mut bandwidth_only = previous.clone();
+    bandwidth_only
+        .profiles
+        .profiles
+        .get_mut("encrypted")
+        .unwrap()
+        .bandwidth = PolicyBandwidth {
+        download_limit: Some(123),
+        upload_limit: None,
+    };
+    assert!(DaemonRuntime::effective_encryption_mode_changes(
+        &previous,
+        &bandwidth_only,
+        &torrents,
+    )
+    .is_empty());
+
+    let mut next = previous.clone();
+    next.profiles
+        .profiles
+        .get_mut("encrypted")
+        .unwrap()
+        .encryption_mode = Some(PeerEncryptionMode::Preferred);
+    assert_eq!(
+        DaemonRuntime::effective_encryption_mode_changes(&previous, &next, &torrents),
+        vec![inherited.info_hash()],
+    );
+}
+
+#[tokio::test]
+async fn torrent_encryption_override_is_durable_and_rolls_back_with_state_write_failure() {
+    use swarmotter_core::config::PeerEncryptionMode;
+    use swarmotter_core::policy::PolicyProfile;
+
+    let root = unique_dir("torrent-encryption-override");
+    let state_path = root.join("state.json");
+    let mut config = Config::default();
+    config.network.mode = NetworkContainmentMode::Disabled;
+    config.profiles.profiles.insert(
+        "encrypted".into(),
+        PolicyProfile {
+            encryption_mode: Some(PeerEncryptionMode::Required),
+            ..Default::default()
+        },
+    );
+    config
+        .profiles
+        .labels
+        .insert("encrypted".into(), "encrypted".into());
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        config.clone(),
+        disabled_health(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let meta =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "durable-encryption-override.bin",
+            b"generated durable encryption override fixture",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let hash = meta.info_hash;
+    let mut torrent = Torrent::new(meta, now());
+    torrent.state = TorrentState::Paused;
+    torrent.labels = vec!["encrypted".into()];
+    runtime.registry.lock().await.add(torrent).unwrap();
+    runtime.queue.lock().await.add(hash);
+
+    runtime
+        .assign_torrent_encryption_mode(&hash, Some(PeerEncryptionMode::Disabled))
+        .await
+        .unwrap();
+    let persisted = crate::state_store::load(&state_path).unwrap().unwrap();
+    assert_eq!(
+        persisted.torrents[0].policy.overrides.encryption_mode,
+        Some(PeerEncryptionMode::Disabled)
+    );
+
+    drop(runtime);
+    let restored = DaemonRuntime::with_paths_broker_and_state(
+        config,
+        disabled_health(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    assert_eq!(restored.restore_persisted_state().await.unwrap(), 1);
+    let restored_torrent = restored.registry.lock().await.get(&hash).cloned().unwrap();
+    assert_eq!(
+        restored_torrent.policy.overrides.encryption_mode,
+        Some(PeerEncryptionMode::Disabled)
+    );
+
+    // A failed durable write must restore the old override before any
+    // effective policy or live session is changed.
+    std::fs::remove_file(&state_path).unwrap();
+    std::fs::create_dir_all(&state_path).unwrap();
+    assert!(restored
+        .assign_torrent_encryption_mode(&hash, Some(PeerEncryptionMode::Preferred))
+        .await
+        .is_err());
+    assert_eq!(
+        restored
+            .registry
+            .lock()
+            .await
+            .get(&hash)
+            .unwrap()
+            .policy
+            .overrides
+            .encryption_mode,
+        Some(PeerEncryptionMode::Disabled)
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
 #[tokio::test]
 async fn profile_replacement_migrates_legacy_label_storage_and_initial_admission() {
     use swarmotter_core::config::StartBehavior;
@@ -6621,6 +6780,16 @@ fn encryption_mode_change_rebuilds_data_plane_without_process_restart() {
 }
 
 #[test]
+fn cow_strategy_change_rebuilds_data_plane_without_process_restart() {
+    let previous = Config::default();
+    let mut next = previous.clone();
+    next.storage.cow_strategy = swarmotter_core::config::CowStrategy::DisableForNewFiles;
+
+    assert!(data_plane_config_changed(&previous, &next));
+    assert!(restart_required_fields(&previous, &next).is_empty());
+}
+
+#[test]
 fn storage_root_changes_reject_torrents_that_still_depend_on_old_roots() {
     let bytes = swarmotter_core::meta::build_single_file_torrent(
         "storage-transition.bin",
@@ -6638,6 +6807,70 @@ fn storage_root_changes_reject_torrents_that_still_depend_on_old_roots() {
         validate_storage_config_transition(&previous, &next, &[torrent]),
         Err(CoreError::InvalidConfig(_))
     ));
+}
+
+#[test]
+fn storage_resume_and_fallback_root_changes_preserve_existing_torrent_placement() {
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "storage-resume-transition.bin",
+        b"storage resume transition payload",
+        8,
+        None,
+        false,
+    );
+    let torrent = Torrent::new(swarmotter_core::meta::parse_torrent(&bytes).unwrap(), 1);
+    let previous = Config::default();
+
+    let mut changed_resume = previous.clone();
+    changed_resume.storage.resume_dir = Some("/tmp/swarmotter-new-resume".into());
+    assert!(matches!(
+        validate_storage_config_transition(
+            &previous,
+            &changed_resume,
+            std::slice::from_ref(&torrent),
+        ),
+        Err(CoreError::InvalidConfig(message)) if message.contains("storage.resume_dir")
+    ));
+
+    let mut changed_temp = previous.clone();
+    changed_temp.storage.temp_dir = Some("/tmp/swarmotter-new-scratch".into());
+    assert!(matches!(
+        validate_storage_config_transition(&previous, &changed_temp, &[torrent]),
+        Err(CoreError::InvalidConfig(message)) if message.contains("storage.temp_dir")
+    ));
+}
+
+#[tokio::test]
+async fn state_directory_change_requires_restart_and_retains_active_state_path() {
+    let root = unique_dir("state-directory-transition");
+    let active_state_path = root.join("active-state.json");
+    let configured_state_dir = root.join("configured-next-state");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        cfg.clone(),
+        disabled_health(),
+        None,
+        None,
+        Some(active_state_path.clone()),
+        EventBroker::default(),
+    );
+    let mut next = cfg;
+    next.storage.state_dir = Some(configured_state_dir.display().to_string());
+
+    let result = runtime.replace_config(next).await.unwrap();
+
+    assert!(result.restart_required);
+    assert_eq!(result.restart_required_fields, vec!["storage.state_dir"]);
+    assert_eq!(
+        runtime.state_path.as_deref(),
+        Some(active_state_path.as_path())
+    );
+    assert_eq!(
+        runtime.get_config().await.storage.state_dir.as_deref(),
+        Some(configured_state_dir.to_string_lossy().as_ref())
+    );
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[tokio::test]
@@ -6663,6 +6896,161 @@ async fn replace_config_preserves_and_redacts_auth_token() {
         Some("existing-token")
     );
     assert_eq!(result.config.api.auth_token, None);
+}
+
+#[tokio::test]
+async fn socks5_data_plane_binder_proxies_tracker_and_webseed_http() {
+    let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_port = proxy_listener.local_addr().unwrap().port();
+    let proxy = tokio::spawn(async move {
+        for (expected_host, expected_path, response) in [
+            (
+                "tracker.example",
+                "GET /announce HTTP/1.1",
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            ),
+            (
+                "webseed.example",
+                "GET /payload HTTP/1.1",
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: 2\r\nContent-Range: bytes 0-1/2\r\nConnection: close\r\n\r\nok",
+            ),
+        ] {
+            let (mut stream, _) = proxy_listener.accept().await.unwrap();
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+
+            let mut request_head = [0u8; 5];
+            stream.read_exact(&mut request_head).await.unwrap();
+            assert_eq!(&request_head[..4], &[5, 1, 0, 3]);
+            let mut target = vec![0u8; usize::from(request_head[4]) + 2];
+            stream.read_exact(&mut target).await.unwrap();
+            assert_eq!(&target[..request_head[4] as usize], expected_host.as_bytes());
+            assert_eq!(&target[request_head[4] as usize..], &80u16.to_be_bytes());
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0u8; 1024];
+                let read = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(read, 0, "HTTP request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+                assert!(request.len() <= 16 * 1024, "HTTP request headers exceeded cap");
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with(expected_path));
+            let request_lower = request.to_ascii_lowercase();
+            assert!(request_lower.contains(&format!("host: {expected_host}")));
+            if expected_host == "webseed.example" {
+                assert!(request_lower.contains("range: bytes=0-1"));
+            }
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.network.socks5.enabled = true;
+    cfg.network.socks5.host = Some("127.0.0.1".into());
+    cfg.network.socks5.port = proxy_port;
+    cfg.torrent.utp_enabled = false;
+    cfg.dht.enabled = false;
+    cfg.validate().unwrap();
+    let mut health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    health.traffic_allowed = true;
+    let runtime = DaemonRuntime::new(cfg, health);
+    let binder = runtime.data_plane_binder_for_test().await;
+
+    let tracker = binder
+        .http_get("http://tracker.example/announce")
+        .await
+        .unwrap();
+    assert_eq!(tracker.body, b"ok");
+    let webseed = binder
+        .http_get_range("http://webseed.example/payload", 0, 2)
+        .await
+        .unwrap();
+    assert_eq!(webseed.body, b"ok");
+    proxy.await.unwrap();
+}
+
+#[tokio::test]
+async fn replace_config_preserves_and_redacts_socks5_password() {
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.network.socks5.enabled = true;
+    cfg.network.socks5.host = Some("proxy.example".into());
+    cfg.network.socks5.username = Some("operator".into());
+    cfg.network.socks5.password = Some("proxy-secret".into());
+    cfg.torrent.utp_enabled = false;
+    cfg.dht.enabled = false;
+    let mut health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    health.traffic_allowed = true;
+    let runtime = DaemonRuntime::new(cfg, health);
+
+    let mut next = runtime.get_config().await;
+    next.network.socks5.password = None;
+    let result = runtime.replace_config(next).await.unwrap();
+
+    assert_eq!(
+        runtime
+            .get_config()
+            .await
+            .network
+            .socks5
+            .password
+            .as_deref(),
+        Some("proxy-secret")
+    );
+    assert_eq!(result.config.network.socks5.password, None);
+}
+
+#[tokio::test]
+async fn socks5_network_diagnostics_are_auditable_without_proxy_secrets() {
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.network.socks5.enabled = true;
+    cfg.network.socks5.host = Some("proxy.example".into());
+    cfg.network.socks5.username = Some("operator".into());
+    cfg.network.socks5.password = Some("proxy-secret".into());
+    cfg.torrent.utp_enabled = false;
+    cfg.dht.enabled = false;
+    let mut health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    health.traffic_allowed = true;
+    let runtime = DaemonRuntime::new(cfg, health);
+
+    let diagnostics = runtime.network_diagnostics().await;
+    assert!(diagnostics.socks5_enabled);
+    assert!(diagnostics.socks5_udp_blocked);
+    assert!(diagnostics.checks.iter().any(|check| {
+        check.id == "socks5_proxy"
+            && check.detail.contains("target DNS is remote")
+            && check
+                .detail
+                .contains("UDP tracker, DHT, and uTP are blocked")
+    }));
+    let serialized = serde_json::to_string(&diagnostics).unwrap();
+    assert!(!serialized.contains("proxy.example"));
+    assert!(!serialized.contains("proxy-secret"));
 }
 
 #[tokio::test]

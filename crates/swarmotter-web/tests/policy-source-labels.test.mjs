@@ -90,10 +90,22 @@ try {
     seed_forever: { value: false, source: { kind: "global" } },
     download_limit: { value: 0, source: { kind: "global" } },
     upload_limit: { value: 0, source: { kind: "global" } },
+    encryption_mode: { value: "required", source: { kind: "torrent" } },
   });
   const policyHtml = elements.get("#details-policy").innerHTML;
   assert.match(policyHtml, /storage fixed at registration/);
   assert.match(policyHtml, /initial admission decision/);
+  assert.match(policyHtml, /Peer encryption/);
+  assert.match(policyHtml, /required.*torrent override/);
+
+  details.renderDetailsEncryptionSelector({
+    encryption_mode: { value: "required", source: { kind: "torrent" } },
+  });
+  assert.equal(elements.get("#details-encryption-mode").value, "required");
+  details.renderDetailsEncryptionSelector({
+    encryption_mode: { value: "required", source: { kind: "profile" } },
+  });
+  assert.equal(elements.get("#details-encryption-mode").value, "");
 } finally {
   await rm(fixtureDirectory, { recursive: true, force: true });
 }

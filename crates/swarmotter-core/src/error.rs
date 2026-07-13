@@ -52,6 +52,8 @@ pub enum CoreError {
     InvalidConfig(String),
     #[error("network containment failure: {0}")]
     NetworkBlocked(String),
+    #[error("SOCKS5 proxy error: {0}")]
+    Proxy(String),
     #[error("storage error: {0}")]
     Storage(String),
     #[error("io error: {0}")]
@@ -83,6 +85,7 @@ impl CoreError {
             CoreError::NotFound(_) => ErrorCode::new("not_found"),
             CoreError::InvalidConfig(_) => ErrorCode::new("invalid_config"),
             CoreError::NetworkBlocked(_) => ErrorCode::new("network_blocked"),
+            CoreError::Proxy(_) => ErrorCode::new("proxy_error"),
             CoreError::Storage(_) => ErrorCode::new("storage_error"),
             CoreError::Io(_) => ErrorCode::new("io_error"),
             CoreError::Elapsed(_) => ErrorCode::new("timeout"),

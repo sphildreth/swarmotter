@@ -152,6 +152,7 @@ pub(super) fn now() -> u64 {
 
 pub(super) fn redact_config(mut cfg: Config) -> Config {
     cfg.api.auth_token = None;
+    cfg.network.socks5.password = None;
     cfg
 }
 
@@ -267,6 +268,9 @@ pub(super) fn restart_required_fields(previous: &Config, next: &Config) -> Vec<S
     if previous.logging.file_path != next.logging.file_path {
         fields.push("logging.file_path".into());
     }
+    if previous.storage.state_dir != next.storage.state_dir {
+        fields.push("storage.state_dir".into());
+    }
     fields
 }
 
@@ -284,10 +288,12 @@ pub(super) fn data_plane_config_changed(previous: &Config, next: &Config) -> boo
         || peer_limits_changed(previous, next)
         || previous.storage.download_dir != next.storage.download_dir
         || previous.storage.incomplete_dir != next.storage.incomplete_dir
+        || previous.storage.temp_dir != next.storage.temp_dir
         || previous.storage.minimum_free_space_bytes != next.storage.minimum_free_space_bytes
         || previous.storage.minimum_free_space_percent != next.storage.minimum_free_space_percent
         || previous.storage.preallocate != next.storage.preallocate
         || previous.storage.sparse != next.storage.sparse
+        || previous.storage.cow_strategy != next.storage.cow_strategy
 }
 
 pub(super) fn peer_limits_changed(previous: &Config, next: &Config) -> bool {
@@ -328,6 +334,21 @@ pub(super) fn validate_storage_config_transition(
                 .into(),
         ));
     }
+    if previous.storage.temp_dir != next.storage.temp_dir
+        && previous.storage.download_dir.is_none()
+        && torrents.iter().any(|torrent| {
+            matches!(
+                DaemonRuntime::effective_policy_with_config(previous, torrent)
+                    .download_dir
+                    .source,
+                swarmotter_core::policy::PolicyValueSource::Global
+            )
+        })
+    {
+        return Err(CoreError::InvalidConfig(
+            "storage.temp_dir cannot change while torrents still use the fallback global download directory; move those torrents to explicit locations first".into(),
+        ));
+    }
     if previous.storage.incomplete_dir != next.storage.incomplete_dir
         && torrents.iter().any(|torrent| {
             !torrent.progress.is_complete()
@@ -341,6 +362,15 @@ pub(super) fn validate_storage_config_transition(
     {
         return Err(CoreError::InvalidConfig(
             "storage.incomplete_dir cannot change while torrents have incomplete payloads".into(),
+        ));
+    }
+    if previous.storage.resume_dir != next.storage.resume_dir
+        && torrents
+            .iter()
+            .any(|torrent| !torrent.progress.is_complete())
+    {
+        return Err(CoreError::InvalidConfig(
+            "storage.resume_dir cannot change while torrents have incomplete payload or selected-file resume state".into(),
         ));
     }
     validate_restored_storage_ownership(torrents.iter(), next)
@@ -689,10 +719,8 @@ pub(super) fn validate_restored_storage_ownership<'a>(
         let (complete_dir, active_dir) =
             DaemonRuntime::policy_storage_paths_with_config(config, torrent);
         for root in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
-            ownerships.push(
-                swarmotter_core::storage::StorageIo::new(torrent.meta.clone(), root)
-                    .path_ownership()?,
-            );
+            ownerships
+                .push(storage_io_with_config(torrent.meta.clone(), root, config).path_ownership()?);
         }
     }
     for index in 0..ownerships.len() {

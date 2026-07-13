@@ -8,7 +8,7 @@
 //! into per-torrent overrides.
 
 use super::*;
-use swarmotter_core::config::StartBehavior;
+use swarmotter_core::config::{PeerEncryptionMode, StartBehavior};
 use swarmotter_core::policy::{EffectiveTorrentPolicy, PolicyProfileOrigin, PolicyStorageSnapshot};
 
 /// Policy fields migrated for a legacy torrent during a profile-configuration
@@ -46,6 +46,54 @@ impl DaemonRuntime {
         torrent: &Torrent,
     ) -> EffectiveTorrentPolicy {
         EffectiveTorrentPolicy::resolve(config, torrent)
+    }
+
+    /// Return only torrents whose resolved encryption policy changes between
+    /// two otherwise valid configurations. Profile edits that leave an
+    /// effective mode unchanged must not tear down their data-plane work.
+    pub(super) fn effective_encryption_mode_changes(
+        previous: &Config,
+        next: &Config,
+        torrents: &[Torrent],
+    ) -> Vec<InfoHash> {
+        torrents
+            .iter()
+            .filter_map(|torrent| {
+                (Self::effective_policy_with_config(previous, torrent)
+                    .encryption_mode
+                    .value
+                    != Self::effective_policy_with_config(next, torrent)
+                        .encryption_mode
+                        .value)
+                    .then_some(torrent.info_hash())
+            })
+            .collect()
+    }
+
+    /// Apply an already-persisted effective encryption change. Existing
+    /// inbound sessions keep their negotiated wire stream, but newly accepted
+    /// seeding sessions use the updated registration immediately. Running
+    /// download/metadata engines are rebuilt so every new outbound session
+    /// uses the new mode.
+    pub(super) async fn restart_changed_encryption_policy_work(&self, hashes: &[InfoHash]) {
+        if hashes.is_empty() {
+            return;
+        }
+        let active = {
+            let handles = self.engine_handles.read().await;
+            hashes
+                .iter()
+                .copied()
+                .filter(|hash| {
+                    handles
+                        .get(hash)
+                        .is_some_and(|handle| !handle.is_finished())
+                })
+                .collect::<Vec<_>>()
+        };
+        for hash in active {
+            self.restart_engine_for_settings(&hash).await;
+        }
     }
 
     /// Capture the resolved storage paths once at registration. This also
@@ -356,12 +404,15 @@ impl DaemonRuntime {
                 )));
             }
         }
-        let previous = {
+        let (previous, mode_changed) = {
             let mut registry = self.registry.lock().await;
             let torrent = registry
                 .get_mut(hash)
                 .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
             let previous = torrent.clone();
+            let previous_mode = Self::effective_policy_with_config(&config, &previous)
+                .encryption_mode
+                .value;
             Self::snapshot_initial_admission(&config, torrent);
             Self::snapshot_existing_storage(&config, torrent);
             torrent.policy.profile = profile;
@@ -370,7 +421,10 @@ impl DaemonRuntime {
                 .profile
                 .as_ref()
                 .map(|_| PolicyProfileOrigin::Torrent);
-            previous
+            let next_mode = Self::effective_policy_with_config(&config, torrent)
+                .encryption_mode
+                .value;
+            (previous, previous_mode != next_mode)
         };
         // Do not expose a new assignment to live limiters/queue reconciliation
         // until the durable state write succeeds. On failure, restore the
@@ -382,6 +436,10 @@ impl DaemonRuntime {
             return Err(error);
         }
         self.refresh_profile_runtime_fields().await;
+        if mode_changed {
+            self.restart_changed_encryption_policy_work(std::slice::from_ref(hash))
+                .await;
+        }
         self.schedule_reconcile_queue("torrent_profile_assignment")
             .await;
         self.reconcile_seeders().await;
@@ -394,9 +452,57 @@ impl DaemonRuntime {
         Ok(())
     }
 
-    /// Update retained per-torrent rate limiters for live inheritance. Queue
-    /// selection and seeding target evaluation resolve profiles on demand, so
-    /// no profile value is copied into a torrent record here.
+    /// Set or clear one torrent's durable peer-wire encryption override.
+    /// Clearing the value restores deterministic profile/label/global
+    /// inheritance. The replacement is persisted before active data-plane
+    /// work is restarted, so a failed durable write cannot expose a transient
+    /// transport policy.
+    pub(super) async fn assign_torrent_encryption_mode(
+        &self,
+        hash: &InfoHash,
+        encryption_mode: Option<PeerEncryptionMode>,
+    ) -> Result<()> {
+        let _config_transaction = self.config_write_lock.lock().await;
+        let config = self.config.read().await.clone();
+        let (previous, mode_changed) = {
+            let mut registry = self.registry.lock().await;
+            let torrent = registry
+                .get_mut(hash)
+                .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+            let previous = torrent.clone();
+            let previous_mode = Self::effective_policy_with_config(&config, &previous)
+                .encryption_mode
+                .value;
+            torrent.policy.overrides.encryption_mode = encryption_mode;
+            let next_mode = Self::effective_policy_with_config(&config, torrent)
+                .encryption_mode
+                .value;
+            (previous, previous_mode != next_mode)
+        };
+        if let Err(error) = self.persist_state().await {
+            if let Some(torrent) = self.registry.lock().await.get_mut(hash) {
+                *torrent = previous;
+            }
+            return Err(error);
+        }
+        self.refresh_profile_runtime_fields().await;
+        if mode_changed {
+            self.restart_changed_encryption_policy_work(std::slice::from_ref(hash))
+                .await;
+        }
+        self.publish_event(Event::new(
+            "torrent_policy_changed",
+            json!({
+                "info_hash": hash.to_hex(),
+            }),
+        ));
+        Ok(())
+    }
+
+    /// Update retained per-torrent rate limiters and registered inbound
+    /// encryption policies for live inheritance. Queue selection and seeding
+    /// target evaluation resolve profiles on demand, so no profile value is
+    /// copied into a torrent record here.
     pub(super) async fn refresh_profile_runtime_fields(&self) {
         let config = self.config.read().await.clone();
         let effective = {
@@ -410,19 +516,26 @@ impl DaemonRuntime {
                         *hash,
                         policy.download_limit.value,
                         policy.upload_limit.value,
+                        policy.encryption_mode.value,
                     )
                 })
                 .collect::<Vec<_>>()
         };
         let limiters = self.torrent_limiters.read().await;
-        for (hash, download, upload) in effective {
-            if let Some(limiter) = limiters.get(&hash) {
+        for (hash, download, upload, _) in &effective {
+            if let Some(limiter) = limiters.get(hash) {
                 limiter.set_capacity(
                     swarmotter_core::bandwidth::RateDirection::Download,
-                    download,
+                    *download,
                 );
-                limiter.set_capacity(swarmotter_core::bandwidth::RateDirection::Upload, upload);
+                limiter.set_capacity(swarmotter_core::bandwidth::RateDirection::Upload, *upload);
             }
+        }
+        drop(limiters);
+        for (hash, _, _, encryption_mode) in effective {
+            self.seeder_registry
+                .update_encryption_mode(&hash, encryption_mode)
+                .await;
         }
     }
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Message Stream Encryption / Protocol Encryption for TCP peer streams.
+//! Message Stream Encryption / Protocol Encryption for contained peer streams.
 //!
 //! MSE/PE is the de facto BitTorrent peer-wire obfuscation layer used by many
 //! clients. It is intentionally scoped to wrapping an already-open peer stream;
@@ -42,7 +42,7 @@ const DH_PRIME: Big768 = Big768([
     0xffff_ffff_ffff_ffff,
 ]);
 
-/// A TCP peer stream after successful MSE/PE negotiation.
+/// A peer byte stream after successful MSE/PE negotiation.
 pub struct MseStream<S> {
     stream: S,
     incoming: Rc4Cipher,
@@ -148,7 +148,7 @@ impl<S: AsyncWrite + Unpin> MseStream<S> {
     }
 }
 
-/// Initiate MSE/PE on an outbound TCP peer stream.
+/// Initiate MSE/PE on an outbound peer byte stream.
 pub async fn connect<S>(mut stream: S, info_hash: InfoHash) -> Result<MseStream<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -192,7 +192,7 @@ where
     Ok(MseStream::new(stream, incoming, outgoing, Vec::new()))
 }
 
-/// Accept MSE/PE on an inbound TCP peer stream for a known torrent info hash.
+/// Accept MSE/PE on an inbound peer byte stream for a known torrent info hash.
 pub async fn accept<S>(stream: S, info_hash: InfoHash) -> Result<MseStream<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,

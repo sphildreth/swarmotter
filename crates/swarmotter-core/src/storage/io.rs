@@ -24,9 +24,11 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::bandwidth::{RateDirection, RateLimiter};
+use crate::config::CowStrategy;
 use crate::error::{CoreError, Result};
 use crate::hash::InfoHash;
 use crate::meta::TorrentMeta;
+use crate::storage::metrics::StorageIoMetrics;
 use crate::storage::resume::{FastResume, PieceBitfield, ResumeFileStamp};
 use crate::storage::{piece_file_ranges, verify_piece};
 
@@ -37,12 +39,20 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct StorageIo {
     meta: TorrentMeta,
     download_dir: PathBuf,
+    /// Optional dedicated root for fast-resume state. When absent, preserve
+    /// the historical adjacent-to-active-data placement.
+    resume_dir: Option<PathBuf>,
     file_handles: Arc<Mutex<HashMap<usize, CachedFileHandle>>>,
     resume_write_lock: Arc<Mutex<()>>,
     /// Optional shared sustained payload-write limiter. The daemon gives every
     /// active torrent on one configured storage root the same limiter, so this
     /// caps aggregate disk pressure without changing storage correctness.
     write_limiter: Option<RateLimiter>,
+    /// Explicit filesystem CoW behavior for newly created payload files.
+    cow_strategy: CowStrategy,
+    /// Optional process-local accounting shared by storage handles on one
+    /// daemon root. It is observational and never changes I/O semantics.
+    metrics: Option<StorageIoMetrics>,
 }
 
 #[derive(Clone)]
@@ -122,10 +132,33 @@ impl StorageIo {
         Self {
             meta,
             download_dir: download_dir.into(),
+            resume_dir: None,
             file_handles: Arc::new(Mutex::new(HashMap::new())),
             resume_write_lock: Arc::new(Mutex::new(())),
             write_limiter: None,
+            cow_strategy: CowStrategy::Conservative,
+            metrics: None,
         }
+    }
+
+    /// Relocate durable fast-resume metadata without changing payload paths.
+    /// The dedicated filename includes the info hash, avoiding collisions
+    /// between torrents that share a display name.
+    pub fn with_resume_dir(mut self, resume_dir: Option<PathBuf>) -> Self {
+        self.resume_dir = resume_dir;
+        self
+    }
+
+    /// Select an explicit CoW behavior for newly created payload files.
+    pub fn with_cow_strategy(mut self, cow_strategy: CowStrategy) -> Self {
+        self.cow_strategy = cow_strategy;
+        self
+    }
+
+    /// Attach shared local storage accounting for diagnostics.
+    pub fn with_metrics(mut self, metrics: Option<StorageIoMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Apply an optional shared sustained payload-write limiter.
@@ -322,13 +355,8 @@ impl StorageIo {
         }
         if !self.meta.is_multi_file && selected[0] {
             let path = self.file_path(0)?;
-            fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&path)
-                .await
-                .map_err(CoreError::from)?;
+            let file = self.open_writable_payload_file(&path).await?;
+            drop(file);
         }
         Ok(())
     }
@@ -352,17 +380,76 @@ impl StorageIo {
             }
             self.ensure_file_dirs(i).await?;
             let path = self.file_path(i)?;
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&path)
-                .await
-                .map_err(CoreError::from)?;
+            let file = self.open_writable_payload_file(&path).await?;
             let len = self.meta.files[i].length;
             file.set_len(len).await.map_err(CoreError::from)?;
         }
         Ok(())
+    }
+
+    /// Apply an explicitly requested CoW flag only to a file that this handle
+    /// just created and before it is sized or receives payload bytes. Existing
+    /// files are deliberately untouched: changing their inode flags could
+    /// surprise an operator or invalidate filesystem-level expectations.
+    async fn apply_cow_strategy_to_new_file(&self, path: &Path, created: bool) -> Result<()> {
+        if !created || self.cow_strategy == CowStrategy::Conservative {
+            return Ok(());
+        }
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || disable_cow_for_new_file(&path))
+            .await
+            .map_err(|error| CoreError::Storage(format!("configure CoW strategy task: {error}")))?
+    }
+
+    /// Atomically create a writable payload file when absent. Explicit NOCOW
+    /// handling is checked before any size change or payload write; when a
+    /// file already exists, its flags are inspected but never modified.
+    async fn open_writable_payload_file(&self, path: &Path) -> Result<fs::File> {
+        self.ensure_cow_strategy_supported_for_path(path).await?;
+        let mut create_options = fs::OpenOptions::new();
+        create_options.read(true).write(true).create_new(true);
+        match create_options.open(path).await {
+            Ok(file) => {
+                self.apply_cow_strategy_to_new_file(path, true).await?;
+                Ok(file)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let file = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(path)
+                    .await
+                    .map_err(CoreError::from)?;
+                self.ensure_existing_file_matches_cow_strategy(path).await?;
+                Ok(file)
+            }
+            Err(error) => Err(CoreError::from(error)),
+        }
+    }
+
+    async fn ensure_cow_strategy_supported_for_path(&self, path: &Path) -> Result<()> {
+        if self.cow_strategy == CowStrategy::Conservative {
+            return Ok(());
+        }
+        let probe = path.parent().unwrap_or(path).to_path_buf();
+        tokio::task::spawn_blocking(move || ensure_cow_strategy_supported_for_path(&probe))
+            .await
+            .map_err(|error| {
+                CoreError::Storage(format!("inspect CoW strategy support task: {error}"))
+            })?
+    }
+
+    async fn ensure_existing_file_matches_cow_strategy(&self, path: &Path) -> Result<()> {
+        if self.cow_strategy == CowStrategy::Conservative {
+            return Ok(());
+        }
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || ensure_existing_file_has_nocow_flag(&path))
+            .await
+            .map_err(|error| {
+                CoreError::Storage(format!("inspect existing CoW strategy task: {error}"))
+            })?
     }
 
     fn validate_file_selection(&self, selected: &[bool]) -> Result<()> {
@@ -461,6 +548,9 @@ impl StorageIo {
             let chunk = &data[data_off..data_off + slice.length as usize];
             file.write_all(chunk).await.map_err(CoreError::from)?;
             data_off += slice.length as usize;
+        }
+        if let Some(metrics) = &self.metrics {
+            metrics.record_payload_write(data_len);
         }
         Ok(())
     }
@@ -582,15 +672,18 @@ impl StorageIo {
         }
 
         let path = self.file_path(index)?;
-        let mut options = fs::OpenOptions::new();
-        options.read(true).truncate(false);
-        if create_if_missing {
-            options.write(true).create(true);
-        }
+        let file = if create_if_missing {
+            self.open_writable_payload_file(&path).await?
+        } else {
+            fs::OpenOptions::new()
+                .read(true)
+                .truncate(false)
+                .open(&path)
+                .await
+                .map_err(CoreError::from)?
+        };
         let file = CachedFileHandle {
-            file: Arc::new(Mutex::new(
-                options.open(&path).await.map_err(CoreError::from)?,
-            )),
+            file: Arc::new(Mutex::new(file)),
             writable: create_if_missing,
         };
 
@@ -656,6 +749,9 @@ impl StorageIo {
             Err(CoreError::Io(_)) => return Ok(false),
             Err(e) => return Err(e),
         };
+        if let Some(metrics) = &self.metrics {
+            metrics.record_verification_read(data.len() as u64);
+        }
         Ok(verify_piece(&self.meta, piece_index, &data))
     }
 
@@ -787,6 +883,9 @@ impl StorageIo {
 
     /// Path of the fast-resume file for this torrent.
     pub fn resume_path(&self) -> PathBuf {
+        if let Some(resume_dir) = &self.resume_dir {
+            return resume_dir.join(format!("{}.swarmotter.resume", self.meta.info_hash));
+        }
         self.download_dir
             .join(format!("{}.swarmotter.resume", self.meta.name))
     }
@@ -815,7 +914,10 @@ impl StorageIo {
     /// contain the torrent's files; refusing to overwrite avoids clobbering
     /// user data when a path is misconfigured.
     pub async fn move_to(&self, destination_dir: impl Into<PathBuf>) -> Result<Self> {
-        let destination = Self::new(self.meta.clone(), destination_dir);
+        let destination = Self::new(self.meta.clone(), destination_dir)
+            .with_resume_dir(self.resume_dir.clone())
+            .with_cow_strategy(self.cow_strategy)
+            .with_metrics(self.metrics.clone());
         if self.shares_storage_root_with(&destination) {
             return Ok(destination);
         }
@@ -835,7 +937,11 @@ impl StorageIo {
     async fn build_move_plan(&self, destination: &Self) -> Result<Vec<MovePlanEntry>> {
         self.path_ownership()?;
         destination.path_ownership()?;
-        if path_lexists(&destination.checked_resume_path()?).await? {
+        let destination_resume = destination.checked_resume_path()?;
+        let source_resume = self.checked_resume_path()?;
+        if normalize_lexical_path(&destination_resume) != normalize_lexical_path(&source_resume)
+            && path_lexists(&destination_resume).await?
+        {
             return Err(CoreError::Storage(format!(
                 "destination resume file already exists while moving torrent data: {}",
                 destination.resume_path().display()
@@ -1033,6 +1139,141 @@ fn temporary_sibling_path(path: &Path, kind: &str) -> Result<PathBuf> {
     let mut temporary_name = file_name.to_os_string();
     temporary_name.push(format!(".{kind}-{}-{sequence}", std::process::id()));
     Ok(path.with_file_name(temporary_name))
+}
+
+/// Set the Linux Btrfs NOCOW inode flag before any payload bytes or extents
+/// exist. The explicit strategy fails on every other platform/filesystem so
+/// callers never mistake a fallback for an applied storage policy.
+#[cfg(target_os = "linux")]
+fn disable_cow_for_new_file(path: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(CoreError::from)?;
+    ensure_btrfs_filesystem(filesystem_magic_for_file(&file, path)?, path)?;
+    let mut flags = inode_flags(&file, path)?;
+    flags |= FS_NOCOW_FL;
+    let set_result = unsafe {
+        // The descriptor remains open for this call, and `flags` is a valid
+        // writable `long` matching the Linux FS_IOC_SETFLAGS ABI.
+        libc::ioctl(file.as_raw_fd(), libc::FS_IOC_SETFLAGS, &flags)
+    };
+    if set_result != 0 {
+        return Err(CoreError::Storage(format!(
+            "apply cow_strategy=disable_for_new_files to {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    file.sync_all().map_err(CoreError::from)
+}
+
+/// Confirm the selected root can satisfy explicit NOCOW before creating a
+/// payload file. This avoids leaving an unsupported filesystem with even an
+/// empty placeholder that might later be mistaken for a configured file.
+#[cfg(target_os = "linux")]
+fn ensure_cow_strategy_supported_for_path(path: &Path) -> Result<()> {
+    let file = std::fs::File::open(path).map_err(CoreError::from)?;
+    ensure_btrfs_filesystem(filesystem_magic_for_file(&file, path)?, path)
+}
+
+/// Existing files are deliberately not modified. Under an explicit NOCOW
+/// policy, require that they already carry the flag before accepting writes.
+#[cfg(target_os = "linux")]
+fn ensure_existing_file_has_nocow_flag(path: &Path) -> Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(CoreError::from)?;
+    ensure_btrfs_filesystem(filesystem_magic_for_file(&file, path)?, path)?;
+    if inode_flags(&file, path)? & FS_NOCOW_FL != 0 {
+        return Ok(());
+    }
+    Err(CoreError::Storage(format!(
+        "cow_strategy=disable_for_new_files will not modify existing payload file {}; recreate or move it, or select cow_strategy=conservative",
+        path.display()
+    )))
+}
+
+#[cfg(target_os = "linux")]
+const FS_NOCOW_FL: libc::c_long = 0x0080_0000;
+
+#[cfg(target_os = "linux")]
+fn filesystem_magic_for_file(file: &std::fs::File, path: &Path) -> Result<libc::c_long> {
+    use std::os::fd::AsRawFd;
+
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let stat_result = unsafe {
+        // `filesystem` points to writable, properly aligned storage and the
+        // file descriptor stays valid for the duration of the syscall.
+        libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr())
+    };
+    if stat_result != 0 {
+        return Err(CoreError::Storage(format!(
+            "inspect filesystem before applying cow_strategy to {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )));
+    }
+    // fstatfs returned success, so the kernel initialized the entire struct.
+    Ok(unsafe { filesystem.assume_init() }.f_type)
+}
+
+#[cfg(target_os = "linux")]
+fn inode_flags(file: &std::fs::File, path: &Path) -> Result<libc::c_long> {
+    use std::os::fd::AsRawFd;
+
+    let mut flags: libc::c_long = 0;
+    let get_result = unsafe {
+        // The descriptor remains valid and `flags` is a writable `long`
+        // matching the Linux FS_IOC_GETFLAGS ABI.
+        libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags)
+    };
+    if get_result == 0 {
+        Ok(flags)
+    } else {
+        Err(CoreError::Storage(format!(
+            "read filesystem flags before applying cow_strategy to {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        )))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn disable_cow_for_new_file(path: &Path) -> Result<()> {
+    Err(CoreError::Storage(format!(
+        "cow_strategy=disable_for_new_files is only supported on Linux Btrfs: {}",
+        path.display()
+    )))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_cow_strategy_supported_for_path(path: &Path) -> Result<()> {
+    Err(CoreError::Storage(format!(
+        "cow_strategy=disable_for_new_files is only supported on Linux Btrfs: {}",
+        path.display()
+    )))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_existing_file_has_nocow_flag(path: &Path) -> Result<()> {
+    ensure_cow_strategy_supported_for_path(path)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_btrfs_filesystem(filesystem_magic: libc::c_long, path: &Path) -> Result<()> {
+    const BTRFS_SUPER_MAGIC: libc::c_long = 0x9123_683eu32 as libc::c_long;
+    if filesystem_magic == BTRFS_SUPER_MAGIC {
+        return Ok(());
+    }
+    Err(CoreError::Storage(format!(
+        "cow_strategy=disable_for_new_files requires Linux Btrfs for {}",
+        path.display()
+    )))
 }
 
 #[cfg(unix)]
@@ -1387,6 +1628,84 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[tokio::test]
+    async fn dedicated_resume_directory_uses_info_hash_without_relocating_payload() {
+        let bytes = build_single_file_torrent("same-name.bin", b"payload", 7, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let active = unique_dir("resume-active");
+        let resume = unique_dir("resume-state");
+        let complete = unique_dir("resume-complete");
+        let store =
+            StorageIo::new(meta.clone(), active.clone()).with_resume_dir(Some(resume.clone()));
+
+        store.ensure_active_layout().await.unwrap();
+        store.write_piece(0, b"payload").await.unwrap();
+        let resume_path = store.resume_path();
+        assert_eq!(
+            resume_path,
+            resume.join(format!("{}.swarmotter.resume", meta.info_hash))
+        );
+        assert!(!resume_path.starts_with(&active));
+
+        let persisted = build_resume(
+            meta.info_hash,
+            meta.name.clone(),
+            PieceBitfield::new(meta.piece_count()),
+            meta.piece_count(),
+            0,
+            0,
+            meta.total_length,
+            Some(active.display().to_string()),
+            1,
+            None,
+            &[crate::models::torrent::FilePriority::Normal],
+            &[meta.total_length],
+        );
+        store.save_resume(&persisted).await.unwrap();
+        assert!(resume_path.is_file());
+
+        let moved = store.move_to(complete.clone()).await.unwrap();
+        assert_eq!(
+            std::fs::read(moved.file_path(0).unwrap()).unwrap(),
+            b"payload"
+        );
+        assert!(!active.join("same-name.bin").exists());
+        assert!(
+            !resume_path.exists(),
+            "completion removes only resume metadata"
+        );
+        assert!(!complete.join("same-name.bin.swarmotter.resume").exists());
+        std::fs::remove_dir_all(active).ok();
+        std::fs::remove_dir_all(resume).ok();
+        std::fs::remove_dir_all(complete).ok();
+    }
+
+    #[tokio::test]
+    async fn storage_metrics_count_successful_writes_and_verification_reads() {
+        let bytes = build_single_file_torrent("metrics.bin", b"metrics", 7, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let root = unique_dir("storage-metrics");
+        let metrics = StorageIoMetrics::default();
+        let store = StorageIo::new(meta, root.clone()).with_metrics(Some(metrics.clone()));
+
+        store.ensure_active_layout().await.unwrap();
+        store.write_piece(0, b"metrics").await.unwrap();
+        assert!(store.verify_piece_on_disk(0).await.unwrap());
+        let throughput = metrics.throughput();
+        assert_eq!(throughput.write_bytes_per_second, 7);
+        assert_eq!(throughput.verification_bytes_per_second, 7);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nocow_strategy_rejects_an_unsupported_filesystem_before_payload_write() {
+        let path = Path::new("unsupported-filesystem-payload");
+        let error = ensure_btrfs_filesystem(0xef53, path).unwrap_err();
+        assert_eq!(error.code().as_str(), "storage_error");
+        assert!(error.to_string().contains("requires Linux Btrfs"));
     }
 
     #[test]

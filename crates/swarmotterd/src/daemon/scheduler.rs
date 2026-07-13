@@ -595,15 +595,20 @@ impl DaemonRuntime {
         binder: Arc<dyn swarmotter_core::net::NetworkBinder>,
         peer_id: [u8; 20],
     ) -> Option<Arc<crate::dht::DhtRunner>> {
-        let (dht_enabled, bootstrap_nodes, dht_port) = {
+        let (dht_enabled, socks5_enabled, bootstrap_nodes, dht_port) = {
             let cfg = self.config.read().await;
             (
                 cfg.dht.enabled,
+                cfg.network.socks5.enabled,
                 cfg.dht.bootstrap_nodes.clone(),
                 cfg.dht.port,
             )
         };
-        if !dht_enabled || !self.network_health.read().await.traffic_allowed {
+        // SOCKS5 support intentionally has no UDP ASSOCIATE path. Configuration
+        // validation requires DHT to be disabled, and this guard remains a
+        // defense-in-depth check for runtime generations created by older API
+        // clients or partially restored state.
+        if !dht_enabled || socks5_enabled || !self.network_health.read().await.traffic_allowed {
             return None;
         }
         if let Some(existing) = self.dht_runner.lock().await.clone() {
@@ -812,6 +817,12 @@ impl DaemonRuntime {
         } else {
             None
         };
+        let resume_dir = config.storage.resume_dir.as_ref().map(PathBuf::from);
+        let cow_strategy = config.storage.cow_strategy;
+        let storage_metrics = Some(
+            self.storage_metrics
+                .metrics_for_path(&config, Path::new(&active_dir)),
+        );
 
         let state = Arc::new(Mutex::new(EngineState::default()));
         self.engine_states.write().await.insert(hash, state.clone());
@@ -844,16 +855,14 @@ impl DaemonRuntime {
                 .clone()
         };
         let peer_session_budget = self.peer_session_budget(hash).await;
-        // Peer transport selection (TCP/uTP) from config. All transports stay
-        // on the contained binder; fail-closed blocks both.
-        let (utp_enabled, utp_prefer_tcp, encryption_mode) = {
-            let cfg = self.config.read().await;
-            (
-                cfg.torrent.utp_enabled,
-                cfg.torrent.utp_prefer_tcp,
-                cfg.torrent.encryption_mode,
-            )
-        };
+        // Peer transport selection from config. SOCKS5 currently supports
+        // only TCP CONNECT, so uTP is defensively disabled here as well as by
+        // full-config validation; no direct UDP fallback is possible.
+        let (utp_enabled, utp_prefer_tcp, encryption_mode) = (
+            config.torrent.utp_enabled && !config.network.socks5.enabled,
+            config.torrent.utp_prefer_tcp,
+            snapshot.encryption_mode,
+        );
 
         let state_for_summary = state.clone();
         let hash_for_task = hash;
@@ -882,8 +891,11 @@ impl DaemonRuntime {
         .with_encryption_mode(encryption_mode)
         .with_preallocate(preallocate)
         .with_sparse(sparse)
+        .with_cow_strategy(cow_strategy)
+        .with_resume_dir(resume_dir)
         .with_storage_reserve(minimum_free_space_bytes, minimum_free_space_percent)
-        .with_storage_write_limiter(storage_write_limiter);
+        .with_storage_write_limiter(storage_write_limiter)
+        .with_storage_metrics(storage_metrics);
         engine = match engine
             .with_file_selection(snapshot.priorities.clone(), snapshot.wanted.clone())
         {

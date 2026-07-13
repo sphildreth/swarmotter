@@ -141,8 +141,49 @@ fn preferred_encryption_preserves_transport_preference() {
     );
     assert_eq!(
         peer_transport_order(true, false, PeerEncryptionMode::Required),
-        vec![PeerTransport::Tcp]
+        vec![PeerTransport::Utp, PeerTransport::Tcp]
     );
+}
+
+#[tokio::test]
+async fn required_encryption_never_retries_a_plaintext_tcp_session_after_mse_failure() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut first, _) = listener.accept().await.unwrap();
+        // Consume part of the MSE initiator data, then close before replying.
+        // A `preferred` client would make a second plaintext connection here;
+        // `required` must leave the listener with exactly one accepted socket.
+        let mut first_byte = [0u8; 1];
+        first.read_exact(&mut first_byte).await.unwrap();
+        drop(first);
+        let accepted = if tokio::time::timeout(Duration::from_millis(300), listener.accept())
+            .await
+            .is_ok()
+        {
+            2
+        } else {
+            1
+        };
+        let _ = accepted_tx.send(accepted);
+    });
+
+    let binder: Arc<dyn NetworkBinder> = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+    let peer_filter = swarmotter_core::peer_filter::PeerFilter::default();
+    let result = attempt_peer_wire_transport(
+        binder,
+        PeerTransport::Tcp,
+        PeerAddr::from_socket_addr(addr),
+        InfoHash::from_bytes([0xE1; 20]),
+        [0x5A; 20],
+        PeerEncryptionMode::Required,
+        &peer_filter,
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(accepted_rx.await.unwrap(), 1);
+    server.await.unwrap();
 }
 
 #[test]

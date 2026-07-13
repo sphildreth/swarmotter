@@ -8,7 +8,10 @@ use axum::{
     response::Response,
     Json,
 };
-use serde::Deserialize;
+use serde::de::Visitor;
+use serde::{Deserialize, Deserializer};
+use std::fmt;
+use swarmotter_core::config::PeerEncryptionMode;
 use swarmotter_core::error::CoreError;
 use swarmotter_core::policy::PolicyProfilesConfig;
 
@@ -22,6 +25,67 @@ pub struct SetTorrentProfileBody {
     /// selection. It never moves existing payload data.
     #[serde(default)]
     pub profile: Option<String>,
+}
+
+/// Replace one torrent's explicit peer-wire encryption override. A JSON
+/// `null` value clears it and resumes profile/label/global inheritance.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetTorrentEncryptionModeBody {
+    pub encryption_mode: ExplicitEncryptionMode,
+}
+
+/// A nullable value that must still be present in the request body. A direct
+/// `Option<T>` field would let serde interpret an omitted key as `None`, which
+/// would make `{}` accidentally clear a durable override.
+#[derive(Debug)]
+pub struct ExplicitEncryptionMode(pub Option<PeerEncryptionMode>);
+
+impl<'de> Deserialize<'de> for ExplicitEncryptionMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ExplicitEncryptionModeVisitor;
+
+        impl<'de> Visitor<'de> for ExplicitEncryptionModeVisitor {
+            type Value = ExplicitEncryptionMode;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a peer encryption mode or null")
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(ExplicitEncryptionMode(None))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let mode = match value {
+                    "disabled" => PeerEncryptionMode::Disabled,
+                    "preferred" => PeerEncryptionMode::Preferred,
+                    "required" => PeerEncryptionMode::Required,
+                    _ => {
+                        return Err(E::unknown_variant(
+                            value,
+                            &["disabled", "preferred", "required"],
+                        ));
+                    }
+                };
+                Ok(ExplicitEncryptionMode(Some(mode)))
+            }
+        }
+
+        // `deserialize_any` makes serde's missing-field deserializer return
+        // its normal "missing field" error. Calling `Option::deserialize`
+        // here would instead turn an omitted key into `None`.
+        deserializer.deserialize_any(ExplicitEncryptionModeVisitor)
+    }
 }
 
 /// Return all named profiles and label mappings.
@@ -77,6 +141,25 @@ pub async fn set_torrent_profile(
     }
     match parse_hash(&hash) {
         Ok(hash) => into_response(state.daemon.set_torrent_profile(&hash, body.profile).await),
+        Err(error) => err_response(error),
+    }
+}
+
+/// Set or clear the durable peer-wire encryption override for one torrent.
+/// Active download/metadata work is rebuilt only when the resulting effective
+/// mode differs from the previous policy.
+pub async fn set_torrent_encryption_mode(
+    State(state): State<SharedState>,
+    Path(hash): Path<String>,
+    Json(body): Json<SetTorrentEncryptionModeBody>,
+) -> Response {
+    match parse_hash(&hash) {
+        Ok(hash) => into_response(
+            state
+                .daemon
+                .set_torrent_encryption_mode(&hash, body.encryption_mode.0)
+                .await,
+        ),
         Err(error) => err_response(error),
     }
 }

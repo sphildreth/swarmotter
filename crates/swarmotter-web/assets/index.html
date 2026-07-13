@@ -199,6 +199,8 @@
           <button id="details-labels-btn" type="button">Save Labels</button>
           <label class="settings-field"><span>Policy profile</span><select id="details-profile"><option value="">Use label or global defaults</option></select></label>
           <button id="details-profile-save-btn" type="button">Save Profile</button>
+          <label class="settings-field"><span>Peer encryption</span><select id="details-encryption-mode"><option value="">Inherit profile or global mode</option><option value="disabled">Disabled (plaintext only)</option><option value="preferred">Preferred</option><option value="required">Required</option></select></label>
+          <button id="details-encryption-mode-save-btn" type="button">Save Encryption</button>
           <label class="settings-field"><span>Download limit B/s (0 = unlimited)</span><input id="details-download-limit" type="number" min="0" step="1"></label>
           <label class="settings-field"><span>Upload limit B/s (0 = unlimited)</span><input id="details-upload-limit" type="number" min="0" step="1"></label>
           <button id="details-limits-btn" type="button">Save Limits</button>
@@ -340,11 +342,16 @@
           <div class="settings-form-grid">
             <label class="settings-field"><span>Download directory</span><input id="cfg-storage-download-dir" type="text"></label>
             <label class="settings-field"><span>Incomplete directory</span><input id="cfg-storage-incomplete-dir" type="text"></label>
+            <label class="settings-field"><span>Fast-resume directory</span><input id="cfg-storage-resume-dir" type="text" placeholder="Optional durable metadata root"></label>
+            <label class="settings-field"><span>State directory</span><input id="cfg-storage-state-dir" type="text" placeholder="Used after restart unless state file is explicit"></label>
+            <label class="settings-field"><span>Fallback temporary root</span><input id="cfg-storage-temp-dir" type="text" placeholder="Used only when download directory is unset"></label>
             <label class="settings-field"><span>Minimum free space bytes</span><input id="cfg-storage-minimum-free-space-bytes" type="number" min="0" step="1"></label>
             <label class="settings-field"><span>Minimum free space percent</span><input id="cfg-storage-minimum-free-space-percent" type="number" min="0" max="100" step="1"></label>
+            <label class="settings-field"><span>CoW strategy</span><select id="cfg-storage-cow-strategy"><option value="conservative">Conservative (default filesystem behavior)</option><option value="disable_for_new_files">Disable CoW for new Linux Btrfs files</option></select></label>
             <label class="settings-check"><input id="cfg-storage-preallocate" type="checkbox"><span>Preallocate files</span></label>
             <label class="settings-check"><input id="cfg-storage-sparse" type="checkbox"><span>Sparse files</span></label>
           </div>
+          <p class="muted">State-directory changes require restart. The NOCOW option is explicit, never changes existing files, and fails on unsupported filesystems rather than falling back.</p>
           <div class="settings-card-heading">
             <h4>Storage root controls</h4>
             <button id="add-storage-root-control-btn" type="button" class="secondary">Add root control</button>
@@ -372,6 +379,15 @@
             <label class="settings-check"><input id="cfg-network-fail-closed" type="checkbox"><span>Fail closed</span></label>
             <label class="settings-check"><input id="cfg-network-validate-route" type="checkbox"><span>Validate route</span></label>
             <label class="settings-check"><input id="cfg-network-validate-dns" type="checkbox"><span>Validate DNS</span></label>
+          </div>
+          <div class="settings-card-heading"><h4>SOCKS5 TCP proxy</h4></div>
+          <p class="muted">Off by default. Peer TCP, HTTP(S) trackers, and webseeds connect through this proxy after the proxy itself is reached through the contained network path. Target hostname resolution is remote through SOCKS5. SOCKS5 UDP is not supported: enabling it requires disabling uTP and DHT, and UDP tracker URLs are refused rather than sent directly.</p>
+          <div class="settings-form-grid">
+            <label class="settings-check"><input id="cfg-network-socks5-enabled" type="checkbox"><span>Enable SOCKS5 proxy</span></label>
+            <label class="settings-field"><span>Proxy host</span><input id="cfg-network-socks5-host" type="text" placeholder="proxy.example"></label>
+            <label class="settings-field"><span>Proxy port</span><input id="cfg-network-socks5-port" type="number" min="1" max="65535" step="1"></label>
+            <label class="settings-field"><span>Username (optional)</span><input id="cfg-network-socks5-username" type="text" autocomplete="username"></label>
+            <label class="settings-field"><span>Password (optional)</span><input id="cfg-network-socks5-password" type="password" autocomplete="new-password" placeholder="Leave blank to preserve existing password"></label>
           </div>
           <div class="settings-card-heading"><h4>Listen-port reachability test</h4></div>
           <p class="muted">Off by default. Configure an HTTP(S) endpoint you operate; the request is made through the contained torrent network path and only reports an informational result.</p>
@@ -438,7 +454,7 @@
 
         <div id="settings-profiles" class="card settings-panel" data-settings-panel="profiles" tabindex="-1" hidden>
           <h3>Policy profiles</h3>
-          <p class="muted">Profiles apply named storage, queue, seeding, and bandwidth defaults. Storage paths are captured when a torrent is added; other profile fields remain live for inheriting torrents.</p>
+          <p class="muted">Profiles apply named storage, queue, seeding, bandwidth, and optional <code>encryption_mode</code> defaults. Storage paths are captured when a torrent is added; other profile fields remain live for inheriting torrents.</p>
           <label class="settings-field"><span>Profiles JSON</span><textarea id="cfg-profiles-json" class="settings-list" rows="18" spellcheck="false"></textarea></label>
           <p class="muted">Use <code>profiles</code> for named definitions and <code>labels</code> to map labels to a profile. Save Settings validates the configuration before applying it.</p>
         </div>

@@ -107,9 +107,10 @@ applies.
 Both statuses are latched. Periodic probe health, a lifecycle command, and a
 partial settings patch cannot reopen the gate. Only an explicit full
 configuration replacement may attempt recovery. Before clearing the latch it
-constructs a binder from the replacement and successfully opens then drops an
-ephemeral contained UDP socket and configured peer listener. A validation or
-persistence failure preserves the old configuration, status, and blocked gate.
+constructs a binder from the replacement and successfully opens then drops the
+configured peer listener and, outside SOCKS5 TCP-only mode, an ephemeral
+contained UDP socket. A validation or persistence failure preserves the old
+configuration, status, and blocked gate.
 Production-path API tests cover immediate block, latching across a healthy
 probe, failed repair, successful replacement, and the generic denial status.
 

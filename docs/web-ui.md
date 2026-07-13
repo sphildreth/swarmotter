@@ -127,8 +127,9 @@ SwarmOtter can negotiate MSE/PE peer encryption. The Settings screen exposes
 `torrent.encryption_mode` with these choices:
 
 - `disabled` (plaintext handshakes only),
-- `preferred` (TCP attempts use MSE/PE first, with plaintext fallback),
-- `required` (refuse plaintext).
+- `preferred` (contained TCP/uTP attempts use MSE/PE first, with a plaintext
+  fallback only on the same selected transport),
+- `required` (refuse plaintext with no fallback).
 
 The default is `preferred`. The UI keeps this control in the same Settings edit
 flow as other daemon config because it changes peer-wire compatibility behavior.
@@ -138,11 +139,14 @@ flow as other daemon config because it changes peer-wire compatibility behavior.
 Settings includes a **Policy profiles** editor for the persisted `profiles`
 configuration section. The Add screen can choose a profile and labels before
 registration. Torrent Details shows every effective profile value with its
-source and can set or clear an explicit profile assignment. Storage paths and
-the initial start-or-paused decision are shown as create-time snapshots:
-profile reassignment does not move existing data or revoke a queued torrent's
-admission. Queue priority, seeding, and bandwidth values remain explainable
-live inheritance.
+source and can set or clear an explicit profile assignment. Profiles may set
+an optional `encryption_mode`; Torrent Details shows its effective source and
+can set an explicit per-torrent encryption mode or choose **Inherit profile or
+global mode** to send an explicit `null` clear. Storage paths and the initial
+start-or-paused decision are shown as create-time snapshots: profile
+reassignment does not move existing data or revoke a queued torrent's
+admission. Queue priority, seeding, bandwidth, and peer encryption remain
+explainable live inheritance.
 
 ## Peer admission
 
@@ -170,7 +174,8 @@ so operators can:
 - review per-root free/available bytes before large add bursts,
 - identify which roots are close to configured reserve thresholds, and
 - diagnose storage pressure alongside active write/recheck activity and
-  configured root controls.
+  configured root controls, mount options, CoW strategy support, and observed
+  sustained payload-write/verification throughput.
 
 Storage reserve fields in configuration are `[storage].minimum_free_space_bytes`
 and `[storage].minimum_free_space_percent`. When configured, add operations are
@@ -182,6 +187,13 @@ entries. Each row exposes a lexical path plus active-download, active-byte,
 write-rate, and concurrent-recheck limits. The Doctor table shows the matching
 control root, declared active bytes, active rechecks, and saturation warnings
 so an operator can distinguish a local root budget from global queue limits.
+It also exposes durable placement for fast-resume metadata, daemon-state
+defaults, and fallback temporary payload storage, plus the explicit CoW
+strategy. A state-directory change is shown as restart-required; a resume
+directory change is rejected while unfinished data remains. The UI does not
+offer an implicit filesystem optimization: NOCOW is explicit, applies only to
+new supported Btrfs files, leaves existing files unchanged, and errors rather
+than falling back silently when an existing writable file lacks the flag.
 
 ## Performance diagnostics and autopilot visibility
 
@@ -249,6 +261,22 @@ Detailed network checks and path diagnostics use:
 ```text
 GET /api/v1/network/diagnostics
 ```
+
+### SOCKS5 TCP proxy
+
+Settings > Network exposes an opt-in SOCKS5 TCP `CONNECT` card with proxy host,
+port, and optional username/password fields. Enabling it clears the uTP and DHT
+controls because this release deliberately blocks UDP tracker, DHT, and uTP
+paths rather than sending them directly outside the proxy. Server-side
+validation remains authoritative if a client submits an incompatible full
+configuration.
+
+The Settings API never returns the SOCKS5 password to the browser, so the
+password field is blank after reload. Saving it blank preserves the existing
+credential only while the username is unchanged; clear the username to remove
+authentication, or supply both a new username and password to replace it. The
+Network summary reports only that SOCKS5 is enabled and TCP-only/UDP-blocked;
+it does not display the proxy host or credentials.
 
 ### Router port mapping and listener reachability
 

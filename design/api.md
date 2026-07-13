@@ -157,17 +157,18 @@ ADR-0009 and ADR-0010.
 - `GET /api/v1/storage/roots` exposes storage-root diagnostics used for
   operator visibility, add-time preflight checks, and root-control admission
   diagnostics. Each row additively reports declared active bytes, active
-  rechecks, the matching lexical control path, configured limits, and
-  saturation warnings.
+  rechecks, the matching lexical control path, configured limits, saturation
+  warnings, best-effort mount point/options/source, actual sustained payload
+  write and verification-read rates, and CoW strategy support. Mount values
+  are nullable platform/container diagnostics, never a failed API response.
 
-- `[torrent].encryption_mode` is part of transport compatibility.
-  `/api/v1/settings` GET includes it in configuration snapshots.
-  `/api/v1/settings` PUT accepts `disabled` | `preferred` | `required`.
-  `preferred` is the default when not set.
-  Changing this field is reported in `restart_required_fields` for existing
-  torrent tasks.
-  Encryption mode is documented for interoperability and must remain under the
-  same contained peer transport path.
+- `[torrent].encryption_mode` is the global transport-compatibility fallback.
+  `/api/v1/settings` GET includes it in configuration snapshots and PUT accepts
+  `disabled` | `preferred` | `required`, with `preferred` as the default.
+  MSE/PE wraps only an already-contained TCP or uTP peer stream. `preferred`
+  can retry plaintext on that same selected transport; `required` never does.
+  Changing this global field live-rebuilds existing data-plane tasks and does
+  not require a process restart.
 
 ## Storage configuration contract
 
@@ -180,6 +181,13 @@ ADR-0009 and ADR-0010.
   most-specific matching lexical active-write root wins; zero means unlimited.
   Root-budget saturation keeps work queued rather than converting it into a
   permanent payload error. See ADR-0056.
+- `storage.resume_dir` stores fast-resume files under info-hash names without
+  moving payloads. `storage.state_dir` supplies the state-file default only
+  after restart and never overrides an explicit CLI/environment state path.
+  `storage.temp_dir` supplies only the fallback payload root. Durable atomic
+  replacement files remain siblings of their targets. `cow_strategy` defaults
+  to conservative; explicit NOCOW is limited to newly created Linux Btrfs
+  payload files and fails rather than silently falling back. See ADR-0064.
 
 ## Policy-profile API contract
 
@@ -192,7 +200,8 @@ ADR-0009 and ADR-0010.
   storage is chosen. Watch and compatibility intake paths follow the same
   ordering.
 - `GET /api/v1/torrents/:hash/policy` returns the effective profile plus every
-  resolved storage, queue, seeding, and bandwidth value with its source layer.
+  resolved storage, queue, seeding, bandwidth, and encryption value with its
+  source layer.
   Serialized source kinds are `global`, `profile`, `label`, `torrent`,
   `legacy_torrent`, `profile_storage_snapshot`,
   `registration_storage_snapshot`, `existing_storage_snapshot`, and
@@ -200,12 +209,20 @@ ADR-0009 and ADR-0010.
   resolved storage choice was fixed at registration; the initial admission
   source means the torrent's one-time start-or-paused decision was captured
   and cannot be retroactively changed by later inherited-policy edits. `PUT`
-  sets or clears an explicit assignment transactionally.
+  sets or clears an explicit profile assignment transactionally.
+- `PUT /api/v1/torrents/:hash/encryption-mode` sets the durable explicit
+  encryption override. Its JSON body must contain `encryption_mode`; a mode
+  wins over profile and global resolution, and explicit `null` clears it. A
+  successful operation persists before affected active download/metadata work
+  is restarted, so a failed state write retains the preceding effective mode.
 - Resolved storage and initial admission are durable create-time snapshots.
   Profile reassignment and label changes preserve existing storage, never move
   payload data, and cannot revoke a queued torrent's admission. Queue priority,
-  seeding, and rate caps remain live for inheriting torrents. Legacy records
-  are migrated transactionally during profile replacement.
+  seeding, rate caps, and encryption remain live for inheriting torrents.
+  Profile or label-map replacement restarts only records whose resolved encryption
+  value changes; global encryption replacement keeps the complete data-plane
+  transaction. Legacy records are migrated transactionally during profile
+  replacement (ADR-0063).
 
 ## Peer-admission API contract
 
@@ -234,11 +251,14 @@ ADR-0009 and ADR-0010.
 - `POST /api/v1/torrents/:hash/autopilot` sets or clears per-torrent override mode
   with `{ "mode": "disabled" | "observe" | "act" | null }`.
 - `GET /api/v1/settings` returns `autopilot.mode` in the configuration snapshot with
-  a redacted `api.auth_token`.
+  redacted `api.auth_token` and `network.socks5.password` values.
 - `PATCH /api/v1/settings` can update `autopilot.mode` as a safe runtime
   setting.
 - `PUT /api/v1/settings` replaces full configuration and accepts `[autopilot].mode`
-  after validation.
+  after validation. It preserves an omitted SOCKS5 password only when the
+  SOCKS5 username is unchanged, validates complete RFC 1929 credentials, and
+  rejects SOCKS5 with uTP or DHT enabled because the supported proxy path is
+  TCP `CONNECT` only.
 
 `PATCH /api/v1/settings` remains constrained to runtime-safe settings and does
 not accept restart-required fields.

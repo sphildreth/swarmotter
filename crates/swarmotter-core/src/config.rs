@@ -161,6 +161,20 @@ pub struct StorageConfig {
     pub download_dir: Option<String>,
     #[serde(default)]
     pub incomplete_dir: Option<String>,
+    /// Optional directory for durable fast-resume metadata. When unset,
+    /// resume files remain beside active payload data for compatibility.
+    #[serde(default)]
+    pub resume_dir: Option<String>,
+    /// Optional directory for the daemon's durable state file when no
+    /// explicit `--state-file` or `SWARMOTTER_STATE_FILE` is supplied.
+    #[serde(default)]
+    pub state_dir: Option<String>,
+    /// Optional scratch root used for the daemon's fallback download layout
+    /// when no download directory is configured. Atomic state and resume
+    /// replacements intentionally continue to use same-directory temporary
+    /// files so a cross-filesystem configuration cannot weaken durability.
+    #[serde(default)]
+    pub temp_dir: Option<String>,
     /// Minimum free bytes to keep available on storage roots after planned
     /// torrent writes. `0` disables byte-reserve enforcement.
     #[serde(default)]
@@ -175,11 +189,41 @@ pub struct StorageConfig {
     /// Use sparse files where supported.
     #[serde(default = "default_true")]
     pub sparse: bool,
+    /// Explicit CoW strategy for newly created payload files. The default
+    /// preserves filesystem defaults and never changes inode flags.
+    #[serde(default)]
+    pub cow_strategy: CowStrategy,
     /// Per-root admission, write-pressure, and recheck controls. A control
     /// applies to its lexical path and descendants; the most specific matching
     /// control wins.
     #[serde(default)]
     pub root_controls: Vec<StorageRootControl>,
+}
+
+/// Copy-on-write handling for newly created payload files.
+///
+/// This is deliberately conservative: opting into `disable_for_new_files`
+/// only succeeds on supported Btrfs filesystems before data is written. It
+/// never changes an existing file and never silently substitutes a different
+/// write strategy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CowStrategy {
+    /// Preserve the filesystem's default CoW behavior.
+    #[default]
+    Conservative,
+    /// Disable CoW for newly created payload files on supported Linux Btrfs
+    /// roots. Unsupported or ineligible files fail explicitly.
+    DisableForNewFiles,
+}
+
+impl CowStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Conservative => "conservative",
+            Self::DisableForNewFiles => "disable_for_new_files",
+        }
+    }
 }
 
 /// Disk-scheduling controls for one lexical storage-root boundary.
@@ -231,6 +275,30 @@ impl StorageConfig {
             .max_by_key(|(root, _)| root.components().count())
             .map(|(_, control)| control)
     }
+
+    /// Return an optional durable state directory as a lexical absolute path.
+    pub fn state_dir_path(&self) -> Result<Option<PathBuf>> {
+        self.state_dir
+            .as_deref()
+            .map(|path| lexical_absolute_path(Path::new(path)))
+            .transpose()
+    }
+
+    /// Return an optional fast-resume directory as a lexical absolute path.
+    pub fn resume_dir_path(&self) -> Result<Option<PathBuf>> {
+        self.resume_dir
+            .as_deref()
+            .map(|path| lexical_absolute_path(Path::new(path)))
+            .transpose()
+    }
+
+    /// Return an optional scratch directory as a lexical absolute path.
+    pub fn temp_dir_path(&self) -> Result<Option<PathBuf>> {
+        self.temp_dir
+            .as_deref()
+            .map(|path| lexical_absolute_path(Path::new(path)))
+            .transpose()
+    }
 }
 
 fn default_true() -> bool {
@@ -242,10 +310,14 @@ impl Default for StorageConfig {
         Self {
             download_dir: None,
             incomplete_dir: None,
+            resume_dir: None,
+            state_dir: None,
+            temp_dir: None,
             minimum_free_space_bytes: 0,
             minimum_free_space_percent: 0,
             preallocate: false,
             sparse: true,
+            cow_strategy: CowStrategy::Conservative,
             root_controls: Vec::new(),
         }
     }
@@ -269,9 +341,10 @@ pub struct TorrentConfig {
     /// the other transport remains available.
     #[serde(default = "default_true")]
     pub utp_prefer_tcp: bool,
-    /// Peer wire encryption policy for TCP peers. `preferred` attempts MSE/PE
-    /// first and falls back to plaintext; `required` refuses plaintext peer
-    /// wire sessions and disables uTP fallback until encrypted uTP is added.
+    /// Peer-wire encryption policy for contained TCP and uTP streams.
+    /// `preferred` attempts MSE/PE first and falls back to plaintext on the
+    /// selected contained transport; `required` refuses plaintext peer-wire
+    /// sessions without silently changing transport.
     #[serde(default)]
     pub encryption_mode: PeerEncryptionMode,
     /// Selfish mode: when true, SwarmOtter removes a torrent from the daemon
@@ -513,6 +586,14 @@ impl Config {
         self.peer_filter.validate()?;
         self.port_mapping.validate()?;
         self.port_test.validate()?;
+        if self.network.socks5.enabled && (self.torrent.utp_enabled || self.dht.enabled) {
+            // SOCKS5 UDP ASSOCIATE is deliberately not implemented. Refuse an
+            // ambiguous configuration rather than presenting a proxy as if it
+            // covered UDP traffic or allowing a contained-direct fallback.
+            return Err(CoreError::InvalidConfig(
+                "network.socks5 is TCP CONNECT only; set torrent.utp_enabled = false and dht.enabled = false when enabling it (UDP tracker URLs are rejected at runtime)".into(),
+            ));
+        }
         if self.port_mapping.enabled
             && (self.network.mode != crate::models::network::NetworkContainmentMode::Strict
                 || !self.network.fail_closed
@@ -600,6 +681,22 @@ impl Config {
             return Err(CoreError::InvalidConfig(
                 "storage.minimum_free_space_percent must be between 0 and 100".into(),
             ));
+        }
+        for (field, path) in [
+            ("storage.resume_dir", self.storage.resume_dir.as_deref()),
+            ("storage.state_dir", self.storage.state_dir.as_deref()),
+            ("storage.temp_dir", self.storage.temp_dir.as_deref()),
+        ] {
+            if let Some(path) = path {
+                if path.trim().is_empty() {
+                    return Err(CoreError::InvalidConfig(format!(
+                        "{field} must not be empty when set"
+                    )));
+                }
+                lexical_absolute_path(Path::new(path)).map_err(|error| {
+                    CoreError::InvalidConfig(format!("{field} could not be normalized: {error}"))
+                })?;
+            }
         }
         let mut normalized_storage_roots = BTreeSet::new();
         for control in &self.storage.root_controls {
@@ -990,6 +1087,50 @@ minimum_free_space_percent = 101
     }
 
     #[test]
+    fn storage_state_placement_and_cow_strategy_parse_with_safe_defaults() {
+        let cfg = Config::from_toml_str(
+            r#"
+[network]
+mode = "disabled"
+
+[storage]
+resume_dir = "runtime/resume"
+state_dir = "runtime/state"
+temp_dir = "runtime/scratch"
+cow_strategy = "disable_for_new_files"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.storage.resume_dir_path().unwrap().unwrap(),
+            lexical_absolute_path(Path::new("runtime/resume")).unwrap()
+        );
+        assert_eq!(
+            cfg.storage.state_dir_path().unwrap().unwrap(),
+            lexical_absolute_path(Path::new("runtime/state")).unwrap()
+        );
+        assert_eq!(cfg.storage.cow_strategy, CowStrategy::DisableForNewFiles);
+
+        let defaults = StorageConfig::default();
+        assert_eq!(defaults.cow_strategy, CowStrategy::Conservative);
+        assert!(defaults.resume_dir.is_none());
+        assert!(defaults.state_dir.is_none());
+        assert!(defaults.temp_dir.is_none());
+    }
+
+    #[test]
+    fn storage_state_placement_rejects_blank_paths() {
+        for field in ["resume_dir", "state_dir", "temp_dir"] {
+            let error = Config::from_toml_str(&format!(
+                "[network]\nmode = \"disabled\"\n\n[storage]\n{field} = \"  \"\n"
+            ))
+            .unwrap_err();
+            assert_eq!(error.code().as_str(), "invalid_config");
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
+    #[test]
     fn storage_root_controls_use_most_specific_lexical_root() {
         let cfg = Config::from_toml_str(
             r#"
@@ -1166,6 +1307,25 @@ encryption_mode = "required"
         ];
         let cfg = cfg.apply_env_overrides(&env).unwrap();
         assert_eq!(cfg.torrent.encryption_mode, PeerEncryptionMode::Disabled);
+    }
+
+    #[test]
+    fn profile_encryption_mode_parses_as_an_optional_override() {
+        let toml = r#"
+[network]
+mode = "disabled"
+
+[torrent]
+encryption_mode = "disabled"
+
+[profiles.profiles.secure]
+encryption_mode = "required"
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(
+            cfg.profiles.profiles["secure"].encryption_mode,
+            Some(PeerEncryptionMode::Required)
+        );
     }
 
     #[test]

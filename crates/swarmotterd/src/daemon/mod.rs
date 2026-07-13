@@ -90,7 +90,7 @@ use crate::seeder::{SeedRegistration, SeedRegistry, SeederHub};
 use storage_controls::{
     is_storage_work_cancelled, storage_root_admission_for_path, storage_work_cancelled_error,
     ExplicitRecheckOperation, StorageAdmissionController, StorageAdmissionPlan,
-    StorageRecheckController, StorageRootAdmission, StorageWorkCancellation,
+    StorageMetricRegistry, StorageRecheckController, StorageRootAdmission, StorageWorkCancellation,
 };
 
 const PEER_DIAGNOSTIC_RECENT_WINDOW: Duration = Duration::from_secs(30);
@@ -222,6 +222,9 @@ pub struct DaemonRuntime {
     /// Root-scoped active-engine reservations and shared write pressure
     /// limiters. These are local-storage controls only.
     storage_admissions: StorageAdmissionController,
+    /// Shared actual local-I/O accounting for storage diagnostics. This is
+    /// observational and cannot alter admission or payload correctness.
+    storage_metrics: StorageMetricRegistry,
     /// Root-scoped full-recheck permits. The RAII permit releases correctly if
     /// an API request is cancelled.
     storage_rechecks: StorageRecheckController,
@@ -456,6 +459,7 @@ struct EngineStartSnapshot {
     active_dir: String,
     download_limit: u64,
     upload_limit: u64,
+    encryption_mode: swarmotter_core::config::PeerEncryptionMode,
     needs_metadata: bool,
     magnet_info_hash: Option<InfoHash>,
     magnet_name: Option<String>,
@@ -483,6 +487,7 @@ impl EngineStartSnapshot {
             active_dir,
             download_limit: policy.download_limit.value,
             upload_limit: policy.upload_limit.value,
+            encryption_mode: policy.encryption_mode.value,
             needs_metadata: torrent.needs_metadata,
             magnet_info_hash: torrent.magnet_info_hash,
             magnet_name: torrent.magnet_name.clone(),
@@ -560,8 +565,12 @@ fn instant_age_seconds(now: Instant, seen: Option<Instant>) -> Option<u64> {
     seen.map(|instant| now.saturating_duration_since(instant).as_secs())
 }
 
-fn default_download_dir_string() -> String {
-    std::env::temp_dir()
+fn default_download_dir_string(cfg: &Config) -> String {
+    cfg.storage
+        .temp_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
         .join("swarmotter-downloads")
         .display()
         .to_string()
@@ -571,7 +580,7 @@ fn resolve_download_dir_from_config(download_dir: Option<&str>, cfg: &Config) ->
     download_dir
         .map(str::to_string)
         .or_else(|| cfg.storage.download_dir.clone())
-        .unwrap_or_else(default_download_dir_string)
+        .unwrap_or_else(|| default_download_dir_string(cfg))
 }
 
 fn resolve_incomplete_dir_from_config(download_dir: &str, cfg: &Config) -> String {
@@ -579,6 +588,18 @@ fn resolve_incomplete_dir_from_config(download_dir: &str, cfg: &Config) -> Strin
         .incomplete_dir
         .clone()
         .unwrap_or_else(|| download_dir.to_string())
+}
+
+/// Construct a storage handle whose durable fast-resume placement matches the
+/// active configuration. Payload paths remain rooted at `download_dir`; only
+/// metadata moves when the operator opts into `storage.resume_dir`.
+pub(super) fn storage_io_with_config(
+    meta: meta::TorrentMeta,
+    download_dir: impl Into<PathBuf>,
+    cfg: &Config,
+) -> swarmotter_core::storage::StorageIo {
+    swarmotter_core::storage::StorageIo::new(meta, download_dir)
+        .with_resume_dir(cfg.storage.resume_dir.as_ref().map(PathBuf::from))
 }
 
 /// Resolve the local storage-root control that owns a torrent's active write

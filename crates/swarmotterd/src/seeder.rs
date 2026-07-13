@@ -72,8 +72,18 @@ impl SeedRegistration {
                 limiter,
                 peer_session_budget,
                 shutdown,
+                encryption_mode: None,
             },
         }
+    }
+
+    /// Attach the effective encryption mode resolved for this torrent. The
+    /// process-wide listener uses it after routing an inbound handshake, so
+    /// per-profile and per-torrent overrides cannot silently admit plaintext
+    /// sessions for a `required` torrent.
+    pub fn with_encryption_mode(mut self, encryption_mode: PeerEncryptionMode) -> Self {
+        self.context.encryption_mode = Some(encryption_mode);
+        self
     }
 
     pub fn info_hash(&self) -> swarmotter_core::hash::InfoHash {
@@ -125,6 +135,19 @@ impl SeedRegistry {
 
     pub async fn clear(&self) {
         self.inner.write().await.clear();
+    }
+
+    /// Update the policy used for subsequently accepted sessions without
+    /// disrupting an already-negotiated upload. The caller has already
+    /// persisted the corresponding torrent/configuration transition.
+    pub async fn update_encryption_mode(
+        &self,
+        info_hash: &swarmotter_core::hash::InfoHash,
+        encryption_mode: PeerEncryptionMode,
+    ) {
+        if let Some(context) = self.inner.write().await.get_mut(info_hash) {
+            context.encryption_mode = Some(encryption_mode);
+        }
     }
 
     async fn context(
@@ -473,6 +496,7 @@ impl Seeder {
                         limiter: self.limiter.clone(),
                         peer_session_budget: self.peer_session_budget.clone(),
                         shutdown: self.shutdown.clone(),
+                        encryption_mode: None,
                     };
                     let encryption_mode = self.encryption_mode;
                     sessions.spawn(async move {
@@ -500,6 +524,10 @@ struct PeerServeContext {
     limiter: ShapedLimiter,
     peer_session_budget: PeerSessionBudget,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    /// `None` retains the listener-wide policy for registrations created by
+    /// older callers/tests. The daemon always records the resolved effective
+    /// mode here.
+    encryption_mode: Option<PeerEncryptionMode>,
 }
 
 #[cfg(test)]
@@ -517,35 +545,52 @@ async fn serve_known_peer(
 async fn serve_routed_peer(
     stream: tokio::net::TcpStream,
     registry: SeedRegistry,
-    encryption_mode: PeerEncryptionMode,
+    listener_encryption_mode: PeerEncryptionMode,
     peer_addr: std::net::SocketAddr,
     peer_filter: Arc<PeerFilter>,
     _global_peer_permit: PeerPermit,
 ) -> Result<()> {
     let plaintext = looks_like_plaintext_peer_handshake(&stream).await?;
-    let (mut stream, encrypted_hash): (Box<dyn PeerDuplex>, Option<_>) = match encryption_mode {
-        PeerEncryptionMode::Disabled => (Box::new(stream), None),
-        PeerEncryptionMode::Preferred if plaintext => (Box::new(stream), None),
-        PeerEncryptionMode::Required if plaintext => {
-            return Err(CoreError::Internal(
-                "plaintext inbound peer rejected by required encryption mode".into(),
-            ));
-        }
-        PeerEncryptionMode::Preferred | PeerEncryptionMode::Required => {
-            let hashes = registry.info_hashes().await;
-            let (hash, encrypted) = timeout(
-                Duration::from_secs(10),
-                swarmotter_core::mse::accept_any(stream, &hashes),
-            )
-            .await??;
-            (Box::new(encrypted), Some(hash))
-        }
+    // An inbound listener must identify the torrent before it can apply a
+    // profile/torrent override. Plaintext handshakes identify themselves in
+    // their normal peer-wire header; encrypted MSE streams identify
+    // themselves through the stream key. Both paths are accepted only long
+    // enough to identify the torrent, then the effective policy decides
+    // whether the peer-wire session may continue.
+    let (mut stream, encrypted_hash): (Box<dyn PeerDuplex>, Option<_>) = if plaintext {
+        (Box::new(stream), None)
+    } else {
+        let hashes = registry.info_hashes().await;
+        let (hash, encrypted) = timeout(
+            Duration::from_secs(10),
+            swarmotter_core::mse::accept_any(stream, &hashes),
+        )
+        .await??;
+        (Box::new(encrypted), Some(hash))
     };
     let their_hs = read_peer_handshake(&mut stream).await?;
     if encrypted_hash.is_some_and(|hash| hash != their_hs.info_hash) {
         return Err(CoreError::Internal(
             "encrypted inbound peer handshake did not match its stream key".into(),
         ));
+    }
+    let context = registry
+        .context(&their_hs.info_hash)
+        .await
+        .ok_or_else(|| CoreError::NotFound("registered inbound torrent".into()))?;
+    let encryption_mode = context.encryption_mode.unwrap_or(listener_encryption_mode);
+    match (plaintext, encryption_mode) {
+        (true, PeerEncryptionMode::Required) => {
+            return Err(CoreError::Internal(
+                "plaintext inbound peer rejected by required encryption mode".into(),
+            ));
+        }
+        (false, PeerEncryptionMode::Disabled) => {
+            return Err(CoreError::Internal(
+                "encrypted inbound peer rejected by disabled encryption mode".into(),
+            ));
+        }
+        _ => {}
     }
     let decision = peer_filter.admit_client_id(&their_hs.peer_id);
     if !decision.is_allowed() {
@@ -561,10 +606,6 @@ async fn serve_routed_peer(
                 .unwrap_or_else(|| "peer rejected by admission policy".into()),
         ));
     }
-    let context = registry
-        .context(&their_hs.info_hash)
-        .await
-        .ok_or_else(|| CoreError::NotFound("registered inbound torrent".into()))?;
     let _torrent_peer_permit = context
         .peer_session_budget
         .try_acquire_torrent_inbound()
@@ -590,6 +631,7 @@ async fn serve_peer(
         peer_id,
         limiter,
         peer_session_budget: _,
+        encryption_mode: _,
         mut shutdown,
     } = context;
     if their_hs.info_hash != meta.info_hash {
@@ -961,6 +1003,94 @@ mod tests {
         for (_, _, dir) in fixtures {
             std::fs::remove_dir_all(dir).ok();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registered_required_encryption_rejects_plaintext_when_listener_prefers() {
+        let content = b"registered encryption policy fixture";
+        let bytes = build_single_file_torrent(
+            "registered-required-encryption.bin",
+            content,
+            content.len() as u64,
+            None,
+            false,
+        );
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("registered-required-encryption");
+        let storage = Arc::new(StorageIo::new(meta.clone(), dir.clone()));
+        storage.write_piece(0, content).await.unwrap();
+        let mut have = PieceBitfield::new(1);
+        have.set(0);
+        let state = Arc::new(Mutex::new(EngineState {
+            piece_count: 1,
+            total_length: content.len() as u64,
+            pieces_have: have,
+            finished: true,
+            ..EngineState::default()
+        }));
+        let registry = SeedRegistry::default();
+        let global_peer_permits = PeerPermitPool::unlimited();
+        let (torrent_shutdown_tx, torrent_shutdown_rx) = tokio::sync::watch::channel(false);
+        registry
+            .register(
+                SeedRegistration::new(
+                    meta.clone(),
+                    storage,
+                    None,
+                    state,
+                    peer_id(b"-REQSRV-"),
+                    RateLimiter::unlimited(),
+                    None,
+                    PeerSessionBudget::new(
+                        global_peer_permits.clone(),
+                        PeerPermitPool::unlimited(),
+                    ),
+                    torrent_shutdown_rx,
+                )
+                .with_encryption_mode(PeerEncryptionMode::Required),
+            )
+            .await;
+        let (hub_shutdown_tx, hub_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+        let hub = SeederHub::new(
+            registry,
+            Arc::new(LoopbackBinder),
+            0,
+            PeerEncryptionMode::Preferred,
+            hub_shutdown_rx,
+            global_peer_permits,
+        )
+        .with_bound_addr(bound_tx);
+        let task = tokio::spawn(hub.run());
+        let address = bound_rx.await.unwrap();
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut read, mut write) = tokio::io::split(stream);
+        peer::write_handshake(
+            &mut write,
+            &Handshake {
+                info_hash: meta.info_hash,
+                peer_id: peer_id(b"-REQCLI-"),
+                reserved: swarmotter_core::extensions::EXTENSION_RESERVED,
+            },
+        )
+        .await
+        .unwrap();
+        write.flush().await.unwrap();
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), read.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "a per-torrent required registration must not serve a plaintext peer"
+        );
+
+        let _ = torrent_shutdown_tx.send(true);
+        let _ = hub_shutdown_tx.send(true);
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

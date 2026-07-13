@@ -115,12 +115,14 @@ is outside this data-plane gate and remains available for diagnostics and
 repair.
 
 HTTP(S) tracker announce/scrape and webseed range reads use one contained
-HTTP/1 codec. The binder resolves and connects every redirect hop; TLS wraps
-only that stream. No connector, independent resolver, or pool can open a data-
-plane socket. HTTPS-to-HTTP redirects are rejected, decoded bodies are bounded,
-and exact webseed Range/Content-Range semantics are enforced. UDP scrape is
+HTTP/1 codec. Each redirect hop asks the binder to connect to the target host;
+the ordinary contained binder resolves it on the contained path, while an
+enabled SOCKS5 binder keeps the hostname for remote target DNS. TLS wraps only
+that stream. No connector, independent resolver, or pool can open a data-plane
+socket. HTTPS-to-HTTP redirects are rejected, decoded bodies are bounded, and
+exact webseed Range/Content-Range semantics are enforced. UDP scrape is
 unsupported and makes no network call; UDP announce remains contained and
-supported.
+supported unless SOCKS5 TCP-only mode is enabled.
 
 Only work demonstrably live at the block edge receives durable recovery intent.
 After recovery, SwarmOtter consumes that intent and resumes those downloads,
@@ -132,10 +134,48 @@ A source, interface, UDP, or peer-listener bind failure blocks immediately and
 reports `socket_bind_failed`; a generic strict-policy denial reports
 `blocked_fail_closed`. These failures remain latched even if the interface probe
 later reports healthy. To recover, submit an explicit full configuration with
-`PUT /api/v1/settings`. SwarmOtter validates contained ephemeral UDP and
-peer-listener binds before clearing the latch. If validation or persistence
-fails, the old configuration remains active and traffic stays blocked. A
-partial settings patch, health tick, or torrent resume does not clear the latch.
+`PUT /api/v1/settings`. SwarmOtter validates the peer-listener bind and, unless
+SOCKS5 TCP-only mode is enabled, a contained ephemeral UDP bind before clearing
+the latch. If validation or persistence fails, the old configuration remains
+active and traffic stays blocked. A partial settings patch, health tick, or
+torrent resume does not clear the latch.
+
+## SOCKS5 TCP proxy
+
+`[network.socks5]` is an opt-in TCP `CONNECT` layer, not a replacement for the
+configured containment path. The daemon uses the contained binder to resolve
+and connect to the proxy itself. TCP peer IP addresses use SOCKS IP-address
+requests; HTTP(S) tracker, scrape, and webseed hostnames use SOCKS domain
+requests so target DNS happens at the proxy. If a proxy connection or handshake
+fails, the target is not retried directly.
+
+SOCKS5 no-authentication and RFC 1929 username/password authentication are
+supported. The password is redacted from Settings reads and update results. A
+blank password in a full Settings save retains the stored value only when the
+username is unchanged.
+
+The supported proxy mode is deliberately TCP-only. Enabling it requires:
+
+```toml
+[network.socks5]
+enabled = true
+host = "proxy.example"
+
+[torrent]
+utp_enabled = false
+
+[dht]
+enabled = false
+```
+
+The proxy binder blocks UDP sockets and direct target resolution, so UDP
+tracker, DHT, and uTP traffic cannot silently escape outside the proxy. SOCKS5
+UDP ASSOCIATE and proxy-provided inbound forwarding are not implemented. Peer
+listeners remain bound to the configured contained path. NAT-PMP/UPnP mapping
+uses the same containment boundary directly for local router traffic; it is not
+a proxy or torrent-egress fallback. Network diagnostics expose only the
+`socks5_enabled` and `socks5_udp_blocked` state, never proxy host or
+credentials.
 
 ## Dynamic interface binding
 

@@ -178,6 +178,10 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             get(handlers::policies::torrent_policy).put(handlers::policies::set_torrent_profile),
         )
         .route(
+            "/torrents/:hash/encryption-mode",
+            put(handlers::policies::set_torrent_encryption_mode),
+        )
+        .route(
             "/torrents/:hash/autopilot",
             get(handlers::autopilot::get_torrent_autopilot)
                 .post(handlers::autopilot::set_torrent_autopilot),

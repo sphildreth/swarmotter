@@ -207,6 +207,7 @@ impl DaemonRuntime {
     }
 
     pub(super) async fn verify_restored_completed_torrents(&self) -> Result<()> {
+        let cfg = self.config.read().await.clone();
         let torrents = self
             .registry
             .lock()
@@ -224,10 +225,8 @@ impl DaemonRuntime {
             } else {
                 self.resolve_incomplete_dir_for(&torrent).await
             };
-            let storage = swarmotter_core::storage::StorageIo::new(
-                torrent.meta.clone(),
-                PathBuf::from(storage_dir),
-            );
+            let storage =
+                storage_io_with_config(torrent.meta.clone(), PathBuf::from(storage_dir), &cfg);
             match self
                 .recheck_storage_under_root_control(&storage, None)
                 .await
@@ -619,6 +618,7 @@ impl DaemonRuntime {
         if targets.is_empty() {
             return Ok(Vec::new());
         }
+        let cfg = self.config.read().await.clone();
         for (hash, _) in &targets {
             self.force_stop_engine(hash).await;
         }
@@ -629,9 +629,10 @@ impl DaemonRuntime {
                 let mut dirs = vec![active_dir, complete_dir];
                 dirs.dedup();
                 for dir in dirs {
-                    let storage = swarmotter_core::storage::StorageIo::new(
+                    let storage = storage_io_with_config(
                         torrent.meta.clone(),
                         std::path::PathBuf::from(&dir),
+                        &cfg,
                     );
                     if let Err(error) = storage.remove_all().await {
                         if let Some(torrent) = self.registry.lock().await.get_mut(hash) {
@@ -1013,13 +1014,11 @@ impl DaemonRuntime {
         active_dir: &str,
         exclude: Option<InfoHash>,
     ) -> Result<()> {
+        let cfg = self.config.read().await.clone();
         let candidates = unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)])
             .into_iter()
-            .map(|root| {
-                swarmotter_core::storage::StorageIo::new(meta.clone(), root).path_ownership()
-            })
+            .map(|root| storage_io_with_config(meta.clone(), root, &cfg).path_ownership())
             .collect::<Result<Vec<_>>>()?;
-        let cfg = self.config.read().await.clone();
         let existing = self
             .registry
             .lock()
@@ -1035,8 +1034,7 @@ impl DaemonRuntime {
             let (complete_dir, active_dir) = Self::policy_storage_paths_with_config(&cfg, &torrent);
             for root in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
                 let ownership =
-                    swarmotter_core::storage::StorageIo::new(torrent.meta.clone(), root)
-                        .path_ownership()?;
+                    storage_io_with_config(torrent.meta.clone(), root, &cfg).path_ownership()?;
                 for candidate in &candidates {
                     candidate.ensure_compatible_with(&ownership)?;
                 }

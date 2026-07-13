@@ -428,10 +428,11 @@ If network health reports `socket_bind_failed` or `blocked_fail_closed`, fixing
 the interface alone does not reopen torrent traffic. Correct the full
 configuration and submit it through `PUT /api/v1/settings` (or restart with an
 already-correct file). A live replacement clears the latch only after both an
-ephemeral contained UDP bind and the configured peer-listener bind validate.
-Failed validation leaves the old configuration and blocked gate in place. Use
-`GET /api/v1/network/health` and `/api/v1/network/diagnostics` to verify the
-result; do not switch strict mode to disabled as a recovery shortcut.
+ephemeral contained UDP bind (unless SOCKS5 TCP-only mode is enabled) and the
+configured peer-listener bind validate. Failed validation leaves the old
+configuration and blocked gate in place. Use `GET /api/v1/network/health` and
+`/api/v1/network/diagnostics` to verify the result; do not switch strict mode
+to disabled as a recovery shortcut.
 
 ## Reverse proxy
 

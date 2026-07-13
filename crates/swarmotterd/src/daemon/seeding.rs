@@ -38,7 +38,19 @@ impl DaemonRuntime {
             shutdowns.insert(hash, shutdown_tx.clone());
         }
         let peer_id = make_peer_id();
-        let listen_port = self.config.read().await.torrent.listen_port;
+        let config = self.config.read().await.clone();
+        let listen_port = config.torrent.listen_port;
+        let encryption_mode = self
+            .registry
+            .lock()
+            .await
+            .get(&hash)
+            .map(|torrent| {
+                Self::effective_policy_with_config(&config, torrent)
+                    .encryption_mode
+                    .value
+            })
+            .unwrap_or(config.torrent.encryption_mode);
         // Reuse the torrent's retained limiter; never replace it when the
         // downloader completes or a queued seed slot becomes available.
         let (dl_limit, ul_limit) = {
@@ -58,16 +70,18 @@ impl DaemonRuntime {
                 })
                 .clone()
         };
-        let storage = Arc::new(swarmotter_core::storage::StorageIo::new(
+        let storage = Arc::new(storage_io_with_config(
             meta.clone(),
             std::path::PathBuf::from(&active_dir),
+            &config,
         ));
         let complete_storage = if active_dir == complete_dir {
             None
         } else {
-            Some(Arc::new(swarmotter_core::storage::StorageIo::new(
+            Some(Arc::new(storage_io_with_config(
                 meta.clone(),
                 std::path::PathBuf::from(&complete_dir),
+                &config,
             )))
         };
         let registration = SeedRegistration::new(
@@ -80,7 +94,8 @@ impl DaemonRuntime {
             Some(self.global_limiter.clone()),
             self.peer_session_budget(hash).await,
             shutdown_rx,
-        );
+        )
+        .with_encryption_mode(encryption_mode);
         self.seeder_registry.register(registration).await;
         if let Err(error) = self.ensure_seeder_listener().await {
             if let Some(shutdown) = self.seeder_shutdowns.lock().await.remove(&hash) {

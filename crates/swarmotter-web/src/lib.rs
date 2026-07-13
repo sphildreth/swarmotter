@@ -424,6 +424,30 @@ mod tests {
     }
 
     #[test]
+    fn web_ui_per_torrent_encryption_override_is_wired() {
+        for id in [
+            "details-encryption-mode",
+            "details-encryption-mode-save-btn",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{id}\"")),
+                "Web UI is missing per-torrent encryption control {id}"
+            );
+        }
+        for needle in [
+            "function renderDetailsEncryptionSelector(policy)",
+            "function explicitEncryptionMode(policy)",
+            "`/torrents/${hash}/encryption-mode`",
+            "encryption_mode: encryptionMode",
+        ] {
+            assert!(
+                DETAILS_JS.contains(needle),
+                "Web UI is missing per-torrent encryption wiring {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn web_ui_sends_api_auth_token_when_configured() {
         for needle in [
             "const API_TOKEN_STORAGE_KEY = \"swarmotter.apiToken\";",

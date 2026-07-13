@@ -26,6 +26,15 @@ updates use two API paths:
   omitted `[network]` table therefore fails validation until an interface,
   source address, or current namespace is configured; only explicit
   `mode = "disabled"` disables in-process containment (ADR-0051).
+- `[network.socks5]` is an explicit TCP `CONNECT` overlay, never an alternate
+  route. Its proxy hostname is resolved and connected through the contained
+  binder; tracker/webseed target hostnames use SOCKS domain-form remote DNS and
+  proxy failure never retries a target directly. It supports no-authentication
+  or complete RFC 1929 username/password credentials (ADR-0062).
+- SOCKS5 configuration is TCP-only: enabling it requires `dht.enabled = false`
+  and `torrent.utp_enabled = false`; the proxy layer rejects UDP tracker, DHT,
+  uTP, and direct target-resolution paths rather than falling back. Router
+  mapping remains a separately contained local-gateway operation.
 - API auth must require a non-empty token when enabled.
 - Chrome extension API access requires authenticated mode plus the configured
   API token at the outer browser-origin guard. Merely retaining `auth_token`
@@ -34,14 +43,17 @@ updates use two API paths:
 - Non-loopback control-plane listeners should use API auth by default; an
   operator may deliberately trust the reachable network and disable it
   (ADR-0049).
-- `GET /api/v1/settings` must redact `api.auth_token`.
+- `GET /api/v1/settings` and full-replacement responses must redact
+  `api.auth_token` and `network.socks5.password`.
 - Full config replacement must preserve the existing auth token when the
-  request omits it.
+  request omits it, and preserve a redacted SOCKS5 password only when its
+  username is unchanged.
 - Runtime updates must report fields that require restart.
 - A concrete bind failure is not cleared by periodic interface health. It is
   latched until `PUT /api/v1/settings` supplies a full validated replacement
-  whose ephemeral contained UDP and peer-listener binds both succeed. A failed
-  replacement leaves the prior configuration and latch authoritative.
+  whose peer-listener bind and, outside SOCKS5 TCP-only mode, ephemeral
+  contained UDP bind succeed. A failed replacement leaves the prior
+  configuration and latch authoritative.
 - Unknown top-level and nested fields must be rejected rather than silently
   ignored.
 - Environment overrides must be applied before final validation and pass
@@ -84,6 +96,24 @@ updates use two API paths:
   is unlimited. Root admission is atomic, changes never weaken containment,
   and diagnostics expose both the matching control and saturation state
   (ADR-0056).
+- `[storage]` also separates durable placement from payload placement:
+  `resume_dir` stores info-hash-named fast-resume metadata, `state_dir` is the
+  default state-file directory after restart when no CLI/environment state path
+  is explicit, and `temp_dir` is only the fallback payload root when no
+  download directory is configured. State/resume atomic temporary files stay
+  beside their targets to preserve same-filesystem rename and directory-sync
+  semantics. `storage.state_dir` replacement is restart-required;
+  `storage.resume_dir` replacement is rejected while incomplete or
+  selected-file resume state remains; a fallback `temp_dir` cannot change
+  while an existing torrent depends on it (ADR-0064).
+- `storage.cow_strategy = "conservative"` is the default and never changes
+  filesystem flags. `disable_for_new_files` is an explicit Linux Btrfs-only
+  NOCOW request applied before a newly created file is sized or written; it
+  rejects unsupported roots, never changes an existing file, and rejects an
+  unflagged existing file for further writes rather than silently changing its
+  strategy. Sparse and preallocation remain separate capacity/layout choices,
+  while piece-hash verification remains the payload-integrity authority
+  (ADR-0064).
 - Per-torrent seeding overrides are durable torrent state, not configuration
   fields. `null` overrides inherit `[seeding]` globals, while `seed_forever`
   suppresses effective targets without erasing stored overrides (ADR-0052).
@@ -91,11 +121,12 @@ updates use two API paths:
   label-to-profile mappings. An explicitly attached add/watch/torrent profile
   wins over a matching label; per-field torrent overrides win last. Resolved
   storage and the initial admission decision are captured in durable torrent
-  state at registration, while queue priority, seeding, and bandwidth resolve
-  live for inheriting records. Reassignment and later label changes preserve
-  existing storage paths; snapshot-bearing torrents retain their captured
-  admission when profile/global start settings change. Legacy records are
-  migrated transactionally on a profile replacement (ADR-0057).
+  state at registration, while queue priority, seeding, bandwidth, and optional
+  `encryption_mode` resolve live for inheriting records. Reassignment and later
+  label changes preserve existing storage paths; snapshot-bearing torrents
+  retain their captured admission when profile/global start settings change.
+  Legacy records are migrated transactionally on a profile replacement
+  (ADR-0057, ADR-0063).
 - Each `[[watch]]` root is a lexical path boundary, not a canonicalized one.
   Scans reject a symlink root, skip child symlinks, require two identical
   length/modified-time observations, and serialize manual/background runs.
@@ -151,22 +182,30 @@ explicit `null` to clear it. Compatibility status, lifecycle, location, file,
 and tracker operations delegate to native durable operations rather than a
 parallel state store (ADR-0061).
 
-`[torrent].encryption_mode` is the protocol-transport compatibility option for
-peer-wire negotiation:
+`[torrent].encryption_mode` is the global fallback for peer-wire encryption
+over contained TCP and uTP byte streams:
 
-- `disabled`: permit plaintext handshakes.
-- `preferred` (default): TCP peer attempts use MSE/PE first, with plaintext
-  fallback when allowed; TCP/uTP ordering still follows `torrent.utp_prefer_tcp`.
-- `required`: refuse plaintext and require encrypted stream negotiation.
+- `disabled`: use plaintext peer-wire sessions only.
+- `preferred` (default): attempt MSE/PE first, then reconnect the same selected
+  contained TCP or uTP transport as plaintext if negotiation fails. TCP/uTP
+  ordering still follows `torrent.utp_prefer_tcp`.
+- `required`: negotiate MSE/PE over the selected contained TCP or uTP stream
+  and refuse plaintext without a fallback retry.
 
-Changing this mode stops and rebuilds the complete torrent data plane before
-the replacement is reported as applied. Engines, tracker sidecars, DHT work,
-the shared listener, and accepted sessions created under the previous policy
-are awaited before eligible tasks start with the new policy (ADR-0047).
+Profiles may set an optional `profiles.profiles.<name>.encryption_mode`, and a
+durable torrent `policy.overrides.encryption_mode` can be set or explicitly
+cleared through the native API. Resolution is torrent override, selected
+profile (explicit assignment or label), then this global fallback. The
+effective-policy response records the source. A global mode replacement still
+stops and rebuilds the complete data plane before reporting success. A profile
+or label-map replacement updates active seeder registrations for future inbound
+TCP sessions and restarts only active download/metadata engines whose resolved
+mode changed after persistence; existing negotiated sessions retain their wire
+stream (ADR-0047, ADR-0063).
 
-This phase is TCP-only; no uTP encryption is included yet. Named policy
-profiles are configuration and lifecycle policy only; they do not introduce a
-per-profile or per-torrent network path.
+MSE/PE itself never opens a socket: it wraps the `NetworkBinder`-created stream.
+Named policy profiles do not introduce a per-profile or per-torrent network
+path, proxy, or production inbound-uTP listener.
 
 All containment-affecting full replacements share the data-plane transaction
 lock. The live containment gate blocks socket creation immediately; each block

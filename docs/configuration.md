@@ -29,10 +29,17 @@ SWARMOTTER_API__AUTH_TOKEN=replace-with-a-long-random-token
 SWARMOTTER_AUTOPILOT__MODE=act
 SWARMOTTER_NETWORK__MODE=strict
 SWARMOTTER_NETWORK__REQUIRED_INTERFACE=br0
+SWARMOTTER_NETWORK__SOCKS5__ENABLED=true
+SWARMOTTER_NETWORK__SOCKS5__HOST=proxy.example
+# SOCKS5 support is TCP-only, so its required UDP features must be disabled.
+SWARMOTTER_TORRENT__UTP_ENABLED=false
+SWARMOTTER_DHT__ENABLED=false
 SWARMOTTER_TORRENT__LISTEN_PORT=51413
 SWARMOTTER_TORRENT__ENCRYPTION_MODE=preferred
 SWARMOTTER_COMPATIBILITY__QBITTORRENT__ENABLED=true
 SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED=true
+SWARMOTTER_STORAGE__RESUME_DIR=/srv/swarmotter/resume
+SWARMOTTER_STORAGE__STATE_DIR=/srv/swarmotter/state
 ```
 
 ## Runtime configuration editing
@@ -42,6 +49,9 @@ SwarmOtter exposes two update modes:
 - `PATCH /api/v1/settings` updates live-safe fields (bandwidth, queue, and seeding policy).
 - `PUT /api/v1/settings` replaces the full config after validation and persists it atomically.
   The existing `api.auth_token` is preserved when omitted from the request body.
+  A redacted `network.socks5.password` is likewise preserved when the SOCKS5
+  username is unchanged; clearing or changing that username requires a complete
+  new credential pair.
 
 The `PUT /api/v1/settings` response reports which fields were applied live, which
 fields require restart, and whether the write was persisted.
@@ -68,7 +78,9 @@ containment or security setting from silently falling back to a default.
 
 Torrent records, queue order, labels, file choices, and per-torrent controls
 are stored separately from configuration in a versioned state file. Select its
-path with `--state-file PATH` or `SWARMOTTER_STATE_FILE=PATH`.
+path with `--state-file PATH` or `SWARMOTTER_STATE_FILE=PATH`. Those explicit
+choices take precedence over `storage.state_dir`; when that setting is present,
+the daemon uses `storage.state_dir/state.json` on its next start.
 
 Without an explicit path, the daemon uses the first available location:
 
@@ -96,6 +108,9 @@ auth_token = "replace-with-a-long-random-token"
 [storage]
 download_dir = "/mnt/incoming/swarmotter/downloads"
 incomplete_dir = "/mnt/incoming/swarmotter/incomplete"
+# resume_dir = "/var/lib/swarmotter/resume"
+# state_dir = "/var/lib/swarmotter/state"
+# temp_dir = "/var/cache/swarmotter"
 
 [network]
 required_interface = "br0"
@@ -310,8 +325,12 @@ Remote HTTP/HTTPS URLs for torrent metadata are rejected by this adapter.
 | --- | --- | --- |
 | `download_dir` | unset | Final directory for verified completed downloads. |
 | `incomplete_dir` | unset | Active write directory for incomplete downloads. |
+| `resume_dir` | unset | Dedicated durable fast-resume directory. Resume filenames use the info hash; unset preserves adjacent active-data placement. |
+| `state_dir` | unset | Default directory for `state.json` when no `--state-file` or `SWARMOTTER_STATE_FILE` is supplied; changing it through Settings requires restart. |
+| `temp_dir` | unset | Root for the fallback `swarmotter-downloads` payload layout when `download_dir` is unset. It does not relocate atomic state/resume temporary files. |
 | `preallocate` | `false` | Pre-size files before downloading. |
 | `sparse` | `true` | When `false`, active payload files are sized up front even if `preallocate = false`. |
+| `cow_strategy` | `conservative` | `conservative` preserves filesystem defaults. `disable_for_new_files` requests NOCOW for newly created Linux Btrfs payload files, never modifies existing files, and fails a write explicitly when the root or existing file cannot satisfy that policy. |
 | `minimum_free_space_bytes` | `0` | If > 0, reject new adds when target-root usable space falls below this number of bytes. |
 | `minimum_free_space_percent` | `0` | If > 0, reject new adds when free space on the target root falls below this percent of total root size. |
 
@@ -319,16 +338,42 @@ The minimum reserve fields apply to add/start-time preflight and are checked
 before payload data is written. Both fields are optional; when both are set,
 the preflight uses the stricter reserve.
 
-When `incomplete_dir` is set, SwarmOtter writes partial pieces and partial
-fast-resume metadata there while the torrent is downloading. After every piece
-is verified, the daemon moves the torrent data into `download_dir` and removes
-SwarmOtter fast-resume metadata so the completed directory contains only user
-payload files. If `incomplete_dir` is unset, the active and final directory are
-both `download_dir`. With `preallocate = false` and `sparse = true`, active
+When `incomplete_dir` is set, SwarmOtter writes partial pieces there while the
+torrent is downloading. `resume_dir`, when configured, stores fast-resume
+metadata separately under an info-hash filename; configuring it never moves
+payload data. After every piece is verified, the daemon moves torrent data into
+`download_dir` and removes its fast-resume metadata so the completed directory
+contains only user payload files. If `incomplete_dir` is unset, the active and
+final directory are both `download_dir`. With `preallocate = false` and `sparse = true`, active
 single-file torrents still create a zero-length placeholder in
 `incomplete_dir` when the engine starts; the file is not sized to the full
 payload until data is written. With `sparse = false`, active payload files are
 sized up front.
+
+`temp_dir` only controls the fallback payload root used when `download_dir` is
+unset. It is not a general replacement for atomic temporary files: daemon
+state and resume writes use a temporary sibling beside their final file, flush
+it, rename it atomically, and sync the target directory. This deliberately
+avoids a cross-filesystem rename weakening crash recovery.
+
+### CoW, preallocation, and sparse files
+
+The default `cow_strategy = "conservative"` never changes filesystem flags.
+Use it unless you have evaluated the filesystem and workload trade-offs.
+`cow_strategy = "disable_for_new_files"` is an explicit Linux Btrfs-only
+choice: before a newly created payload file is sized or written, SwarmOtter
+requests the NOCOW inode flag. It does not touch existing files; an existing
+file that lacks NOCOW is rejected for further writes rather than being changed
+or silently accepted under a different strategy. The daemon also fails the
+start rather than silently applying a different strategy if Btrfs, the
+required capability, or the flag operation is unavailable.
+
+On Btrfs, NOCOW changes filesystem-level behavior: data checksumming,
+compression, snapshots, and fragmentation characteristics can differ. It does
+not replace SwarmOtter piece-hash verification or forced rechecks. `preallocate`
+and `sparse` remain independent choices: preallocation reserves/sizes files
+up front, while sparse layout delays allocation until payload writes. Choose
+them based on capacity and fragmentation needs, not as an integrity setting.
 
 ### Per-root storage controls
 
@@ -371,13 +416,17 @@ replacement; subsequent admissions use the replacement controls.
 Named policy profiles keep category-style defaults consistent without copying
 queue, seeding, or bandwidth values into every torrent. A profile can supply
 storage paths, queue priority, initial start behavior, ratio/idle defaults,
-seed-forever, and per-torrent transfer caps. Labels map case-insensitively to
-profiles; when more than one mapped label is present, the normalized label name
-makes the selection deterministic.
+seed-forever, per-torrent transfer caps, and an optional peer-wire
+`encryption_mode`. Labels map case-insensitively to profiles; when more than
+one mapped label is present, the normalized label name makes the selection
+deterministic.
 
 ```toml
 [profiles.labels]
 linux = "linux-release"
+
+[profiles.profiles.linux-release]
+encryption_mode = "required" # disabled, preferred, or required
 
 [profiles.profiles.linux-release.storage]
 download_dir = "/srv/releases/linux"
@@ -399,9 +448,20 @@ upload_limit = 5242880
 
 An explicit profile supplied at add time, by a watch folder, or through the
 torrent policy API wins over a label mapping. Per-torrent limits and seeding
-settings then win for their individual fields. Profile queue priority,
-seeding, and rate limits remain live for inheriting torrents. `start_behavior`
-controls initial admission; changing it never stops already-running work.
+settings then win for their individual fields. A durable per-torrent encryption
+override is set with `PUT /api/v1/torrents/:hash/encryption-mode`; its body
+must contain `encryption_mode`, and JSON `null` explicitly clears the override
+to restore profile/label/global inheritance. Profile queue priority, seeding,
+rate limits, and encryption remain live for inheriting torrents.
+`start_behavior` controls initial admission; changing it never stops
+already-running work.
+
+Encryption precedence is explicit torrent override, selected profile, then
+global `torrent.encryption_mode`. A profile or label-map replacement restarts
+only active download/metadata engines whose effective mode changes; future
+inbound TCP seeding sessions use the refreshed mode, while an already
+negotiated peer session retains its wire stream. Profiles do not create a
+separate network path or proxy.
 
 Storage is deliberately different: the resolved completed and incomplete
 paths are captured when a torrent is registered, including the global/no-
@@ -428,6 +488,48 @@ global queue behavior.
 | `validate_route` | `false` | Requires route validation when supported by the probe. |
 | `validate_dns` | `false` | Reports `dns_not_constrained` in network health when DNS cannot be proven constrained. Hostname resolution is still fail-closed unless DNS is constrained or a network namespace is used. |
 
+### `[network.socks5]`
+
+SOCKS5 is an explicit, opt-in TCP `CONNECT` transport layered on top of the
+configured network path. The daemon resolves and connects to the proxy through
+the contained binder first. For peer TCP addresses it sends SOCKS IP-address
+forms; HTTP(S) tracker, scrape, and webseed hostnames use SOCKS domain forms so
+their target DNS resolution happens at the proxy. A failed proxy connection or
+handshake returns an error; SwarmOtter never retries the target directly.
+
+```toml
+[network.socks5]
+enabled = true
+host = "proxy.example"
+port = 1080
+# Omit both for SOCKS5 no-authentication, or set both for RFC 1929 auth.
+# username = "operator"
+# password = "supply-with-your-secret-manager"
+
+[torrent]
+utp_enabled = false
+
+[dht]
+enabled = false
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Enables the contained SOCKS5 TCP `CONNECT` wrapper. |
+| `host` | unset | Required when enabled. The proxy hostname is resolved through the configured containment path. |
+| `port` | `1080` | SOCKS5 listener port; must be nonzero. |
+| `username` | unset | RFC 1929 username. Must be supplied together with `password`, or both must be omitted for no-authentication. |
+| `password` | unset | RFC 1929 password. API settings reads and replacement responses redact it. |
+
+SOCKS5 `CONNECT` is intentionally TCP-only. Configuration validation requires
+`torrent.utp_enabled = false` and `dht.enabled = false` when it is enabled. A
+UDP tracker URL is rejected through the proxy binder rather than routed directly;
+SOCKS5 UDP ASSOCIATE is not implemented. The Network diagnostics view reports
+only that SOCKS5 is enabled and that its UDP path is blocked; it never exposes
+the proxy host or credentials. NAT-PMP/UPnP router mapping remains a local
+gateway operation on the same contained path, not a proxy bypass for torrent
+traffic. See ADR-0062.
+
 Strict mode is the default and requires at least one enforceable path: interface,
 source address, or network namespace. **Breaking change (ADR-0051):** an omitted
 `[network]` table no longer selects disabled mode. It produces strict mode
@@ -450,11 +552,11 @@ a blocked interval cancel even if recovery is immediate.
 Concrete bind failures block synchronously and latch `socket_bind_failed` (or
 `blocked_fail_closed` for a generic policy denial). A healthy probe alone does
 not clear the latch. Only an explicit `PUT /api/v1/settings` replacement whose
-contained UDP and peer-listener bind validation succeeds may recover it; a
-failed replacement preserves the prior configuration and blocked state. On
-Linux, route and DNS path validation invoke `ip route get`; direct and tarball
-installs must provide the `ip` utility from the distribution's `iproute2` or
-`iproute` package.
+peer-listener bind and, outside SOCKS5 TCP-only mode, contained UDP bind
+validation succeeds may recover it; a failed replacement preserves the prior
+configuration and blocked state. On Linux, route and DNS path validation invoke
+`ip route get`; direct and tarball installs must provide the `ip` utility from
+the distribution's `iproute2` or `iproute` package.
 
 Tracker announce, supported HTTP/HTTPS BEP 48 scrape, and webseed ranges use a
 framed HTTP/1 client only over binder-provided streams. Redirects repeat
@@ -525,7 +627,7 @@ this diagnostic through the same contained runtime path.
 | `allow_ipv6` | `true` | Enables IPv6 peers when network containment also allows IPv6; when false, IPv6 peers are filtered before connecting. |
 | `utp_enabled` | `true` | Enables uTP peer transport through contained UDP sockets. |
 | `utp_prefer_tcp` | `true` | Tries TCP first, with uTP fallback. |
-| `encryption_mode` | `preferred` | TCP MSE/PE peer wire mode. `disabled` permits plaintext handshakes. `preferred` enables MSE/PE with plaintext fallback for TCP attempts while preserving the configured TCP/uTP preference. `required` refuses plaintext and requires encrypted TCP stream negotiation. Changing this setting rebuilds active data-plane tasks before it is reported as applied. |
+| `encryption_mode` | `preferred` | Contained TCP/uTP MSE/PE peer-wire mode. `disabled` uses plaintext only. `preferred` attempts MSE/PE first, then retries plaintext only on the same selected contained transport. `required` refuses plaintext and never falls back. Changing this global setting rebuilds active data-plane tasks before it is reported as applied. |
 | `selfish` | `false` | Removes a torrent after verified completion and does not seed it; already-completed managed records are also removed on runtime reconciliation while preserving downloaded data. |
 
 ### `[port_mapping]`

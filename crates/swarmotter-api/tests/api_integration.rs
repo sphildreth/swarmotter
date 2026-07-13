@@ -9,7 +9,10 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeSet;
-use swarmotter_core::config::{Config, StartBehavior, StorageRootControl, WatchFolderConfig};
+use swarmotter_api::state::DaemonOps;
+use swarmotter_core::config::{
+    Config, PeerEncryptionMode, StartBehavior, StorageRootControl, WatchFolderConfig,
+};
 use swarmotter_core::meta::{build_single_file_torrent, MAX_TORRENT_METADATA_BYTES};
 use swarmotter_core::models::network::{NetworkContainmentMode, NetworkContainmentStatus};
 use swarmotter_core::models::{
@@ -1293,6 +1296,7 @@ async fn policy_profiles_apply_at_add_and_expose_explainable_native_routes() {
                 download_limit: Some(1_000),
                 upload_limit: Some(2_000),
             },
+            ..Default::default()
         },
     );
     cfg.profiles.labels.insert("linux".into(), "linux".into());
@@ -1376,6 +1380,90 @@ async fn policy_profiles_apply_at_add_and_expose_explainable_native_routes() {
         "/profiles/linux/complete"
     );
     assert_eq!(assigned_policy["data"]["download_limit"]["value"], 3_000);
+}
+
+#[tokio::test]
+async fn per_torrent_encryption_override_is_explainable_and_clearable() {
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.torrent.encryption_mode = PeerEncryptionMode::Disabled;
+    cfg.profiles.profiles.insert(
+        "encrypted".into(),
+        PolicyProfile {
+            encryption_mode: Some(PeerEncryptionMode::Required),
+            ..Default::default()
+        },
+    );
+    cfg.profiles
+        .labels
+        .insert("encrypted".into(), "encrypted".into());
+    let app = swarmotter_api::app_router(fake_daemon::fake_state_with_config(cfg));
+
+    let (status, added) = post_json(
+        &app,
+        "/api/v1/torrents/magnet",
+        serde_json::json!({
+            "magnet": named_magnet(9_101, "policy-encryption"),
+            "labels": ["encrypted"]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hash = added["data"].as_str().unwrap();
+
+    let (status, inherited) = get_json(&app, &format!("/api/v1/torrents/{hash}/policy")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inherited["data"]["encryption_mode"]["value"], "required");
+    assert_eq!(
+        inherited["data"]["encryption_mode"]["source"]["kind"],
+        "label"
+    );
+
+    let missing_field = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/torrents/{hash}/encryption-mode"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let (status, changed) = put_json(
+        &app,
+        &format!("/api/v1/torrents/{hash}/encryption-mode"),
+        serde_json::json!({ "encryption_mode": "preferred" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(changed["success"], true);
+    let (status, overridden) = get_json(&app, &format!("/api/v1/torrents/{hash}/policy")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(overridden["data"]["encryption_mode"]["value"], "preferred");
+    assert_eq!(
+        overridden["data"]["encryption_mode"]["source"]["kind"],
+        "torrent"
+    );
+
+    let (status, cleared) = put_json(
+        &app,
+        &format!("/api/v1/torrents/{hash}/encryption-mode"),
+        serde_json::json!({ "encryption_mode": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cleared["success"], true);
+    let (status, restored) = get_json(&app, &format!("/api/v1/torrents/{hash}/policy")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(restored["data"]["encryption_mode"]["value"], "required");
+    assert_eq!(
+        restored["data"]["encryption_mode"]["source"]["kind"],
+        "label"
+    );
 }
 
 #[tokio::test]
@@ -2774,6 +2862,32 @@ async fn settings_redacts_auth_token() {
 }
 
 #[tokio::test]
+async fn settings_redacts_and_preserves_socks5_password() {
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.network.socks5.enabled = true;
+    cfg.network.socks5.host = Some("proxy.example".into());
+    cfg.network.socks5.username = Some("operator".into());
+    cfg.network.socks5.password = Some("proxy-secret".into());
+    cfg.torrent.utp_enabled = false;
+    cfg.dht.enabled = false;
+    let (state, daemon) = fake_daemon::fake_state_with_config_and_daemon(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let (status, settings) = get_json(&app, "/api/v1/settings").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(settings["data"]["network"]["socks5"]["password"].is_null());
+
+    let (status, result) = put_json(&app, "/api/v1/settings", settings["data"].clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(result["data"]["config"]["network"]["socks5"]["password"].is_null());
+    assert_eq!(
+        daemon.get_config().await.network.socks5.password.as_deref(),
+        Some("proxy-secret")
+    );
+}
+
+#[tokio::test]
 async fn api_body_limit_rejects_oversized_upload() {
     let state = fake_daemon::fake_state();
     let app = swarmotter_api::routes::app_router_with_body_limit(state, 8);
@@ -2888,6 +3002,8 @@ async fn network_diagnostics_endpoint() {
         .unwrap();
     let v: NetworkDiagnostics = parse_api_data(&body);
     assert_eq!(v.health.status, NetworkContainmentStatus::Disabled);
+    assert!(!v.socks5_enabled);
+    assert!(!v.socks5_udp_blocked);
     let checks = v.checks;
     assert!(!checks.is_empty());
     assert!(!v.interfaces.is_empty());
@@ -2930,6 +3046,60 @@ async fn storage_roots_endpoint_reports_reserve_configuration() {
     assert_eq!(roots[0]["max_concurrent_rechecks"], 1);
     assert_eq!(roots[0]["active_bytes"], 0);
     assert_eq!(roots[0]["active_rechecks"], 0);
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn storage_roots_endpoint_reports_state_placement_and_optional_mount_diagnostics() {
+    let root = std::env::temp_dir().join(format!(
+        "swarmotter-storage-placement-api-test-{}",
+        std::process::id()
+    ));
+    let resume = root.join("resume");
+    let state_dir = root.join("state");
+    let temp = root.join("scratch");
+    for directory in [&resume, &state_dir, &temp] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    let mut cfg = Config::default();
+    cfg.storage.download_dir = Some(root.display().to_string());
+    cfg.storage.resume_dir = Some(resume.display().to_string());
+    cfg.storage.state_dir = Some(state_dir.display().to_string());
+    cfg.storage.temp_dir = Some(temp.display().to_string());
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let (status, value) = get_json(&app, "/api/v1/storage/roots").await;
+    assert_eq!(status, StatusCode::OK);
+    let roots = value["data"]["roots"].as_array().unwrap();
+    let find = |path: &std::path::Path| {
+        roots
+            .iter()
+            .find(|root| root["path"] == path.display().to_string())
+            .unwrap()
+    };
+    assert!(find(&resume)["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|role| role == "resume"));
+    assert!(find(&state_dir)["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|role| role == "state"));
+    assert!(find(&temp)["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|role| role == "temporary"));
+    let download = find(&root);
+    assert!(download.get("mount_point").is_some());
+    assert!(download.get("mount_options").is_some());
+    assert_eq!(download["sustained_write_bytes_per_second"], 0);
+    assert_eq!(download["sustained_verification_bytes_per_second"], 0);
+    assert_eq!(download["cow_strategy"], "conservative");
 
     let _ = std::fs::remove_dir_all(root);
 }

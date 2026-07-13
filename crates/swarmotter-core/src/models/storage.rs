@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::CowStrategy;
+
 /// Point-in-time diagnostics for configured and discovered storage roots.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageDiagnostics {
@@ -19,6 +21,14 @@ pub struct StorageDiagnostics {
 pub enum StorageRootRole {
     Download,
     Incomplete,
+    /// Durable fast-resume metadata, when `storage.resume_dir` is set.
+    Resume,
+    /// Durable daemon state (and a future durable database), when configured.
+    State,
+    /// Configured scratch/fallback temporary storage.
+    Temporary,
+    /// Daemon file logging destination.
+    Log,
     TorrentOverride,
     WatchDownload,
     DefaultDownload,
@@ -34,6 +44,13 @@ pub struct StorageRootDiagnostics {
     pub is_directory: bool,
     pub writable: bool,
     pub filesystem_type: Option<String>,
+    /// Most-specific mounted filesystem boundary discovered for this root.
+    /// `None` is a safe platform fallback when mount metadata is unavailable.
+    pub mount_point: Option<String>,
+    /// Mount options reported by the host, when available.
+    pub mount_options: Option<Vec<String>>,
+    /// Mount source reported by the host, when available.
+    pub mount_source: Option<String>,
     pub total_space_bytes: Option<u64>,
     pub free_space_bytes: Option<u64>,
     pub available_space_bytes: Option<u64>,
@@ -47,6 +64,19 @@ pub struct StorageRootDiagnostics {
     pub active_bytes: u64,
     pub active_write_rate: u64,
     pub active_recheck_rate: Option<u64>,
+    /// Rolling sustained local payload-write throughput observed by storage
+    /// handles associated with this root.
+    pub sustained_write_bytes_per_second: u64,
+    /// Rolling sustained local verification-read throughput observed while
+    /// validating pieces on this root. Seeder reads are intentionally not
+    /// included.
+    pub sustained_verification_bytes_per_second: u64,
+    /// The explicit configured CoW strategy. A strategy never changes an
+    /// existing payload file.
+    pub cow_strategy: CowStrategy,
+    /// Whether the configured CoW strategy can be applied on this root.
+    /// `None` means the platform could not determine this safely.
+    pub cow_strategy_supported: Option<bool>,
     /// Number of full rechecks currently using this root.
     pub active_rechecks: usize,
     /// The matching configured lexical control root, when one applies.

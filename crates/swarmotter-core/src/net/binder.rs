@@ -77,6 +77,18 @@ pub trait NetworkBinder: Send + Sync {
     /// Open a TCP connection to a peer address through the contained path.
     async fn connect_peer(&self, addr: SocketAddr) -> Result<tokio::net::TcpStream>;
 
+    /// Open a TCP connection to a hostname through the contained path.
+    ///
+    /// The default resolves the hostname through [`Self::resolve_host`] and
+    /// then uses [`Self::connect_peer`]. Proxy-aware binders override this
+    /// seam to pass the hostname to an upstream resolver without resolving the
+    /// target locally. HTTP(S) tracker and webseed callers use this method so
+    /// a SOCKS5 remote-DNS policy cannot be bypassed accidentally.
+    async fn connect_host(&self, host: &str, port: u16) -> Result<tokio::net::TcpStream> {
+        let addr = self.resolve_host(host, port).await?;
+        self.connect_peer(addr).await
+    }
+
     /// Issue an HTTP/1.1 GET to a tracker/announce URL through the contained
     /// path and return the response body. IP-literal hosts and localhost are
     /// supported; hostnames needing DNS resolution are handled by the binder

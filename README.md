@@ -72,8 +72,12 @@ infringement.
   workflows.
 - Magnet links and `.torrent` file intake.
 - TCP and uTP peer wire protocol support.
-- TCP peer-wire protocol encryption (MSE/PE) with configurable mode:
-  `disabled`, `preferred` (default), or `required`.
+- Contained TCP/uTP peer-wire protocol encryption (MSE/PE) with configurable
+  global, profile, and durable per-torrent modes: `disabled`, `preferred`
+  (default), or `required`.
+- Opt-in contained SOCKS5 TCP `CONNECT` proxy support for outbound peer TCP,
+  HTTP(S) tracker/scrape, and webseed requests, with remote target DNS and no
+  direct fallback. Proxy mode intentionally blocks DHT, uTP, and UDP trackers.
 - DHT, PEX, HTTP/HTTPS trackers, UDP trackers, and webseeds.
 - BEP 9 magnet metadata fetching.
 - Fast resume and forced recheck.
@@ -88,6 +92,10 @@ infringement.
   preflight, and per-root active-work, declared-byte, verified-write, and
   full-recheck budgets via `[[storage.root_controls]]` and
   `GET /api/v1/storage/roots`.
+- Filesystem-aware storage diagnostics and placement: best-effort mount data,
+  sustained local write/verification rates, deliberate log/resume/state/fallback
+  roots, and an explicit conservative-or-Btrfs-NOCOW strategy that never
+  modifies existing payload files.
 - Settings two-panel layout for dense configuration in the Web UI.
 - Strict VPN/NIC traffic containment with fail-closed behavior.
 - Opt-in NAT-PMP/UPnP TCP listener mapping and operator-hosted reachability
@@ -127,8 +135,9 @@ must be selected explicitly and is limited to development or a separately
 enforced boundary such as the supplied Gluetun shared namespace. Live path loss
 blocks one process-wide gate before socket-owning tasks are aborted. Concrete
 socket bind failures block immediately and remain latched until an explicit,
-fully validated configuration replacement proves both UDP and peer-listener
-binds succeed; a healthy interface probe alone never reopens traffic.
+fully validated configuration replacement proves the peer-listener bind and,
+outside SOCKS5 TCP-only mode, an ephemeral UDP bind succeed; a healthy
+interface probe alone never reopens traffic.
 
 This default is the breaking configuration change in `v2.0.0`. Existing `1.x`
 installations that relied on omitted network configuration must add a strict

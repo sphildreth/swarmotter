@@ -28,9 +28,6 @@ project.
 
 | Priority | Feature | User Value | Source Signals |
 | --- | --- | --- | --- |
-| P0 | SOCKS5 Proxy Support | Route torrent traffic through a SOCKS5 proxy; shipped by every major client for seedbox and restricted-network deployments | Transmission [#1250](https://github.com/transmission/transmission/issues/1250), qBittorrent SOCKS5, Deluge proxy support |
-| P0 | Protocol Encryption / MSE-PE | Interoperate with peers that refuse plaintext handshakes and reduce plaintext peer-wire exposure | Transmission, qBittorrent, Deluge, BiglyBT all ship MSE/PE; private trackers commonly require it |
-| P0 | Filesystem-aware storage strategy and state placement | Extend shipped root resource controls with filesystem-aware write behavior, observability, and state-path placement | qBittorrent [#23683](https://github.com/qbittorrent/qBittorrent/issues/23683), [#22949](https://github.com/qbittorrent/qBittorrent/issues/22949), Transmission [#5594](https://github.com/transmission/transmission/issues/5594), [#1060](https://github.com/transmission/transmission/issues/1060) |
 | P0 | Advanced policy-profile rules | Extend shipped named profiles with tracker, file-selection, and completion-action policy dimensions | qBittorrent [#24500](https://github.com/qbittorrent/qBittorrent/issues/24500), [#23722](https://github.com/qbittorrent/qBittorrent/issues/23722), Transmission [#1461](https://github.com/transmission/transmission/issues/1461), [#6425](https://github.com/transmission/transmission/issues/6425) |
 | P0 | Per-Profile / Per-Torrent Network-Path Binding | Assign a contained network path (namespace/VPN endpoint/interface) per profile, label, or torrent; fail-closed per path | rTorrent/Flood multi-user isolation, Deluge multi-profile routing, self-hosting VPN routing patterns |
 | P0 | Multi-User / Multi-Tenant Support | Role-based access control, per-user torrent isolation, per-user quotas, and shared-server deployments | qBittorrent [#3327](https://github.com/qbittorrent/qBittorrent/issues/3327), Flood multi-user, rTorrent+ruTorrent multi-user, Deluge thin-client auth |
@@ -82,124 +79,6 @@ project.
 | P3 | Documentation Discoverability | Search index for `docs/` and a built-in help pane in the Web UI tied to daemon version | mdBook search, DocSearch, Sonarr/Radarr in-app help |
 
 ## P0 Features
-
-### SOCKS5 Proxy Support
-
-Problem: seedbox and restricted-network users rely on SOCKS5 proxies as a
-simpler alternative to full VPN/namespace containment. Many users want both
-SOCKS5 and VPN containment for different use cases.
-
-Requested elsewhere:
-
-- Transmission [#1250](https://github.com/transmission/transmission/issues/1250)
-  is a top-voted feature request.
-- qBittorrent and Deluge ship built-in SOCKS5 proxy support.
-- Common in seedbox deployments where VPN is not available or practical.
-
-SwarmOtter feature shape:
-
-- Add optional SOCKS5 proxy configuration for torrent traffic.
-- Route peer TCP connections, tracker announces, and webseed requests through
-  the proxy.
-- Support authentication (username/password) and unauthenticated modes.
-- Proxy configuration can be added as a future per-profile policy field for
-  multi-path deployments.
-- SOCKS5 proxy is distinct from network containment; both can coexist with
-  clear precedence rules.
-
-Acceptance direction:
-
-- Proxy configuration must be explicit and auditable.
-- When both SOCKS5 and network containment are configured, containment takes
-  precedence; proxy traffic must still go through the contained path.
-- DNS resolution for proxy hostname must respect containment.
-
-### Protocol Encryption / MSE-PE
-
-Problem: every mainstream torrent client (Transmission, qBittorrent, Deluge,
-BiglyBT) implements Message Stream Encryption / Protocol Encryption
-(MSE/PE). Many peers refuse plaintext handshakes, and private trackers
-commonly *require* encrypted connections. SwarmOtter's network containment
-model constrains routing, not wire-level obfuscation: without MSE/PE, a contained peer
-connection is still a plaintext handshake on the wire. Without MSE/PE
-SwarmOtter cannot fully interoperate with a large fraction of swarms, and
-the comparison matrix should reflect that honestly rather than imply
-parity. This is arguably a core interoperability gap rather than a
-differentiator.
-
-Requested elsewhere:
-
-- Transmission, qBittorrent, Deluge, and BiglyBT all ship MSE/PE and have
-  for years; it is treated as table stakes.
-- Private tracker ecosystems commonly require encryption; peers that do
-  not offer it are rejected at the handshake.
-- Plaintext peer-wire handshakes reduce interoperability with encrypted-only
-  peers and expose more protocol metadata than necessary for contained operation.
-
-SwarmOtter feature shape:
-
-- Implemented in v1.1.0 for TCP peer connections:
-  - MSE/PE obfuscated handshake and encrypted-stream negotiation with no
-    separate socket creation.
-  - Configurable `torrent.encryption_mode` (`disabled`, `preferred`, `required`),
-    default `preferred`.
-- Remaining work:
-  - Encrypted transport for uTP.
-  - Per-profile and per-torrent overrides for encryption mode.
-
-Acceptance direction:
-
-- Framing is interoperability and wire-level integrity, consistent with
-  the lawful-use posture already applied to VPN/NIC containment. This is
-  not piracy-evasion framing; SwarmOtter does not advertise or document
-  this as a way to evade copyright enforcement.
-- Encryption never weakens network containment; the implemented path is TCP over
-  the existing contained peer transport. uTP encrypted transport remains
-  backlog work.
-- `required` mode must not silently fall back to plaintext; it must refuse or
-  close the connection.
-- Local swarm fixtures exercise encrypted, preferred (default), and
-  required handshakes before the default mode changes.
-- `design/COMPARISON.md` reflects TCP-only MSE/PE status and leaves partial-scope
-  work visible so roadmap comparisons stay truthful.
-- Implementing this requires an ADR (new wire-protocol surface and a
-  default-mode decision with interop trade-offs).
-
-### Filesystem-Aware Storage Strategy and State Placement
-
-Problem: root-scoped admission, write budgets, and recheck budgets now keep
-active work within explicit local resource limits. Operators still need
-filesystem-aware behavior and deliberate placement of high-write state on
-Btrfs, HDDs, NAS mounts, and constrained disks.
-
-Requested elsewhere:
-
-- qBittorrent has a heavily discussed CoW filesystem request in
-  [qbittorrent#23683](https://github.com/qbittorrent/qBittorrent/issues/23683).
-- qBittorrent users requested relocating state files away from OS SSD/NVMe
-  drives in [qbittorrent#22949](https://github.com/qbittorrent/qBittorrent/issues/22949).
-- Transmission users requested prominent free-space display in
-  [transmission#5594](https://github.com/transmission/transmission/issues/5594).
-- Transmission has a Btrfs/subvolume move-performance issue in
-  [transmission#1060](https://github.com/transmission/transmission/issues/1060).
-
-Remaining SwarmOtter feature shape:
-
-- Extend current storage-root diagnostics with mount options, sustained write
-  throughput, and verification throughput per configured storage root.
-- Add optional CoW-aware write strategy for Btrfs-like filesystems, including
-  preallocation policy, sparse policy, and clearly surfaced trade-offs.
-- Add state-directory controls for logs, resume files, database/state, and
-  temporary files so high-write paths can be placed intentionally.
-
-Acceptance direction:
-
-- No storage optimization may risk silent data corruption.
-- CoW-related behavior must be explicit and documented because checksumming,
-  compression, snapshots, and fragmentation trade off differently per
-  filesystem.
-- Further optimizer phases require ADR updates when they change storage
-  strategy, persistence, or runtime scheduling behavior.
 
 ### Advanced Policy-Profile Rules
 
@@ -935,11 +814,11 @@ Acceptance direction:
 
 ### HTTP / HTTPS Proxy Support
 
-Problem: the backlog already covers SOCKS5 (P0), but corporate and
+Problem: SwarmOtter ships contained TCP-only SOCKS5 support, but corporate and
 egress-filtered environments frequently expose only HTTP/CONNECT proxies.
-Users in those environments cannot route SwarmOtter traffic without an
-HTTP proxy option. qBittorrent and aria2 both support HTTP proxies
-alongside SOCKS5.
+Users in those environments cannot route applicable SwarmOtter traffic without
+an HTTP proxy option. qBittorrent and aria2 both support HTTP proxies alongside
+SOCKS5.
 
 Requested elsewhere:
 
@@ -967,7 +846,7 @@ Acceptance direction:
   contained path.
 - DNS resolution for the proxy hostname respects containment.
 - Implementing this may share the connection-egress abstraction with the
-  existing SOCKS5 work (P0).
+  existing contained SOCKS5 TCP support.
 
 ### Scriptable CLI (`swarmotterctl`)
 

@@ -31,7 +31,7 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use swarmotter_core::bandwidth::{RateDirection, RateLimiter, ShapedLimiter};
-use swarmotter_core::config::PeerEncryptionMode;
+use swarmotter_core::config::{CowStrategy, PeerEncryptionMode};
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
 use swarmotter_core::meta::TorrentMeta;
@@ -45,7 +45,7 @@ use swarmotter_core::peer::{
 };
 use swarmotter_core::peer_filter::PeerFilter;
 use swarmotter_core::storage::resume::PieceBitfield;
-use swarmotter_core::storage::{piece_file_ranges, verify_piece, StorageIo};
+use swarmotter_core::storage::{piece_file_ranges, verify_piece, StorageIo, StorageIoMetrics};
 use swarmotter_core::tracker::{self, AnnounceEvent, AnnounceRequest};
 use swarmotter_core::udp_tracker;
 use swarmotter_core::utp::{self, PeerTransport};
@@ -370,11 +370,14 @@ pub struct TorrentEngine {
     encryption_mode: PeerEncryptionMode,
     preallocate: bool,
     sparse: bool,
+    cow_strategy: CowStrategy,
+    resume_dir: Option<PathBuf>,
     minimum_free_space_bytes: u64,
     minimum_free_space_percent: u8,
     /// Optional shared local-storage payload-write limiter supplied by the
     /// daemon for the configured active storage root.
     storage_write_limiter: Option<RateLimiter>,
+    storage_metrics: Option<StorageIoMetrics>,
     max_peer_workers: Arc<AtomicUsize>,
     allow_ipv6: bool,
     /// Immutable peer-admission rules for this data-plane configuration
@@ -454,9 +457,12 @@ impl TorrentEngine {
             encryption_mode: PeerEncryptionMode::default(),
             preallocate: true,
             sparse: true,
+            cow_strategy: CowStrategy::Conservative,
+            resume_dir: None,
             minimum_free_space_bytes: 0,
             minimum_free_space_percent: 0,
             storage_write_limiter: None,
+            storage_metrics: None,
             max_peer_workers: Arc::new(AtomicUsize::new(DEFAULT_PEER_WORKER_LIMIT)),
             allow_ipv6: true,
             peer_filter: Arc::new(PeerFilter::default()),
@@ -496,7 +502,7 @@ impl TorrentEngine {
         self
     }
 
-    /// Configure TCP peer-wire encryption policy.
+    /// Configure peer-wire encryption policy for contained TCP/uTP streams.
     pub fn with_encryption_mode(mut self, encryption_mode: PeerEncryptionMode) -> Self {
         self.encryption_mode = encryption_mode;
         self
@@ -512,6 +518,18 @@ impl TorrentEngine {
     /// are sized up front even if full preallocation is disabled.
     pub fn with_sparse(mut self, sparse: bool) -> Self {
         self.sparse = sparse;
+        self
+    }
+
+    /// Configure explicit CoW handling for newly created active payload files.
+    pub fn with_cow_strategy(mut self, cow_strategy: CowStrategy) -> Self {
+        self.cow_strategy = cow_strategy;
+        self
+    }
+
+    /// Configure a dedicated fast-resume metadata root.
+    pub fn with_resume_dir(mut self, resume_dir: Option<PathBuf>) -> Self {
+        self.resume_dir = resume_dir;
         self
     }
 
@@ -531,6 +549,12 @@ impl TorrentEngine {
     /// only local disk writes and leaves all network containment unchanged.
     pub fn with_storage_write_limiter(mut self, limiter: Option<RateLimiter>) -> Self {
         self.storage_write_limiter = limiter;
+        self
+    }
+
+    /// Attach shared actual-I/O accounting for the active storage root.
+    pub fn with_storage_metrics(mut self, metrics: Option<StorageIoMetrics>) -> Self {
+        self.storage_metrics = metrics;
         self
     }
 

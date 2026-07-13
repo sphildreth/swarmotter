@@ -53,6 +53,7 @@ export async function openDetails(hash) {
     renderDetailsPolicy(policy);
     renderDetailsControls(t);
     renderDetailsProfileSelector(policy, profiles);
+    renderDetailsEncryptionSelector(policy);
     renderDetailsActivity(stats || t);
     renderAutopilotDiagnostics({
       torrent: t,
@@ -179,8 +180,9 @@ export function renderDetailsPolicy(policy) {
       ["Seed forever", field(policy.seed_forever, value => value ? "yes" : "no")],
       ["Download cap", field(policy.download_limit, policyRateLabel)],
       ["Upload cap", field(policy.upload_limit, policyRateLabel)],
+      ["Peer encryption", field(policy.encryption_mode)],
     ])}
-    <p class="muted">Storage paths are fixed when a torrent is added or reassigned; queue priority, seeding, and rate limits update while they inherit. Start behavior controls initial admission and never stops running work.</p>`;
+    <p class="muted">Storage paths are fixed when a torrent is added or reassigned; queue priority, seeding, rate limits, and peer encryption update while they inherit. Start behavior controls initial admission and never stops running work.</p>`;
 }
 
 export function explicitProfileName(policy) {
@@ -197,6 +199,19 @@ export function renderDetailsProfileSelector(policy, profiles) {
     ...names.map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`),
   ].join("");
   select.value = names.includes(selected) ? selected : "";
+}
+
+export function explicitEncryptionMode(policy) {
+  return policy?.encryption_mode?.source?.kind === "torrent"
+    ? policy.encryption_mode.value || ""
+    : "";
+}
+
+export function renderDetailsEncryptionSelector(policy) {
+  const select = $("#details-encryption-mode");
+  if (!select) return;
+  const selected = explicitEncryptionMode(policy);
+  select.value = ["disabled", "preferred", "required"].includes(selected) ? selected : "";
 }
 
 export function renderDetailsControls(t) {
@@ -641,6 +656,33 @@ $("#details-profile-save-btn").addEventListener("click", async event => {
     refreshTorrentsHandler();
   } catch (error) {
     if (detailsRequestIsCurrent(hash)) showError("Save policy profile failed", error);
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("#details-encryption-mode-save-btn").addEventListener("click", async event => {
+  if (!state.currentHash) return;
+  const hash = state.currentHash;
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const encryptionMode = $("#details-encryption-mode").value || null;
+    await api(`/torrents/${hash}/encryption-mode`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ encryption_mode: encryptionMode }),
+    });
+    if (!detailsRequestIsCurrent(hash)) return;
+    showToast(
+      "Peer encryption saved",
+      encryptionMode || "Using profile or global mode",
+      "success",
+    );
+    await openDetails(hash);
+    refreshTorrentsHandler();
+  } catch (error) {
+    if (detailsRequestIsCurrent(hash)) showError("Save peer encryption failed", error);
   } finally {
     button.disabled = false;
   }

@@ -64,6 +64,7 @@ fn strict_config_with_interface(iface: &str, source: &str, root: &std::path::Pat
         fail_closed: true,
         validate_route: false,
         validate_dns: false,
+        socks5: Default::default(),
     };
     cfg.api.require_auth = false;
     cfg.dht.enabled = false;

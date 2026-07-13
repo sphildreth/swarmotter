@@ -31,7 +31,13 @@ SwarmOtter is a Rust async daemon with these layers:
   (BEP 29, with LEDBAT congestion control, SACK, and the full connection
   lifecycle) is implemented in `swarmotter-core::utp`, both over the binder's
   contained UDP socket. The engine selects TCP/uTP peer transports per config
-  (see `configuration.md` and ADR-0020). Opt-in NAT-PMP/UPnP router mapping,
+  and wraps either already-contained peer byte stream in MSE/PE when its
+  effective encryption policy requires it; the wrapper creates no socket or
+  resolver (see `configuration.md`, ADR-0020, and ADR-0063). An opt-in
+  `Socks5Binder` can wrap the contained TCP path for peer TCP and HTTP(S)
+  tracker/webseed traffic; it uses contained proxy DNS/connection, remote
+  target DNS, and blocks UDP rather than providing a direct fallback
+  (ADR-0062). Opt-in NAT-PMP/UPnP router mapping,
   UPnP SOAP control, and operator-configured listener reachability tests use
   the same binder boundary; none can create a default-route diagnostic or
   router-control socket (ADR-0059, ADR-0060).
@@ -40,9 +46,13 @@ SwarmOtter is a Rust async daemon with these layers:
   move/rename, missing/changed file detection logic. Runtime storage I/O reuses
   per-torrent file handles and flushes cached writes at read/verification and
   move/remove boundaries rather than after every block write. The daemon owns
-  root-scoped atomic active-work admission, shared verified-write limiters, and
-  RAII recheck permits; these local controls never create or alter torrent
-  network paths (ADR-0043, ADR-0056).
+  root-scoped atomic active-work admission, shared verified-write limiters,
+  RAII recheck permits, and observational actual-I/O metrics. Best-effort mount
+  diagnostics and explicit resume/state/fallback placement remain local;
+  same-directory atomic replacement is retained for durable files. Optional
+  NOCOW only touches newly created supported Btrfs payload files before data
+  is written. These local controls never create or alter torrent network paths
+  (ADR-0043, ADR-0056, ADR-0064).
 - **API layer** (`swarmotter-api`): REST endpoints plus SSE/WebSocket events
   built on `axum`. The API is a first-class product surface (see ADR-0004 and
   `api.md`). It talks to the daemon through the `DaemonOps` trait, so the
@@ -155,12 +165,14 @@ unavailable while the control plane stays available.
 
 `swarmotter-core::net::ContainedHttpClient` is the shared tracker announce,
 supported HTTP/HTTPS scrape, and webseed range transport (ADR-0055). Each hop
-uses `NetworkBinder::resolve_host` and `connect_peer`; TLS is layered over that
-stream, and Hyper is only an HTTP/1 codec through its Tokio I/O adapter. There
-is no Hyper connector, resolver, pool, or general client capable of creating a
-socket. Requests use origin-form targets and exact Host authorities. One
-logical timeout spans redirects and the decoded body, while decoded tracker
-bodies and exact webseed ranges have independent hard caps.
+uses `NetworkBinder::connect_host`; the ordinary contained binder resolves and
+connects through its path, while `Socks5Binder` keeps the target hostname for
+a remote-DNS SOCKS `CONNECT`. TLS is layered over that stream, and Hyper is only
+an HTTP/1 codec through its Tokio I/O adapter. There is no Hyper connector,
+resolver, pool, or general client capable of creating a socket. Requests use
+origin-form targets and exact Host authorities. One logical timeout spans
+redirects and the decoded body, while decoded tracker bodies and exact webseed
+ranges have independent hard caps.
 
 Only the bounded redirect set is followed, every hop reconnects through the
 binder, HTTPS downgrade is rejected, and webseed Range survives redirects.
@@ -234,10 +246,20 @@ reporting and requires operator intervention rather than repeated import.
 
 The daemon owns and awaits every torrent data-plane task: engines, tracker
 announce sidecars, DHT work, the shared inbound listener, and accepted inbound
-peer sessions. Network, listen-port, IP-family, uTP, encryption, or DHT changes
-stop the complete old task set before the new configuration is installed and
-eligible torrents are reconciled with fresh binders. This prevents a task from
-retaining an obsolete containment policy (ADR-0047).
+peer sessions. Network, listen-port, IP-family, uTP, global encryption, or DHT
+changes stop the complete old task set before the new configuration is
+installed and eligible torrents are reconciled with fresh binders. This
+prevents a task from retaining an obsolete containment policy (ADR-0047).
+
+MSE/PE is a `PeerDuplex` wrapper, not a transport or socket factory. Outbound
+peer and magnet-metadata sessions apply the resolved torrent override, profile,
+or global mode over the selected contained TCP/uTP stream. Required mode has no
+plaintext retry; preferred mode retries plaintext only on that same selected
+contained transport. Profile or label-map updates refresh the future inbound
+TCP registration and restart only active download/metadata engines whose
+effective mode changed after persistence. Existing negotiated sessions remain
+on their established wire stream; a production inbound-uTP listener is not part
+of this architecture (ADR-0063).
 
 Peer-admission filtering is a separate, global admission layer (ADR-0058).
 The daemon compiles a bounded immutable generation from local rules/imports

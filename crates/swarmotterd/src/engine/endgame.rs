@@ -28,7 +28,7 @@ impl TorrentEngine {
         let shared_have = Arc::new(Mutex::new(have.clone()));
         let outstanding = Arc::new(Mutex::new(OutstandingRequests::new(ENDGAME_MAX_PEERS)));
         let made_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let download_dir = self.download_dir.clone();
+        let storage = storage.clone();
         let selection = self.piece_selection.clone();
 
         let peers: Vec<PeerAddr> = candidates.iter().take(ENDGAME_MAX_PEERS).copied().collect();
@@ -41,7 +41,7 @@ impl TorrentEngine {
             let shared_have = shared_have.clone();
             let outstanding = outstanding.clone();
             let made_progress = made_progress.clone();
-            let download_dir = download_dir.clone();
+            let storage = storage.clone();
             let state = self.state.clone();
             let limiter = self.limiter.clone();
             let utp_enabled = self.utp_enabled;
@@ -59,7 +59,7 @@ impl TorrentEngine {
                     peer_id,
                     shared_have,
                     outstanding,
-                    download_dir,
+                    storage,
                     deadline,
                     made_progress,
                     state,
@@ -104,7 +104,7 @@ impl TorrentEngine {
         if progressed {
             *have = merged.clone();
             self.update_progress(&merged).await;
-            if let Err(e) = self.persist_resume(storage, &merged).await {
+            if let Err(e) = self.persist_resume(&storage, &merged).await {
                 tracing::warn!(error = %e, "endgame resume persist failed");
             }
         }
@@ -163,7 +163,7 @@ pub(super) async fn endgame_peer_session(
     peer_id: [u8; 20],
     shared_have: Arc<Mutex<PieceBitfield>>,
     outstanding: Arc<Mutex<swarmotter_core::endgame::OutstandingRequests>>,
-    download_dir: PathBuf,
+    storage: StorageIo,
     deadline: Instant,
     made_progress: Arc<std::sync::atomic::AtomicBool>,
     state: Arc<Mutex<EngineState>>,
@@ -188,7 +188,6 @@ pub(super) async fn endgame_peer_session(
         return Ok(false);
     }
     let _peer_permit = peer_session_budget.acquire_outbound().await?;
-    let storage = StorageIo::new(meta.clone(), download_dir);
     let (mut reader, mut write_half, transport) = connect_peer_wire_with_transport(
         binder.clone(),
         peer_addr,

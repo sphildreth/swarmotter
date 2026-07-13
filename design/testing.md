@@ -29,12 +29,23 @@ feature completion and acceptance criteria, not by time estimates.
 - Config validation.
 - Policy-profile resolution: explicit and deterministic label precedence,
   resolved create-time storage and initial-admission snapshots, live inherited
-  queue/seeding/bandwidth values, legacy-state migration on profile
-  replacement, and transactional assignment/config rollback.
+  queue/seeding/bandwidth/encryption values, durable per-torrent encryption
+  override/explicit-null clearing, mode-source explanation, legacy-state
+  migration on profile replacement, and transactional assignment/config
+  rollback. Profile or label-map encryption edits must restart only records
+  whose effective mode changes.
+- MSE/PE policy: TCP and uTP transport ordering remains independent from
+  encryption mode, `required` never retries plaintext after a failed
+  negotiation, and inbound routing rejects plaintext after identifying a
+  torrent whose effective mode is `required`.
 - Peer-admission filtering: IPv4/IPv6 single-IP, CIDR, and inclusive-range
   parsing; bounded local eMule/PeerGuardian imports; manual-ban and peer-ID
   prefix decisions; and fail-closed compile failure behavior.
 - Network containment validation logic.
+- SOCKS5 TCP proxy framing and policy: no-auth and RFC 1929 negotiation,
+  domain-form remote DNS, IP-literal peer targets, malformed/refused replies,
+  proxy-host-only contained resolution, credential bounds, and rejection of
+  every UDP/direct-target-resolution seam without a fallback socket.
 - Router port-mapping and listener-reachability configuration: opt-in defaults,
   strict fail-closed/interface requirements for mapping, protocol ordering,
   bounded leases/cache/timeout values, endpoint syntax, and status snapshots
@@ -224,6 +235,19 @@ operator API/configuration/Web UI guides, the completion tracker, changelog,
 and affected ADRs (including ADR-0052 and ADR-0054) aligned with the tested
 behavior.
 
+### Contained SOCKS5 TCP proxy acceptance matrix
+
+ADR-0062 is complete only when local fixtures prove that proxy use remains
+inside the existing containment boundary and that enabling it cannot leave a
+misleading direct UDP path.
+
+| Capability | Required assertions | Acceptance evidence |
+| --- | --- | --- |
+| Explicit configuration and secret safety | SOCKS5 defaults disabled; enabled configuration requires a valid host/nonzero port, complete bounded credentials, and explicit uTP/DHT disablement. Settings GET/PUT and runtime replacement redact the password while retaining it only for an unchanged username. | `config::tests::{socks5_is_opt_in_and_normalizes_a_proxy_hostname, socks5_validation_requires_safe_complete_configuration, socks5_requires_udp_features_to_be_explicitly_disabled}`, `settings_redacts_and_preserves_socks5_password`, `daemon::tests::replace_config_preserves_and_redacts_socks5_password`. |
+| Contained proxy protocol and remote DNS | A no-auth domain request, RFC 1929 authentication, malformed/refused response, and IP-literal peer form are exercised against in-memory/local SOCKS fixtures. The inner binder resolves/connects only the configured proxy, never the target, and never creates a direct fallback. | `net::socks5::tests::{no_auth_connect_uses_domain_form_for_remote_dns, username_password_authentication_is_negotiated_without_logging_credentials, malformed_and_refused_responses_are_proxy_errors, wrapper_resolves_only_proxy_and_never_falls_back_to_target}`. |
+| Safe UDP policy | Every SOCKS UDP binder seam and target-DNS seam returns a typed proxy error without calling the inner UDP or resolver path. The runtime disables DHT/uTP construction and a UDP tracker attempt is rejected rather than routed directly. | `net::socks5::tests::wrapper_blocks_udp_and_local_target_resolution`, configuration/scheduler assertions, and contained UDP tracker coverage. |
+| Production HTTP and operator visibility | One local SOCKS listener observes tracker and webseed HTTP requests with exact SOCKS domain targets and HTTP Range semantics. Network diagnostics expose only enabled/TCP-only-UDP-blocked state; the Settings UI preserves redacted secrets and disables incompatible uTP/DHT controls. | `daemon::tests::{socks5_data_plane_binder_proxies_tracker_and_webseed_http, socks5_network_diagnostics_are_auditable_without_proxy_secrets}`, `node crates/swarmotter-web/tests/app-startup.test.mjs`. |
+
 ### Contained router mapping, listener reachability, and compatibility acceptance matrix
 
 ADR-0059, ADR-0060, and ADR-0061 require production-boundary coverage. A
@@ -300,6 +324,12 @@ transition.
   correct paused/completed restoration after a dropped explicit recheck, and
   root-control-only replacement wake-up without tearing down grandfathered
   engines (ADR-0056).
+- Filesystem-aware storage: dedicated info-hash fast-resume placement without
+  payload relocation; atomic resume/state handling stays same-directory;
+  configuration validation and full-settings transition behavior for state,
+  resume, and fallback temporary roots; optional mount diagnostic fallback;
+  actual successful write/verification metric accounting; and NOCOW rejection
+  on unsupported filesystems before any payload write (ADR-0064).
 
 ### Local swarm tests
 
@@ -318,6 +348,9 @@ transition.
   generated payload over the contained UDP socket; the engine completes the
   download over uTP, verifying piece hashes and final file contents; a
   fail-closed test proves the `BlockedBinder` blocks uTP swarm downloads)
+- Required MSE/PE over uTP: covered by a generated local swarm whose seed
+  accepts MSE/PE on a contained `UtpStream`; the engine completes and verifies
+  the payload with `required` mode and no TCP/plaintext fallback.
 - Recheck after completion: covered via `StorageIo::recheck`
 - Per-torrent health during active download: an actively-downloading
   generated lawful local payload reports a non-zero health score and at

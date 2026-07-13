@@ -20,10 +20,18 @@ enabled = false
 [storage]
 download_dir = "/data/downloads"
 incomplete_dir = "/data/incomplete"
+# Optional high-write-state placement. Explicit --state-file or
+# SWARMOTTER_STATE_FILE still wins over state_dir.
+# resume_dir = "/config/swarmotter/resume"
+# state_dir = "/config/swarmotter/state"
+# temp_dir = "/tmp/swarmotter"
 minimum_free_space_bytes = 0
 minimum_free_space_percent = 0
 preallocate = false
 sparse = true
+# Keep the container filesystem's default CoW behavior unless the mounted
+# filesystem and operator policy explicitly support disable_for_new_files.
+cow_strategy = "conservative"
 
 # Optional per-root local resource controls. The most-specific lexical path
 # wins; a zero limit is unlimited. These govern local storage work only.
@@ -40,6 +48,17 @@ sparse = true
 # kill switch are the fail-closed boundary. Do not copy disabled mode into a
 # standalone container or native deployment.
 mode = "disabled"
+
+# Optional TCP-only SOCKS5 proxy. The proxy connection remains inside the VPN
+# sidecar's network namespace; target DNS is sent to the proxy. Enable this
+# only after setting torrent.utp_enabled = false and [dht] enabled = false,
+# because UDP tracker, DHT, and uTP paths are deliberately blocked.
+[network.socks5]
+enabled = false
+# host = "proxy.example"
+port = 1080
+# username = "operator"
+# password = "set-through-a-secret-manager"
 
 [autopilot]
 # Optional: disabled (off), observe (reasons only), or act (bounded actions).
@@ -88,11 +107,15 @@ auto_start = true
 global_ratio_limit = 2.0
 global_idle_limit = 1800
 
-# Optional named policy profiles. Resolved storage and the initial start-or-
-# paused decision are captured at registration; inheriting queue, seeding,
-# and bandwidth values remain live.
+# Optional named policy profiles. Explicit add/watch/torrent profiles win over
+# label mappings. Resolved storage and the initial start-or-paused decision are
+# captured at registration; queue/seeding/bandwidth/encryption values remain
+# live while inherited.
 # [profiles.labels]
 # linux = "linux-release"
+#
+# [profiles.profiles.linux-release]
+# encryption_mode = "required" # disabled, preferred, or required
 #
 # [profiles.profiles.linux-release.storage]
 # download_dir = "/data/releases/linux"

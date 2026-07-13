@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR-0063: Contained MSE/PE for TCP and uTP with Effective
+Encryption Policy](0063-contained-mse-utp-and-effective-encryption-policy.md).
 
 ## Context
 
@@ -44,14 +45,15 @@ not force TCP ahead of uTP when `torrent.utp_prefer_tcp = false`.
   compatibility, not as evasive behavior.
 - No separate socket allocation path is introduced, so `NetworkBinder` and existing
   fail-closed logic remain authoritative for peer transport.
-- uTP encryption and per-profile/per-torrent overrides remain out of scope for
-  this phase and stay in the backlog.
+- uTP encryption and per-profile/per-torrent overrides were out of scope for
+  this phase; ADR-0063 supersedes this decision and completes that scope.
 - Changing the encryption mode requires restarting or recreating existing torrent
   tasks; new tasks use the updated configuration.
 
 ## Related Documents
 
-- `design/BACKLOG.md` (`Protocol Encryption / MSE-PE` section)
+- [ADR-0063: Contained MSE/PE for TCP and uTP with Effective Encryption
+  Policy](0063-contained-mse-utp-and-effective-encryption-policy.md)
 - `design/COMPARISON.md`
 - `docs/configuration.md`
 - `docs/api.md`
