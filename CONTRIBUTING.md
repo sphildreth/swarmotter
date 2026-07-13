@@ -59,7 +59,7 @@ module. Keep the feature import graph acyclic and preserve the `script-src
 'self'` CSP. Run syntax checks for every asset and the executable DOM harnesses:
 
 ```bash
-find crates/swarmotter-web/assets -type f -name '*.js' -exec node --check {} \;
+scripts/check-web-js-modules.sh
 node crates/swarmotter-web/tests/watch-history.test.js
 node crates/swarmotter-web/tests/seeding-policy.test.js
 ```

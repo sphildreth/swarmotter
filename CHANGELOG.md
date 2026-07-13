@@ -46,6 +46,12 @@ date or duration estimates.
 
 ### Fixed
 
+- **Web UI ES-module startup validation:** corrected an invalid shared-state
+  redeclaration in `torrents.js` that prevented the UI module graph from
+  loading. CI, local prechecks, and the Web UI Rust suite now parse every
+  embedded JavaScript asset in ES-module mode so script-mode syntax checks
+  cannot miss imported-binding redeclarations.
+
 - **Reachable terminal tracker diagnostics:** a bounded engine attempt now
   enters `tracker_error` when every attempted configured tracker fails and no
   usable DHT, PEX, direct-peer, or webseed source exists. Native summaries and

@@ -122,8 +122,9 @@ Every HTML and module response passes through the same security middleware.
 The Content Security Policy remains `script-src 'self'` with no inline-script
 exception, and the module routes retain the entry script's absence of an
 explicit cache header. Route tests assert status, content type, CSP, and cache
-policy for every module. Contributor checks run `node --check` on every
-JavaScript asset; the executable watch-history and seeding-policy DOM harnesses
+policy for every module. Contributor checks run
+`scripts/check-web-js-modules.sh` so every JavaScript asset is parsed with ES
+module semantics; the executable watch-history and seeding-policy DOM harnesses
 remain part of the test surface.
 
 ## Control plane vs data plane

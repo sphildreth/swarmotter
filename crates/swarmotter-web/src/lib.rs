@@ -1248,6 +1248,50 @@ mod tests {
     }
 
     #[test]
+    fn every_embedded_javascript_asset_parses_as_an_es_module() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        for (name, source) in [
+            ("app.js", APP_JS_ENTRY),
+            ("js/api.js", API_JS),
+            ("js/state.js", STATE_JS),
+            ("js/torrents.js", TORRENTS_JS),
+            ("js/details.js", DETAILS_JS),
+            ("js/settings.js", SETTINGS_JS),
+            ("js/events.js", EVENTS_JS),
+            ("js/ui.js", UI_JS),
+            ("seeding-policy.js", SEEDING_POLICY_JS),
+            ("watch-history.js", WATCH_HISTORY_JS),
+            ("theme-bootstrap.js", THEME_BOOTSTRAP_JS),
+            ("vendor/tabulator/tabulator.min.js", TABULATOR_JS),
+        ] {
+            let mut child = Command::new("node")
+                .args(["--input-type=module", "--check"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("Node.js is required by the Web UI quality gate");
+            child
+                .stdin
+                .take()
+                .expect("module checker stdin is piped")
+                .write_all(source.as_bytes())
+                .expect("embedded JavaScript can be written to Node.js");
+            let output = child
+                .wait_with_output()
+                .expect("module syntax checker exits");
+            assert!(
+                output.status.success(),
+                "JavaScript module syntax failed for {name}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+
+    #[test]
     fn torrent_details_exposes_terminal_error_diagnostics() {
         for needle in [
             "[\"Last error\", t.error || \"\"]",

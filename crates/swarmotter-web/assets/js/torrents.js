@@ -925,7 +925,6 @@ export async function uploadDroppedFiles(files) {
   }
 }
 
-let state.dragDepth = 0;
 export function setDropActive(active) {
   $("#drop-overlay").classList.toggle("hidden", !active);
 }

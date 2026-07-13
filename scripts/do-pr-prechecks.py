@@ -10,7 +10,7 @@ pull requests:
   - cargo check --workspace --all-targets --all-features
   - cargo clippy --workspace --all-targets --all-features -- -D warnings
   - cargo test --all --all-features
-  - node --check for every embedded Web UI JavaScript asset
+  - ES-module syntax validation for every embedded Web UI JavaScript asset
   - executable Web UI DOM-state harnesses
   - docker compose config for the supported deployment manifest
   - cargo +1.88.0 check --locked --workspace --all-targets --all-features
@@ -59,7 +59,7 @@ PR_CHECKS = (
     "cargo check --workspace --all-targets --all-features",
     "cargo clippy --workspace --all-targets --all-features -- -D warnings",
     "cargo test --all --all-features",
-    "find crates/swarmotter-web/assets -type f -name '*.js' -exec node --check {} \\;",
+    "scripts/check-web-js-modules.sh",
     "node crates/swarmotter-web/tests/watch-history.test.js && node crates/swarmotter-web/tests/seeding-policy.test.js",
     "GLUETUN_ENV_FILE=gluetun.env.example docker compose --env-file deploy/.env.example -f deploy/compose.yml config",
     "cargo +1.88.0 check --locked --workspace --all-targets --all-features",
@@ -180,14 +180,13 @@ def build_steps(args: argparse.Namespace) -> list[CheckStep]:
         ]
     )
 
-    for javascript in sorted(Path("crates/swarmotter-web/assets").rglob("*.js")):
-        steps.append(
-            CheckStep(
-                f"Validate JavaScript: {javascript.relative_to('crates/swarmotter-web/assets')}",
-                ["node", "--check", str(javascript)],
-                PR_CHECKS[4],
-            )
+    steps.append(
+        CheckStep(
+            "Validate JavaScript ES modules",
+            ["scripts/check-web-js-modules.sh"],
+            PR_CHECKS[4],
         )
+    )
 
     steps.extend(
         [

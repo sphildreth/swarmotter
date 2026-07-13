@@ -186,8 +186,9 @@ node crates/swarmotter-web/tests/seeding-policy.test.js
 The matrix definition of done also requires `cargo fmt --all -- --check`,
 `cargo check --locked --workspace --all-targets --all-features`,
 `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`,
-`cargo test --locked --workspace --all-targets --all-features`, `node --check`
-for every file below `crates/swarmotter-web/assets`, both executable DOM
+`cargo test --locked --workspace --all-targets --all-features`, module-aware
+syntax checks through `scripts/check-web-js-modules.sh` for every file below
+`crates/swarmotter-web/assets`, both executable DOM
 harnesses, `mdbook build`, and `git diff --check` to pass. Documentation
 must keep `design/requirements.md`, architecture/API/configuration design,
 operator API/configuration/Web UI guides, the completion tracker, changelog,

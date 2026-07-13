@@ -436,9 +436,9 @@ documented below; no required capability remains marked in progress.
 | `cargo fmt --all -- --check` | pass |
 | `cargo check --locked --workspace --all-targets --all-features` | pass |
 | `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` | pass (no warnings) |
-| `cargo test --locked --workspace --all-targets --all-features` | pass (780 passed, 2 intentional opt-in scale tests ignored; includes 394 core, 54 API unit, 56 API integration, 6 origin-matrix, 32 Web, 195 daemon-library, containment, daemon-download, generated local-swarm, throughput, metadata-ingress, and public-path suites) |
+| `cargo test --locked --workspace --all-targets --all-features` | pass (781 passed, 2 intentional opt-in scale tests ignored; includes 394 core, 54 API unit, 56 API integration, 6 origin-matrix, 33 Web, 195 daemon-library, containment, daemon-download, generated local-swarm, throughput, metadata-ingress, and public-path suites) |
 | `cargo +1.88.0 check --locked --workspace --all-targets --all-features` | pass |
-| `find crates/swarmotter-web/assets -type f -name '*.js' -exec node --check {} \;` | pass for all 12 JavaScript assets |
+| `scripts/check-web-js-modules.sh` | pass for all 12 JavaScript assets in ES-module mode |
 | `node crates/swarmotter-web/tests/watch-history.test.js` and `node crates/swarmotter-web/tests/seeding-policy.test.js` | pass |
 | `GLUETUN_ENV_FILE=gluetun.env.example docker compose --env-file deploy/.env.example -f deploy/compose.yml config` | pass |
 | `mdbook build` | pass |

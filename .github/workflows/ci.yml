@@ -30,9 +30,7 @@ jobs:
       - name: Test
         run: cargo test --all --all-features
       - name: Validate Web UI JavaScript
-        run: |
-          node --check crates/swarmotter-web/assets/theme-bootstrap.js
-          node --check crates/swarmotter-web/assets/app.js
+        run: scripts/check-web-js-modules.sh
       - name: Validate deployment manifests
         run: |
           cp deploy/gluetun.env.example deploy/gluetun.env
