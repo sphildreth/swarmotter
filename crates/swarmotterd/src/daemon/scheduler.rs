@@ -816,6 +816,7 @@ impl DaemonRuntime {
                 Ok(final_state) => {
                     let finished = final_state.finished;
                     let stopped_by_command = final_state.stopped_by_command;
+                    let terminal_tracker_error = final_state.terminal_tracker_error();
                     let mut metadata_received = false;
                     let mut changed_state = None;
                     {
@@ -845,6 +846,10 @@ impl DaemonRuntime {
                                     SeedingStatus::NotEligible
                                 };
                                 t.date_completed = Some(now());
+                            } else if let Some(error) = terminal_tracker_error.as_ref() {
+                                t.state = TorrentState::TrackerError;
+                                t.seeding_status = SeedingStatus::NotEligible;
+                                t.error = Some(error.clone());
                             } else if t.state == TorrentState::DownloadingMetadata {
                                 // Metadata fetched but download incomplete; mark
                                 // downloading.
@@ -859,11 +864,12 @@ impl DaemonRuntime {
                         runtime_for_task.publish_event(torrent_metadata_event(hash_for_task));
                     }
                     if let Some(state) = changed_state {
-                        runtime_for_task.publish_torrent_event(
-                            "torrent_changed",
-                            hash_for_task,
-                            state,
-                        );
+                        let event = if state == TorrentState::TrackerError {
+                            "torrent_error"
+                        } else {
+                            "torrent_changed"
+                        };
+                        runtime_for_task.publish_torrent_event(event, hash_for_task, state);
                         if state == TorrentState::Completed {
                             runtime_for_task.publish_torrent_event(
                                 "torrent_completed",
@@ -882,7 +888,7 @@ impl DaemonRuntime {
                         runtime_for_task
                             .selfish_remove_completed(hash_for_task)
                             .await;
-                    } else if !finished && !stopped_by_command {
+                    } else if !finished && !stopped_by_command && terminal_tracker_error.is_none() {
                         let queued = runtime_for_task
                             .queue_torrent_for_retry(
                                 hash_for_task,

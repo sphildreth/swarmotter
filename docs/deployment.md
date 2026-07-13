@@ -1,5 +1,16 @@
 # Deployment
 
+## Upgrading from 1.x to v2.0.0
+
+`v2.0.0` makes strict containment the configuration default. An installation
+that previously omitted `[network]` no longer starts with torrent containment
+disabled; it fails validation until an enforceable interface, source address,
+or namespace is configured. Explicit `mode = "disabled"` remains limited to
+development or deployments where a separate boundary, such as the supplied
+Gluetun shared namespace, provides fail-closed containment. Run
+`swarmotterd --check-config --config PATH` against the migrated configuration
+before restarting a package, systemd, or container deployment.
+
 ## Basic Linux service
 
 Build the daemon:

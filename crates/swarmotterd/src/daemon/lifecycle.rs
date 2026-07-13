@@ -266,7 +266,8 @@ impl DaemonOps for DaemonRuntime {
     async fn reannounce(&self, hash: &InfoHash) -> Result<()> {
         // If the engine is running, send a reannounce command; otherwise
         // restart the engine which announces on start.
-        if let Some(tx) = self.engine_cmds.lock().await.get(hash) {
+        let tx = self.engine_cmds.lock().await.get(hash).cloned();
+        if let Some(tx) = tx {
             let _ = tx.send(EngineCommand::Reannounce).await;
             Ok(())
         } else {

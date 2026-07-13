@@ -137,8 +137,13 @@ required capabilities; `PRD.md` remains the detailed reference. When this
 document and `PRD.md` diverge, treat it as a documentation issue to resolve
 immediately.
 
-## TODO
+## Traceability
 
-- Cross-reference each capability above to specific acceptance criteria and
-  tracked test areas as implementation begins.
-- Keep this document and `PRD.md` aligned.
+The production entry point, named production-path acceptance test, and
+operator/developer documentation for every capability and acceptance criterion
+above are indexed in [v1-traceability.md](v1-traceability.md). That release
+audit also maps every completed row in
+[v1-completion-tracker.md](v1-completion-tracker.md) and identifies the
+production reachability evidence that cannot be replaced by a type, helper, or
+mock-only assertion. Keep this document, the traceability matrix, and `PRD.md`
+aligned whenever a capability or acceptance contract changes.

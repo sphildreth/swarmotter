@@ -75,6 +75,12 @@ inserted into the table. Scrape is operational telemetry scheduled by download,
 magnet, reannounce, completion, and active seeder tracker activity; it is not a
 separate user mutation.
 
+The Details summary also displays **Last error** from the native torrent
+summary. If every attempted configured tracker fails and no usable alternative
+source exists, the state becomes `tracker error` and this row retains the last
+tracker failure. Reannounce, Resume, or Start Now clears the terminal error and
+starts a new attempt.
+
 ## Per-torrent seeding policy
 
 Torrent Details includes a Seeding Policy card. Its read-only summary reports

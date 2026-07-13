@@ -332,6 +332,7 @@ async fn health_and_version_endpoints() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["data"]["name"], "SwarmOtter");
+    assert_eq!(v["data"]["version"], env!("CARGO_PKG_VERSION"));
 }
 
 #[tokio::test]

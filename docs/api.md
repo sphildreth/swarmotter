@@ -176,12 +176,21 @@ the process-wide connection-limit authority.
 | POST | `/torrents/:hash/limits` | Set per-torrent bandwidth limits: `{ download_limit, upload_limit }`, bytes/sec, `0` = unlimited. |
 | PUT | `/torrents/:hash/seeding` | Replace the persisted per-torrent ratio/idle/forever policy. |
 
-Torrent list/detail rows include `uploaded`, `ratio`, `seeding`,
-`seeding_status`, `effective_ratio_limit`, and `effective_idle_limit`. The
-persisted `seeding` object has nullable `ratio_limit` and `idle_limit` fields
-plus `seed_forever`. Nullable targets inherit `[seeding]` globals; explicit
-zero is an immediate target. `seed_forever: true` makes both effective fields
-`null` without erasing stored overrides.
+Torrent list/detail rows include nullable `error`, `uploaded`, `ratio`,
+`seeding`, `seeding_status`, `effective_ratio_limit`, and
+`effective_idle_limit`. `error` retains the last terminal/runtime failure for
+operator diagnosis and is `null` after a successful retry or lifecycle action
+that clears it. The persisted `seeding` object has nullable `ratio_limit` and
+`idle_limit` fields plus `seed_forever`. Nullable targets inherit `[seeding]`
+globals; explicit zero is an immediate target. `seed_forever: true` makes both
+effective fields `null` without erasing stored overrides.
+
+When every attempted configured tracker fails and no usable DHT, PEX,
+direct-peer, or webseed source exists, the daemon stops the bounded engine
+attempt in `tracker_error` and exposes the last tracker failure in `error`.
+`POST /torrents/:hash/reannounce` or Resume/Start Now clears the terminal error
+and starts a new attempt. A successful tracker response or usable alternative
+source prevents `tracker_error`.
 
 The replacement request requires exactly these keys:
 

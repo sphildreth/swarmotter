@@ -122,6 +122,12 @@ socket bind failures block immediately and remain latched until an explicit,
 fully validated configuration replacement proves both UDP and peer-listener
 binds succeed; a healthy interface probe alone never reopens traffic.
 
+This default is the breaking configuration change in `v2.0.0`. Existing `1.x`
+installations that relied on omitted network configuration must add a strict
+interface/source/namespace path before upgrading, or explicitly set
+`mode = "disabled"` only when development or another boundary supplies the
+required containment.
+
 See [`docs/network-containment.md`](docs/network-containment.md).
 
 ## Lawful Use

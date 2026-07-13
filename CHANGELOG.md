@@ -7,7 +7,15 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
-## [Unreleased]
+## [2.0.0] - [2026-07-12]
+
+### Upgrade notes
+
+- Existing `1.x` installations that omitted `[network]` must configure a
+  strict interface/source/namespace path before upgrading. Explicit
+  `mode = "disabled"` is accepted only for development or when a separately
+  enforced boundary supplies containment. Validate the migrated file with
+  `swarmotterd --check-config --config PATH` before restarting.
 
 ### Added
 
@@ -37,6 +45,13 @@ date or duration estimates.
   [ADR-0052](design/adr/0052-persisted-per-torrent-seeding-policy-and-runtime-lifecycle.md).
 
 ### Fixed
+
+- **Reachable terminal tracker diagnostics:** a bounded engine attempt now
+  enters `tracker_error` when every attempted configured tracker fails and no
+  usable DHT, PEX, direct-peer, or webseed source exists. Native summaries and
+  Torrent Details retain the last error; reannounce/resume clears and retries.
+  Reannounce no longer holds the engine-command lock while delegating to
+  resume, preventing a stopped-engine deadlock.
 
 - **Stable, idempotent, transactional watch ingestion:** complete sorted
   directory walks now run off the async workers, reject symlink roots, skip
@@ -104,7 +119,7 @@ date or duration estimates.
   relied on the disabled default must configure a strict path or set
   `mode = "disabled"` explicitly. See
   [ADR-0051](design/adr/0051-explicit-network-path-and-live-containment-gate.md).
-  Version bump deferred to a later phase.
+  This breaking contract is released as `v2.0.0`.
 
 - **Live containment gate:** one process-wide `ContainmentGate` (atomics plus
   `tokio::sync::Notify`) is now shared by every torrent data-plane component.

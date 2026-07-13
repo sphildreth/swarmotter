@@ -1,9 +1,12 @@
 # SwarmOtter v1.0.0 Completion Tracker
 
-This tracker records progress toward `v1.0.0` as defined by `design/PRD.md` and
-`design/requirements.md`. Progress is tracked by completed capabilities,
+This tracker records the capabilities originally required for `v1.0.0` as
+defined by `design/PRD.md` and `design/requirements.md`. The assembled release
+is `v2.0.0` because the strict-containment default changes the configuration
+compatibility contract. Progress is tracked by completed capabilities,
 acceptance criteria, passing tests, and working end-to-end behavior — never by
-time estimates.
+time estimates. The production/test/document mapping for every completed row is
+indexed in [v1-traceability.md](v1-traceability.md).
 
 ## Status Legend
 
@@ -370,12 +373,17 @@ UDP socket (see ADR-0020).
       symlink/sorting/pruning semantics, concurrent manual scans, bounded
       history eviction, the real file-add router contract, and Watch UI outcome
       rendering (ADR-0054).
+      Final production reachability additionally covers a real contained
+      failing tracker transitioning the daemon/native detail route to
+      `tracker_error`, retaining the last failure, and clearing/retrying through
+      manual reannounce.
 - [x] Network containment live tests (fail-closed via daemon) — `BlockedBinder`
       proves TCP/UDP/listener fail-closed at the binder; daemon strict-mode
-      integration tests cover add-under-blocked and health reporting; live
-      "VPN path removed while active" via the daemon health loop is covered
-      structurally (the health loop stops engines/seeders and marks torrents
-      `network_blocked`)
+      integration tests cover add-under-blocked and health reporting. The
+      privileged namespace harness transfers verified bytes through a strict,
+      route-less veth, deletes that veth during the active transfer, and proves
+      `interface_missing`, `network_blocked`, empty data-plane diagnostics,
+      stable bytes, and a continuously available control API.
 - [x] Storage tests — live interrupted-write/missing-file/resume/recheck covered;
       exact verified-byte accounting is asserted for a short final piece and a
       multi-file boundary after restore, partial forced recheck, and full forced
@@ -428,12 +436,17 @@ documented below; no required capability remains marked in progress.
 | `cargo fmt --all -- --check` | pass |
 | `cargo check --locked --workspace --all-targets --all-features` | pass |
 | `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` | pass (no warnings) |
-| `cargo test --locked --workspace --all-targets --all-features` | pass (809 passed, 3 intentional opt-in scale tests ignored; includes 348 core, 51 API unit, 54 API integration, 3 origin-matrix, 27 Web, both 146-test daemon targets, containment, daemon-download, and generated local-swarm suites) |
+| `cargo test --locked --workspace --all-targets --all-features` | pass (780 passed, 2 intentional opt-in scale tests ignored; includes 394 core, 54 API unit, 56 API integration, 6 origin-matrix, 32 Web, 195 daemon-library, containment, daemon-download, generated local-swarm, throughput, metadata-ingress, and public-path suites) |
 | `cargo +1.88.0 check --locked --workspace --all-targets --all-features` | pass |
-| `node --check crates/swarmotter-web/assets/theme-bootstrap.js` | pass |
-| `node --check crates/swarmotter-web/assets/app.js` | pass |
-| `docker compose --env-file deploy/.env.example -f deploy/compose.yml config` | pass with `GLUETUN_ENV_FILE=gluetun.env.example` |
+| `find crates/swarmotter-web/assets -type f -name '*.js' -exec node --check {} \;` | pass for all 12 JavaScript assets |
+| `node crates/swarmotter-web/tests/watch-history.test.js` and `node crates/swarmotter-web/tests/seeding-policy.test.js` | pass |
+| `GLUETUN_ENV_FILE=gluetun.env.example docker compose --env-file deploy/.env.example -f deploy/compose.yml config` | pass |
 | `mdbook build` | pass |
+| `cargo test --locked -p swarmotterd ignored_thousand_mixed_state_torrents_keep_scheduler_bounds -- --ignored` | pass |
+| `cargo test --locked -p swarmotter-api --test scale_harness -- --ignored` | pass |
+| `scripts/test-network-containment-transition.sh "$PWD/target/debug/swarmotterd"` | pass as a non-root build user with command-scoped `sudo ip` inside an isolated privileged Linux container |
+| `docker build -f deploy/Dockerfile -t swarmotter:version-check .` and image-label inspection | pass; `org.opencontainers.image.version=2.0.0` |
+| `python3 scripts/do-pr-prechecks.py --no-update-stable --no-install-rust-components --no-install-minimum-rust` | pass, including doctests and every CI-equivalent check |
 | local swarm download (HTTP tracker + direct peer) | pass |
 | local swarm download (UDP tracker, BEP 15) | pass |
 | local swarm seeding (inbound Seeder serves completed download) | pass |
@@ -456,6 +469,7 @@ documented below; no required capability remains marked in progress.
 | uTP reliable exchange over contained socket (local fixture) | pass |
 | HTTPS tracker over contained socket (local TLS fixture) | pass |
 | daemon download through `DaemonOps` | pass |
+| terminal tracker failure through contained HTTP, daemon state, native detail route, and reannounce | pass |
 
 ## ADRs Created or Updated
 
@@ -485,6 +499,9 @@ documented below; no required capability remains marked in progress.
 - ADR-0050: Bounded untrusted metainfo parsing
 - ADR-0051: Explicit network path and live containment gate
 - ADR-0052: Persisted per-torrent seeding policy and runtime lifecycle
+- ADR-0053: Process-wide peer-session permit pool
+- ADR-0054: Watch-folder stability, idempotence, and import atomicity
+- ADR-0055: Contained HTTP/1 client framing and redirect policy
 
 ## Notes
 

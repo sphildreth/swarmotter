@@ -170,6 +170,7 @@ impl Torrent {
             info_hash: self.info_hash(),
             name: self.name().to_string(),
             state: self.state,
+            error: self.error.clone(),
             total_length: self.meta.total_length,
             bytes_completed: self.bytes_completed(),
             uploaded: self.uploaded,

@@ -115,6 +115,15 @@ feature completion and acceptance criteria, not by time estimates.
 - Per-torrent health serialization: `TorrentSummary` and the torrent detail
   endpoint both include a `health` object with score, bars, label, and
   per-component sub-scores.
+- Terminal tracker failure reachability: a real contained HTTP tracker failure
+  must drive the daemon to `tracker_error`, retain its last failure in the
+  native summary, and allow manual reannounce/resume to clear and retry. A
+  successful tracker response or usable DHT, PEX, direct-peer, or webseed
+  signal must prevent this terminal classification. The production-path
+  evidence is
+  `terminal_tracker_failure_sets_tracker_error_and_reannounce_retries`; the
+  classifier matrix is
+  `terminal_tracker_error_requires_all_failures_and_no_successful_alternative`.
 
 ### Watch-folder stability and atomicity acceptance matrix
 
@@ -300,6 +309,9 @@ Tests must use clearly lawful sources (generated local torrents, public-domain
 files, open datasets, Linux distribution examples, project-owned sample files).
 See `content-policy.md`.
 
-## TODO
+## Traceability
 
-- Keep this document aligned with `requirements.md`.
+The release-wide mapping from requirements to production paths, acceptance
+tests, and documents is maintained in
+[v1-traceability.md](v1-traceability.md). Keep both documents aligned when a
+test contract changes.

@@ -734,6 +734,12 @@ Required torrent states:
 - `storage_error`
 - `tracker_error`
 
+`tracker_error` is a reachable terminal state for a bounded engine attempt:
+every attempted configured tracker failed and no usable DHT, PEX, direct-peer,
+or webseed source existed. The native summary retains the last tracker failure;
+manual reannounce or resume clears it and retries. Any successful tracker or
+usable alternative source prevents this classification.
+
 ## Queue Management Requirements
 
 The application must support queue management as part of v1.0.0.

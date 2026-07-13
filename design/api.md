@@ -181,6 +181,12 @@ not accept restart-required fields.
 
 ## Per-torrent seeding contract
 
+- Native list/detail summaries expose nullable `error`. A bounded engine run
+  that exhausts every attempted configured tracker with no usable DHT, PEX,
+  direct-peer, or webseed source transitions to `tracker_error` and retains the
+  last tracker failure there. Reannounce, Resume, or Start Now clears the error
+  and retries; a successful tracker or alternative source prevents the
+  terminal classification.
 - Native list and detail summaries expose the persisted `seeding` object,
   `seeding_status`, ratio/uploaded counters, and resolved
   `effective_ratio_limit` / `effective_idle_limit`.

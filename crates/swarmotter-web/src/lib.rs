@@ -1248,6 +1248,19 @@ mod tests {
     }
 
     #[test]
+    fn torrent_details_exposes_terminal_error_diagnostics() {
+        for needle in [
+            "[\"Last error\", t.error || \"\"]",
+            "renderDetailsSummary(t)",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "Torrent Details is missing terminal error diagnostics {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn web_ui_renders_health_for_sample_torrent_summary() {
         // Mimic the renderHealth output for a sample summary and assert
         // the produced HTML is a valid container with the right number of

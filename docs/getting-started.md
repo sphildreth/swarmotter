@@ -14,6 +14,17 @@ The daemon binary is:
 ./target/release/swarmotterd
 ```
 
+## Upgrading from 1.x to v2.0.0
+
+`v2.0.0` changes an omitted `[network]` table from implicit disabled
+containment to strict containment without a configured path, which fails
+startup validation. Before upgrading an existing installation, configure the
+strict interface, source address, or namespace that torrent traffic must use.
+Set `mode = "disabled"` explicitly only for local development or when a
+separate boundary such as the supplied Gluetun shared namespace provides
+fail-closed containment. Validate the migrated file with
+`swarmotterd --check-config --config PATH` before restarting the service.
+
 ## Create a config file
 
 Create directories for downloads and incomplete data:

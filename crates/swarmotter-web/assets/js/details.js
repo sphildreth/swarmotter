@@ -105,6 +105,7 @@ export function renderDetailsSummary(t) {
     <h3>Details</h3>
     ${renderKv([
       ["State", t.state],
+      ["Last error", t.error || ""],
       ["Peers", `${fmtCount(t.active_peer_workers)} active / ${fmtCount(t.known_peers)} known`],
       ["Rate down", fmtRate(t.rate_down)],
       ["Rate up", fmtRate(t.rate_up)],

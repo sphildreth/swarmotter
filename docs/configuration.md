@@ -7,6 +7,16 @@ settings.
 Most sections can be omitted entirely. When a section is present with only a
 few fields, unspecified fields use their documented defaults.
 
+## v2.0.0 containment migration
+
+In `1.x`, omitting `[network]` could select disabled containment. In `v2.0.0`,
+omission selects strict mode without an enforceable path and validation fails.
+Existing installations must configure the intended interface, source address,
+or namespace, or explicitly set `mode = "disabled"` only when local development
+or a separately enforced boundary supplies containment. Check the migrated file
+with `swarmotterd --check-config --config PATH` before replacing a running
+daemon.
+
 ## Environment overrides
 
 Environment variables use the `SWARMOTTER_` prefix. Nested fields are separated

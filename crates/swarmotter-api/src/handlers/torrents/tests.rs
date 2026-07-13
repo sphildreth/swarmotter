@@ -32,6 +32,7 @@ fn summary_with(
         info_hash: hash(seed),
         name: name.to_string(),
         state,
+        error: None,
         total_length: 1000,
         bytes_completed: 500,
         uploaded: 0,

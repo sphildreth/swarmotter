@@ -209,6 +209,8 @@ pub struct TorrentSummary {
     pub info_hash: InfoHash,
     pub name: String,
     pub state: TorrentState,
+    /// Last terminal/runtime error associated with this torrent, if any.
+    pub error: Option<String>,
     pub total_length: u64,
     pub bytes_completed: u64,
     pub uploaded: u64,

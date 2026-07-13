@@ -6,6 +6,47 @@ use swarmotter_core::meta::{build_multi_file_torrent, build_single_file_torrent}
 use swarmotter_core::net::{ContainedUdpSocket, PeerListener};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[test]
+fn terminal_tracker_error_requires_all_failures_and_no_successful_alternative() {
+    let failed = TrackerAnnounceSnapshot {
+        status: TrackerStatus::Error,
+        seeders: 0,
+        leechers: 0,
+        downloads: 0,
+        last_error: Some("connection refused".into()),
+        last_message: None,
+        last_announce: Some(42),
+    };
+    let mut state = EngineState {
+        tracker_message: Some("http://tracker.invalid/announce: connection refused".into()),
+        tracker_failures_recent: 1,
+        ..Default::default()
+    };
+    state
+        .tracker_announces
+        .insert("http://tracker.invalid/announce".into(), failed);
+
+    let error = state
+        .terminal_tracker_error()
+        .expect("terminal all-tracker failure should be classified");
+    assert!(error.contains("connection refused"));
+
+    state.dht_discovery_ok = true;
+    assert!(state.terminal_tracker_error().is_none());
+    state.dht_discovery_ok = false;
+    state.pex_discovery_ok = true;
+    assert!(state.terminal_tracker_error().is_none());
+    state.pex_discovery_ok = false;
+    state.webseed_last_seen = Some(Instant::now());
+    assert!(state.terminal_tracker_error().is_none());
+    state.webseed_last_seen = None;
+    state.peer_scheduler.eligible_peers = 1;
+    assert!(state.terminal_tracker_error().is_none());
+    state.peer_scheduler.eligible_peers = 0;
+    state.tracker_ok = true;
+    assert!(state.terminal_tracker_error().is_none());
+}
+
 fn unique_dir(label: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
         "swarmotter-engine-{}-{}-{}",

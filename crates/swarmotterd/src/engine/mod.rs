@@ -256,6 +256,64 @@ pub struct EngineState {
     pub resolved_meta: Option<TorrentMeta>,
 }
 
+impl EngineState {
+    /// Return the terminal tracker error when every attempted configured
+    /// tracker failed and no non-tracker source produced a usable candidate or
+    /// payload. A successful tracker response (even with zero peers) and any
+    /// successful DHT, PEX, peer, or webseed signal prevent this classification.
+    pub fn terminal_tracker_error(&self) -> Option<String> {
+        if self.finished
+            || self.stopped_by_command
+            || self.tracker_ok
+            || self.tracker_announces.is_empty()
+        {
+            return None;
+        }
+
+        let attempted = u32::try_from(self.tracker_announces.len()).unwrap_or(u32::MAX);
+        let explicit_failures = u32::try_from(
+            self.tracker_announces
+                .values()
+                .filter(|snapshot| snapshot.status == TrackerStatus::Error)
+                .count(),
+        )
+        .unwrap_or(u32::MAX);
+        let any_success = self
+            .tracker_announces
+            .values()
+            .any(|snapshot| snapshot.status == TrackerStatus::Ok);
+        let all_attempts_failed = !any_success
+            && (explicit_failures == attempted || self.tracker_failures_recent >= attempted);
+        if !all_attempts_failed {
+            return None;
+        }
+
+        let peer_payload_received = self.last_valid_block.is_some()
+            || self.block_last_seen.is_some()
+            || self
+                .peer_health
+                .values()
+                .any(|peer| peer.last_valid_block.is_some() || peer.useful_recently);
+        let alternative_succeeded = self.dht_discovery_ok
+            || self.pex_discovery_ok
+            || self.webseed_last_seen.is_some()
+            || peer_payload_received
+            || self.peer_scheduler.eligible_peers > 0;
+        if alternative_succeeded {
+            return None;
+        }
+
+        let detail = self
+            .tracker_message
+            .as_deref()
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or("all configured tracker announces failed");
+        Some(format!(
+            "all configured trackers failed and no usable alternative source was available: {detail}"
+        ))
+    }
+}
+
 /// Commands sent to an engine task to control its lifecycle.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
