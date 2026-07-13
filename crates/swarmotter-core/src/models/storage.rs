@@ -22,6 +22,7 @@ pub enum StorageRootRole {
     TorrentOverride,
     WatchDownload,
     DefaultDownload,
+    Policy,
 }
 
 /// Per-root storage health and capacity summary.
@@ -40,7 +41,23 @@ pub struct StorageRootDiagnostics {
     pub reserve_satisfied: Option<bool>,
     pub torrent_count: usize,
     pub active_torrents: usize,
+    /// Declared payload bytes currently admitted to this root's active
+    /// download engines. This is a scheduling reservation, not a free-space
+    /// measurement.
+    pub active_bytes: u64,
     pub active_write_rate: u64,
     pub active_recheck_rate: Option<u64>,
+    /// Number of full rechecks currently using this root.
+    pub active_rechecks: usize,
+    /// The matching configured lexical control root, when one applies.
+    pub root_control_path: Option<String>,
+    /// Per-root active download-engine cap; `0` means unlimited.
+    pub max_active_downloads: usize,
+    /// Per-root declared active-payload cap; `0` means unlimited.
+    pub max_active_bytes: u64,
+    /// Shared sustained payload-write cap in bytes/sec; `0` means unlimited.
+    pub max_write_bytes_per_second: u64,
+    /// Per-root simultaneous full-recheck cap; `0` means unlimited.
+    pub max_concurrent_rechecks: usize,
     pub warnings: Vec<String>,
 }

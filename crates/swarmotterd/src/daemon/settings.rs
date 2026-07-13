@@ -1,6 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use swarmotter_core::peer_filter::PeerFilter;
+
+/// The complete pre-transition generation needed to roll back a peer runtime
+/// reconfiguration. Keeping these values together prevents a restore from
+/// mixing state from different configuration generations.
+struct PeerReconfigurationRollback<'a> {
+    previous: &'a Config,
+    previous_peer_filter: &'a Arc<PeerFilter>,
+    previous_permits: &'a PeerPermitConfiguration,
+    previous_health: &'a NetworkHealth,
+    previous_bind_failure: &'a Option<HealthReport>,
+    previous_lifecycle: &'a HashMap<InfoHash, LiveTorrentTaskSnapshot>,
+    live_work: &'a LivePeerWorkSnapshot,
+}
 
 impl DaemonRuntime {
     pub(super) async fn apply_runtime_config_fields(&self) {
@@ -25,12 +39,17 @@ impl DaemonRuntime {
             swarmotter_core::bandwidth::RateDirection::Upload,
             cfg.bandwidth.effective_upload(),
         );
+        // Profile bandwidth is inherited live. Storage profile paths are
+        // deliberately excluded: those were snapshotted at torrent creation.
+        self.refresh_profile_runtime_fields().await;
         // Evaluate configuration changes through the same transition operation
         // as periodic path monitoring. Updating the health snapshot directly
         // would hide the healthy-to-blocked edge from the next tick and leave
         // cancelled task registries/state unreconciled.
         self.network_health_tick().await;
         self.apply_peer_worker_limits().await;
+        self.storage_admissions.notify_waiters();
+        self.storage_rechecks.notify_waiters();
         self.schedule_reconcile_queue("runtime_config").await;
         if allow_irreversible {
             self.sweep_selfish_completed_torrents_best_effort("runtime_config")
@@ -329,8 +348,7 @@ impl DaemonRuntime {
                 .unwrap_or_else(|| {
                     now().saturating_sub(torrent.date_completed.unwrap_or(torrent.date_added))
                 });
-            if automatic_seeding_status(&torrent, &cfg.seeding, idle_seconds)
-                == SeedingStatus::Queued
+            if automatic_seeding_status(&torrent, &cfg, idle_seconds) == SeedingStatus::Queued
                 && (cfg.queue.max_active_seeds == 0 || expected.len() < cfg.queue.max_active_seeds)
             {
                 expected.insert(hash);
@@ -352,63 +370,52 @@ impl DaemonRuntime {
         self.verify_eligible_peer_work().await
     }
 
-    pub(super) async fn restore_peer_reconfiguration(
+    async fn restore_peer_reconfiguration(
         &self,
-        previous: &Config,
-        previous_permits: &PeerPermitConfiguration,
-        previous_health: &NetworkHealth,
-        previous_bind_failure: &Option<HealthReport>,
-        previous_lifecycle: &HashMap<InfoHash, LiveTorrentTaskSnapshot>,
-        live_work: &LivePeerWorkSnapshot,
+        rollback: &PeerReconfigurationRollback<'_>,
     ) -> Result<()> {
         let transition = self.data_plane_transition_lock.lock().await;
-        self.restore_peer_reconfiguration_while_transition_locked(
-            previous,
-            previous_permits,
-            previous_health,
-            previous_bind_failure,
-            previous_lifecycle,
-            live_work,
-        )
-        .await?;
+        self.restore_peer_reconfiguration_while_transition_locked(rollback)
+            .await?;
         drop(transition);
         self.apply_runtime_config_fields().await;
-        self.verify_peer_permit_configuration_identity(previous_permits)
+        self.verify_peer_permit_configuration_identity(rollback.previous_permits)
             .await?;
-        self.verify_live_peer_work(live_work).await?;
+        self.verify_live_peer_work(rollback.live_work).await?;
         self.persist_state().await
     }
 
-    pub(super) async fn restore_peer_reconfiguration_while_transition_locked(
+    async fn restore_peer_reconfiguration_while_transition_locked(
         &self,
-        previous: &Config,
-        previous_permits: &PeerPermitConfiguration,
-        previous_health: &NetworkHealth,
-        previous_bind_failure: &Option<HealthReport>,
-        previous_lifecycle: &HashMap<InfoHash, LiveTorrentTaskSnapshot>,
-        live_work: &LivePeerWorkSnapshot,
+        rollback: &PeerReconfigurationRollback<'_>,
     ) -> Result<()> {
         self.stop_data_plane_for_reconfiguration().await;
-        *self.config.write().await = previous.clone();
-        self.install_peer_permit_configuration(previous_permits.clone())
+        *self.config.write().await = rollback.previous.clone();
+        // Restore the exact prior immutable policy generation alongside the
+        // persisted configuration. This keeps a failed manual ban/config
+        // replacement from leaving any newly compiled policy live.
+        *self.peer_filter.write().await = Arc::clone(rollback.previous_peer_filter);
+        self.install_peer_permit_configuration(rollback.previous_permits.clone())
             .await;
-        *self.network_health.write().await = previous_health.clone();
-        *self.bind_failure_latched.write().await = previous_bind_failure.clone();
-        if previous_health.traffic_allowed
-            || previous_health.mode == NetworkContainmentMode::Disabled
+        *self.network_health.write().await = rollback.previous_health.clone();
+        *self.bind_failure_latched.write().await = rollback.previous_bind_failure.clone();
+        if rollback.previous_health.traffic_allowed
+            || rollback.previous_health.mode == NetworkContainmentMode::Disabled
         {
             self.containment_gate.allow();
         } else {
-            self.containment_gate
-                .block(previous_health.status, previous_health.detail.clone());
+            self.containment_gate.block(
+                rollback.previous_health.status,
+                rollback.previous_health.detail.clone(),
+            );
         }
-        self.restore_torrent_lifecycle_snapshot(previous_lifecycle)
+        self.restore_torrent_lifecycle_snapshot(rollback.previous_lifecycle)
             .await;
-        self.reconstruct_live_peer_work_while_transition_locked(live_work)
+        self.reconstruct_live_peer_work_while_transition_locked(rollback.live_work)
             .await?;
-        self.verify_peer_permit_configuration_identity(previous_permits)
+        self.verify_peer_permit_configuration_identity(rollback.previous_permits)
             .await?;
-        self.verify_live_peer_work(live_work).await?;
+        self.verify_live_peer_work(rollback.live_work).await?;
         self.persist_state().await
     }
 
@@ -420,6 +427,11 @@ impl DaemonRuntime {
         clear_bind_failure_latch: bool,
     ) -> Result<()> {
         let previous = self.config.read().await.clone();
+        // Compile before touching a live task, permit, or persisted file. A
+        // validation/load failure therefore cannot produce a partial policy
+        // replacement, and rollback can restore this exact prior generation.
+        let next_peer_filter = Arc::new(PeerFilter::from_config(&next.peer_filter)?);
+        let previous_peer_filter = self.peer_filter.read().await.clone();
         let previous_permits = self.current_peer_permit_configuration().await;
         let previous_health = self.network_health.read().await.clone();
         let previous_bind_failure = self.bind_failure_latched.read().await.clone();
@@ -435,6 +447,15 @@ impl DaemonRuntime {
         self.reconcile_engine_progress_for_transition().await;
         let live_work = self.live_peer_work_snapshot().await;
         let previous_lifecycle = self.torrent_lifecycle_snapshot().await;
+        let rollback_snapshot = PeerReconfigurationRollback {
+            previous: &previous,
+            previous_peer_filter: &previous_peer_filter,
+            previous_permits: &previous_permits,
+            previous_health: &previous_health,
+            previous_bind_failure: &previous_bind_failure,
+            previous_lifecycle: &previous_lifecycle,
+            live_work: &live_work,
+        };
         let next_is_blocked =
             !next_health.traffic_allowed && next_health.mode != NetworkContainmentMode::Disabled;
         if next_is_blocked {
@@ -456,14 +477,7 @@ impl DaemonRuntime {
             .await
         {
             let rollback = self
-                .restore_peer_reconfiguration_while_transition_locked(
-                    &previous,
-                    &previous_permits,
-                    &previous_health,
-                    &previous_bind_failure,
-                    &previous_lifecycle,
-                    &live_work,
-                )
+                .restore_peer_reconfiguration_while_transition_locked(&rollback_snapshot)
                 .await;
             drop(transition);
             if rollback.is_ok() {
@@ -482,6 +496,7 @@ impl DaemonRuntime {
         // deliberately evaluated only after both candidate objects are live.
         self.install_peer_permit_configuration(peer_permits).await;
         *self.config.write().await = next.clone();
+        *self.peer_filter.write().await = next_peer_filter;
         if clear_bind_failure_latch {
             *self.bind_failure_latched.write().await = None;
         }
@@ -512,14 +527,7 @@ impl DaemonRuntime {
         }
         if self.peer_reconfiguration_failure_injected() {
             let rollback = self
-                .restore_peer_reconfiguration_while_transition_locked(
-                    &previous,
-                    &previous_permits,
-                    &previous_health,
-                    &previous_bind_failure,
-                    &previous_lifecycle,
-                    &live_work,
-                )
+                .restore_peer_reconfiguration_while_transition_locked(&rollback_snapshot)
                 .await;
             drop(transition);
             let rollback = async {
@@ -595,14 +603,7 @@ impl DaemonRuntime {
         };
         if let Err(error) = reconstruction {
             let rollback = self
-                .restore_peer_reconfiguration_while_transition_locked(
-                    &previous,
-                    &previous_permits,
-                    &previous_health,
-                    &previous_bind_failure,
-                    &previous_lifecycle,
-                    &live_work,
-                )
+                .restore_peer_reconfiguration_while_transition_locked(&rollback_snapshot)
                 .await;
             drop(transition);
             let rollback = async {
@@ -639,16 +640,7 @@ impl DaemonRuntime {
             self.verify_eligible_peer_work().await
         };
         if let Err(error) = post_reconcile_verification {
-            let rollback = self
-                .restore_peer_reconfiguration(
-                    &previous,
-                    &previous_permits,
-                    &previous_health,
-                    &previous_bind_failure,
-                    &previous_lifecycle,
-                    &live_work,
-                )
-                .await;
+            let rollback = self.restore_peer_reconfiguration(&rollback_snapshot).await;
             let file_rollback = match (persist_path, file_snapshot.as_ref()) {
                 (Some(path), Some(snapshot)) => restore_config_file(path, snapshot),
                 _ => Ok(()),
@@ -669,16 +661,7 @@ impl DaemonRuntime {
                 write_config_atomically(path, &next)
             };
             if let Err(error) = persisted {
-                let rollback = self
-                    .restore_peer_reconfiguration(
-                        &previous,
-                        &previous_permits,
-                        &previous_health,
-                        &previous_bind_failure,
-                        &previous_lifecycle,
-                        &live_work,
-                    )
-                    .await;
+                let rollback = self.restore_peer_reconfiguration(&rollback_snapshot).await;
                 let file_rollback = file_snapshot
                     .as_ref()
                     .map_or(Ok(()), |snapshot| restore_config_file(path, snapshot));

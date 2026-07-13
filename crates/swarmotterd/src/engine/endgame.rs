@@ -47,6 +47,7 @@ impl TorrentEngine {
             let utp_enabled = self.utp_enabled;
             let utp_prefer_tcp = self.utp_prefer_tcp;
             let encryption_mode = self.encryption_mode;
+            let peer_filter = self.peer_filter.clone();
             let selection = selection.clone();
             let peer_session_budget = self.peer_session_budget.clone();
             handles.push(tokio::spawn(async move {
@@ -66,6 +67,7 @@ impl TorrentEngine {
                     utp_enabled,
                     utp_prefer_tcp,
                     encryption_mode,
+                    peer_filter,
                     peer_session_budget,
                 )
                 .await
@@ -169,9 +171,20 @@ pub(super) async fn endgame_peer_session(
     utp_enabled: bool,
     utp_prefer_tcp: bool,
     encryption_mode: PeerEncryptionMode,
+    peer_filter: Arc<swarmotter_core::peer_filter::PeerFilter>,
     peer_session_budget: PeerSessionBudget,
 ) -> Result<bool> {
     if !binder.traffic_allowed() {
+        return Ok(false);
+    }
+    let decision = peer_filter.admit_ip(peer_addr.ip);
+    if !decision.is_allowed() {
+        tracing::info!(
+            peer = %peer_addr.socket_addr(),
+            reason = decision.audit_reason(),
+            detail = ?decision.rejection_message(),
+            "endgame peer rejected before contained outbound admission"
+        );
         return Ok(false);
     }
     let _peer_permit = peer_session_budget.acquire_outbound().await?;
@@ -184,6 +197,7 @@ pub(super) async fn endgame_peer_session(
         utp_enabled,
         utp_prefer_tcp,
         encryption_mode,
+        peer_filter.as_ref(),
     )
     .await?;
     tracing::debug!(peer = %peer_addr.socket_addr(), transport = transport.as_str(), "endgame peer connected");

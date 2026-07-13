@@ -29,6 +29,7 @@ use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::meta::TorrentMeta;
 use swarmotter_core::net::NetworkBinder;
 use swarmotter_core::peer::{self, Bitfield, Handshake, Message, PeerReader};
+use swarmotter_core::peer_filter::PeerFilter;
 use swarmotter_core::storage::StorageIo;
 use swarmotter_core::utp::PeerDuplex;
 
@@ -148,6 +149,7 @@ pub struct SeederHub {
     encryption_mode: PeerEncryptionMode,
     shutdown: tokio::sync::watch::Receiver<bool>,
     global_peer_permits: Arc<PeerPermitPool>,
+    peer_filter: Arc<PeerFilter>,
     bound_addr: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
 }
 
@@ -167,8 +169,16 @@ impl SeederHub {
             encryption_mode,
             shutdown,
             global_peer_permits,
+            peer_filter: Arc::new(PeerFilter::default()),
             bound_addr: None,
         }
+    }
+
+    /// Attach the immutable admission policy for this listener generation.
+    /// Accepted sockets still originate from the contained binder.
+    pub fn with_peer_filter(mut self, peer_filter: Arc<PeerFilter>) -> Self {
+        self.peer_filter = peer_filter;
+        self
     }
 
     pub(crate) fn with_bound_addr(
@@ -217,22 +227,43 @@ impl SeederHub {
                             continue;
                         }
                     };
+                    let peer_addr = match stream.peer_addr() {
+                        Ok(peer_addr) => peer_addr,
+                        Err(error) => {
+                            tracing::warn!(%error, "inbound socket rejected because its peer address is unavailable");
+                            drop(stream);
+                            continue;
+                        }
+                    };
+                    let decision = self.peer_filter.admit_ip(peer_addr.ip());
+                    if !decision.is_allowed() {
+                        tracing::info!(
+                            peer = %peer_addr,
+                            reason = decision.audit_reason(),
+                            detail = ?decision.rejection_message(),
+                            "inbound peer rejected before session admission"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     let Some(global_peer_permit) = self.global_peer_permits.try_acquire() else {
                         tracing::warn!("process-wide peer session limit reached; inbound socket rejected before handshake");
                         drop(stream);
                         continue;
                     };
-                    let peer_addr = stream.peer_addr().ok();
                     let registry = self.registry.clone();
                     let encryption_mode = self.encryption_mode;
+                    let peer_filter = self.peer_filter.clone();
                     sessions.spawn(async move {
                         if let Err(error) = serve_routed_peer(
                             stream,
                             registry,
                             encryption_mode,
+                            peer_addr,
+                            peer_filter,
                             global_peer_permit,
                         ).await {
-                            tracing::debug!(peer = ?peer_addr, %error, "inbound peer session ended");
+                            tracing::debug!(peer = %peer_addr, %error, "inbound peer session ended");
                         }
                     });
                 }
@@ -487,6 +518,8 @@ async fn serve_routed_peer(
     stream: tokio::net::TcpStream,
     registry: SeedRegistry,
     encryption_mode: PeerEncryptionMode,
+    peer_addr: std::net::SocketAddr,
+    peer_filter: Arc<PeerFilter>,
     _global_peer_permit: PeerPermit,
 ) -> Result<()> {
     let plaintext = looks_like_plaintext_peer_handshake(&stream).await?;
@@ -512,6 +545,20 @@ async fn serve_routed_peer(
     if encrypted_hash.is_some_and(|hash| hash != their_hs.info_hash) {
         return Err(CoreError::Internal(
             "encrypted inbound peer handshake did not match its stream key".into(),
+        ));
+    }
+    let decision = peer_filter.admit_client_id(&their_hs.peer_id);
+    if !decision.is_allowed() {
+        tracing::info!(
+            peer = %peer_addr,
+            reason = decision.audit_reason(),
+            detail = ?decision.rejection_message(),
+            "inbound peer rejected after contained handshake"
+        );
+        return Err(CoreError::Internal(
+            decision
+                .rejection_message()
+                .unwrap_or_else(|| "peer rejected by admission policy".into()),
         ));
     }
     let context = registry

@@ -624,6 +624,8 @@ fn add_options_picks_query_value_when_body_absent() {
     let q = AddTorrentQuery {
         paused: Some(false),
         start_behavior: None,
+        profile: None,
+        labels: None,
     };
     let opts = add_options(None, None, None, Some(&q)).unwrap();
     assert!(!opts.paused);
@@ -634,6 +636,8 @@ fn add_options_rejects_conflicting_paused() {
     let q = AddTorrentQuery {
         paused: Some(true),
         start_behavior: None,
+        profile: None,
+        labels: None,
     };
     let err = add_options(None, Some(false), None, Some(&q)).unwrap_err();
     assert!(err.to_string().contains("conflict"));
@@ -644,6 +648,8 @@ fn add_options_rejects_conflicting_start_behavior() {
     let q = AddTorrentQuery {
         paused: None,
         start_behavior: Some(StartBehavior::Start),
+        profile: None,
+        labels: None,
     };
     let err = add_options(None, None, Some(StartBehavior::Paused), Some(&q)).unwrap_err();
     assert!(err.to_string().contains("conflict"));

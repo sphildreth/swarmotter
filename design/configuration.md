@@ -57,9 +57,34 @@ updates use two API paths:
   through PATCH or full PUT replace pool objects and reconstruct peer-bearing
   work transactionally; failed reconstruction or persistence restores the old
   config, pool identities, tasks, and persistent files.
+- `[peer_filter]` is disabled by default and defines one global peer-admission
+  policy. It accepts individual IPs, CIDRs, inclusive ranges, bounded local
+  eMule/PeerGuardian-style import paths, manual IP bans, and printable
+  peer-ID-prefix rules. Remote blocklist URLs are intentionally unsupported.
+  Rules compile before startup or replacement commits; a failed compile leaves
+  the old policy active, and construction failures deny rather than silently
+  admitting peers. The policy applies before contained peer connection/service
+  but never changes route binding or fail-closed containment (ADR-0058).
+- `[[storage.root_controls]]` is a repeatable local-storage scheduling surface.
+  Controls use the most-specific matching lexical active-write root; duplicate
+  normalized paths are invalid while nested paths are intentional. Each root
+  can independently cap active engines, declared active payload bytes,
+  sustained verified payload writes, and concurrent full rechecks. A zero cap
+  is unlimited. Root admission is atomic, changes never weaken containment,
+  and diagnostics expose both the matching control and saturation state
+  (ADR-0056).
 - Per-torrent seeding overrides are durable torrent state, not configuration
   fields. `null` overrides inherit `[seeding]` globals, while `seed_forever`
   suppresses effective targets without erasing stored overrides (ADR-0052).
+- `[profiles]` holds named policy definitions and deterministic
+  label-to-profile mappings. An explicitly attached add/watch/torrent profile
+  wins over a matching label; per-field torrent overrides win last. Resolved
+  storage and the initial admission decision are captured in durable torrent
+  state at registration, while queue priority, seeding, and bandwidth resolve
+  live for inheriting records. Reassignment and later label changes preserve
+  existing storage paths; snapshot-bearing torrents retain their captured
+  admission when profile/global start settings change. Legacy records are
+  migrated transactionally on a profile replacement (ADR-0057).
 - Each `[[watch]]` root is a lexical path boundary, not a canonicalized one.
   Scans reject a symlink root, skip child symlinks, require two identical
   length/modified-time observations, and serialize manual/background runs.
@@ -120,8 +145,9 @@ the replacement is reported as applied. Engines, tracker sidecars, DHT work,
 the shared listener, and accepted sessions created under the previous policy
 are awaited before eligible tasks start with the new policy (ADR-0047).
 
-This phase is TCP-only; no uTP encryption and no per-profile/per-torrent override
-surface is included yet.
+This phase is TCP-only; no uTP encryption is included yet. Named policy
+profiles are configuration and lifecycle policy only; they do not introduce a
+per-profile or per-torrent network path.
 
 All containment-affecting full replacements share the data-plane transaction
 lock. The live containment gate blocks socket creation immediately; each block

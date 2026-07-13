@@ -169,22 +169,22 @@ pub async fn torrents_add(
         if Magnet::parse(url).is_err() {
             return text_response(StatusCode::BAD_REQUEST, "only magnet URLs are supported");
         }
-        match state
-            .daemon
-            .add_magnet(
-                url,
-                AddTorrentOptions::new(save_path.clone(), paused.unwrap_or(false)),
-            )
-            .await
-        {
-            Ok(hash) => {
-                if let Some(category) = category.as_ref() {
-                    if let Err(error) = state.daemon.set_labels(&hash, vec![category.clone()]).await
-                    {
-                        return core_error_text(error);
-                    }
-                }
-            }
+        // An omitted qBittorrent `paused`/`stopped` field is not an explicit
+        // request to start. Preserve that omission so the daemon can apply a
+        // label-mapped profile's initial admission behavior. An explicit
+        // false still wins over that policy.
+        let options = AddTorrentOptions::request(
+            save_path.clone(),
+            paused.unwrap_or(false),
+            paused.is_some(),
+            None,
+            // qBittorrent categories map to SwarmOtter labels. Supply it at
+            // add time so a label-derived policy selects its create-time
+            // storage and admission behavior.
+            category.iter().cloned().collect(),
+        );
+        match state.daemon.add_magnet(url, options).await {
+            Ok(_) => {}
             Err(error) => return core_error_text(error),
         }
     }

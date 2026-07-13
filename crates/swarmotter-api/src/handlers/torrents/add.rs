@@ -11,6 +11,13 @@ pub struct AddMagnetBody {
     pub paused: Option<bool>,
     #[serde(default)]
     pub start_behavior: Option<StartBehavior>,
+    /// Optional named policy profile for this add request.
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Labels are applied before profile resolution, enabling deterministic
+    /// label-to-profile defaults when `profile` is omitted.
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
 }
 #[derive(Debug, Default, Deserialize)]
 pub struct AddTorrentQuery {
@@ -18,6 +25,11 @@ pub struct AddTorrentQuery {
     pub paused: Option<bool>,
     #[serde(default)]
     pub start_behavior: Option<StartBehavior>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// Comma-separated labels for raw .torrent uploads.
+    #[serde(default)]
+    pub labels: Option<String>,
 }
 /// Add via magnet (JSON body with magnet) or file (multipart). Dispatches based
 /// on content-type: application/json -> magnet; multipart -> file.
@@ -51,6 +63,10 @@ pub async fn add_torrent_file_or_magnet(
                     Ok(options) => options,
                     Err(e) => return err_response(e),
                 };
+                let options = match apply_policy_add_options(options, b.profile, b.labels, &query) {
+                    Ok(options) => options,
+                    Err(e) => return err_response(e),
+                };
                 return into_response(
                     state
                         .daemon
@@ -64,6 +80,10 @@ pub async fn add_torrent_file_or_magnet(
     }
     // Treat raw body as torrent file bytes.
     let options = match add_options(None, None, None, Some(&query)) {
+        Ok(options) => options,
+        Err(e) => return err_response(e),
+    };
+    let options = match apply_policy_add_options(options, None, None, &query) {
         Ok(options) => options,
         Err(e) => return err_response(e),
     };
@@ -94,6 +114,10 @@ pub async fn add_magnet(
         Ok(options) => options,
         Err(e) => return err_response(e),
     };
+    let options = match apply_policy_add_options(options, body.profile, body.labels, &query) {
+        Ok(options) => options,
+        Err(e) => return err_response(e),
+    };
     into_response(
         state
             .daemon
@@ -110,6 +134,10 @@ pub async fn add_torrent_file(
     request: Request,
 ) -> Response {
     let options = match add_options(None, None, None, Some(&query)) {
+        Ok(options) => options,
+        Err(e) => return err_response(e),
+    };
+    let options = match apply_policy_add_options(options, None, None, &query) {
         Ok(options) => options,
         Err(e) => return err_response(e),
     };
@@ -240,10 +268,52 @@ pub(super) fn add_options(
     let paused = merge_paused(body_paused, query.and_then(|q| q.paused), "paused")?;
     let start_behavior =
         merge_start_behavior(body_start_behavior, query.and_then(|q| q.start_behavior))?;
-    Ok(AddTorrentOptions::new(
+    Ok(AddTorrentOptions::request(
         download_dir,
         resolve_start_paused(paused, start_behavior)?,
+        paused.is_some() || start_behavior.is_some(),
+        None,
+        Vec::new(),
     ))
+}
+
+pub(super) fn apply_policy_add_options(
+    mut options: AddTorrentOptions,
+    body_profile: Option<String>,
+    body_labels: Option<Vec<String>>,
+    query: &AddTorrentQuery,
+) -> Result<AddTorrentOptions> {
+    options.profile = match (body_profile, query.profile.clone()) {
+        (Some(body), Some(query)) if body != query => {
+            return Err(CoreError::InvalidArgument(
+                "body and query profile values conflict".into(),
+            ));
+        }
+        (Some(profile), _) => Some(profile),
+        (None, profile) => profile,
+    };
+    options.labels = match body_labels {
+        Some(labels) => labels,
+        None => query
+            .labels
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .map(str::to_string)
+            .collect(),
+    };
+    if options
+        .profile
+        .as_deref()
+        .is_some_and(|profile| profile.trim().is_empty())
+    {
+        return Err(CoreError::InvalidArgument(
+            "profile must not be empty when set".into(),
+        ));
+    }
+    Ok(options)
 }
 
 pub(super) fn merge_paused(

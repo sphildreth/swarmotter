@@ -144,7 +144,10 @@ ADR-0009 and ADR-0010.
 ## Storage API contract
 
 - `GET /api/v1/storage/roots` exposes storage-root diagnostics used for
-  operator visibility and add-time preflight checks.
+  operator visibility, add-time preflight checks, and root-control admission
+  diagnostics. Each row additively reports declared active bytes, active
+  rechecks, the matching lexical control path, configured limits, and
+  saturation warnings.
 
 - `[torrent].encryption_mode` is part of transport compatibility.
   `/api/v1/settings` GET includes it in configuration snapshots.
@@ -160,6 +163,56 @@ ADR-0009 and ADR-0010.
 - `[storage].minimum_free_space_bytes` and `[storage].minimum_free_space_percent`
   define the reserve rule used by add/start-time checks. These values are
   validated and enforced before payload writes.
+- Repeatable `[[storage.root_controls]]` entries define the local
+  `max_active_downloads`, `max_active_bytes`,
+  `max_write_bytes_per_second`, and `max_concurrent_rechecks` budgets. The
+  most-specific matching lexical active-write root wins; zero means unlimited.
+  Root-budget saturation keeps work queued rather than converting it into a
+  permanent payload error. See ADR-0056.
+
+## Policy-profile API contract
+
+- `GET`/`PUT /api/v1/profiles` expose and replace only the persisted
+  `{ profiles, labels }` configuration section. Full replacement validates
+  profile names, references, paths, and finite/non-negative ratio values before
+  it affects runtime state.
+- Native add requests and bulk add may supply a profile and labels. Labels are
+  assigned before resolution so their mapping can select a profile before
+  storage is chosen. Watch and compatibility intake paths follow the same
+  ordering.
+- `GET /api/v1/torrents/:hash/policy` returns the effective profile plus every
+  resolved storage, queue, seeding, and bandwidth value with its source layer.
+  Serialized source kinds are `global`, `profile`, `label`, `torrent`,
+  `legacy_torrent`, `profile_storage_snapshot`,
+  `registration_storage_snapshot`, `existing_storage_snapshot`, and
+  `initial_admission_snapshot`. The registration storage source means the
+  resolved storage choice was fixed at registration; the initial admission
+  source means the torrent's one-time start-or-paused decision was captured
+  and cannot be retroactively changed by later inherited-policy edits. `PUT`
+  sets or clears an explicit assignment transactionally.
+- Resolved storage and initial admission are durable create-time snapshots.
+  Profile reassignment and label changes preserve existing storage, never move
+  payload data, and cannot revoke a queued torrent's admission. Queue priority,
+  seeding, and rate caps remain live for inheriting torrents. Legacy records
+  are migrated transactionally during profile replacement.
+
+## Peer-admission API contract
+
+- `GET`/`PUT /api/v1/peer-filter` expose and replace the global
+  `{ enabled, rules, blocklist_paths, manual_bans, blocked_client_ids }`
+  policy. GET includes the active direct rules, local import paths/outcomes,
+  manual bans, client-ID prefixes, and rejection counters for the active
+  compiled policy instance.
+- `POST /api/v1/torrents/:hash/peers/ban` and `unban` modify the same global
+  manual-ban list; a ban initiated from one torrent is therefore effective for
+  all torrents. `POST /api/v1/peer-filter/unban` removes a global manual ban
+  without requiring a selected torrent.
+- Replacement parses and compiles every local source before it affects active
+  peer work. Engine/session reconstruction and persistence are transactional;
+  a failed update retains the preceding policy and data-plane generation.
+- Filtering is an admission decision only. It rejects candidates before socket
+  creation or inbound service, with peer-ID-prefix checks after handshake, and
+  does not change the required contained network path (ADR-0058).
 
 ## Autopilot API contract
 

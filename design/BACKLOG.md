@@ -30,11 +30,10 @@ project.
 | --- | --- | --- | --- |
 | P0 | UPnP / NAT-PMP Port Forwarding | Automatic port mapping for reachability behind NAT; every major client ships this as table stakes | qBittorrent UPnP/NAT-PMP, Transmission port forwarding, Deluge UPnP/NAT-PMP |
 | P0 | SOCKS5 Proxy Support | Route torrent traffic through a SOCKS5 proxy; shipped by every major client for seedbox and restricted-network deployments | Transmission [#1250](https://github.com/transmission/transmission/issues/1250), qBittorrent SOCKS5, Deluge proxy support |
-| P0 | IP Filtering / Blocklists / Peer Banning | Filter unwanted peers via CIDR/range lists, blocklist import, and manual peer bans; table-stakes security feature | qBittorrent IP filtering, Deluge IP filtering, eMule/PeerGuardian blocklist formats, qBittorrent [#10258](https://github.com/qbittorrent/qBittorrent/issues/10258) |
 | P0 | Listen Port Reachability Test | Active test of whether the configured peer listen port is reachable; basic diagnostic every client provides | qBittorrent port test, Transmission port test, Deluge port check, µTorrent port status indicator |
 | P0 | Protocol Encryption / MSE-PE | Interoperate with peers that refuse plaintext handshakes and reduce plaintext peer-wire exposure | Transmission, qBittorrent, Deluge, BiglyBT all ship MSE/PE; private trackers commonly require it |
-| P0 | Disk-aware storage optimizer | Better performance and fewer storage surprises on Btrfs, NAS, HDD, and constrained disks | qBittorrent [#23683](https://github.com/qbittorrent/qBittorrent/issues/23683), [#22949](https://github.com/qbittorrent/qBittorrent/issues/22949), [#23572](https://github.com/qbittorrent/qBittorrent/issues/23572), Transmission [#5064](https://github.com/transmission/transmission/issues/5064), [#5594](https://github.com/transmission/transmission/issues/5594), [#1060](https://github.com/transmission/transmission/issues/1060) |
-| P0 | Policy profiles and inherited torrent settings | Apply consistent path, ratio, queue, bandwidth, tracker, and file rules by label/category/profile | qBittorrent [#9939](https://github.com/qbittorrent/qBittorrent/issues/9939), [#24500](https://github.com/qbittorrent/qBittorrent/issues/24500), [#23722](https://github.com/qbittorrent/qBittorrent/issues/23722), [#24131](https://github.com/qbittorrent/qBittorrent/issues/24131), Transmission [#6710](https://github.com/transmission/transmission/issues/6710), [#1461](https://github.com/transmission/transmission/issues/1461), [#6425](https://github.com/transmission/transmission/issues/6425) |
+| P0 | Filesystem-aware storage strategy and state placement | Extend shipped root resource controls with filesystem-aware write behavior, observability, and state-path placement | qBittorrent [#23683](https://github.com/qbittorrent/qBittorrent/issues/23683), [#22949](https://github.com/qbittorrent/qBittorrent/issues/22949), Transmission [#5594](https://github.com/transmission/transmission/issues/5594), [#1060](https://github.com/transmission/transmission/issues/1060) |
+| P0 | Advanced policy-profile rules | Extend shipped named profiles with tracker, file-selection, and completion-action policy dimensions | qBittorrent [#24500](https://github.com/qbittorrent/qBittorrent/issues/24500), [#23722](https://github.com/qbittorrent/qBittorrent/issues/23722), Transmission [#1461](https://github.com/transmission/transmission/issues/1461), [#6425](https://github.com/transmission/transmission/issues/6425) |
 | P0 | Ecosystem Compatibility API | Operate alongside Sonarr/Radarr/Flood via qBittorrent-compatible and Transmission-compatible API shims | Deluge API parity requests, Flood UI, Sonarr/Radarr integration, self-hosting ecosystem (2026) |
 | P0 | Per-Profile / Per-Torrent Network-Path Binding | Assign a contained network path (namespace/VPN endpoint/interface) per profile, label, or torrent; fail-closed per path | rTorrent/Flood multi-user isolation, Deluge multi-profile routing, self-hosting VPN routing patterns |
 | P0 | Multi-User / Multi-Tenant Support | Role-based access control, per-user torrent isolation, per-user quotas, and shared-server deployments | qBittorrent [#3327](https://github.com/qbittorrent/qBittorrent/issues/3327), Flood multi-user, rTorrent+ruTorrent multi-user, Deluge thin-client auth |
@@ -134,7 +133,8 @@ SwarmOtter feature shape:
 - Route peer TCP connections, tracker announces, and webseed requests through
   the proxy.
 - Support authentication (username/password) and unauthenticated modes.
-- Proxy configuration is per-profile (existing P0) for multi-path deployments.
+- Proxy configuration can be added as a future per-profile policy field for
+  multi-path deployments.
 - SOCKS5 proxy is distinct from network containment; both can coexist with
   clear precedence rules.
 
@@ -144,33 +144,6 @@ Acceptance direction:
 - When both SOCKS5 and network containment are configured, containment takes
   precedence; proxy traffic must still go through the contained path.
 - DNS resolution for proxy hostname must respect containment.
-
-### IP Filtering / Blocklists / Peer Banning
-
-Problem: operators need tools to filter abusive, hostile, or misbehaving peers
-across all peer sources without ad hoc manual intervention.
-
-Requested elsewhere:
-
-- qBittorrent and Deluge ship built-in IP filtering and blocklist import.
-- eMule/PeerGuardian `.dat` blocklist formats are widely used in the community.
-- Manual peer banning is a common request across clients.
-
-SwarmOtter feature shape:
-
-- Support CIDR and range-based peer filters.
-- Import eMule/PeerGuardian `.dat` blocklist formats.
-- Add manual per-peer ban controls.
-- Add client-ID-based peer blocking (e.g., Xunlei/Thunder, known bad actors)
-  as a complement to IP-based filtering.
-- Integrate with the tracker and peer operations workbench (existing P1).
-- Filtering is framed as abuse mitigation and operational safety, not evasion.
-
-Acceptance direction:
-
-- Framing is consistent with lawful-use policy: filtering is abuse mitigation.
-- Applies to all peer sources through the contained network path.
-- Filters are auditable in logs and API.
 
 ### Listen Port Reachability Test
 
@@ -252,7 +225,7 @@ SwarmOtter feature shape:
     default `preferred`.
 - Remaining work:
   - Encrypted transport for uTP.
-  - Per-profile (existing P0) and per-torrent overrides for encryption mode.
+  - Per-profile and per-torrent overrides for encryption mode.
 
 Acceptance direction:
 
@@ -272,11 +245,12 @@ Acceptance direction:
 - Implementing this requires an ADR (new wire-protocol surface and a
   default-mode decision with interop trade-offs).
 
-### Disk-Aware Storage Optimizer
+### Filesystem-Aware Storage Strategy and State Placement
 
-Problem: torrent clients often treat storage as a passive byte sink, but users
-hit real performance and durability problems on Btrfs, HDDs, NAS mounts,
-limited SSDs, and large queues.
+Problem: root-scoped admission, write budgets, and recheck budgets now keep
+active work within explicit local resource limits. Operators still need
+filesystem-aware behavior and deliberate placement of high-write state on
+Btrfs, HDDs, NAS mounts, and constrained disks.
 
 Requested elsewhere:
 
@@ -284,10 +258,6 @@ Requested elsewhere:
   [qbittorrent#23683](https://github.com/qbittorrent/qBittorrent/issues/23683).
 - qBittorrent users requested relocating state files away from OS SSD/NVMe
   drives in [qbittorrent#22949](https://github.com/qbittorrent/qBittorrent/issues/22949).
-- qBittorrent users requested a total active-download size cap in
-  [qbittorrent#23572](https://github.com/qbittorrent/qBittorrent/issues/23572).
-- Transmission users requested parallel verification in
-  [transmission#5064](https://github.com/transmission/transmission/issues/5064).
 - Transmission users requested prominent free-space display in
   [transmission#5594](https://github.com/transmission/transmission/issues/5594).
 - Transmission has a Btrfs/subvolume move-performance issue in
@@ -297,8 +267,6 @@ Remaining SwarmOtter feature shape:
 
 - Extend current storage-root diagnostics with mount options, sustained write
   throughput, and verification throughput per configured storage root.
-- Add disk-aware queue controls: active byte cap, active write-pressure cap,
-  per-storage-root concurrency, and recheck concurrency.
 - Add optional CoW-aware write strategy for Btrfs-like filesystems, including
   preallocation policy, sparse policy, and clearly surfaced trade-offs.
 - Add state-directory controls for logs, resume files, database/state, and
@@ -313,46 +281,38 @@ Acceptance direction:
 - Further optimizer phases require ADR updates when they change storage
   strategy, persistence, or runtime scheduling behavior.
 
-### Policy Profiles and Inherited Torrent Settings
+### Advanced Policy-Profile Rules
 
-Problem: users manage different classes of lawful torrents with different
-rules. Applying those rules one torrent at a time does not scale.
+Problem: named profiles now resolve deterministic storage, queue, initial-start,
+seeding, and bandwidth policy for adds, labels, watch folders, and explicit
+torrent assignment. Advanced tracker, file-selection, and completion rules
+still require one-off operations.
 
 Requested elsewhere:
 
-- qBittorrent's long-running inherited settings request is
-  [qbittorrent#9939](https://github.com/qbittorrent/qBittorrent/issues/9939).
 - qBittorrent users requested boolean logic for seed limits in
   [qbittorrent#24500](https://github.com/qbittorrent/qBittorrent/issues/24500).
 - qBittorrent users requested category-level filename exclusions in
   [qbittorrent#23722](https://github.com/qbittorrent/qBittorrent/issues/23722).
-- qBittorrent users requested watch-folder category defaults in
-  [qbittorrent#24131](https://github.com/qbittorrent/qBittorrent/issues/24131).
-- Transmission users requested Web UI automatic torrent management in
-  [transmission#6710](https://github.com/transmission/transmission/issues/6710).
 - Transmission users requested per-tracker seed ratio and tracker priority in
   [transmission#1461](https://github.com/transmission/transmission/issues/1461)
   and [transmission#6425](https://github.com/transmission/transmission/issues/6425).
 
 SwarmOtter feature shape:
 
-- Introduce named policy profiles that can be assigned by label, watch folder,
-  add request, torrent, tracker host, or explicit user selection.
-- Resolve effective settings from global defaults, profile defaults, label
-  defaults, watch-folder defaults, and per-torrent overrides.
-- Support profile-controlled storage path, incomplete path, queue priority,
-  start behavior, ratio/idle rules, bandwidth caps, tracker priority, file
-  exclusion patterns, and completion actions.
-- Show the effective policy and the source of each setting in the Web UI and
-  API.
+- Add profile-scoped tracker-host matching, tracker priority, and tracker
+  policy controls.
+- Add profile-scoped file exclusion patterns and completion actions.
+- Retain the existing deterministic effective-policy API/UI so the source of
+  each new field remains explainable.
 
 Acceptance direction:
 
 - Effective values must be deterministic and explainable.
-- Profile changes must clearly distinguish between live inheritance and
-  create-time snapshots.
-- Implementing this requires an ADR because it changes persistent settings and
-  runtime behavior.
+- New fields must clearly distinguish between live inheritance and create-time
+  snapshots.
+- Further persistent policy or runtime-scheduling decisions require an ADR
+  update.
 
 ### Ecosystem Compatibility API
 
@@ -416,7 +376,7 @@ SwarmOtter feature shape:
 
 - Assign a contained network path (network namespace, VPN endpoint, or
   interface) per profile, label, or torrent.
-- Policy profiles (existing P0) gain a network-path binding field; the
+- The implemented policy-profile model gains a network-path binding field; the
   `NetworkBinder` containment layer enforces assignment.
 - Deterministic resolution: torrent → label → profile → global default.
 - Each path fails closed independently; no torrent may egress outside its
@@ -458,7 +418,8 @@ SwarmOtter feature shape:
   can be combined with per-profile network-path binding (existing P0)
   for full per-user isolation on a shared host.
 - Add per-user API keys with scoped permissions.
-- Integrate with policy profiles (existing P0) for per-user default settings.
+- Integrate with the implemented policy-profile model for per-user default
+  settings.
 - Integrate with per-profile network-path binding (existing P0) for per-user
   network isolation on shared hosts.
 - Add user management via API and Web UI.
@@ -712,7 +673,7 @@ SwarmOtter feature shape:
 
 - Add a seed-priority seeding mode that allocates upload bandwidth
   proportionally to torrents with the fewest available seeds.
-- Configurable per-torrent and per-profile (existing P0).
+- Configurable per-torrent and per-profile.
 - Complements (does not replace) ratio-based and time-based seeding limits.
 - Surface seed-count data from trackers, DHT, and PEX in the API and UI.
 
@@ -801,7 +762,8 @@ SwarmOtter feature shape:
 - Match existing on-disk data to new lawful torrents by piece layout and piece
   size.
 - Link instead of re-download where the filesystem supports it.
-- Integrate with disk-aware storage optimizer (existing P0).
+- Integrate with shipped storage-root resource controls and the future
+  filesystem-aware storage strategy.
 - Explicit user-visible link vs copy behavior; no silent data loss.
 
 Acceptance direction:
@@ -831,8 +793,8 @@ SwarmOtter feature shape:
 
 - Add a per-tracker trust state: trusted, neutral, untrusted, or blocked,
   with an explicit operator-controlled source (manual, imported, learned).
-- Support tracker allowlists and denylists integrated with the existing IP
-   filtering workbench (P0) and policy profiles (P0).
+- Support tracker allowlists and denylists integrated with the implemented
+  peer-admission filtering and policy-profile surfaces.
 - Surface, for every torrent, the trust state of every active tracker and
   the effective upload/download policy the daemon is applying because of it.
 - Support a content provenance mode: import `.torrent` files and magnets
@@ -920,8 +882,8 @@ SwarmOtter feature shape:
 - Each reason includes a stable code, a human-readable message, the
   measured inputs that produced the decision, the timestamp of the last
   decision, and the relevant subsystem.
-- The autopilot "why is this slow?" report, the disk-aware storage
-  optimizer decisions, the per-path fail-closed states, and the bandwidth
+- The autopilot "why is this slow?" report, filesystem-aware storage
+  decisions, the per-path fail-closed states, and the bandwidth
   scheduler all share the same explainability shape.
 - Reasons are versioned; downstream automation can rely on stable codes.
 
@@ -1053,12 +1015,12 @@ Acceptance direction:
   party lookup.
 - Operators can disable the rollup or restrict it to specific torrents
   if they prefer.
-- This complements the IP filtering / blocklists workbench (P0) for
+- This complements the implemented peer-admission filtering surface for
   abuse mitigation.
 
 ### Filesystem Snapshot Integration
 
-Problem: the disk-aware storage optimizer (P0) and the Btrfs/CoW
+Problem: shipped storage-root controls and the filesystem-aware storage
 discussion in the backlog already recognize that torrent clients run on
 sophisticated filesystems. There is no native integration with filesystem
 snapshots, so an operator who wants rollback for a torrent root or a
@@ -1068,8 +1030,8 @@ mainstream clients and is a natural differentiator on Linux.
 Requested elsewhere:
 
 - qBittorrent users have requested CoW-aware behavior but not snapshot
-  integration; see qBittorrent CoW discussion in the disk-aware storage
-  optimizer entry.
+  integration; see the qBittorrent CoW discussion in the filesystem-aware
+  storage strategy entry.
 - Self-hosting operators using Snapper, ZFS, or Btrfs subvolumes for
   `/var/lib/swarmotter` and download roots have to script snapshot
   workflows by hand.
@@ -1117,8 +1079,7 @@ SwarmOtter feature shape:
 - Route peer TCP connections, tracker announces, webseed requests, and
   DHT where applicable through the configured HTTP proxy.
 - Support authenticated and unauthenticated modes.
-- Per-profile (existing P0) proxy configuration for multi-path
-  deployments.
+- A future per-profile proxy policy field for multi-path deployments.
 - HTTP proxy is distinct from SOCKS5 and from network containment; all
   three can coexist with documented precedence rules.
 
@@ -1192,9 +1153,9 @@ SwarmOtter feature shape:
   seeding-from-complete state (created content or re-verified complete
   data), pre-read and verify all pieces in the background before the
   tracker announce and DHT announce go out.
-- Integrate with superseeding / initial seeding (existing P1) and the
-  disk-aware storage optimizer (existing P0) so warm-up respects disk
-  pressure and concurrency limits.
+- Integrate with superseeding / initial seeding (existing P1), shipped
+  storage-root controls, and the future filesystem-aware storage strategy so
+  warm-up respects disk pressure and concurrency limits.
 - Surface warm-up progress and completion in the API, UI, and the
   explainability API (existing P1).
 
@@ -1231,8 +1192,8 @@ SwarmOtter feature shape:
   where the fast-resume hash matches.
 - Surface the recognition decision in the explainability API (existing
   P1): "re-add recognized existing complete data, skipped verify."
-- Integrate with cross-seed (existing P1/P2) and the disk-aware storage
-  optimizer (existing P0).
+- Integrate with cross-seed (existing P1/P2), shipped storage-root controls,
+  and the future filesystem-aware storage strategy.
 
 Acceptance direction:
 
@@ -1443,7 +1404,7 @@ SwarmOtter feature shape:
   the client identification from the BEP 10 extension handshake.
 - When disabled (default): use the standard SwarmOtter peer ID prefix and
   User-Agent for normal protocol operation.
-- Per-profile (existing P0) anonymous mode setting for multi-path
+- Per-profile anonymous-mode policy for multi-path
   deployments where some traffic classes should be anonymous and others
   should not.
 - Surface the anonymous mode state in the API and UI so operators can
@@ -1498,7 +1459,7 @@ SwarmOtter feature shape:
   sequential writes to reduce HDD seek overhead.
 - Add read-ahead configuration for sequential download (existing P2) and
   seeding workloads.
-- Integrate with the disk-aware storage optimizer (existing P0): cache
+- Integrate with the future filesystem-aware storage strategy: cache
   settings can be per-storage-root so HDD roots get larger caches and
   SSD roots get smaller caches.
 - Surface cache hit/miss statistics in the API and UI for performance
@@ -1743,8 +1704,8 @@ No mainstream torrent client treats object storage as a first-class
 torrent storage root, so these operators must mount the bucket and
 accept the limitations of a POSIX-over-object layer. A native
 object-storage-backed storage root fits SwarmOtter's lawful-distribution
-mission and complements the disk-aware storage optimizer (existing P0)
-and torrent creation (existing P1).
+mission and complements shipped storage-root controls, the future
+filesystem-aware storage strategy, and torrent creation (existing P1).
 
 Requested elsewhere:
 
@@ -1761,9 +1722,9 @@ SwarmOtter feature shape:
   S3-compatible, and WebDAV targets.
 - Support both seeding-from-existing-object-data and
   download-to-object-storage workflows for lawful distribution.
-- Reuse the existing piece-hash verification path; an object-storage
-  root is treated like any other storage root by the disk-aware storage
-  optimizer (existing P0).
+- Reuse the existing piece-hash verification path; an object-storage root is
+  treated like any other storage root by the resource-control and future
+  filesystem-aware storage layers.
 - All object-storage access respects network containment; the bucket
   endpoint is resolved and reached through the contained network path.
 
@@ -1815,8 +1776,8 @@ Acceptance direction:
 - Operators can disable the rollup or restrict it to specific torrents.
 - IP addresses are not exported by the rollup; only aggregated
   country/ASN counts.
-- This complements the IP filtering / blocklists workbench (existing P0)
-  for abuse mitigation.
+- This complements the implemented peer-admission filtering surface for abuse
+  mitigation.
 
 ### Responsive / Mobile-Friendly Web UI
 

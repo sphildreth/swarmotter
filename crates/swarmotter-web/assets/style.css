@@ -323,24 +323,73 @@ nav { display: flex; gap: 0.3rem; }
 }
 .settings-card-heading,
 .watch-folder-header,
+.storage-root-control-header,
 .settings-actions {
   display: flex;
   align-items: center;
   gap: 0.5rem;
 }
 .settings-card-heading,
-.watch-folder-header {
+.watch-folder-header,
+.storage-root-control-header {
   justify-content: space-between;
   margin-bottom: 0.7rem;
 }
 .settings-actions {
   flex-wrap: wrap;
 }
-.settings-watch-list {
+.settings-watch-list,
+.settings-storage-root-controls {
   display: grid;
   gap: 0.75rem;
 }
-.watch-folder-editor {
+.peer-filter-status,
+.peer-filter-manual-bans {
+  display: grid;
+  gap: 0.55rem;
+  margin-top: 1rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--border);
+}
+.peer-filter-status h4,
+.peer-filter-manual-bans h4,
+.peer-filter-status h5 {
+  margin: 0;
+}
+.peer-filter-source-table,
+.peer-filter-manual-ban-table {
+  font-size: 0.9rem;
+}
+.peer-filter-source-table td,
+.peer-filter-manual-ban-table td {
+  overflow-wrap: anywhere;
+  vertical-align: top;
+}
+.peer-filter-rules {
+  min-width: 0;
+}
+.peer-filter-rules summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.peer-filter-rules pre {
+  max-height: 14rem;
+  margin: 0.5rem 0 0;
+  overflow: auto;
+  padding: 0.65rem;
+  color: var(--fg);
+  background: var(--field-bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.status-detail {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.watch-folder-editor,
+.storage-root-control-editor {
   min-width: 0;
   padding: 0.8rem;
   border: 1px solid var(--border);

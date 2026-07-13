@@ -108,6 +108,20 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
         .route("/storage/roots", get(handlers::storage::storage_roots))
         // Autopilot
         .route("/autopilot/status", get(handlers::autopilot::status))
+        // Policy profiles and explainable inheritance
+        .route(
+            "/profiles",
+            get(handlers::policies::list_profiles).put(handlers::policies::replace_profiles),
+        )
+        // Global peer-admission policy and its compiled/audit status.
+        .route(
+            "/peer-filter",
+            get(handlers::peer_filter::status).put(handlers::peer_filter::replace),
+        )
+        .route(
+            "/peer-filter/unban",
+            post(handlers::peer_filter::unban_global),
+        )
         // Torrent management
         .route("/torrents", get(handlers::torrents::list_torrents))
         .route(
@@ -127,6 +141,10 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             get(handlers::torrents::get_torrent).delete(handlers::torrents::remove_torrent),
         )
         .route("/torrents/:hash/stats", get(handlers::stats::torrent_stats))
+        .route(
+            "/torrents/:hash/policy",
+            get(handlers::policies::torrent_policy).put(handlers::policies::set_torrent_profile),
+        )
         .route(
             "/torrents/:hash/autopilot",
             get(handlers::autopilot::get_torrent_autopilot)
@@ -183,6 +201,14 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             post(handlers::trackers::edit_tracker),
         )
         .route("/torrents/:hash/peers", get(handlers::peers::list_peers))
+        .route(
+            "/torrents/:hash/peers/ban",
+            post(handlers::peer_filter::ban),
+        )
+        .route(
+            "/torrents/:hash/peers/unban",
+            post(handlers::peer_filter::unban),
+        )
         .route(
             "/torrents/:hash/queue/move-up",
             post(handlers::queue::move_up),

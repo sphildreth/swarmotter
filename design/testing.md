@@ -27,6 +27,13 @@ feature completion and acceptance criteria, not by time estimates.
 - Ratio/seeding behavior.
 - Bandwidth limit logic.
 - Config validation.
+- Policy-profile resolution: explicit and deterministic label precedence,
+  resolved create-time storage and initial-admission snapshots, live inherited
+  queue/seeding/bandwidth values, legacy-state migration on profile
+  replacement, and transactional assignment/config rollback.
+- Peer-admission filtering: IPv4/IPv6 single-IP, CIDR, and inclusive-range
+  parsing; bounded local eMule/PeerGuardian imports; manual-ban and peer-ID
+  prefix decisions; and fail-closed compile failure behavior.
 - Network containment validation logic.
 - Per-torrent health calculation: complete / network-blocked / paused /
   missing pieces with zero sources / good active swarm / many connected but
@@ -109,6 +116,11 @@ feature completion and acceptance criteria, not by time estimates.
 - File priority behavior.
 - Queue behavior.
 - Settings behavior.
+- Native profile/label add, watch, compatibility, detail, and replacement
+  routes, including durable storage preservation and explainable effective
+  sources.
+- Native peer-filter replacement and manual ban/unban routes, including a
+  blocked candidate that never reaches a binder connection attempt.
 - Concurrent atomic configuration replacement.
 - Durable torrent and queue restoration after daemon reconstruction.
 - WebSocket/SSE event delivery.
@@ -205,6 +217,9 @@ behavior.
 - Socket bind failure.
 - VPN path removed while torrents are active.
 - Torrent traffic blocked when fail-closed is active.
+- Peer filtering rejects all configured discovery and inbound paths without
+  creating a bypass socket; an allowed peer still uses the same contained
+  binder path.
 - API listener remains available when torrent data plane is blocked, if
   configured that way.
 - Injected fake-probe live path-loss transition (ADR-0051): a mutable fake
@@ -246,6 +261,14 @@ behavior.
 - Cross-torrent storage path collision rejection.
 - Move complete behavior.
 - Rename path behavior.
+- Storage-root controls: lexical longest-match validation, atomic
+  active-engine/declared-byte admission, shared write-pressure limiter
+  assignment, queued magnet-metadata admission, and bounded rechecks on
+  explicit API, startup/fast-resume, and restored-complete paths. Exercise
+  lifecycle cancellation while waiting and while verifying, permit release,
+  correct paused/completed restoration after a dropped explicit recheck, and
+  root-control-only replacement wake-up without tearing down grandfathered
+  engines (ADR-0056).
 
 ### Local swarm tests
 

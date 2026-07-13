@@ -3,7 +3,7 @@
 
 import { state } from "./js/state.js";
 import { $, $$, applyTheme, toggleTheme, setThemeRefreshHandler, setLogHandler } from "./js/ui.js";
-import { refreshTorrents, refreshTorrentTableTheme, setOpenDetailsHandler, applySavedTorrentQueryView } from "./js/torrents.js";
+import { refreshTorrents, refreshTorrentTableTheme, setOpenDetailsHandler, applySavedTorrentQueryView, refreshProfileChoices } from "./js/torrents.js";
 import { openDetails, setRefreshTorrentsHandler } from "./js/details.js";
 import { refreshSettings, setSettingsDependencies } from "./js/settings.js";
 import { refreshNetwork, refreshWatch, refreshLogs, refreshDoctor, refreshDoctorBadge, appendLogLine, setEventsDependencies } from "./js/events.js";
@@ -22,6 +22,7 @@ function openView(view, activeButton = null) {
   $$(".view").forEach(element => element.classList.add("hidden"));
   $("#view-" + view).classList.remove("hidden");
   if (view === "torrents") refreshTorrents();
+  if (view === "add") refreshProfileChoices();
   if (view === "network") refreshNetwork();
   if (view === "settings") refreshSettings();
   if (view === "watch") refreshWatch();

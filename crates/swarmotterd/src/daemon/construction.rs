@@ -77,6 +77,17 @@ impl DaemonRuntime {
             config.bandwidth.effective_upload(),
         );
         let selfish_completion_enabled = config.torrent.selfish;
+        let peer_filter = match swarmotter_core::peer_filter::PeerFilter::from_config(
+            &config.peer_filter,
+        ) {
+            Ok(filter) => Arc::new(filter),
+            Err(error) => {
+                tracing::error!(%error, "peer filter could not be compiled during runtime construction; peer admission is fail-closed");
+                Arc::new(swarmotter_core::peer_filter::PeerFilter::fail_closed(
+                    error.to_string(),
+                ))
+            }
+        };
         let peer_sessions_denied = Arc::new(AtomicU64::new(0));
         let peer_permit_pool =
             PeerPermitPool::new(config.bandwidth.max_peers, peer_sessions_denied.clone())
@@ -95,6 +106,7 @@ impl DaemonRuntime {
             registry: Arc::new(Mutex::new(TorrentRegistry::default())),
             queue: Arc::new(Mutex::new(QueueState::new(config.queue.clone()))),
             config: Arc::new(RwLock::new(config)),
+            peer_filter: Arc::new(RwLock::new(peer_filter)),
             network_health: Arc::new(RwLock::new(startup_health)),
             watch_imports: Arc::new(Mutex::new(VecDeque::new())),
             watch_observations: Arc::new(Mutex::new(HashMap::new())),
@@ -106,6 +118,10 @@ impl DaemonRuntime {
             state_path,
             state_write_lock: Arc::new(Mutex::new(())),
             storage_ownership_lock: Arc::new(Mutex::new(())),
+            storage_admissions: StorageAdmissionController::default(),
+            storage_rechecks: StorageRecheckController::default(),
+            engine_storage_cancellations: Arc::new(Mutex::new(HashMap::new())),
+            explicit_rechecks: Arc::new(Mutex::new(HashMap::new())),
             engine_states: Arc::new(RwLock::new(HashMap::new())),
             engine_cmds: Arc::new(Mutex::new(HashMap::new())),
             engine_handles: Arc::new(RwLock::new(HashMap::new())),
@@ -131,6 +147,14 @@ impl DaemonRuntime {
             add_mutation_fail_persistence: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             watch_after_read_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            storage_admission_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            explicit_recheck_before_persist_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            root_control_replacement_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            generic_config_fail_after_rename: Arc::new(AtomicBool::new(false)),
             global_limiter,
             torrent_limiters: Arc::new(RwLock::new(HashMap::new())),
             rate_samples: Arc::new(RwLock::new(HashMap::new())),

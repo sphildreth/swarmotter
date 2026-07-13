@@ -80,11 +80,14 @@ infringement.
 - Watch-folder import.
 - File selection, file prioritization, and path rename controls.
 - Queue, bandwidth, ratio, and seeding controls.
+- Named policy profiles with deterministic label selection, durable resolved
+  storage and initial-admission snapshots, and explainable effective values.
 - Adaptive swarm performance autopilot with per-torrent diagnostics and
   override controls.
-- Disk-aware storage optimizer: storage-root diagnostics and add-time free-space
-  preflight via `[storage].minimum_free_space_bytes`,
-  `[storage].minimum_free_space_percent`, and `GET /api/v1/storage/roots`.
+- Disk-aware storage controls: storage-root diagnostics, add-time free-space
+  preflight, and per-root active-work, declared-byte, verified-write, and
+  full-recheck budgets via `[[storage.root_controls]]` and
+  `GET /api/v1/storage/roots`.
 - Settings two-panel layout for dense configuration in the Web UI.
 - Strict VPN/NIC traffic containment with fail-closed behavior.
 - Container and homelab-friendly deployment.

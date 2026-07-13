@@ -57,7 +57,7 @@ impl TorrentEngine {
         .await;
         match result {
             Ok(Ok(lookup)) => {
-                let peers = lookup.peers;
+                let peers = self.filter_allowed_peers(lookup.peers);
                 if lookup.responding_nodes > 0 || !peers.is_empty() {
                     let mut s = self.state.lock().await;
                     s.dht_discovery_ok = !peers.is_empty();
@@ -109,7 +109,7 @@ impl TorrentEngine {
             .await;
         self.record_tracker_activity(self.meta.info_hash, &outcome, scrape_urls)
             .await;
-        outcome.peers
+        self.filter_allowed_peers(outcome.peers)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -378,7 +378,8 @@ impl TorrentEngine {
                         self.utp_enabled,
                         self.utp_prefer_tcp,
                         self.encryption_mode,
-                    ),
+                    )
+                    .with_peer_filter(self.peer_filter.clone()),
                     &candidates,
                 )
                 .await
@@ -656,6 +657,7 @@ pub(super) fn classify_peer_candidates(
     bad_peers: &HashMap<SocketAddr, Instant>,
     peer_backoff: &HashMap<SocketAddr, Instant>,
     allow_ipv6: bool,
+    peer_filter: &swarmotter_core::peer_filter::PeerFilter,
 ) -> (Vec<PeerAddr>, PeerCandidateCounts) {
     let mut eligible = Vec::new();
     let mut counts = PeerCandidateCounts {
@@ -663,7 +665,8 @@ pub(super) fn classify_peer_candidates(
         ..Default::default()
     };
     for peer in discovered {
-        if !peer_allowed_by_config(peer, allow_ipv6) {
+        if !peer_allowed_by_config(peer, allow_ipv6) || !peer_filter.admit_ip(peer.ip).is_allowed()
+        {
             counts.filtered += 1;
             continue;
         }
@@ -763,12 +766,23 @@ pub(super) fn add_pex_peers<I>(
     discovered: &mut Vec<PeerAddr>,
     peers: I,
     allow_ipv6: bool,
+    peer_filter: &swarmotter_core::peer_filter::PeerFilter,
     max_peers: usize,
 ) where
     I: IntoIterator<Item = PeerAddr>,
 {
     for peer in peers {
-        if !allow_ipv6 && peer.ip.is_ipv6() {
+        if !peer_allowed_by_config(&peer, allow_ipv6) {
+            continue;
+        }
+        let decision = peer_filter.admit_ip(peer.ip);
+        if !decision.is_allowed() {
+            tracing::debug!(
+                peer = %peer.socket_addr(),
+                reason = decision.audit_reason(),
+                detail = ?decision.rejection_message(),
+                "PEX peer rejected by admission policy"
+            );
             continue;
         }
         if max_peers > 0 && discovered.len() >= max_peers {

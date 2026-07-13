@@ -28,6 +28,7 @@ use swarmotter_core::hash::InfoHash;
 use swarmotter_core::meta::{TorrentMeta, MAX_TORRENT_METADATA_BYTES};
 use swarmotter_core::net::NetworkBinder;
 use swarmotter_core::peer::{self, Handshake, Message, PeerAddr};
+use swarmotter_core::peer_filter::PeerFilter;
 use swarmotter_core::utp::{self, PeerDuplex, PeerTransport};
 
 use crate::peer_permits::PeerSessionBudget;
@@ -43,6 +44,7 @@ pub(crate) struct MetadataFetchContext {
     utp_enabled: bool,
     utp_prefer_tcp: bool,
     encryption_mode: PeerEncryptionMode,
+    peer_filter: Arc<PeerFilter>,
 }
 
 impl MetadataFetchContext {
@@ -63,7 +65,13 @@ impl MetadataFetchContext {
             utp_enabled,
             utp_prefer_tcp,
             encryption_mode,
+            peer_filter: Arc::new(PeerFilter::default()),
         }
+    }
+
+    pub(crate) fn with_peer_filter(mut self, peer_filter: Arc<PeerFilter>) -> Self {
+        self.peer_filter = peer_filter;
+        self
     }
 }
 
@@ -83,6 +91,20 @@ pub(crate) async fn fetch_metadata_with_transport(
             "torrent data plane blocked; cannot fetch metadata".into(),
         ));
     }
+    let decision = context.peer_filter.admit_ip(peer.ip);
+    if !decision.is_allowed() {
+        tracing::info!(
+            peer = %peer.socket_addr(),
+            reason = decision.audit_reason(),
+            detail = ?decision.rejection_message(),
+            "metadata peer rejected before contained outbound admission"
+        );
+        return Err(CoreError::Internal(
+            decision
+                .rejection_message()
+                .unwrap_or_else(|| "peer rejected by admission policy".into()),
+        ));
+    }
     let _peer_permit = context.peer_session_budget.acquire_outbound().await?;
     let transports = peer_transport_order(
         context.utp_enabled,
@@ -99,6 +121,7 @@ pub(crate) async fn fetch_metadata_with_transport(
             context.peer_id,
             peer,
             context.encryption_mode,
+            context.peer_filter.as_ref(),
         )
         .await
         {
@@ -135,6 +158,7 @@ async fn fetch_metadata_via_transport(
     peer_id: [u8; 20],
     peer: PeerAddr,
     encryption_mode: PeerEncryptionMode,
+    peer_filter: &PeerFilter,
 ) -> Result<Vec<u8>> {
     if transport == PeerTransport::Utp && matches!(encryption_mode, PeerEncryptionMode::Required) {
         return Err(CoreError::Internal(
@@ -188,13 +212,14 @@ async fn fetch_metadata_via_transport(
         }
         (PeerTransport::Utp, _) => stream,
     };
-    fetch_metadata_over_stream(stream, info_hash, peer_id).await
+    fetch_metadata_over_stream(stream, info_hash, peer_id, peer_filter).await
 }
 
 async fn fetch_metadata_over_stream(
     stream: Box<dyn PeerDuplex>,
     info_hash: InfoHash,
     peer_id: [u8; 20],
+    peer_filter: &PeerFilter,
 ) -> Result<Vec<u8>> {
     let (read_half, mut write_half) = tokio::io::split(stream);
 
@@ -210,6 +235,19 @@ async fn fetch_metadata_over_stream(
     if their_hs.info_hash != info_hash {
         return Err(CoreError::Internal(
             "metadata peer info hash mismatch".into(),
+        ));
+    }
+    let decision = peer_filter.admit_client_id(&their_hs.peer_id);
+    if !decision.is_allowed() {
+        tracing::info!(
+            reason = decision.audit_reason(),
+            detail = ?decision.rejection_message(),
+            "metadata peer rejected after contained handshake"
+        );
+        return Err(CoreError::Internal(
+            decision
+                .rejection_message()
+                .unwrap_or_else(|| "peer rejected by admission policy".into()),
         ));
     }
     if !their_hs.supports_extensions() {

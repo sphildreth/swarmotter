@@ -14,7 +14,7 @@ impl DaemonRuntime {
             return Ok(0);
         };
         let traffic_allowed = self.network_health.read().await.traffic_allowed;
-        let restore_seeding_policy = self.config.read().await.seeding.clone();
+        let restore_config = self.config.read().await.clone();
         let mut restored = TorrentRegistry::default();
         for mut torrent in stored.torrents.drain(..) {
             let persisted_state = torrent.state;
@@ -148,7 +148,7 @@ impl DaemonRuntime {
             recompute_restored_seeding_lifecycle(
                 &mut torrent,
                 persisted_state,
-                &restore_seeding_policy,
+                &restore_config,
                 now(),
             );
             let hash = torrent.info_hash();
@@ -176,11 +176,12 @@ impl DaemonRuntime {
             .torrents
             .iter()
             .map(|(hash, torrent)| {
+                let policy = Self::effective_policy_with_config(&config, torrent);
                 (
                     *hash,
                     Arc::new(swarmotter_core::bandwidth::RateLimiter::new(
-                        torrent.download_limit,
-                        torrent.upload_limit,
+                        policy.download_limit.value,
+                        policy.upload_limit.value,
                     )),
                 )
             })
@@ -221,13 +222,16 @@ impl DaemonRuntime {
             let storage_dir = if torrent.progress.is_complete() {
                 complete_dir
             } else {
-                self.resolve_incomplete_dir(&complete_dir).await
+                self.resolve_incomplete_dir_for(&torrent).await
             };
             let storage = swarmotter_core::storage::StorageIo::new(
                 torrent.meta.clone(),
                 PathBuf::from(storage_dir),
             );
-            match storage.recheck().await {
+            match self
+                .recheck_storage_under_root_control(&storage, None)
+                .await
+            {
                 Ok(bitfield) => {
                     let selection_complete = torrent_selection_complete(&torrent, &bitfield)?;
                     let traffic_allowed = self.network_health.read().await.traffic_allowed;
@@ -281,6 +285,55 @@ impl DaemonRuntime {
         tokio::task::spawn_blocking(move || crate::state_store::save(&path, &state))
             .await
             .map_err(|error| CoreError::Storage(format!("save daemon state task: {error}")))??;
+        Ok(())
+    }
+
+    /// Persist a state transition that must be paired with another durable
+    /// transaction. A state-directory sync can fail after rename, so capture
+    /// and restore the previous raw file while holding the state-write lock.
+    /// On error the state file is therefore returned to the generation that
+    /// existed before this call whenever the rollback succeeds.
+    pub(super) async fn persist_state_with_file_rollback(&self) -> Result<()> {
+        let Some(path) = self.state_path.clone() else {
+            return Ok(());
+        };
+        let _write_guard = self.state_write_lock.lock().await;
+        let capture_path = path.clone();
+        let snapshot =
+            tokio::task::spawn_blocking(move || crate::state_store::capture_file(&capture_path))
+                .await
+                .map_err(|error| {
+                    CoreError::Storage(format!("capture daemon state task: {error}"))
+                })??;
+        let torrents = self
+            .registry
+            .lock()
+            .await
+            .torrents
+            .values()
+            .cloned()
+            .collect();
+        let queue = self.queue.lock().await.clone();
+        let state = crate::state_store::DaemonState::new(torrents, queue);
+        let write_path = path.clone();
+        let persisted =
+            tokio::task::spawn_blocking(move || crate::state_store::save(&write_path, &state))
+                .await
+                .map_err(|error| CoreError::Storage(format!("save daemon state task: {error}")))?;
+        if let Err(error) = persisted {
+            let rollback_path = path.clone();
+            let rollback_snapshot = snapshot.clone();
+            let rollback = tokio::task::spawn_blocking(move || {
+                crate::state_store::restore_file(&rollback_path, &rollback_snapshot)
+            })
+            .await
+            .map_err(|join_error| {
+                CoreError::Storage(format!("restore daemon state task: {join_error}"))
+            })?;
+            return Err(CoreError::Storage(format!(
+                "save daemon state: {error}; state rollback: {rollback:?}"
+            )));
+        }
         Ok(())
     }
 
@@ -338,6 +391,11 @@ impl DaemonRuntime {
         bytes: Vec<u8>,
         options: AddTorrentOptions,
     ) -> Result<InfoHash> {
+        // Keep profile resolution and the durable registration in the same
+        // transaction as profile replacement. Otherwise a profile could be
+        // removed after this add validates it but before its attachment is
+        // persisted into daemon state.
+        let _config_transaction = self.config_write_lock.lock().await;
         let parsed = match meta::parse_torrent(&bytes) {
             Ok(parsed) => parsed,
             Err(e) => {
@@ -354,8 +412,17 @@ impl DaemonRuntime {
         if let Some(d) = options.download_dir {
             t.download_dir = Some(d);
         }
+        let paused = self
+            .apply_add_profile(
+                &mut t,
+                options.profile,
+                options.labels,
+                options.start_behavior_explicit,
+                options.paused,
+            )
+            .await?;
         match self
-            .add_torrent_mutation(t, options.paused, "torrent_file_added")
+            .add_torrent_mutation(t, paused, "torrent_file_added")
             .await?
         {
             TorrentAddMutationOutcome::Inserted { state, .. } => {
@@ -383,6 +450,9 @@ impl DaemonRuntime {
         magnet: &str,
         options: AddTorrentOptions,
     ) -> Result<InfoHash> {
+        // See `add_torrent_file_with_options`: this lock makes profile
+        // selection and durable registration indivisible from profile PUT.
+        let _config_transaction = self.config_write_lock.lock().await;
         let m = Magnet::parse(magnet)?;
         let hash = m.info_hash;
         let name = m.display_name.clone().unwrap_or_else(|| hash.to_hex());
@@ -409,10 +479,16 @@ impl DaemonRuntime {
         if let Some(d) = options.download_dir {
             t.download_dir = Some(d);
         }
-        match self
-            .add_torrent_mutation(t, options.paused, "magnet_added")
-            .await?
-        {
+        let paused = self
+            .apply_add_profile(
+                &mut t,
+                options.profile,
+                options.labels,
+                options.start_behavior_explicit,
+                options.paused,
+            )
+            .await?;
+        match self.add_torrent_mutation(t, paused, "magnet_added").await? {
             TorrentAddMutationOutcome::Inserted { state, .. } => {
                 tracing::info!(
                     info_hash = %hash,
@@ -446,8 +522,8 @@ impl DaemonRuntime {
         if previous_torrent.is_some() {
             return Ok(TorrentAddMutationOutcome::Duplicate { hash });
         }
-        self.preflight_storage_for_download(
-            torrent.download_dir.as_deref(),
+        self.preflight_storage_for_torrent(
+            &torrent,
             if torrent.needs_metadata {
                 0
             } else {
@@ -461,7 +537,7 @@ impl DaemonRuntime {
         }
         let committed_state = torrent.state;
 
-        self.ensure_storage_paths_available(&torrent.meta, torrent.download_dir.as_deref())
+        self.ensure_storage_paths_available_for_torrent(&torrent, None)
             .await?;
 
         self.registry
@@ -492,7 +568,16 @@ impl DaemonRuntime {
             return Err(error);
         }
 
-        self.ensure_torrent_limiter(hash, 0, 0).await;
+        let inserted = self
+            .registry
+            .lock()
+            .await
+            .get(&hash)
+            .cloned()
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+        let policy = self.effective_policy(&inserted).await;
+        self.ensure_torrent_limiter(hash, policy.download_limit.value, policy.upload_limit.value)
+            .await;
         self.ensure_torrent_peer_permit_pool(hash).await;
         drop(mutation_guard);
         if committed_state == TorrentState::Queued {
@@ -535,7 +620,7 @@ impl DaemonRuntime {
         if delete_data {
             for (hash, torrent) in &targets {
                 let complete_dir = self.resolve_download_dir(torrent).await;
-                let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
+                let active_dir = self.resolve_incomplete_dir_for(torrent).await;
                 let mut dirs = vec![active_dir, complete_dir];
                 dirs.dedup();
                 for dir in dirs {
@@ -592,10 +677,15 @@ impl DaemonRuntime {
     }
 
     /// Resolve the download directory for a torrent: per-torrent override,
-    /// then global config, then a default temp dir.
+    /// profile creation snapshot, then global config, then a default temp dir.
     pub(super) async fn resolve_download_dir(&self, t: &Torrent) -> String {
-        self.resolve_download_dir_override(t.download_dir.as_deref())
-            .await
+        self.policy_storage_paths(t).await.0
+    }
+
+    /// Resolve the active incomplete path for a torrent. Unlike the legacy
+    /// helper, this sees a profile's create-time incomplete-path snapshot.
+    pub(super) async fn resolve_incomplete_dir_for(&self, t: &Torrent) -> String {
+        self.policy_storage_paths(t).await.1
     }
 
     pub(super) async fn ensure_torrent_limiter(
@@ -874,22 +964,10 @@ impl DaemonRuntime {
         }
     }
 
-    pub(super) async fn resolve_download_dir_override(&self, download_dir: Option<&str>) -> String {
-        let cfg = self.config.read().await;
-        resolve_download_dir_from_config(download_dir, &cfg)
-    }
-
-    /// Resolve the active write directory for a torrent. Incomplete downloads
-    /// use the configured incomplete directory when present; otherwise they
-    /// write directly to the final download directory.
-    pub(super) async fn resolve_incomplete_dir(&self, download_dir: &str) -> String {
-        let cfg = self.config.read().await;
-        resolve_incomplete_dir_from_config(download_dir, &cfg)
-    }
-
-    pub(super) async fn preflight_storage_for_download(
+    /// Preflight a candidate using its resolved profile storage snapshot.
+    pub(super) async fn preflight_storage_for_torrent(
         &self,
-        download_dir: Option<&str>,
+        torrent: &Torrent,
         total_length: u64,
     ) -> Result<()> {
         let cfg = self.config.read().await.clone();
@@ -897,38 +975,46 @@ impl DaemonRuntime {
         {
             return Ok(());
         }
-        let complete_dir = resolve_download_dir_from_config(download_dir, &cfg);
-        let active_dir = resolve_incomplete_dir_from_config(&complete_dir, &cfg);
+        let (complete_dir, active_dir) = Self::policy_storage_paths_with_config(&cfg, torrent);
         for dir in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
             swarmotter_core::storage::check_storage_preflight(&dir, &cfg.storage, total_length)?;
         }
         Ok(())
     }
 
-    pub(super) async fn ensure_storage_paths_available(
+    /// Validate ownership for a candidate torrent at its effective storage
+    /// paths. Existing profile-derived paths are resolved from their durable
+    /// snapshots; no profile value is copied into an override.
+    pub(super) async fn ensure_storage_paths_available_for_torrent(
         &self,
-        meta: &meta::TorrentMeta,
-        download_dir: Option<&str>,
-    ) -> Result<()> {
-        self.ensure_storage_paths_available_except(meta, download_dir, None)
-            .await
-    }
-
-    pub(super) async fn ensure_storage_paths_available_except(
-        &self,
-        meta: &meta::TorrentMeta,
-        download_dir: Option<&str>,
+        torrent: &Torrent,
         exclude: Option<InfoHash>,
     ) -> Result<()> {
         let cfg = self.config.read().await.clone();
-        let complete_dir = resolve_download_dir_from_config(download_dir, &cfg);
-        let active_dir = resolve_incomplete_dir_from_config(&complete_dir, &cfg);
+        let (complete_dir, active_dir) = Self::policy_storage_paths_with_config(&cfg, torrent);
+        self.ensure_storage_paths_available_at_paths_except(
+            &torrent.meta,
+            &complete_dir,
+            &active_dir,
+            exclude,
+        )
+        .await
+    }
+
+    pub(super) async fn ensure_storage_paths_available_at_paths_except(
+        &self,
+        meta: &meta::TorrentMeta,
+        complete_dir: &str,
+        active_dir: &str,
+        exclude: Option<InfoHash>,
+    ) -> Result<()> {
         let candidates = unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)])
             .into_iter()
             .map(|root| {
                 swarmotter_core::storage::StorageIo::new(meta.clone(), root).path_ownership()
             })
             .collect::<Result<Vec<_>>>()?;
+        let cfg = self.config.read().await.clone();
         let existing = self
             .registry
             .lock()
@@ -941,9 +1027,7 @@ impl DaemonRuntime {
             if exclude.is_some_and(|hash| torrent.info_hash() == hash) {
                 continue;
             }
-            let complete_dir =
-                resolve_download_dir_from_config(torrent.download_dir.as_deref(), &cfg);
-            let active_dir = resolve_incomplete_dir_from_config(&complete_dir, &cfg);
+            let (complete_dir, active_dir) = Self::policy_storage_paths_with_config(&cfg, &torrent);
             for root in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
                 let ownership =
                     swarmotter_core::storage::StorageIo::new(torrent.meta.clone(), root)
@@ -960,33 +1044,161 @@ impl DaemonRuntime {
         &self,
         hash: InfoHash,
         resolved: meta::TorrentMeta,
-        download_dir: Option<String>,
+        complete_dir: String,
+        active_dir: String,
+        cancellation: StorageWorkCancellation,
     ) -> Result<()> {
+        if cancellation.is_cancelled() {
+            return Err(storage_work_cancelled_error());
+        }
         if resolved.info_hash != hash {
             return Err(CoreError::MalformedTorrent(
                 "resolved magnet metadata info hash changed during preflight".into(),
             ));
         }
-        let _storage_ownership = self.storage_ownership_lock.lock().await;
-        self.ensure_storage_paths_available_except(&resolved, download_dir.as_deref(), Some(hash))
-            .await?;
-        let previous = {
-            let mut registry = self.registry.lock().await;
-            let torrent = registry
-                .get_mut(&hash)
-                .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
-            let previous = torrent.clone();
-            let empty_state = EngineState {
-                piece_count: resolved.piece_count(),
-                total_length: resolved.total_length,
-                ..EngineState::default()
+        // Validate ownership before waiting for a root budget, but never hold
+        // the ownership mutex while a bounded root is saturated. Other adds,
+        // moves, and metadata resolutions must remain able to make progress.
+        let initial_previous = {
+            let _storage_ownership = tokio::select! {
+                guard = self.storage_ownership_lock.lock() => guard,
+                _ = cancellation.cancelled() => return Err(storage_work_cancelled_error()),
             };
-            apply_resolved_metadata(torrent, &resolved, &empty_state);
-            previous
+            self.ensure_storage_paths_available_at_paths_except(
+                &resolved,
+                &complete_dir,
+                &active_dir,
+                Some(hash),
+            )
+            .await?;
+            self.registry
+                .lock()
+                .await
+                .get(&hash)
+                .cloned()
+                .ok_or_else(|| CoreError::NotFound("torrent".into()))?
         };
+        let storage_admission = loop {
+            if cancellation.is_cancelled() {
+                return Err(storage_work_cancelled_error());
+            }
+            let storage_admission = {
+                let cfg = self.config.read().await;
+                storage_root_admission_for_path(&cfg, Path::new(&active_dir))
+            };
+            let Some(admission) = storage_admission else {
+                break None;
+            };
+            if !self
+                .storage_admissions
+                .declared_bytes_can_fit(&admission, resolved.total_length)
+            {
+                return Err(CoreError::Storage(format!(
+                    "storage root admission cannot fit resolved magnet metadata for {}: declared payload {} bytes exceeds configured active-byte limit {}",
+                    admission.root.display(),
+                    resolved.total_length,
+                    admission.max_active_bytes
+                )));
+            }
+            // Register before testing the atomic reservation so a completed
+            // root engine or a configuration change cannot lose its wake-up.
+            let changed = self.storage_admissions.changed();
+            if self
+                .storage_admissions
+                .reserve(hash, &admission, resolved.total_length)
+                .await
+                .is_ok()
+            {
+                break Some(admission);
+            }
+            tokio::select! {
+                _ = cancellation.cancelled() => return Err(storage_work_cancelled_error()),
+                _ = changed => {}
+            }
+        };
+        if cancellation.is_cancelled() {
+            if storage_admission.is_some() {
+                self.storage_admissions.release(&hash).await;
+            }
+            return Err(storage_work_cancelled_error());
+        }
+        let _storage_ownership = tokio::select! {
+            guard = self.storage_ownership_lock.lock() => guard,
+            _ = cancellation.cancelled() => {
+                if storage_admission.is_some() {
+                    self.storage_admissions.release(&hash).await;
+                }
+                return Err(storage_work_cancelled_error());
+            }
+        };
+        if cancellation.is_cancelled() {
+            if storage_admission.is_some() {
+                self.storage_admissions.release(&hash).await;
+            }
+            return Err(storage_work_cancelled_error());
+        }
+        if let Err(error) = self
+            .ensure_storage_paths_available_at_paths_except(
+                &resolved,
+                &complete_dir,
+                &active_dir,
+                Some(hash),
+            )
+            .await
+        {
+            if let Some(admission) = &storage_admission {
+                let _ = self
+                    .storage_admissions
+                    .reserve(hash, admission, initial_previous.meta.total_length)
+                    .await;
+            }
+            return Err(error);
+        }
+        if cancellation.is_cancelled() {
+            if storage_admission.is_some() {
+                self.storage_admissions.release(&hash).await;
+            }
+            return Err(storage_work_cancelled_error());
+        }
+        let previous = self.registry.lock().await.get(&hash).cloned();
+        let Some(previous) = previous else {
+            if let Some(admission) = &storage_admission {
+                let _ = self
+                    .storage_admissions
+                    .reserve(hash, admission, initial_previous.meta.total_length)
+                    .await;
+            }
+            return Err(CoreError::NotFound("torrent".into()));
+        };
+        let updated = {
+            let mut registry = self.registry.lock().await;
+            registry.get_mut(&hash).map(|torrent| {
+                let empty_state = EngineState {
+                    piece_count: resolved.piece_count(),
+                    total_length: resolved.total_length,
+                    ..EngineState::default()
+                };
+                apply_resolved_metadata(torrent, &resolved, &empty_state);
+            })
+        };
+        if updated.is_none() {
+            if let Some(admission) = &storage_admission {
+                let _ = self
+                    .storage_admissions
+                    .reserve(hash, admission, previous.meta.total_length)
+                    .await;
+            }
+            return Err(CoreError::NotFound("torrent".into()));
+        }
         if let Err(error) = self.persist_state().await {
             if let Some(torrent) = self.registry.lock().await.get_mut(&hash) {
-                *torrent = previous;
+                *torrent = previous.clone();
+            }
+            if let Some(admission) = &storage_admission {
+                let _ = self
+                    .storage_admissions
+                    .reserve(hash, admission, previous.meta.total_length)
+                    .await;
             }
             return Err(error);
         }

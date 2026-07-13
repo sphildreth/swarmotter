@@ -4,7 +4,19 @@ use super::*;
 
 impl TorrentEngine {
     pub(super) fn peer_allowed(&self, peer: &PeerAddr) -> bool {
-        peer_allowed_by_config(peer, self.allow_ipv6)
+        if !peer_allowed_by_config(peer, self.allow_ipv6) {
+            return false;
+        }
+        let decision = self.peer_filter.admit_ip(peer.ip);
+        if !decision.is_allowed() {
+            tracing::info!(
+                peer = %peer.socket_addr(),
+                reason = decision.audit_reason(),
+                detail = ?decision.rejection_message(),
+                "peer rejected by outbound admission policy"
+            );
+        }
+        decision.is_allowed()
     }
 
     pub(super) fn filter_allowed_peers(&self, peers: Vec<PeerAddr>) -> Vec<PeerAddr> {
@@ -54,6 +66,7 @@ impl TorrentEngine {
             self.utp_enabled,
             self.utp_prefer_tcp,
             self.encryption_mode,
+            self.peer_filter.as_ref(),
         )
         .await?;
         tracing::debug!(peer = %peer_addr.socket_addr(), transport = transport.as_str(), "peer connected");
@@ -351,6 +364,7 @@ impl TorrentEngine {
                                 discovered,
                                 pex.added.into_iter().chain(pex.added6),
                                 self.allow_ipv6,
+                                self.peer_filter.as_ref(),
                                 max_peers,
                             );
                             if discovered.len() > before {
@@ -543,7 +557,22 @@ pub(super) async fn connect_peer_wire_with_transport(
     utp_enabled: bool,
     utp_prefer_tcp: bool,
     encryption_mode: PeerEncryptionMode,
+    peer_filter: &swarmotter_core::peer_filter::PeerFilter,
 ) -> Result<(PeerReader<PeerReadHalf>, PeerWriteHalf, PeerTransport)> {
+    let decision = peer_filter.admit_ip(peer_addr.ip);
+    if !decision.is_allowed() {
+        tracing::info!(
+            peer = %peer_addr.socket_addr(),
+            reason = decision.audit_reason(),
+            detail = ?decision.rejection_message(),
+            "peer rejected before contained outbound transport admission"
+        );
+        return Err(CoreError::Internal(
+            decision
+                .rejection_message()
+                .unwrap_or_else(|| "peer rejected by admission policy".into()),
+        ));
+    }
     let transports = peer_transport_order(utp_enabled, utp_prefer_tcp, encryption_mode);
 
     let mut last_error = None;
@@ -555,6 +584,7 @@ pub(super) async fn connect_peer_wire_with_transport(
             info_hash,
             peer_id,
             encryption_mode,
+            peer_filter,
         )
         .await
         {
@@ -601,6 +631,7 @@ pub(super) async fn attempt_peer_wire_transport(
     info_hash: InfoHash,
     peer_id: [u8; 20],
     encryption_mode: PeerEncryptionMode,
+    peer_filter: &swarmotter_core::peer_filter::PeerFilter,
 ) -> Result<(PeerReader<PeerReadHalf>, PeerWriteHalf, PeerTransport)> {
     if transport == PeerTransport::Utp && matches!(encryption_mode, PeerEncryptionMode::Required) {
         return Err(CoreError::Internal(
@@ -673,6 +704,20 @@ pub(super) async fn attempt_peer_wire_transport(
     if their_hs.info_hash != info_hash {
         return Err(CoreError::Internal(
             "peer handshake info hash mismatch".into(),
+        ));
+    }
+    let decision = peer_filter.admit_client_id(&their_hs.peer_id);
+    if !decision.is_allowed() {
+        tracing::info!(
+            peer = %peer_addr.socket_addr(),
+            reason = decision.audit_reason(),
+            detail = ?decision.rejection_message(),
+            "peer rejected after contained outbound handshake"
+        );
+        return Err(CoreError::Internal(
+            decision
+                .rejection_message()
+                .unwrap_or_else(|| "peer rejected by admission policy".into()),
         ));
     }
 

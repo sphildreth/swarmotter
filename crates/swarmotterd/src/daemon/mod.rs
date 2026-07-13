@@ -13,9 +13,11 @@ mod containment;
 mod diagnostics;
 mod lifecycle;
 mod persistence;
+mod policy_runtime;
 mod scheduler;
 mod seeding;
 mod settings;
+mod storage_controls;
 #[path = "watch.rs"]
 mod watch_runtime;
 
@@ -83,6 +85,11 @@ use crate::peer_permits::{
     PeerPermitPool, PeerPermitSnapshot, PeerSessionBudget, DEFAULT_PER_TORRENT_PEER_LIMIT,
 };
 use crate::seeder::{SeedRegistration, SeedRegistry, SeederHub};
+use storage_controls::{
+    is_storage_work_cancelled, storage_root_admission_for_path, storage_work_cancelled_error,
+    ExplicitRecheckOperation, StorageAdmissionController, StorageAdmissionPlan,
+    StorageRecheckController, StorageRootAdmission, StorageWorkCancellation,
+};
 
 const PEER_DIAGNOSTIC_RECENT_WINDOW: Duration = Duration::from_secs(30);
 const QUEUE_RECONCILE_DEBOUNCE: Duration = Duration::from_millis(25);
@@ -184,6 +191,9 @@ enum ConfigFileSnapshot {
 pub struct DaemonRuntime {
     pub registry: Arc<Mutex<TorrentRegistry>>,
     pub config: Arc<RwLock<Config>>,
+    /// One compiled immutable peer-admission policy shared by every active
+    /// engine, magnet metadata fetch, and inbound listener generation.
+    peer_filter: Arc<RwLock<Arc<swarmotter_core::peer_filter::PeerFilter>>>,
     pub network_health: Arc<RwLock<NetworkHealth>>,
     pub watch_imports: Arc<Mutex<VecDeque<watch::ImportResult>>>,
     watch_observations: Arc<Mutex<HashMap<watch::ObservationKey, WatchObservation>>>,
@@ -200,6 +210,19 @@ pub struct DaemonRuntime {
     state_path: Option<PathBuf>,
     state_write_lock: Arc<Mutex<()>>,
     storage_ownership_lock: Arc<Mutex<()>>,
+    /// Root-scoped active-engine reservations and shared write pressure
+    /// limiters. These are local-storage controls only.
+    storage_admissions: StorageAdmissionController,
+    /// Root-scoped full-recheck permits. The RAII permit releases correctly if
+    /// an API request is cancelled.
+    storage_rechecks: StorageRecheckController,
+    /// Cancellation signals for daemon-managed engine storage waits and
+    /// startup verification. Lifecycle operations signal these before asking
+    /// the engine to stop, so a saturated root cannot block command polling.
+    engine_storage_cancellations: Arc<Mutex<HashMap<InfoHash, StorageWorkCancellation>>>,
+    /// Explicit API rechecks have no engine task while their disk work runs.
+    /// Track them separately so move/pause/stop can cancel and await cleanup.
+    explicit_rechecks: Arc<Mutex<HashMap<InfoHash, ExplicitRecheckOperation>>>,
     engine_states: Arc<RwLock<HashMap<InfoHash, Arc<Mutex<EngineState>>>>>,
     engine_cmds: Arc<Mutex<HashMap<InfoHash, tokio::sync::mpsc::Sender<EngineCommand>>>>,
     engine_handles: Arc<RwLock<HashMap<InfoHash, JoinHandle<()>>>>,
@@ -242,6 +265,22 @@ pub struct DaemonRuntime {
     /// Deterministic pause between bounded watch read and metadata recheck.
     #[cfg(test)]
     watch_after_read_pause: AsyncTestPause,
+    /// Deterministic pause while an engine owns the transition lock immediately
+    /// before it resolves a storage-root admission.
+    #[cfg(test)]
+    storage_admission_pause: AsyncTestPause,
+    /// Deterministic pause after an explicit recheck has finalized its state
+    /// but before its normal persistence write begins.
+    #[cfg(test)]
+    explicit_recheck_before_persist_pause: AsyncTestPause,
+    /// Deterministic pause after a root-control-only replacement owns the
+    /// transition lock and before it installs the new controls.
+    #[cfg(test)]
+    root_control_replacement_pause: AsyncTestPause,
+    /// Deterministic post-rename configuration-write failure used to verify
+    /// that generic/root-control replacements restore their file snapshot.
+    #[cfg(test)]
+    generic_config_fail_after_rename: Arc<AtomicBool>,
     global_limiter: swarmotter_core::bandwidth::RateLimiter,
     /// One retained live limiter per torrent. The same buckets are shared by
     /// downloader and seeder tasks and survive lifecycle transitions.
@@ -397,13 +436,15 @@ struct StorageRootAccumulator {
     roles: Vec<StorageRootRole>,
     torrent_count: usize,
     active_torrents: usize,
+    active_bytes: u64,
     active_write_rate: u64,
 }
 
 #[derive(Debug, Clone)]
 struct EngineStartSnapshot {
     meta: meta::TorrentMeta,
-    download_dir: Option<String>,
+    complete_dir: String,
+    active_dir: String,
     download_limit: u64,
     upload_limit: u64,
     needs_metadata: bool,
@@ -415,12 +456,24 @@ struct EngineStartSnapshot {
 }
 
 impl EngineStartSnapshot {
-    fn from_torrent(torrent: &Torrent) -> Self {
+    fn from_torrent(torrent: &Torrent, config: &Config) -> Self {
+        let policy = DaemonRuntime::effective_policy_with_config(config, torrent);
+        let complete_dir = policy.download_dir.value.unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("swarmotter-downloads")
+                .display()
+                .to_string()
+        });
+        let active_dir = policy
+            .incomplete_dir
+            .value
+            .unwrap_or_else(|| complete_dir.clone());
         Self {
             meta: torrent.meta.clone(),
-            download_dir: torrent.download_dir.clone(),
-            download_limit: torrent.download_limit,
-            upload_limit: torrent.upload_limit,
+            complete_dir,
+            active_dir,
+            download_limit: policy.download_limit.value,
+            upload_limit: policy.upload_limit.value,
             needs_metadata: torrent.needs_metadata,
             magnet_info_hash: torrent.magnet_info_hash,
             magnet_name: torrent.magnet_name.clone(),
@@ -517,6 +570,28 @@ fn resolve_incomplete_dir_from_config(download_dir: &str, cfg: &Config) -> Strin
         .incomplete_dir
         .clone()
         .unwrap_or_else(|| download_dir.to_string())
+}
+
+/// Resolve the local storage-root control that owns a torrent's active write
+/// directory. Controls intentionally do not affect network containment.
+#[cfg(test)]
+fn storage_root_admission_for_download(
+    cfg: &Config,
+    download_dir: Option<&str>,
+) -> Option<StorageRootAdmission> {
+    let complete_dir = resolve_download_dir_from_config(download_dir, cfg);
+    let active_dir = resolve_incomplete_dir_from_config(&complete_dir, cfg);
+    storage_root_admission_for_path(cfg, Path::new(&active_dir))
+}
+
+/// Profile storage selects a path; root controls remain globally configured
+/// and are then chosen by that resolved active path.
+fn storage_root_admission_for_torrent(
+    cfg: &Config,
+    torrent: &Torrent,
+) -> Option<StorageRootAdmission> {
+    let (_, active_dir) = DaemonRuntime::policy_storage_paths_with_config(cfg, torrent);
+    storage_root_admission_for_path(cfg, Path::new(&active_dir))
 }
 
 fn torrent_event(kind: &'static str, hash: InfoHash, state: TorrentState) -> Event {

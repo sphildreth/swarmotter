@@ -25,6 +25,15 @@ minimum_free_space_percent = 0
 preallocate = false
 sparse = true
 
+# Optional per-root local resource controls. The most-specific lexical path
+# wins; a zero limit is unlimited. These govern local storage work only.
+# [[storage.root_controls]]
+# path = "/data/downloads"
+# max_active_downloads = 2
+# max_active_bytes = 0
+# max_write_bytes_per_second = 0
+# max_concurrent_rechecks = 1
+
 [network]
 # This explicit exception is valid only because deploy/compose.yml joins the
 # Gluetun network namespace (`network_mode: service:vpn`), whose firewall and
@@ -63,6 +72,29 @@ auto_start = true
 global_ratio_limit = 2.0
 global_idle_limit = 1800
 
+# Optional named policy profiles. Resolved storage and the initial start-or-
+# paused decision are captured at registration; inheriting queue, seeding,
+# and bandwidth values remain live.
+# [profiles.labels]
+# linux = "linux-release"
+#
+# [profiles.profiles.linux-release.storage]
+# download_dir = "/data/releases/linux"
+# incomplete_dir = "/data/incomplete/linux"
+#
+# [profiles.profiles.linux-release.queue]
+# priority = "high"
+# start_behavior = "start"
+#
+# [profiles.profiles.linux-release.seeding]
+# ratio_limit = 2.0
+# idle_limit = 86400
+# seed_forever = false
+#
+# [profiles.profiles.linux-release.bandwidth]
+# download_limit = 0
+# upload_limit = 5242880
+
 [dht]
 enabled = true
 port = 51413
@@ -74,6 +106,15 @@ bootstrap_nodes = [
 [pex]
 enabled = true
 max_peers = 0
+
+# Optional local-only peer-admission filtering. Rules are IPs, CIDRs, or
+# inclusive ranges; manual bans are normally managed through the native API/UI.
+[peer_filter]
+enabled = false
+rules = []
+blocklist_paths = []
+manual_bans = []
+blocked_client_ids = []
 
 [logging]
 level = "info"

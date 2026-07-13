@@ -186,7 +186,27 @@ pub(super) fn write_config_atomically(path: &Path, config: &Config) -> Result<()
     write_config_bytes_atomically(path, toml.as_bytes())
 }
 
+/// Test-only simulation of a directory-sync failure after `rename(2)` has
+/// already made the candidate file visible. This is the failure mode that
+/// requires the caller's configuration-file rollback snapshot.
+#[cfg(test)]
+pub(super) fn write_config_atomically_with_post_rename_sync_failure(
+    path: &Path,
+    config: &Config,
+) -> Result<()> {
+    let toml = config.to_toml_string()?;
+    write_config_bytes_atomically_inner(path, toml.as_bytes(), true)
+}
+
 pub(super) fn write_config_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_config_bytes_atomically_inner(path, bytes, false)
+}
+
+fn write_config_bytes_atomically_inner(
+    path: &Path,
+    bytes: &[u8],
+    fail_after_rename_for_test: bool,
+) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(CoreError::from)?;
     let sequence = CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -208,6 +228,14 @@ pub(super) fn write_config_bytes_atomically(path: &Path, bytes: &[u8]) -> Result
         file.sync_all().map_err(CoreError::from)?;
         drop(file);
         fs::rename(&tmp, path).map_err(CoreError::from)?;
+        #[cfg(test)]
+        if fail_after_rename_for_test {
+            return Err(CoreError::Storage(
+                "injected config directory sync failure after rename".into(),
+            ));
+        }
+        #[cfg(not(test))]
+        let _ = fail_after_rename_for_test;
         fs::File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(CoreError::from)?;
@@ -252,6 +280,7 @@ pub(super) fn data_plane_config_changed(previous: &Config, next: &Config) -> boo
         || previous.dht != next.dht
         || previous.pex.enabled != next.pex.enabled
         || previous.pex.max_peers != next.pex.max_peers
+        || previous.peer_filter != next.peer_filter
         || peer_limits_changed(previous, next)
         || previous.storage.download_dir != next.storage.download_dir
         || previous.storage.incomplete_dir != next.storage.incomplete_dir
@@ -285,9 +314,14 @@ pub(super) fn validate_storage_config_transition(
     torrents: &[Torrent],
 ) -> Result<()> {
     if previous.storage.download_dir != next.storage.download_dir
-        && torrents
-            .iter()
-            .any(|torrent| torrent.download_dir.is_none())
+        && torrents.iter().any(|torrent| {
+            matches!(
+                DaemonRuntime::effective_policy_with_config(previous, torrent)
+                    .download_dir
+                    .source,
+                swarmotter_core::policy::PolicyValueSource::Global
+            )
+        })
     {
         return Err(CoreError::InvalidConfig(
             "storage.download_dir cannot change while torrents still use the global download directory; move those torrents to explicit locations first"
@@ -295,9 +329,15 @@ pub(super) fn validate_storage_config_transition(
         ));
     }
     if previous.storage.incomplete_dir != next.storage.incomplete_dir
-        && torrents
-            .iter()
-            .any(|torrent| !torrent.progress.is_complete())
+        && torrents.iter().any(|torrent| {
+            !torrent.progress.is_complete()
+                && matches!(
+                    DaemonRuntime::effective_policy_with_config(previous, torrent)
+                        .incomplete_dir
+                        .source,
+                    swarmotter_core::policy::PolicyValueSource::Global
+                )
+        })
     {
         return Err(CoreError::InvalidConfig(
             "storage.incomplete_dir cannot change while torrents have incomplete payloads".into(),
@@ -553,7 +593,7 @@ pub(super) fn apply_resolved_metadata(
 
 pub(super) fn automatic_seeding_status(
     torrent: &Torrent,
-    global: &swarmotter_core::ratio::SeedingPolicy,
+    config: &Config,
     idle_seconds: u64,
 ) -> SeedingStatus {
     let accounting = TorrentAccounting {
@@ -561,7 +601,8 @@ pub(super) fn automatic_seeding_status(
         uploaded: torrent.uploaded,
         idle_seconds,
     };
-    match ratio::evaluate_seeding(&accounting, global, &torrent.seeding) {
+    let (global, per_torrent) = DaemonRuntime::effective_ratio_policy(config, torrent);
+    match ratio::evaluate_seeding(&accounting, &global, &per_torrent) {
         SeedDecision::Continue => SeedingStatus::Queued,
         SeedDecision::StopOnRatio => SeedingStatus::StoppedRatio,
         SeedDecision::StopOnIdle => SeedingStatus::StoppedIdle,
@@ -574,7 +615,7 @@ pub(super) fn automatic_seeding_status(
 pub(super) fn recompute_restored_seeding_lifecycle(
     torrent: &mut Torrent,
     persisted_state: TorrentState,
-    global: &swarmotter_core::ratio::SeedingPolicy,
+    config: &Config,
     now_secs: u64,
 ) {
     if !torrent.progress.is_complete() {
@@ -589,7 +630,7 @@ pub(super) fn recompute_restored_seeding_lifecycle(
             _ if torrent.seeding_status != SeedingStatus::NotEligible => torrent.seeding_status,
             _ => automatic_seeding_status(
                 torrent,
-                global,
+                config,
                 now_secs.saturating_sub(torrent.date_completed.unwrap_or(torrent.date_added)),
             ),
         };
@@ -608,7 +649,7 @@ pub(super) fn recompute_restored_seeding_lifecycle(
         torrent.state = TorrentState::Completed;
         torrent.seeding_status = automatic_seeding_status(
             torrent,
-            global,
+            config,
             now_secs.saturating_sub(torrent.date_completed.unwrap_or(torrent.date_added)),
         );
     } else {
@@ -645,9 +686,8 @@ pub(super) fn validate_restored_storage_ownership<'a>(
 ) -> Result<()> {
     let mut ownerships = Vec::new();
     for torrent in torrents {
-        let complete_dir =
-            resolve_download_dir_from_config(torrent.download_dir.as_deref(), config);
-        let active_dir = resolve_incomplete_dir_from_config(&complete_dir, config);
+        let (complete_dir, active_dir) =
+            DaemonRuntime::policy_storage_paths_with_config(config, torrent);
         for root in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
             ownerships.push(
                 swarmotter_core::storage::StorageIo::new(torrent.meta.clone(), root)
@@ -908,6 +948,7 @@ pub(super) fn add_storage_root_usage(
     entry.torrent_count += 1;
     if torrent.state.is_active() {
         entry.active_torrents += 1;
+        entry.active_bytes = entry.active_bytes.saturating_add(torrent.meta.total_length);
         entry.active_write_rate = entry.active_write_rate.saturating_add(torrent.rate_down);
     }
 }

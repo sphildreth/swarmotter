@@ -7,7 +7,7 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
-## [2.0.0] - [2026-07-12]
+## [2.0.0] - [UNRELEASED]
 
 ### Upgrade notes
 
@@ -18,6 +18,32 @@ date or duration estimates.
   `swarmotterd --check-config --config PATH` before restarting.
 
 ### Added
+
+- **Storage-root resource controls:** repeatable
+  `[[storage.root_controls]]` entries now provide independently observable,
+  longest-path-matched active-download, declared-byte, verified-write, and
+  full-recheck budgets. Queue admission is atomic, bounded rechecks release
+  capacity on cancellation, and the API, Doctor view, and Settings expose
+  limits, use, and saturation without changing torrent network containment.
+  See [ADR-0056](design/adr/0056-storage-root-resource-controls.md).
+
+- **Named policy profiles and explainable inheritance:** profiles can be
+  selected explicitly, by watch folder, or by deterministic label mapping for
+  storage, queue, seeding, and per-torrent bandwidth behavior. Creation-time
+  resolved-storage and initial-admission snapshots prevent profile edits or
+  reassignment from moving payloads or changing an existing torrent's start
+  intent. Older durable records are migrated transactionally when profile
+  policy is replaced, while inheriting operational settings
+  resolve live and are visible through native policy endpoints and the Web UI.
+  See
+  [ADR-0057](design/adr/0057-policy-profiles-and-inherited-settings.md).
+
+- **Global peer-admission filtering:** bounded local IP/CIDR/range blocklists,
+  manual IP bans, and peer-ID-prefix rules now apply consistently to peer
+  discovery, metadata, engine, and inbound-session admission. Policy updates
+  validate and replace transactionally while retaining the required contained
+  socket path, and expose audit counters through the API and Web UI. See
+  [ADR-0058](design/adr/0058-global-peer-admission-filtering.md).
 
 - **Contained framed tracker/webseed HTTP and real HTTP(S) scrape:** tracker
   announce, supported BEP 48 scrape, and webseed range reads now share one
@@ -127,7 +153,7 @@ date or duration estimates.
   relied on the disabled default must configure a strict path or set
   `mode = "disabled"` explicitly. See
   [ADR-0051](design/adr/0051-explicit-network-path-and-live-containment-gate.md).
-  This breaking contract is released as `v2.0.0`.
+  This breaking contract is part of the unreleased `v2.0.0` work.
 
 - **Live containment gate:** one process-wide `ContainmentGate` (atomics plus
   `tokio::sync::Notify`) is now shared by every torrent data-plane component.

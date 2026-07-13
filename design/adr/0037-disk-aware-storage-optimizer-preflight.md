@@ -61,14 +61,15 @@ This ADR covers only that scoped v1.1.0 phase slice.
    `/api/v1/storage/roots` without changing existing torrent workflow.
 - Add operations fail fast under low-space conditions, avoiding partial
   write-path behavior and making the behavior deterministic.
-- This phase intentionally does not define CoW policy, root-level queue caps,
-  write-pressure tuning, or state-directory routing; those remain future
-  backlog work.
+- This phase intentionally does not define CoW policy or state-directory
+  routing. Root-level active-work, write-pressure, and recheck controls were
+  subsequently decided in ADR-0056.
 
 ## Related Documents
 
-- [Backlog feature: Disk-aware storage optimizer](../BACKLOG.md)
+- [Product backlog](../BACKLOG.md)
 - [API reference](../../docs/api.md)
 - [Configuration reference](../../docs/configuration.md)
 - [API design notes](../api.md)
 - [ADR-0036: Large-Library Torrent Query API](0036-large-library-torrent-query-api.md)
+- [ADR-0056: Storage-Root Resource Controls](0056-storage-root-resource-controls.md)

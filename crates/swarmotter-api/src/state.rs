@@ -25,6 +25,7 @@ use swarmotter_core::models::storage::StorageDiagnostics;
 use swarmotter_core::models::torrent::TorrentFile;
 use swarmotter_core::models::torrent::TorrentSummary;
 use swarmotter_core::models::tracker::TrackerInfo;
+use swarmotter_core::peer_filter::{ManualPeerBan, PeerFilterConfig, PeerFilterStatus};
 use tokio::sync::Mutex;
 
 /// Options applied when registering a newly added torrent.
@@ -32,6 +33,14 @@ use tokio::sync::Mutex;
 pub struct AddTorrentOptions {
     pub download_dir: Option<String>,
     pub paused: bool,
+    /// Whether `paused` came from an explicit caller choice. If false, the
+    /// daemon resolves the effective profile/global start behavior.
+    pub start_behavior_explicit: bool,
+    /// Explicit profile requested at add time.
+    pub profile: Option<String>,
+    /// Labels assigned before policy resolution so label mappings can select a
+    /// profile deterministically.
+    pub labels: Vec<String>,
 }
 
 impl AddTorrentOptions {
@@ -39,6 +48,30 @@ impl AddTorrentOptions {
         Self {
             download_dir,
             paused,
+            // Preserve the historical programmatic-add behavior: `false`
+            // delegates to the daemon's queue/profile policy, while `true`
+            // remains an explicit pause request.
+            start_behavior_explicit: paused,
+            profile: None,
+            labels: Vec::new(),
+        }
+    }
+
+    /// Construct options from an API request where no paused/start value may
+    /// have been supplied. Existing programmatic callers should use `new`.
+    pub fn request(
+        download_dir: Option<String>,
+        paused: bool,
+        start_behavior_explicit: bool,
+        profile: Option<String>,
+        labels: Vec<String>,
+    ) -> Self {
+        Self {
+            download_dir,
+            paused,
+            start_behavior_explicit,
+            profile,
+            labels,
         }
     }
 }
@@ -112,6 +145,19 @@ pub trait DaemonOps: Send + Sync + 'static {
         seeding: swarmotter_core::ratio::TorrentSeeding,
     ) -> Result<TorrentSummary>;
 
+    /// Explain the profile-derived effective policy for a torrent.
+    async fn torrent_policy(
+        &self,
+        _hash: &InfoHash,
+    ) -> Option<swarmotter_core::policy::EffectiveTorrentPolicy> {
+        None
+    }
+    /// Assign or clear an explicit profile for a torrent. Storage paths remain
+    /// unchanged; moving data is a separate explicit operation.
+    async fn set_torrent_profile(&self, _hash: &InfoHash, _profile: Option<String>) -> Result<()> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
+
     /// List files for a torrent.
     async fn list_files(&self, hash: &InfoHash) -> Option<Vec<TorrentFile>>;
     /// Set wanted/unwanted files.
@@ -140,6 +186,25 @@ pub trait DaemonOps: Send + Sync + 'static {
 
     /// List peers for a torrent.
     async fn list_peers(&self, hash: &InfoHash) -> Option<Vec<Peer>>;
+
+    /// Report the compiled global peer-admission policy and its active-instance
+    /// counters. This is distinct from network containment: admitted peers
+    /// still use the contained data-plane binder.
+    async fn peer_filter_status(&self) -> PeerFilterStatus;
+    /// Replace the complete global peer-admission policy through the daemon's
+    /// normal persistent configuration transaction.
+    async fn replace_peer_filter(&self, peer_filter: PeerFilterConfig) -> Result<PeerFilterStatus>;
+    /// Add or update a global manual IP ban after confirming the supplied
+    /// torrent exists. The torrent hash scopes the UI action; the policy is
+    /// deliberately global so every torrent receives the same protection.
+    async fn ban_peer(&self, hash: &InfoHash, ban: ManualPeerBan) -> Result<PeerFilterStatus>;
+    /// Remove a global manual IP ban after confirming the supplied torrent
+    /// exists. Removing an absent ban is idempotent.
+    async fn unban_peer(&self, hash: &InfoHash, ip: String) -> Result<PeerFilterStatus>;
+    /// Remove a global manual IP ban without requiring a currently selected
+    /// torrent. This supports the global peer-admission settings surface.
+    /// Removing an absent ban is idempotent.
+    async fn unban_global_peer(&self, ip: String) -> Result<PeerFilterStatus>;
 
     /// Queue: move up.
     async fn queue_move_up(&self, hash: &InfoHash) -> Result<()>;

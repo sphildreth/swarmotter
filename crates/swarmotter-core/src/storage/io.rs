@@ -23,6 +23,7 @@ use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+use crate::bandwidth::{RateDirection, RateLimiter};
 use crate::error::{CoreError, Result};
 use crate::hash::InfoHash;
 use crate::meta::TorrentMeta;
@@ -38,6 +39,10 @@ pub struct StorageIo {
     download_dir: PathBuf,
     file_handles: Arc<Mutex<HashMap<usize, CachedFileHandle>>>,
     resume_write_lock: Arc<Mutex<()>>,
+    /// Optional shared sustained payload-write limiter. The daemon gives every
+    /// active torrent on one configured storage root the same limiter, so this
+    /// caps aggregate disk pressure without changing storage correctness.
+    write_limiter: Option<RateLimiter>,
 }
 
 #[derive(Clone)]
@@ -119,7 +124,18 @@ impl StorageIo {
             download_dir: download_dir.into(),
             file_handles: Arc::new(Mutex::new(HashMap::new())),
             resume_write_lock: Arc::new(Mutex::new(())),
+            write_limiter: None,
         }
+    }
+
+    /// Apply an optional shared sustained payload-write limiter.
+    ///
+    /// The limiter is consumed before a verified payload write. It never
+    /// drops, modifies, or reorders bytes; a configured limit only delays the
+    /// write until the root-level budget is available.
+    pub fn with_write_limiter(mut self, write_limiter: Option<RateLimiter>) -> Self {
+        self.write_limiter = write_limiter;
+        self
     }
 
     /// The torrent name (top-level directory or single-file name).
@@ -430,6 +446,9 @@ impl StorageIo {
             return Err(CoreError::Storage(format!(
                 "storage write mapped {mapped_len} of {data_len} bytes"
             )));
+        }
+        if let Some(limiter) = &self.write_limiter {
+            limiter.acquire(RateDirection::Download, data_len).await;
         }
         let mut data_off = 0usize;
         for slice in slices {

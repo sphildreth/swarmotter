@@ -330,6 +330,90 @@ single-file torrents still create a zero-length placeholder in
 payload until data is written. With `sparse = false`, active payload files are
 sized up front.
 
+### Per-root storage controls
+
+Use repeatable `[[storage.root_controls]]` entries to give different local
+storage roots independent admission, write-pressure, and recheck budgets:
+
+```toml
+[[storage.root_controls]]
+path = "/srv/torrents/hdd"
+max_active_downloads = 2
+max_active_bytes = 107374182400
+max_write_bytes_per_second = 52428800
+max_concurrent_rechecks = 1
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `path` | required | Lexical root path. A control applies to this path and descendants. |
+| `max_active_downloads` | `0` | Maximum active torrent engines on the root; `0` is unlimited. |
+| `max_active_bytes` | `0` | Maximum sum of admitted declared payload bytes on the root; `0` is unlimited. |
+| `max_write_bytes_per_second` | `0` | Shared sustained rate for verified local payload writes; `0` is unlimited. |
+| `max_concurrent_rechecks` | `0` | Maximum full rechecks running on the root; `0` is unlimited. |
+
+Nested controls are allowed; the most-specific lexical path wins. Duplicate
+normalized paths are rejected. The active write directory determines the
+matching control, so an `incomplete_dir` below a root shares its budget with
+other descendants. Active-engine count and declared payload bytes are reserved
+before an engine starts; a saturated root leaves eligible work queued until
+capacity becomes available. A magnet reservation is updated after its metadata
+is verified. `max_active_bytes` is a scheduling budget, not a replacement for
+the free-space reserve preflight.
+
+The write ceiling delays verified local payload writes without dropping or
+modifying data. Full rechecks wait for a root slot and release it even if their
+request is cancelled. Existing work may finish safely during a configuration
+replacement; subsequent admissions use the replacement controls.
+
+### `[profiles]`
+
+Named policy profiles keep category-style defaults consistent without copying
+queue, seeding, or bandwidth values into every torrent. A profile can supply
+storage paths, queue priority, initial start behavior, ratio/idle defaults,
+seed-forever, and per-torrent transfer caps. Labels map case-insensitively to
+profiles; when more than one mapped label is present, the normalized label name
+makes the selection deterministic.
+
+```toml
+[profiles.labels]
+linux = "linux-release"
+
+[profiles.profiles.linux-release.storage]
+download_dir = "/srv/releases/linux"
+incomplete_dir = "/srv/releases/.incoming"
+
+[profiles.profiles.linux-release.queue]
+priority = "high"       # low, normal, or high
+start_behavior = "start" # start or paused
+
+[profiles.profiles.linux-release.seeding]
+ratio_limit = 2.0
+idle_limit = 86400
+seed_forever = false
+
+[profiles.profiles.linux-release.bandwidth]
+download_limit = 0       # bytes/sec; 0 is unlimited
+upload_limit = 5242880
+```
+
+An explicit profile supplied at add time, by a watch folder, or through the
+torrent policy API wins over a label mapping. Per-torrent limits and seeding
+settings then win for their individual fields. Profile queue priority,
+seeding, and rate limits remain live for inheriting torrents. `start_behavior`
+controls initial admission; changing it never stops already-running work.
+
+Storage is deliberately different: the resolved completed and incomplete
+paths are captured when a torrent is registered, including the global/no-
+profile result. Editing a profile, changing labels on an existing torrent, or
+assigning a profile later never relocates data. The resolved start-or-paused
+decision is captured at registration too, so later profile or global
+auto-start edits cannot revoke a queued torrent's admission. Use the move-data
+operation for an intentional relocation. State restored from before these
+fields is migrated transactionally from its preceding effective values when a
+profile configuration replacement is applied; until then it retains legacy
+global queue behavior.
+
 ### `[network]`
 
 | Option | Default | Meaning |
@@ -527,6 +611,34 @@ In strict mode, bootstrap hostnames are subject to DNS containment policy.
 | `enabled` | `true` | Enables peer exchange for non-private torrents. |
 | `max_peers` | `0` | PEX peer addition cap, `0` means unlimited. |
 
+### `[peer_filter]`
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Enables global peer-admission filtering. |
+| `rules` | `[]` | IP addresses, CIDRs, or inclusive IP ranges to reject. |
+| `blocklist_paths` | `[]` | Explicit local eMule/PeerGuardian-style blocklist files to load. |
+| `manual_bans` | `[]` | Global IP bans created by an operator or the Peer UI action. |
+| `blocked_client_ids` | `[]` | Printable peer-ID prefixes to reject after a BitTorrent handshake. |
+
+Each manual-ban entry has an `ip` and optional nonblank 1–240-character
+`reason`. Client-ID prefixes must be 1–20 printable ASCII characters.
+
+Blocklist imports are local-only UTF-8 regular files. Each is limited to 32 MiB
+and 4 KiB per line; configured/imported rule sets are capped at 250,000 rules.
+Blank and comment lines are ignored. A malformed otherwise non-empty import
+line is skipped and counted in that source's `skipped_lines` status, while an
+overlong line, unreadable/non-UTF-8/non-regular file, or limit excess rejects
+the configuration update. SwarmOtter never fetches blocklists itself.
+
+A policy update rebuilds peer work transactionally, so a persistence or
+reconstruction failure restores the prior compiled policy and session
+instance. The status counters belong to the active compiled policy instance and
+reset after a successful replacement. IP rules reject candidate peers before a
+socket is opened and inbound peers before service; peer-ID-prefix rules run
+after the BitTorrent handshake. Neither rule type replaces the required
+network-containment path.
+
 ### `[[watch]]`
 
 | Option | Default | Meaning |
@@ -535,6 +647,7 @@ In strict mode, bootstrap hostnames are subject to DNS containment policy.
 | `recursive` | `false` | Scans child folders when true. |
 | `download_dir` | unset | Per-watch download directory override. |
 | `label` | unset | Label applied to imports. |
+| `profile` | unset | Named profile applied before the torrent is registered. It must exist in `[profiles.profiles]`. |
 | `start_behavior` | `"start"` | `"start"` or `"paused"`. |
 | `archive_dir` | unset | Where imported files are archived. |
 | `failure_dir` | unset | Where failed imports are moved. |
@@ -545,6 +658,10 @@ metadata limit (`MAX_TORRENT_METADATA_BYTES`) before parsing and before any
 piece-sized allocation, regardless of `max_request_body_bytes`. Oversized or
 malformed watch files are rejected as `malformed_torrent` / `bencode_error`
 and never panic the daemon. See ADR-0050.
+
+Watch `profile`, `label`, and `download_dir` defaults are applied before policy
+resolution. A watch profile therefore captures its storage paths for a newly
+imported torrent; later edits affect only the profile's live inheriting fields.
 
 Watch ingestion is stability-gated (ADR-0054). The scanner walks in a blocking
 filesystem task, sorts root-relative paths, rejects a configured symlink root,

@@ -123,6 +123,7 @@ impl DaemonRuntime {
             let _ = finished.await;
         }
         let cfg = self.config.read().await.clone();
+        let peer_filter = self.peer_filter.read().await.clone();
         let binder = self.make_binder().await;
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
@@ -134,6 +135,7 @@ impl DaemonRuntime {
             shutdown_rx,
             self.peer_permit_pool.read().await.clone(),
         )
+        .with_peer_filter(peer_filter)
         .with_bound_addr(bound_tx);
         *self.seeder_listener_shutdown.lock().await = Some(shutdown_tx);
         let containment_gate = self.containment_gate.clone();
@@ -252,8 +254,8 @@ impl DaemonRuntime {
                 uploaded: torrent.uploaded,
                 idle_seconds,
             };
-            if ratio::evaluate_seeding(&accounting, &cfg.seeding, &torrent.seeding)
-                == SeedDecision::Continue
+            let (global, per_torrent) = Self::effective_ratio_policy(&cfg, torrent);
+            if ratio::evaluate_seeding(&accounting, &global, &per_torrent) == SeedDecision::Continue
             {
                 intents.insert(*hash, ContainmentRecoveryIntent::Seeding);
             }
@@ -547,10 +549,10 @@ impl DaemonRuntime {
             .get(&hash)
             .cloned()
             .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
-        let global = self.config.read().await.seeding.clone();
+        let config = self.config.read().await.clone();
         let idle_seconds =
             now().saturating_sub(torrent.date_completed.unwrap_or(torrent.date_added));
-        let status = automatic_seeding_status(&torrent, &global, idle_seconds);
+        let status = automatic_seeding_status(&torrent, &config, idle_seconds);
         if status != SeedingStatus::Queued {
             if let Some(stored) = self.registry.lock().await.get_mut(&hash) {
                 stored.state = TorrentState::Completed;
@@ -562,7 +564,7 @@ impl DaemonRuntime {
         }
         torrent.seeding_status = SeedingStatus::Queued;
         let complete_dir = self.resolve_download_dir(&torrent).await;
-        let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
+        let active_dir = self.resolve_incomplete_dir_for(&torrent).await;
         let state = Arc::new(Mutex::new(EngineState {
             piece_count: torrent.meta.piece_count(),
             total_length: torrent.meta.total_length,
@@ -975,7 +977,7 @@ impl DaemonRuntime {
                 .unwrap_or_else(|| {
                     now_secs.saturating_sub(torrent.date_completed.unwrap_or(torrent.date_added))
                 });
-            let status = automatic_seeding_status(torrent, &cfg.seeding, idle_seconds);
+            let status = automatic_seeding_status(torrent, &cfg, idle_seconds);
             desired_status.insert(hash, status);
             if status == SeedingStatus::Queued
                 && (seeding_limit == 0 || allowed.len() < seeding_limit)
@@ -1039,7 +1041,7 @@ impl DaemonRuntime {
                 continue;
             };
             let complete_dir = self.resolve_download_dir(&torrent_for_dir).await;
-            let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
+            let active_dir = self.resolve_incomplete_dir_for(&torrent_for_dir).await;
             let existing_state = self.engine_states.read().await.get(&hash).cloned();
             let state = if let Some(state) = existing_state {
                 state

@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use std::sync::Arc;
 use swarmotter_core::autopilot::{AutopilotAnalyzer, AutopilotConfig, AutopilotMode};
-use swarmotter_core::config::Config;
+use swarmotter_core::config::{Config, StartBehavior};
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::InfoHash;
 use swarmotter_core::magnet::Magnet;
@@ -29,6 +29,8 @@ use swarmotter_core::models::{
     NetworkDiagnostics, NetworkInterfaceDiagnostic, NetworkPathCheck, ResetResult,
     WatchFolderStatus, WatchStatus,
 };
+use swarmotter_core::peer_filter::{ManualPeerBan, PeerFilter, PeerFilterConfig, PeerFilterStatus};
+use swarmotter_core::policy::{EffectiveTorrentPolicy, PolicyProfileOrigin, PolicyStorageSnapshot};
 use swarmotter_core::torrent::{Torrent, TorrentRegistry};
 use swarmotter_core::watch::ImportResult;
 use tokio::sync::Mutex;
@@ -78,20 +80,34 @@ impl FakeDaemon {
     }
 
     async fn summary(&self, hash: &InfoHash) -> Option<TorrentSummary> {
-        let mut summary = self
-            .registry
-            .lock()
-            .await
-            .get(hash)
-            .map(Torrent::to_summary)?;
-        let global = &self.config.lock().await.seeding;
-        summary.effective_ratio_limit = summary.seeding.effective_ratio_limit(global);
-        summary.effective_idle_limit = summary.seeding.effective_idle_limit(global);
+        let torrent = self.registry.lock().await.get(hash).cloned()?;
+        let config = self.config.lock().await.clone();
+        let policy = EffectiveTorrentPolicy::resolve(&config, &torrent);
+        let mut summary = torrent.to_summary();
+        summary.effective_ratio_limit = (!policy.seed_forever.value)
+            .then_some(policy.ratio_limit.value)
+            .flatten();
+        summary.effective_idle_limit = (!policy.seed_forever.value)
+            .then_some(policy.idle_limit.value)
+            .flatten();
         Some(summary)
     }
 
     async fn record_call(&self, call: &'static str) {
         self.calls.lock().await.push(call);
+    }
+
+    async fn remove_manual_ban(&self, ip: String) -> Result<PeerFilterStatus> {
+        let ip = ip.trim().parse::<std::net::IpAddr>().map_err(|error| {
+            CoreError::InvalidArgument(format!("manual peer ban IP '{ip}': {error}"))
+        })?;
+        let mut next = self.config.lock().await.clone();
+        next.peer_filter
+            .manual_bans
+            .retain(|existing| existing.ip.trim().parse::<std::net::IpAddr>() != Ok(ip));
+        next.validate()?;
+        *self.config.lock().await = next.clone();
+        Ok(PeerFilter::from_config(&next.peer_filter)?.status())
     }
 
     #[allow(dead_code)]
@@ -125,6 +141,59 @@ impl FakeDaemon {
     }
 }
 
+async fn apply_fake_add_policy(
+    config: &Mutex<Config>,
+    torrent: &mut Torrent,
+    options: &AddTorrentOptions,
+) -> Result<bool> {
+    torrent.labels = options.labels.clone();
+    if let Some(profile) = options.profile.as_ref() {
+        let config = config.lock().await.clone();
+        if !config.profiles.profiles.contains_key(profile) {
+            return Err(CoreError::InvalidArgument(format!(
+                "unknown policy profile {profile}"
+            )));
+        }
+        torrent.policy.profile = Some(profile.clone());
+        torrent.policy.profile_origin = Some(PolicyProfileOrigin::AddRequest);
+    }
+    let config = config.lock().await.clone();
+    let effective = EffectiveTorrentPolicy::resolve(&config, torrent);
+    if torrent.policy.storage_snapshot.is_none() {
+        torrent.policy.storage_snapshot = Some(PolicyStorageSnapshot {
+            profile: effective
+                .profile
+                .as_ref()
+                .map(|profile| profile.name.clone())
+                .unwrap_or_default(),
+            preserve_existing_storage: false,
+            download_dir: effective.download_dir.value,
+            incomplete_dir: effective.incomplete_dir.value,
+        });
+    }
+    let initial_start_behavior = if options.start_behavior_explicit {
+        if options.paused {
+            StartBehavior::Paused
+        } else {
+            StartBehavior::Start
+        }
+    } else {
+        effective.start_behavior.value
+    };
+    torrent.policy.initial_start_behavior = Some(initial_start_behavior);
+    let profile_requests_pause = effective
+        .profile
+        .as_ref()
+        .and_then(|assignment| config.profiles.profiles.get(&assignment.name))
+        .and_then(|profile| profile.queue.start_behavior)
+        .is_some_and(|behavior| matches!(behavior, StartBehavior::Paused));
+    Ok(if options.start_behavior_explicit {
+        options.paused
+    } else {
+        profile_requests_pause
+    })
+}
+
 impl Default for FakeDaemon {
     fn default() -> Self {
         Self::new()
@@ -134,20 +203,29 @@ impl Default for FakeDaemon {
 #[async_trait]
 impl swarmotter_api::state::DaemonOps for FakeDaemon {
     async fn list_torrents(&self) -> Vec<TorrentSummary> {
-        let mut summaries = self
+        let torrents = self
             .registry
             .lock()
             .await
             .list()
             .iter()
-            .map(|t| t.to_summary())
+            .map(|t| (*t).clone())
             .collect::<Vec<_>>();
-        let config = self.config.lock().await;
-        for summary in &mut summaries {
-            summary.effective_ratio_limit = summary.seeding.effective_ratio_limit(&config.seeding);
-            summary.effective_idle_limit = summary.seeding.effective_idle_limit(&config.seeding);
-        }
-        summaries
+        let config = self.config.lock().await.clone();
+        torrents
+            .iter()
+            .map(|torrent| {
+                let policy = EffectiveTorrentPolicy::resolve(&config, torrent);
+                let mut summary = torrent.to_summary();
+                summary.effective_ratio_limit = (!policy.seed_forever.value)
+                    .then_some(policy.ratio_limit.value)
+                    .flatten();
+                summary.effective_idle_limit = (!policy.seed_forever.value)
+                    .then_some(policy.idle_limit.value)
+                    .flatten();
+                summary
+            })
+            .collect()
     }
     async fn get_torrent(&self, hash: &InfoHash) -> Option<TorrentSummary> {
         self.summary(hash).await
@@ -160,8 +238,9 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         self.record_call("add_torrent_file").await;
         let meta = meta::parse_torrent(&bytes)?;
         let mut t = Torrent::new(meta, now());
-        t.download_dir = options.download_dir;
-        if options.paused {
+        t.download_dir = options.download_dir.clone();
+        let paused = apply_fake_add_policy(&self.config, &mut t, &options).await?;
+        if paused {
             t.state = TorrentState::Paused;
         }
         self.insert(t).await
@@ -179,12 +258,13 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         );
         let meta = meta::parse_torrent(&bytes)?;
         let mut t = Torrent::new(meta, now());
-        t.state = if options.paused {
+        t.download_dir = options.download_dir.clone();
+        let paused = apply_fake_add_policy(&self.config, &mut t, &options).await?;
+        t.state = if paused {
             TorrentState::Paused
         } else {
             TorrentState::DownloadingMetadata
         };
-        t.download_dir = options.download_dir;
         self.insert(t).await
     }
     async fn remove_torrent(&self, hash: &InfoHash, _delete_data: bool) -> Result<()> {
@@ -256,9 +336,27 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         Ok(())
     }
     async fn set_labels(&self, hash: &InfoHash, labels: Vec<String>) -> Result<()> {
+        let config = self.config.lock().await.clone();
         let mut reg = self.registry.lock().await;
         match reg.get_mut(hash) {
             Some(t) => {
+                if t.policy.storage_snapshot.is_none() {
+                    let effective = EffectiveTorrentPolicy::resolve(&config, t);
+                    t.policy.storage_snapshot = Some(PolicyStorageSnapshot {
+                        profile: String::new(),
+                        preserve_existing_storage: true,
+                        download_dir: if t.download_dir.is_none() {
+                            effective.download_dir.value
+                        } else {
+                            None
+                        },
+                        incomplete_dir: if t.policy.overrides.incomplete_dir.is_none() {
+                            effective.incomplete_dir.value
+                        } else {
+                            None
+                        },
+                    });
+                }
                 t.labels = labels;
                 Ok(())
             }
@@ -275,6 +373,8 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             Some(t) => {
                 t.download_limit = limits.download;
                 t.upload_limit = limits.upload;
+                t.policy.overrides.download_limit = Some(limits.download);
+                t.policy.overrides.upload_limit = Some(limits.upload);
                 Ok(())
             }
             None => Err(CoreError::NotFound("torrent".into())),
@@ -292,6 +392,9 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
                 .get_mut(hash)
                 .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
             torrent.seeding = seeding;
+            torrent.policy.overrides.ratio_limit = torrent.seeding.ratio_limit;
+            torrent.policy.overrides.idle_limit = torrent.seeding.idle_limit;
+            torrent.policy.overrides.seed_forever = Some(torrent.seeding.seed_forever);
         }
         self.summary(hash)
             .await
@@ -426,6 +529,60 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         self.registry.lock().await.get(hash)?;
         Some(Vec::new())
     }
+    async fn peer_filter_status(&self) -> PeerFilterStatus {
+        let config = self.config.lock().await.clone();
+        PeerFilter::from_config(&config.peer_filter)
+            .unwrap_or_else(|error| PeerFilter::fail_closed(error.to_string()))
+            .status()
+    }
+    async fn replace_peer_filter(&self, peer_filter: PeerFilterConfig) -> Result<PeerFilterStatus> {
+        self.record_call("replace_peer_filter").await;
+        let mut next = self.config.lock().await.clone();
+        next.peer_filter = peer_filter;
+        next.validate()?;
+        *self.config.lock().await = next.clone();
+        Ok(PeerFilter::from_config(&next.peer_filter)?.status())
+    }
+    async fn ban_peer(&self, hash: &InfoHash, ban: ManualPeerBan) -> Result<PeerFilterStatus> {
+        self.record_call("ban_peer").await;
+        if self.registry.lock().await.get(hash).is_none() {
+            return Err(CoreError::NotFound("torrent".into()));
+        }
+        let ip = ban.ip.trim().parse::<std::net::IpAddr>().map_err(|error| {
+            CoreError::InvalidArgument(format!("manual peer ban IP '{}': {error}", ban.ip))
+        })?;
+        let mut next = self.config.lock().await.clone();
+        next.peer_filter.enabled = true;
+        let ban = ManualPeerBan {
+            ip: ip.to_string(),
+            reason: ban.reason.map(|reason| reason.trim().to_string()),
+        };
+        if let Some(existing) = next.peer_filter.manual_bans.iter_mut().find(|existing| {
+            existing
+                .ip
+                .trim()
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|current| current == ip)
+        }) {
+            *existing = ban;
+        } else {
+            next.peer_filter.manual_bans.push(ban);
+        }
+        next.validate()?;
+        *self.config.lock().await = next.clone();
+        Ok(PeerFilter::from_config(&next.peer_filter)?.status())
+    }
+    async fn unban_peer(&self, hash: &InfoHash, ip: String) -> Result<PeerFilterStatus> {
+        self.record_call("unban_peer").await;
+        if self.registry.lock().await.get(hash).is_none() {
+            return Err(CoreError::NotFound("torrent".into()));
+        }
+        self.remove_manual_ban(ip).await
+    }
+    async fn unban_global_peer(&self, ip: String) -> Result<PeerFilterStatus> {
+        self.record_call("unban_global_peer").await;
+        self.remove_manual_ban(ip).await
+    }
     async fn queue_move_up(&self, _hash: &InfoHash) -> Result<()> {
         Ok(())
     }
@@ -473,6 +630,52 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             applied_runtime_fields: vec!["config".into()],
             config: redacted,
         })
+    }
+    async fn torrent_policy(
+        &self,
+        hash: &InfoHash,
+    ) -> Option<swarmotter_core::policy::EffectiveTorrentPolicy> {
+        let torrent = self.registry.lock().await.get(hash).cloned()?;
+        let config = self.config.lock().await.clone();
+        Some(EffectiveTorrentPolicy::resolve(&config, &torrent))
+    }
+    async fn set_torrent_profile(&self, hash: &InfoHash, profile: Option<String>) -> Result<()> {
+        let config = self.config.lock().await.clone();
+        if let Some(profile) = profile.as_ref() {
+            if !config.profiles.profiles.contains_key(profile) {
+                return Err(CoreError::InvalidArgument(format!(
+                    "unknown policy profile {profile}"
+                )));
+            }
+        }
+        let mut registry = self.registry.lock().await;
+        let torrent = registry
+            .get_mut(hash)
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+        if torrent.policy.storage_snapshot.is_none() {
+            let effective = EffectiveTorrentPolicy::resolve(&config, torrent);
+            torrent.policy.storage_snapshot = Some(PolicyStorageSnapshot {
+                profile: String::new(),
+                preserve_existing_storage: true,
+                download_dir: if torrent.download_dir.is_none() {
+                    effective.download_dir.value
+                } else {
+                    None
+                },
+                incomplete_dir: if torrent.policy.overrides.incomplete_dir.is_none() {
+                    effective.incomplete_dir.value
+                } else {
+                    None
+                },
+            });
+        }
+        torrent.policy.profile = profile;
+        torrent.policy.profile_origin = torrent
+            .policy
+            .profile
+            .as_ref()
+            .map(|_| PolicyProfileOrigin::Torrent);
+        Ok(())
     }
     async fn reset_downloads(&self) -> Result<ResetResult> {
         let removed = self.registry.lock().await.torrents.len();

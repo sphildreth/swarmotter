@@ -9,11 +9,14 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeSet;
-use swarmotter_core::config::{Config, StartBehavior, WatchFolderConfig};
+use swarmotter_core::config::{Config, StartBehavior, StorageRootControl, WatchFolderConfig};
 use swarmotter_core::meta::{build_single_file_torrent, MAX_TORRENT_METADATA_BYTES};
-use swarmotter_core::models::network::NetworkContainmentStatus;
+use swarmotter_core::models::network::{NetworkContainmentMode, NetworkContainmentStatus};
 use swarmotter_core::models::{
     ConfigUpdateResult, DiagnosticLevel, DoctorReport, LogSnapshot, NetworkDiagnostics, WatchStatus,
+};
+use swarmotter_core::policy::{
+    PolicyBandwidth, PolicyProfile, PolicyQueue, PolicySeeding, PolicyStorage, QueuePriority,
 };
 use tower::ServiceExt;
 
@@ -1265,6 +1268,117 @@ async fn settings_get_and_update() {
 }
 
 #[tokio::test]
+async fn policy_profiles_apply_at_add_and_expose_explainable_native_routes() {
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.storage.download_dir = Some("/global/complete".into());
+    cfg.storage.incomplete_dir = Some("/global/incomplete".into());
+    cfg.profiles.profiles.insert(
+        "linux".into(),
+        PolicyProfile {
+            storage: PolicyStorage {
+                download_dir: Some("/profiles/linux/complete".into()),
+                incomplete_dir: Some("/profiles/linux/incomplete".into()),
+            },
+            queue: PolicyQueue {
+                priority: Some(QueuePriority::High),
+                start_behavior: Some(StartBehavior::Paused),
+            },
+            seeding: PolicySeeding {
+                ratio_limit: Some(2.0),
+                idle_limit: Some(600),
+                seed_forever: Some(false),
+            },
+            bandwidth: PolicyBandwidth {
+                download_limit: Some(1_000),
+                upload_limit: Some(2_000),
+            },
+        },
+    );
+    cfg.profiles.labels.insert("linux".into(), "linux".into());
+    let state = fake_daemon::fake_state_with_config(cfg.clone());
+    let app = swarmotter_api::app_router(state);
+
+    let (status, profiles) = get_json(&app, "/api/v1/profiles").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(profiles["data"]["labels"]["linux"], "linux");
+    assert_eq!(
+        profiles["data"]["profiles"]["linux"]["storage"]["download_dir"],
+        "/profiles/linux/complete"
+    );
+
+    let (status, added) = post_json(
+        &app,
+        "/api/v1/torrents/magnet",
+        serde_json::json!({ "magnet": named_magnet(9_001, "profiled-linux"), "labels": ["linux"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hash = added["data"].as_str().unwrap();
+
+    let (status, policy) = get_json(&app, &format!("/api/v1/torrents/{hash}/policy")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(policy["data"]["profile"]["name"], "linux");
+    assert_eq!(policy["data"]["profile"]["source"]["kind"], "label");
+    assert_eq!(
+        policy["data"]["download_dir"]["value"],
+        "/profiles/linux/complete"
+    );
+    assert_eq!(
+        policy["data"]["download_dir"]["source"]["kind"],
+        "profile_storage_snapshot"
+    );
+    assert_eq!(policy["data"]["queue_priority"]["value"], "high");
+    assert_eq!(policy["data"]["start_behavior"]["value"], "paused");
+    assert_eq!(policy["data"]["download_limit"]["value"], 1_000);
+
+    let mut replacement = cfg.profiles.clone();
+    replacement.profiles.insert(
+        "manual".into(),
+        PolicyProfile {
+            bandwidth: PolicyBandwidth {
+                download_limit: Some(3_000),
+                upload_limit: Some(4_000),
+            },
+            ..Default::default()
+        },
+    );
+    let (status, replaced) = put_json(
+        &app,
+        "/api/v1/profiles",
+        serde_json::to_value(&replacement).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(replaced["data"]["profiles"]["manual"].is_object());
+
+    let (status, assigned) = put_json(
+        &app,
+        &format!("/api/v1/torrents/{hash}/policy"),
+        serde_json::json!({ "profile": "manual" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(assigned["success"], true);
+
+    let (status, assigned_policy) =
+        get_json(&app, &format!("/api/v1/torrents/{hash}/policy")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(assigned_policy["data"]["profile"]["name"], "manual");
+    assert_eq!(
+        assigned_policy["data"]["profile"]["source"]["kind"],
+        "profile"
+    );
+    // Reassignment changes live fields but preserves the original add-time
+    // storage snapshot rather than moving the payload into the manual profile.
+    assert_eq!(
+        assigned_policy["data"]["download_dir"]["value"],
+        "/profiles/linux/complete"
+    );
+    assert_eq!(assigned_policy["data"]["download_limit"]["value"], 3_000);
+}
+
+#[tokio::test]
 async fn settings_put_replaces_and_preserves_auth_token() {
     let mut cfg = Config::default();
     cfg.network.mode = swarmotter_core::models::network::NetworkContainmentMode::Disabled;
@@ -1973,6 +2087,158 @@ async fn compatibility_keeps_only_previously_supported_ratio_and_upload_fields()
 }
 
 #[tokio::test]
+async fn compatibility_omitted_paused_uses_label_profile_admission() {
+    let mut cfg = Config::default();
+    cfg.compatibility.qbittorrent.enabled = true;
+    cfg.compatibility.transmission.enabled = true;
+    cfg.profiles.profiles.insert(
+        "hold".into(),
+        PolicyProfile {
+            queue: PolicyQueue {
+                start_behavior: Some(StartBehavior::Paused),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    cfg.profiles.labels.insert("hold".into(), "hold".into());
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let qb_paused_magnet =
+        "magnet%3A%3Fxt%3Durn%3Abtih%3Add8255ecdc7ca55fb0bbf81323d87062ba1f7a4e%26dn%3Dqb-profile-paused";
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/add",
+        &format!("urls={qb_paused_magnet}&category=hold"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+
+    let (status, body) = qb_get(
+        app.clone(),
+        "/api/v2/torrents/info?category=hold",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rows.as_array().unwrap()[0]["state"], "pausedDL");
+
+    // Explicit false must remain an explicit start request, even when the
+    // category selects a paused profile.
+    let qb_started_magnet =
+        "magnet%3A%3Fxt%3Durn%3Abtih%3A1111111111111111111111111111111111111111%26dn%3Dqb-profile-started";
+    let (status, _, body) = qb_post_form(
+        app.clone(),
+        "/api/v2/torrents/add",
+        &format!("urls={qb_started_magnet}&paused=false&category=hold"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+    let (status, body) = qb_get(
+        app.clone(),
+        "/api/v2/torrents/info?category=hold",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let started = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "qb-profile-started")
+        .unwrap();
+    assert_eq!(started["state"], "metaDL");
+
+    let session = transmission_session(app.clone(), None).await;
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "method": "torrent-add",
+            "arguments": {
+                "filename": named_magnet(9_199, "transmission-profile-paused"),
+                "labels": ["hold"]
+            }
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let paused_hash = body["arguments"]["torrent-added"]["hashString"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "method": "torrent-get",
+            "arguments": { "fields": ["hashString", "status"] }
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let paused = body["arguments"]["torrents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["hashString"] == paused_hash)
+        .unwrap();
+    assert_eq!(paused["status"], 0);
+
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "method": "torrent-add",
+            "arguments": {
+                "filename": named_magnet(9_200, "transmission-profile-started"),
+                "labels": ["hold"],
+                "paused": false
+            }
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let started_hash = body["arguments"]["torrent-added"]["hashString"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, body) = transmission_rpc(
+        app,
+        &session,
+        serde_json::json!({
+            "method": "torrent-get",
+            "arguments": { "fields": ["hashString", "status"] }
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let started = body["arguments"]["torrents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["hashString"] == started_hash)
+        .unwrap();
+    assert_eq!(started["status"], 4);
+}
+
+#[tokio::test]
 async fn transmission_rpc_add_get_action_and_remove_torrent() {
     let mut cfg = Config::default();
     cfg.compatibility.transmission.enabled = true;
@@ -2315,6 +2581,13 @@ async fn storage_roots_endpoint_reports_reserve_configuration() {
     cfg.storage.download_dir = Some(root.display().to_string());
     cfg.storage.minimum_free_space_bytes = 4096;
     cfg.storage.minimum_free_space_percent = 5;
+    cfg.storage.root_controls = vec![StorageRootControl {
+        path: root.display().to_string(),
+        max_active_downloads: 2,
+        max_active_bytes: 8_192,
+        max_write_bytes_per_second: 1_024,
+        max_concurrent_rechecks: 1,
+    }];
     let state = fake_daemon::fake_state_with_config(cfg);
     let app = swarmotter_api::app_router(state);
 
@@ -2327,6 +2600,13 @@ async fn storage_roots_endpoint_reports_reserve_configuration() {
     assert_eq!(roots.len(), 1);
     assert_eq!(roots[0]["path"], root.display().to_string());
     assert!(roots[0]["available_space_bytes"].is_u64());
+    assert_eq!(roots[0]["root_control_path"], root.display().to_string());
+    assert_eq!(roots[0]["max_active_downloads"], 2);
+    assert_eq!(roots[0]["max_active_bytes"], 8_192);
+    assert_eq!(roots[0]["max_write_bytes_per_second"], 1_024);
+    assert_eq!(roots[0]["max_concurrent_rechecks"], 1);
+    assert_eq!(roots[0]["active_bytes"], 0);
+    assert_eq!(roots[0]["active_rechecks"], 0);
 
     let _ = std::fs::remove_dir_all(root);
 }
@@ -2339,6 +2619,7 @@ async fn watch_status_endpoint_reflects_config() {
         recursive: true,
         download_dir: Some("/tmp/downloads".into()),
         label: Some("linux".into()),
+        profile: None,
         start_behavior: StartBehavior::Paused,
         archive_dir: None,
         failure_dir: None,
@@ -2758,6 +3039,75 @@ async fn list_peers_returns_empty_for_added_torrent() {
     assert_eq!(v["success"], true);
     assert!(v["data"].is_array());
     assert_eq!(v["data"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn peer_filter_policy_status_and_manual_bans_are_available_through_api() {
+    let mut config = Config::default();
+    config.network.mode = NetworkContainmentMode::Disabled;
+    let app = swarmotter_api::routes::app_router(fake_daemon::fake_state_with_config(config));
+
+    let (status, initial) = get_json(&app, "/api/v1/peer-filter").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(initial["data"]["enabled"], false);
+    assert_eq!(initial["data"]["configured_rule_count"], 0);
+
+    let (status, replaced) = put_json(
+        &app,
+        "/api/v1/peer-filter",
+        serde_json::json!({
+            "enabled": true,
+            "rules": ["198.51.100.0/24"],
+            "blocklist_paths": [],
+            "manual_bans": [],
+            "blocked_client_ids": ["-ABCD"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replaced}");
+    assert_eq!(replaced["data"]["enabled"], true);
+    assert_eq!(
+        replaced["data"]["rules"],
+        serde_json::json!(["198.51.100.0/24"])
+    );
+    assert_eq!(replaced["data"]["configured_rule_count"], 1);
+    assert_eq!(replaced["data"]["blocked_client_ids"][0], "-ABCD");
+
+    let hash = add_named_test_magnet(&app, 210, "peer-filter", true, "/tmp/dl").await;
+    let (status, banned) = post_json(
+        &app,
+        &format!("/api/v1/torrents/{hash}/peers/ban"),
+        serde_json::json!({ "ip": "203.0.113.7", "reason": "operator review" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(banned["data"]["enabled"], true);
+    assert_eq!(banned["data"]["manual_bans"][0]["ip"], "203.0.113.7");
+    assert_eq!(
+        banned["data"]["manual_bans"][0]["reason"],
+        "operator review"
+    );
+
+    let (status, global_unbanned) = post_json(
+        &app,
+        "/api/v1/peer-filter/unban",
+        serde_json::json!({ "ip": "203.0.113.7" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        global_unbanned["data"]["manual_bans"],
+        serde_json::json!([])
+    );
+
+    let (status, unbanned) = post_json(
+        &app,
+        &format!("/api/v1/torrents/{hash}/peers/unban"),
+        serde_json::json!({ "ip": "203.0.113.7" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(unbanned["data"]["manual_bans"], serde_json::json!([]));
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 # SwarmOtter Comparison Matrix
 
-Last reviewed: 2026-07-06
+Last reviewed: 2026-07-13
 
 This document compares SwarmOtter with popular free and open-source torrent
 clients. It is intended to help users understand product fit, feature coverage,
@@ -146,7 +146,7 @@ differentiators.
 | Sequential download/streaming | Roadmap P2 | Partial | ✅ | Partial | ✅ | Partial | Partial |
 | Torrent creation | Roadmap P1 | ✅ | ✅ | Plugin | ✅ | ❌ | Plugin/scripts |
 | Superseeding/initial seeding | Roadmap P1 | Partial | ✅ | ✅ | ✅ | ❌ | ✅ |
-| IP filtering/blocklists | Roadmap P0 (table stakes) | ✅ | ✅ | Plugin | ✅ | ❌ | Partial |
+| IP filtering/blocklists | ✅ | ✅ | ✅ | Plugin | ✅ | ❌ | Partial |
 | UPnP/NAT-PMP | Roadmap P0 (table stakes) | ✅ | ✅ | ✅ | ✅ | ❌ | Partial |
 | SOCKS/proxy support | Roadmap P0 (table stakes) | ❌ | ✅ | ✅ | ✅ | ✅ | Partial |
 | HTTP/HTTPS proxy support | Roadmap P1 | ❌ | ✅ | ❌ | ❌ | ✅ | Partial |
@@ -155,7 +155,7 @@ differentiators.
 | Torrent metadata display (comment, creator, date) | Roadmap P1 | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
 | Magnet link generation from added torrents | Roadmap P1 | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
 | Torrent file export | Roadmap P1 | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
-| Categories/tags/policy groups | Roadmap P0 policy profiles | Partial | ✅ | Plugin | ✅ | ❌ | Partial |
+| Categories/tags/policy groups | Partial (labels and named profiles) | Partial | ✅ | Plugin | ✅ | ❌ | Partial |
 | Large-library UI operations | Roadmap P0 | Partial | Partial | Partial | Partial | ❌ | Partial |
 | Bulk import/export and backup | Roadmap P2 | Partial | Partial | Partial | Migration tooling | Session files | Session files |
 | Automation hooks | Roadmap P1 safe hooks | Completion script | External program/API | Execute plugin/API | Plugins | RPC/scripts | XMLRPC/scripts |
@@ -176,7 +176,8 @@ differentiators.
 | Transmission API emulation | ✅ | Native API | ❌ | ❌ | Partial remote support | ❌ | ❌ |
 | qBittorrent API emulation | Partial (v1.1.0 shim; deeper parity is Roadmap P0) | ❌ | Native API | ❌ | ❌ | ❌ | ❌ |
 | Adaptive swarm performance autopilot | Roadmap P0 | ❌ | ❌ | ❌ | Partial/plugin concepts | ❌ | Scripts/plugins |
-| Disk-aware storage optimizer | Roadmap P0 | ❌ | ❌ | ❌ | Partial disk views | ❌ | Manual |
+| Storage-root resource controls | ✅ | ❌ | ❌ | ❌ | Partial disk views | ❌ | Manual |
+| Filesystem-aware storage strategy and state placement | Roadmap P0 | ❌ | ❌ | ❌ | Partial disk views | ❌ | Manual |
 | Per-profile/per-torrent network path binding | Roadmap P0 | ❌ | ❌ | ❌ | Partial VPN helper | ❌ | Manual |
 | Multi-user/multi-tenant operation | Roadmap P0 | ❌ | ❌ | Partial auth | ❌ | RPC token only | Partial via deployment |
 | Permissioned extension system | Roadmap P3 | ❌ | Search plugins only | ✅ | ✅ | ❌ | ruTorrent plugins |
@@ -192,12 +193,11 @@ usable, remove it from `design/BACKLOG.md` and update this comparison.
 | --- | --- | --- |
 | P0 | UPnP / NAT-PMP Port Forwarding *(table stakes)* | Adds automatic port mapping for reachability behind NAT. Every major client ships this; its absence cripples seeding for non-VPN users. |
 | P0 | SOCKS5 Proxy Support *(table stakes)* | Adds a standard proxy deployment option for seedbox and restricted-network users. Shipped by qBittorrent, Deluge, and BiglyBT. |
-| P0 | IP Filtering / Blocklists / Peer Banning *(table stakes)* | Closes blocklist and manual peer-ban parity. Standard security feature in qBittorrent, Deluge, and BiglyBT. |
 | P0 | Listen Port Reachability Test *(table stakes)* | Adds active port-open/closed diagnostic. Every major client provides a port status indicator or test. |
 | P0 | Protocol Encryption / MSE-PE *(table stakes)* | TCP MSE/PE is now implemented with configurable `required/preferred/disabled`; remaining work is uTP encryption and per-profile/per-torrent override policy. |
 | P0 | Adaptive swarm performance autopilot | Differentiates SwarmOtter on real-world throughput diagnosis and automatic swarm tuning. |
-| P0 | Disk-aware storage optimizer | Adds storage-root health, disk pressure controls, CoW-aware behavior, and queue decisions based on disk conditions. |
-| P0 | Policy profiles and inherited torrent settings | Closes category/tag/profile parity gaps and gives SwarmOtter a clearer policy model than most clients. |
+| P0 | Filesystem-aware storage strategy and state placement | Builds on shipped storage-root resource controls with filesystem-aware behavior, richer diagnostics, and deliberate state placement. |
+| P0 | Advanced policy-profile rules | Extends shipped named profiles with tracker, file-selection, and completion-action policy dimensions. |
 | P0 | Large-library Web UI operations console | Closes operational gaps for hundreds or thousands of torrents through server-side filtering, sorting, grouping, pagination, and bulk actions. |
 | P0 | Ecosystem Compatibility API | Adds qBittorrent-compatible API support beside the existing Transmission RPC compatibility layer. |
 | P0 | Per-Profile / Per-Torrent Network-Path Binding | Extends containment from one daemon-wide path to contained network paths by profile or torrent. |

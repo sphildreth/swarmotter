@@ -203,6 +203,7 @@ async fn real_daemon_watch_accepts_exact_metadata_limit_and_rejects_one_over() {
         recursive: false,
         download_dir: Some(root.path().join("downloads").display().to_string()),
         label: Some("phase-1-limit".into()),
+        profile: None,
         start_behavior: StartBehavior::Paused,
         archive_dir: None,
         failure_dir: None,

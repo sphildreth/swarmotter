@@ -158,8 +158,8 @@ the process-wide connection-limit authority.
 | GET | `/torrents` | List torrents. |
 | GET | `/torrents/query` | Query torrents with server-side filters, sorting, pagination, counts, and optional grouping. |
 | POST | `/torrents` | Add magnet JSON or raw `.torrent` body. |
-| POST | `/torrents/magnet` | Add magnet JSON: `{ magnet, download_dir?, paused?, start_behavior? }`. |
-| POST | `/torrents/file` | Upload raw `.torrent` body. |
+| POST | `/torrents/magnet` | Add magnet JSON: `{ magnet, download_dir?, paused?, start_behavior?, profile?, labels? }`. |
+| POST | `/torrents/file` | Upload raw `.torrent` body; query supports `paused`, `start_behavior`, `profile`, and comma-separated `labels`. |
 | POST | `/torrents/bulk` | Add multiple magnets and/or base64 `.torrent` payloads. |
 | GET | `/torrents/:hash` | Torrent details. |
 | GET | `/torrents/:hash/stats` | Per-torrent counters and live engine diagnostics. |
@@ -175,6 +175,8 @@ the process-wide connection-limit authority.
 | POST | `/torrents/:hash/labels` | Set labels: `{ labels }`. |
 | POST | `/torrents/:hash/limits` | Set per-torrent bandwidth limits: `{ download_limit, upload_limit }`, bytes/sec, `0` = unlimited. |
 | PUT | `/torrents/:hash/seeding` | Replace the persisted per-torrent ratio/idle/forever policy. |
+| GET | `/torrents/:hash/policy` | Effective profile values plus the source of every value. |
+| PUT | `/torrents/:hash/policy` | Set/clear explicit profile: `{ profile: "name" }` or `{ profile: null }`. |
 
 Torrent list/detail rows include nullable `error`, `uploaded`, `ratio`,
 `seeding`, `seeding_status`, `effective_ratio_limit`, and
@@ -228,6 +230,39 @@ reserve configured under `[storage]`.
 Strict fail-closed network blocking can still put the new torrent in
 `network_blocked` instead of `paused`.
 
+## Policy profiles
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/profiles` | Return the complete `{ profiles, labels }` configuration section. |
+| PUT | `/profiles` | Replace the complete `{ profiles, labels }` section after validation. |
+
+Add requests may include `profile` and `labels`; labels are applied before
+resolution so a label mapping can select a profile. Bulk add accepts the same
+top-level `profile` and `labels` values for every item. An unknown or empty
+profile is rejected. Compatibility adapters likewise attach their category or
+labels before registration.
+
+`GET /torrents/:hash/policy` returns the selected profile plus each effective
+storage, queue, seeding, and bandwidth value with a machine-readable source:
+`global`, `profile`, `label`, `torrent`, `legacy_torrent`,
+`profile_storage_snapshot`, `registration_storage_snapshot`,
+`existing_storage_snapshot`, or `initial_admission_snapshot`. This lets
+clients explain why a value applies without duplicating daemon precedence
+rules. `registration_storage_snapshot` means the resolved storage choice was
+fixed when the torrent was registered; `initial_admission_snapshot` means the
+one-time start-or-paused decision was captured for that torrent, so later
+profile, label, or global edits do not retroactively change its admission.
+
+Resolved storage is captured at registration, including a global/no-profile
+result. Assigning or clearing a profile, or changing labels later, preserves
+the torrent's existing completed and incomplete locations; use
+`POST /torrents/:hash/move` to relocate data. The initial start-or-paused
+decision is captured too, so profile/global auto-start edits cannot revoke a
+new or migrated queued torrent's admission. Queue priority, seeding, and rate
+caps update live while a torrent inherits them. Legacy state is migrated
+transactionally during a profile configuration replacement.
+
 Successful add responses mean the torrent record was registered and inserted
 into queue order. The daemon does not wait for queue reconciliation, metadata
 fetching, tracker announces, peer connections, or engine startup before
@@ -240,11 +275,13 @@ Bulk add requests use:
   "magnets": ["magnet:?xt=urn:btih:..."],
   "torrent_files": [{ "metainfo": "base64 .torrent bytes" }],
   "download_dir": "/data/downloads",
-  "paused": true
+  "paused": true,
+  "profile": "linux-release",
+  "labels": ["linux"]
 }
 ```
 
-`download_dir`, `paused`, and `start_behavior` apply to every item in the
+`download_dir`, `paused`, `start_behavior`, `profile`, and `labels` apply to every item in the
 batch. The response includes `added` items with `{ kind, index, info_hash }`
 and `failed` items with `{ kind, index, code, message }`, so one invalid or
 duplicate item does not prevent other valid items from being registered.
@@ -349,10 +386,27 @@ field shapes.
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/torrents/:hash/peers` | List peers. |
+| POST | `/torrents/:hash/peers/ban` | Add or update a global manual ban: `{ ip, reason? }`. |
+| POST | `/torrents/:hash/peers/unban` | Remove a global manual ban: `{ ip }`. |
 
 Peer rows include the discovered peer address, direction, current rates, flags,
 and ban state. Negotiated per-peer encryption state is not exposed in this
 phase.
+
+## Peer admission policy
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/peer-filter` | Return active direct rules/import paths, local import results, manual bans, client-ID prefixes, and rejection counters. |
+| PUT | `/peer-filter` | Replace `{ enabled, rules, blocklist_paths, manual_bans, blocked_client_ids }`. |
+| POST | `/peer-filter/unban` | Remove a global manual ban: `{ ip }`. |
+
+Manual bans are global by IP even when created from a torrent peer view. A
+replacement validates and compiles all local sources before it affects live
+peer work. The status response contains trimmed direct `rules`,
+`blocklist_paths`, per-source import outcomes, manual bans, client-ID prefixes,
+and counters for the active compiled policy instance; those counters reset on a
+successful replacement. It also reports any fail-closed loading detail.
 
 ## Queue
 
@@ -383,7 +437,9 @@ phase.
 Changing this field is reported in `restart_required_fields` for already-running
 torrent tasks.
 
-Per-profile and per-torrent overrides are not yet documented in this phase.
+Named profiles are part of the full settings configuration under `profiles`;
+the dedicated `/profiles` endpoints are preferred when only that section needs
+to change.
 
 `PUT /settings` validates the full config before persistence, preserves the
 existing `api.auth_token` when omitted, applies live-safe fields immediately,
@@ -404,7 +460,7 @@ and reports fields that require restart.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/storage/roots` | Return diagnostics for configured storage roots, including free space and availability. |
+| GET | `/storage/roots` | Return diagnostics for configured storage roots, including free space, active local work, and root controls. |
 
 The storage diagnostics response currently includes per-root identity and space
 data needed by operators and automation. Typical fields include:
@@ -426,8 +482,15 @@ data needed by operators and automation. Typical fields include:
       "reserve_satisfied": true,
       "torrent_count": 4,
       "active_torrents": 2,
+      "active_bytes": 67108864,
       "active_write_rate": 1048576,
       "active_recheck_rate": 0,
+      "active_rechecks": 0,
+      "root_control_path": "/mnt/media",
+      "max_active_downloads": 2,
+      "max_active_bytes": 107374182400,
+      "max_write_bytes_per_second": 52428800,
+      "max_concurrent_rechecks": 1,
       "warnings": []
     }
   ],
@@ -436,6 +499,11 @@ data needed by operators and automation. Typical fields include:
   "generated_at": 1783227600
 }
 ```
+
+`active_bytes` is the aggregate declared payload budget reserved by active
+engines, not free space consumed on the filesystem. A limit value of `0` means
+unlimited. `root_control_path` is `null` when no `[[storage.root_controls]]`
+entry applies; nested controls resolve to the most-specific lexical root.
 
 ## Watch folders
 

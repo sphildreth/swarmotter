@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use super::lifecycle::ExplicitRecheckRestoreState;
 use super::*;
 use futures_util::StreamExt as _;
 use swarmotter_api::state::DaemonOps;
@@ -247,6 +248,443 @@ async fn durable_state_restores_torrents_settings_and_queue() {
         222
     );
     std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn profile_assignment_preserves_existing_storage_and_rolls_back_on_persistence_failure() {
+    use swarmotter_core::policy::{PolicyProfile, PolicyStorage};
+
+    let root = unique_dir("policy-profile-assignment");
+    let state_path = root.join("state.json");
+    let complete = root.join("complete");
+    let incomplete = root.join("incomplete");
+    let profile_complete = root.join("profile-complete");
+    let profile_incomplete = root.join("profile-incomplete");
+    let other_complete = root.join("other-complete");
+    let other_incomplete = root.join("other-incomplete");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.storage.download_dir = Some(complete.display().to_string());
+    cfg.storage.incomplete_dir = Some(incomplete.display().to_string());
+    cfg.profiles.profiles.insert(
+        "archive".into(),
+        PolicyProfile {
+            storage: PolicyStorage {
+                download_dir: Some(profile_complete.display().to_string()),
+                incomplete_dir: Some(profile_incomplete.display().to_string()),
+            },
+            ..Default::default()
+        },
+    );
+    cfg.profiles.profiles.insert(
+        "other".into(),
+        PolicyProfile {
+            storage: PolicyStorage {
+                download_dir: Some(other_complete.display().to_string()),
+                incomplete_dir: Some(other_incomplete.display().to_string()),
+            },
+            ..Default::default()
+        },
+    );
+    cfg.profiles.labels.insert("linux".into(), "archive".into());
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        cfg.clone(),
+        health.clone(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let meta =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "existing-storage.bin",
+            b"existing storage payload",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let hash = meta.info_hash;
+    let mut torrent = Torrent::new(meta, now());
+    torrent.state = TorrentState::Paused;
+    // This models a legacy explicit completed-data path with an inherited
+    // incomplete path. Profile reassignment must retain both locations.
+    torrent.download_dir = Some(complete.display().to_string());
+    runtime.registry.lock().await.add(torrent).unwrap();
+    runtime.queue.lock().await.add(hash);
+
+    // A label can select a profile after registration, but must not redirect
+    // existing data into the profile's storage root.
+    runtime
+        .set_labels(&hash, vec!["linux".into()])
+        .await
+        .unwrap();
+    let labelled = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    let label_policy = runtime.effective_policy(&labelled).await;
+    assert!(matches!(
+        label_policy.profile.unwrap().source,
+        swarmotter_core::policy::PolicyValueSource::Label { .. }
+    ));
+    assert_eq!(
+        runtime.policy_storage_paths(&labelled).await,
+        (
+            complete.display().to_string(),
+            incomplete.display().to_string(),
+        )
+    );
+
+    runtime
+        .assign_torrent_profile(&hash, Some("archive".into()))
+        .await
+        .unwrap();
+    let assigned = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    let snapshot = assigned.policy.storage_snapshot.as_ref().unwrap();
+    assert!(snapshot.preserve_existing_storage);
+    assert_eq!(snapshot.download_dir, None);
+    assert_eq!(
+        snapshot.incomplete_dir.as_deref(),
+        Some(incomplete.to_string_lossy().as_ref())
+    );
+    assert_eq!(
+        runtime.policy_storage_paths(&assigned).await,
+        (
+            complete.display().to_string(),
+            incomplete.display().to_string(),
+        )
+    );
+    let persisted = crate::state_store::load(&state_path).unwrap().unwrap();
+    assert_eq!(
+        persisted.torrents[0].policy.profile.as_deref(),
+        Some("archive")
+    );
+
+    // A restart reads the durable snapshot rather than re-resolving the new
+    // assignment's profile storage paths.
+    let restored = DaemonRuntime::with_paths_broker_and_state(
+        cfg,
+        health,
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    assert_eq!(restored.restore_persisted_state().await.unwrap(), 1);
+    let restored_torrent = restored.registry.lock().await.get(&hash).cloned().unwrap();
+    assert_eq!(
+        restored.policy_storage_paths(&restored_torrent).await,
+        (
+            complete.display().to_string(),
+            incomplete.display().to_string(),
+        )
+    );
+    drop(restored);
+
+    // Turn the durable-state target into a directory so the next transactional
+    // write fails. The prior profile and storage snapshot must remain intact.
+    std::fs::remove_file(&state_path).unwrap();
+    std::fs::create_dir_all(&state_path).unwrap();
+    assert!(runtime
+        .assign_torrent_profile(&hash, Some("other".into()))
+        .await
+        .is_err());
+    let rolled_back = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    assert_eq!(rolled_back.policy.profile.as_deref(), Some("archive"));
+    assert_eq!(
+        runtime.policy_storage_paths(&rolled_back).await,
+        (
+            complete.display().to_string(),
+            incomplete.display().to_string(),
+        )
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn profile_replacement_migrates_legacy_label_storage_and_initial_admission() {
+    use swarmotter_core::config::StartBehavior;
+    use swarmotter_core::policy::{PolicyProfile, PolicyQueue, PolicyStorage, PolicyValueSource};
+
+    let root = unique_dir("legacy-profile-config-migration");
+    let state_path = root.join("state.json");
+    let global_complete = root.join("global-complete");
+    let global_incomplete = root.join("global-incomplete");
+    let profile_complete = root.join("profile-complete");
+    let profile_incomplete = root.join("profile-incomplete");
+    let mut config = Config::default();
+    config.network.mode = NetworkContainmentMode::Disabled;
+    config.queue.auto_start = false;
+    config.storage.download_dir = Some(global_complete.display().to_string());
+    config.storage.incomplete_dir = Some(global_incomplete.display().to_string());
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        config.clone(),
+        disabled_health(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let meta =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "legacy-profile-migration.bin",
+            b"generated lawful legacy profile migration payload",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let hash = meta.info_hash;
+    let mut legacy = Torrent::new(meta, now());
+    legacy.state = TorrentState::Queued;
+    legacy.labels = vec!["linux".into()];
+    runtime.registry.lock().await.add(legacy).unwrap();
+    runtime.queue.lock().await.add(hash);
+    runtime.persist_state().await.unwrap();
+
+    let mut replacement = config.clone();
+    replacement.profiles.profiles.insert(
+        "archive".into(),
+        PolicyProfile {
+            storage: PolicyStorage {
+                download_dir: Some(profile_complete.display().to_string()),
+                incomplete_dir: Some(profile_incomplete.display().to_string()),
+            },
+            queue: PolicyQueue {
+                start_behavior: Some(StartBehavior::Start),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    replacement
+        .profiles
+        .labels
+        .insert("linux".into(), "archive".into());
+    runtime.replace_config(replacement.clone()).await.unwrap();
+
+    let migrated = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    assert!(migrated
+        .policy
+        .storage_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.preserve_existing_storage));
+    assert_eq!(
+        migrated.policy.initial_start_behavior,
+        Some(StartBehavior::Paused),
+        "the legacy record keeps the admission decision from before the profile PUT"
+    );
+    let effective = runtime.effective_policy(&migrated).await;
+    assert!(matches!(
+        effective.profile.unwrap().source,
+        PolicyValueSource::Label { .. }
+    ));
+    assert!(matches!(
+        effective.download_dir.source,
+        PolicyValueSource::ExistingStorageSnapshot
+    ));
+    assert!(matches!(
+        effective.start_behavior.source,
+        PolicyValueSource::InitialAdmissionSnapshot
+    ));
+    assert_eq!(
+        runtime.policy_storage_paths(&migrated).await,
+        (
+            global_complete.display().to_string(),
+            global_incomplete.display().to_string(),
+        )
+    );
+
+    let persisted = crate::state_store::load(&state_path).unwrap().unwrap();
+    let persisted = persisted
+        .torrents
+        .into_iter()
+        .find(|torrent| torrent.info_hash() == hash)
+        .unwrap();
+    assert!(persisted.policy.storage_snapshot.is_some());
+    assert_eq!(
+        persisted.policy.initial_start_behavior,
+        Some(StartBehavior::Paused)
+    );
+
+    let restarted = DaemonRuntime::with_paths_broker_and_state(
+        replacement,
+        disabled_health(),
+        None,
+        None,
+        Some(state_path),
+        EventBroker::default(),
+    );
+    assert_eq!(restarted.restore_persisted_state().await.unwrap(), 1);
+    let restored = restarted.registry.lock().await.get(&hash).cloned().unwrap();
+    assert_eq!(
+        restarted.policy_storage_paths(&restored).await,
+        (
+            global_complete.display().to_string(),
+            global_incomplete.display().to_string(),
+        )
+    );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn failed_profile_replacement_restores_legacy_policy_state_and_config() {
+    use swarmotter_core::config::StartBehavior;
+    use swarmotter_core::policy::{PolicyProfile, PolicyQueue};
+
+    let root = unique_dir("legacy-profile-config-rollback");
+    let config_path = root.join("swarmotter.toml");
+    let state_path = root.join("state.json");
+    let mut config = Config::default();
+    config.network.mode = NetworkContainmentMode::Disabled;
+    config.storage.download_dir = Some(root.join("global-complete").display().to_string());
+    config.storage.incomplete_dir = Some(root.join("global-incomplete").display().to_string());
+    write_config_atomically(&config_path, &config).unwrap();
+    let previous_config_file = std::fs::read(&config_path).unwrap();
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        config.clone(),
+        disabled_health(),
+        Some(config_path.clone()),
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let meta =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "legacy-profile-config-rollback.bin",
+            b"generated lawful legacy profile rollback payload",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let hash = meta.info_hash;
+    let mut legacy = Torrent::new(meta, now());
+    legacy.state = TorrentState::Paused;
+    legacy.labels = vec!["linux".into()];
+    runtime.registry.lock().await.add(legacy).unwrap();
+    runtime.queue.lock().await.add(hash);
+    runtime.persist_state().await.unwrap();
+
+    let mut replacement = config.clone();
+    replacement.profiles.profiles.insert(
+        "archive".into(),
+        PolicyProfile {
+            queue: PolicyQueue {
+                start_behavior: Some(StartBehavior::Start),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    replacement
+        .profiles
+        .labels
+        .insert("linux".into(), "archive".into());
+    runtime.inject_generic_config_persistence_failure_after_rename();
+    assert!(runtime.replace_config(replacement).await.is_err());
+
+    let restored_live = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    assert!(restored_live.policy.storage_snapshot.is_none());
+    assert!(restored_live.policy.initial_start_behavior.is_none());
+    let restored_disk = crate::state_store::load(&state_path).unwrap().unwrap();
+    let restored_disk = restored_disk
+        .torrents
+        .iter()
+        .find(|torrent| torrent.info_hash() == hash)
+        .unwrap();
+    assert!(restored_disk.policy.storage_snapshot.is_none());
+    assert!(restored_disk.policy.initial_start_behavior.is_none());
+    assert_eq!(std::fs::read(&config_path).unwrap(), previous_config_file);
+    assert!(runtime.config.read().await.profiles.profiles.is_empty());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn profile_start_behavior_is_fixed_for_queued_torrents_after_edit_and_assignment() {
+    use swarmotter_core::config::StartBehavior;
+    use swarmotter_core::policy::{PolicyProfile, PolicyQueue, PolicyValueSource};
+
+    let mut config = Config::default();
+    config.network.mode = NetworkContainmentMode::Disabled;
+    config.queue.auto_start = false;
+    config.profiles.profiles.insert(
+        "launch".into(),
+        PolicyProfile {
+            queue: PolicyQueue {
+                start_behavior: Some(StartBehavior::Start),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    config.profiles.profiles.insert(
+        "hold".into(),
+        PolicyProfile {
+            queue: PolicyQueue {
+                start_behavior: Some(StartBehavior::Paused),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    config
+        .profiles
+        .labels
+        .insert("launch".into(), "launch".into());
+    let runtime = DaemonRuntime::new(config.clone(), disabled_health());
+    let hash = runtime
+        .add_torrent_file_with_options(
+            swarmotter_core::meta::build_single_file_torrent(
+                "initial-admission-snapshot.bin",
+                b"generated lawful initial admission snapshot payload",
+                8,
+                None,
+                false,
+            ),
+            AddTorrentOptions::request(None, false, false, None, vec!["launch".into()]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(runtime.desired_download_hashes().await, vec![hash]);
+
+    let mut replacement = config.clone();
+    replacement.profiles.profiles.insert(
+        "launch".into(),
+        PolicyProfile {
+            queue: PolicyQueue {
+                start_behavior: Some(StartBehavior::Paused),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    runtime.replace_config(replacement).await.unwrap();
+    assert_eq!(
+        runtime.desired_download_hashes().await,
+        vec![hash],
+        "editing a profile cannot revoke an existing queued torrent's initial admission"
+    );
+
+    runtime
+        .assign_torrent_profile(&hash, Some("hold".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.desired_download_hashes().await,
+        vec![hash],
+        "reassignment cannot retroactively pause a queued torrent admitted at creation"
+    );
+    let torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    let policy = runtime.effective_policy(&torrent).await;
+    assert!(matches!(
+        policy.start_behavior.source,
+        PolicyValueSource::InitialAdmissionSnapshot
+    ));
+    assert_eq!(policy.start_behavior.value, StartBehavior::Start);
 }
 
 #[tokio::test]
@@ -1344,6 +1782,140 @@ async fn put_peer_limits_failure_restores_runtime_file_and_live_ownership() {
 }
 
 #[tokio::test]
+async fn manual_peer_ban_persistence_failure_restores_prior_policy_and_live_sessions() {
+    let (runtime, hash, root, config_path) =
+        peer_reconfiguration_fixture("manual-peer-ban-persistence-rollback").await;
+    let previous_filter = runtime.peer_filter.read().await.clone();
+    let previous_file = std::fs::read(&config_path).unwrap();
+    let previous_config = runtime.config.read().await.clone();
+    runtime.inject_peer_reconfiguration_persistence_failure();
+
+    let error = runtime
+        .ban_peer(
+            &hash,
+            swarmotter_core::peer_filter::ManualPeerBan {
+                ip: "203.0.113.7".into(),
+                reason: Some("test rollback".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("persistence failed"));
+    let current_filter = runtime.peer_filter.read().await.clone();
+    assert!(Arc::ptr_eq(&current_filter, &previous_filter));
+    assert_eq!(
+        runtime.config.read().await.to_toml_string().unwrap(),
+        previous_config.to_toml_string().unwrap()
+    );
+    assert_eq!(std::fs::read(&config_path).unwrap(), previous_file);
+    assert!(runtime.seeder_registry.contains(&hash).await);
+
+    runtime.force_stop_seeder(&hash).await;
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn peer_rows_mark_only_manual_bans_without_recording_admission_checks() {
+    let mut config = Config::default();
+    config.network.mode = NetworkContainmentMode::Disabled;
+    config.peer_filter.enabled = true;
+    config.peer_filter.rules = vec!["198.51.100.0/24".into()];
+    config.peer_filter.manual_bans = vec![swarmotter_core::peer_filter::ManualPeerBan {
+        ip: "203.0.113.7".into(),
+        reason: Some("operator ban".into()),
+    }];
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::new(config, health);
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "peer-row-ban-state.bin",
+        b"peer row ban state",
+        8,
+        None,
+        false,
+    );
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let hash = meta.info_hash;
+    runtime
+        .registry
+        .lock()
+        .await
+        .add(Torrent::new(meta, 1))
+        .unwrap();
+    runtime.engine_states.write().await.insert(
+        hash,
+        Arc::new(Mutex::new(EngineState {
+            peers: vec![
+                swarmotter_core::peer::PeerAddr::from_socket_addr(
+                    "203.0.113.7:6881".parse().unwrap(),
+                ),
+                swarmotter_core::peer::PeerAddr::from_socket_addr(
+                    "198.51.100.9:6881".parse().unwrap(),
+                ),
+            ],
+            ..Default::default()
+        })),
+    );
+    let before = runtime.peer_filter.read().await.status().rejections;
+
+    let peers = runtime.list_peers(&hash).await.unwrap();
+
+    assert!(
+        peers
+            .iter()
+            .find(|peer| peer.ip.to_string() == "203.0.113.7")
+            .unwrap()
+            .banned
+    );
+    assert!(
+        !peers
+            .iter()
+            .find(|peer| peer.ip.to_string() == "198.51.100.9")
+            .unwrap()
+            .banned
+    );
+    let after = runtime.peer_filter.read().await.status().rejections;
+    assert_eq!(after.ip_checks, before.ip_checks);
+    assert_eq!(after.manual_bans, before.manual_bans);
+    assert_eq!(after.configured_rules, before.configured_rules);
+}
+
+#[tokio::test]
+async fn global_peer_unban_removes_a_manual_ban_without_a_torrent_scope() {
+    let mut config = Config::default();
+    config.network.mode = NetworkContainmentMode::Disabled;
+    config.peer_filter.enabled = true;
+    config.peer_filter.manual_bans = vec![swarmotter_core::peer_filter::ManualPeerBan {
+        ip: "203.0.113.7".into(),
+        reason: Some("operator ban".into()),
+    }];
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::new(config, health);
+
+    let status = runtime
+        .unban_global_peer("203.0.113.7".into())
+        .await
+        .unwrap();
+
+    assert!(status.manual_bans.is_empty());
+    assert!(runtime
+        .config
+        .read()
+        .await
+        .peer_filter
+        .manual_bans
+        .is_empty());
+}
+
+#[tokio::test]
 async fn combined_peer_and_seeding_policy_update_commits_only_eligible_work() {
     let (runtime, hash, root, _) = peer_reconfiguration_fixture("peer-combined-seeding").await;
     runtime
@@ -2050,8 +2622,14 @@ async fn failed_shared_listener_bind_does_not_register_or_announce_seeder() {
     assert!(!runtime.seeder_handles.lock().await.contains_key(&hash));
     assert!(runtime.seeder_registry.is_empty().await);
     let torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
-    assert_eq!(torrent.state, TorrentState::Completed);
-    assert_eq!(torrent.seeding_status, SeedingStatus::Queued);
+    assert!(matches!(
+        torrent.state,
+        TorrentState::Completed | TorrentState::Seeding
+    ));
+    assert!(matches!(
+        torrent.seeding_status,
+        SeedingStatus::Queued | SeedingStatus::Active
+    ));
     assert!(torrent.error.is_some());
     drop(occupied);
     std::fs::remove_dir_all(root).ok();
@@ -3026,6 +3604,832 @@ async fn retryable_magnet_metadata_no_peers_stays_queued_after_progress_reconcil
         TorrentState::Queued,
         "stale engine diagnostics must not reactivate a magnet queued for metadata retry"
     );
+}
+
+#[tokio::test]
+async fn storage_root_declared_byte_control_defers_only_the_over_budget_queue_entry() {
+    let root = unique_dir("storage-root-admission");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.queue.max_active_downloads = 0;
+    cfg.storage.download_dir = Some(root.display().to_string());
+    cfg.storage.root_controls = vec![swarmotter_core::config::StorageRootControl {
+        path: root.display().to_string(),
+        max_active_downloads: 0,
+        max_active_bytes: 10,
+        max_write_bytes_per_second: 0,
+        max_concurrent_rechecks: 0,
+    }];
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::new(cfg.clone(), health);
+    let first =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "root-active.bin",
+            b"12345678",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let blocked =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "root-blocked.bin",
+            b"123456",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let fitting =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "root-fitting.bin",
+            b"12",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let first_hash = first.info_hash;
+    let blocked_hash = blocked.info_hash;
+    let fitting_hash = fitting.info_hash;
+    let mut first_torrent = Torrent::new(first.clone(), 1);
+    first_torrent.state = TorrentState::Downloading;
+    {
+        let mut registry = runtime.registry.lock().await;
+        registry.add(first_torrent).unwrap();
+        registry.add(Torrent::new(blocked, 2)).unwrap();
+        registry.add(Torrent::new(fitting, 3)).unwrap();
+    }
+    {
+        let mut queue = runtime.queue.lock().await;
+        queue.add(first_hash);
+        queue.add(blocked_hash);
+        queue.add(fitting_hash);
+    }
+    let admission = storage_root_admission_for_download(&cfg, None).unwrap();
+    runtime
+        .storage_admissions
+        .reserve(first_hash, &admission, first.total_length)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        runtime.desired_download_hashes().await,
+        vec![first_hash, fitting_hash]
+    );
+    runtime.storage_admissions.release(&first_hash).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn root_scoped_recheck_cancellation_releases_a_running_permit() {
+    let root = unique_dir("root-recheck-cancellation");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.storage.download_dir = Some(root.display().to_string());
+    cfg.storage.root_controls = vec![swarmotter_core::config::StorageRootControl {
+        path: root.display().to_string(),
+        max_active_downloads: 0,
+        max_active_bytes: 0,
+        max_write_bytes_per_second: 0,
+        max_concurrent_rechecks: 1,
+    }];
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::new(cfg, health);
+    let cancellation = StorageWorkCancellation::new();
+    let worker_runtime = runtime.clone();
+    let worker_root = root.clone();
+    let worker_cancellation = cancellation.clone();
+    let worker = tokio::spawn(async move {
+        worker_runtime
+            .run_root_scoped_recheck(
+                &worker_root,
+                Some(&worker_cancellation),
+                std::future::pending::<Result<()>>(),
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if runtime.storage_rechecks.active_counts().len() == 1 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recheck should acquire its root permit before cancellation");
+
+    cancellation.cancel();
+    let error = tokio::time::timeout(Duration::from_secs(1), worker)
+        .await
+        .expect("cancelled recheck should complete")
+        .expect("recheck task should not panic")
+        .expect_err("cancelled recheck should report cancellation");
+    assert!(is_storage_work_cancelled(&error));
+    assert!(runtime.storage_rechecks.active_counts().is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn metadata_root_admission_wait_observes_lifecycle_cancellation() {
+    let root = unique_dir("metadata-admission-cancellation");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.storage.download_dir = Some(root.display().to_string());
+    cfg.storage.root_controls = vec![swarmotter_core::config::StorageRootControl {
+        path: root.display().to_string(),
+        max_active_downloads: 1,
+        max_active_bytes: 0,
+        max_write_bytes_per_second: 0,
+        max_concurrent_rechecks: 0,
+    }];
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::new(cfg.clone(), health);
+    let resolved =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "metadata-cancellation.bin",
+            b"generated metadata admission fixture",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let hash = resolved.info_hash;
+    let mut torrent = Torrent::new(resolved.clone(), now());
+    torrent.state = TorrentState::DownloadingMetadata;
+    torrent.needs_metadata = true;
+    runtime.registry.lock().await.add(torrent).unwrap();
+    let admission = storage_root_admission_for_path(&cfg, &root).unwrap();
+    let blocker = InfoHash::from_bytes([0x42; 20]);
+    runtime
+        .storage_admissions
+        .reserve(blocker, &admission, 0)
+        .await
+        .unwrap();
+
+    let cancellation = StorageWorkCancellation::new();
+    let waiting_runtime = runtime.clone();
+    let waiting_cancellation = cancellation.clone();
+    let complete_dir = root.display().to_string();
+    let active_dir = complete_dir.clone();
+    let waiter = tokio::spawn(async move {
+        waiting_runtime
+            .reserve_resolved_magnet_metadata(
+                hash,
+                resolved,
+                complete_dir,
+                active_dir,
+                waiting_cancellation,
+            )
+            .await
+    });
+    tokio::task::yield_now().await;
+    cancellation.cancel();
+
+    let error = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("metadata admission cancellation should complete the engine preflight")
+        .expect("metadata admission task should not panic")
+        .expect_err("cancelled metadata admission must not proceed");
+    assert!(is_storage_work_cancelled(&error));
+    assert_eq!(runtime.storage_admissions.records().await.len(), 1);
+    runtime.storage_admissions.release(&blocker).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn dropped_explicit_recheck_restores_and_persists_incomplete_state() {
+    let root = unique_dir("dropped-explicit-recheck");
+    let state_path = root.join("state.json");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.storage.download_dir = Some(root.display().to_string());
+    cfg.storage.root_controls = vec![swarmotter_core::config::StorageRootControl {
+        path: root.display().to_string(),
+        max_active_downloads: 0,
+        max_active_bytes: 0,
+        max_write_bytes_per_second: 0,
+        max_concurrent_rechecks: 1,
+    }];
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        cfg.clone(),
+        health,
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let meta =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "cancelled-incomplete.bin",
+            b"generated incomplete recheck fixture",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let hash = meta.info_hash;
+    let mut torrent = Torrent::new(meta, now());
+    torrent.state = TorrentState::Paused;
+    runtime.registry.lock().await.add(torrent).unwrap();
+    runtime.queue.lock().await.add(hash);
+    let admission = storage_root_admission_for_path(&cfg, &root).unwrap();
+    let held_permit = runtime.storage_rechecks.try_acquire(&admission).unwrap();
+
+    let recheck_runtime = runtime.clone();
+    let recheck = tokio::spawn(async move { recheck_runtime.recheck(&hash).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if runtime
+                .registry
+                .lock()
+                .await
+                .get(&hash)
+                .is_some_and(|torrent| torrent.state == TorrentState::Checking)
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("explicit recheck should wait behind the held root permit");
+
+    recheck.abort();
+    let _ = recheck.await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let restored = runtime
+                .registry
+                .lock()
+                .await
+                .get(&hash)
+                .is_some_and(|torrent| {
+                    torrent.state == TorrentState::Paused
+                        && torrent.seeding_status == SeedingStatus::NotEligible
+                });
+            let finished = !runtime.explicit_rechecks.lock().await.contains_key(&hash);
+            if restored && finished {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropped explicit recheck should restore a non-checking state");
+
+    let persisted = crate::state_store::load(&state_path)
+        .unwrap()
+        .expect("cancelled recheck should persist its restored state");
+    assert_eq!(
+        persisted
+            .torrents
+            .iter()
+            .find(|torrent| torrent.info_hash() == hash)
+            .map(|torrent| torrent.state),
+        Some(TorrentState::Paused)
+    );
+    assert_eq!(runtime.storage_rechecks.active_counts().len(), 1);
+    drop(held_permit);
+    assert!(runtime.storage_rechecks.active_counts().is_empty());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn cancelled_explicit_recheck_restores_completed_torrent_to_seeding_queue() {
+    let root = unique_dir("cancelled-completed-recheck");
+    let state_path = root.join("state.json");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.storage.download_dir = Some(root.display().to_string());
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        cfg,
+        health,
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let meta =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "cancelled-completed.bin",
+            b"generated completed recheck fixture",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let hash = meta.info_hash;
+    let mut torrent = Torrent::new(meta.clone(), now());
+    for piece in 0..meta.piece_count() {
+        torrent.progress.have_piece(piece);
+    }
+    torrent.recompute_file_bytes_completed();
+    torrent.state = TorrentState::Checking;
+    runtime.registry.lock().await.add(torrent).unwrap();
+    let operation = ExplicitRecheckOperation::new();
+    runtime
+        .explicit_rechecks
+        .lock()
+        .await
+        .insert(hash, operation.clone());
+
+    runtime
+        .finish_cancelled_explicit_recheck(
+            hash,
+            operation,
+            ExplicitRecheckRestoreState {
+                was_completed: true,
+                was_manually_paused: false,
+            },
+        )
+        .await;
+
+    let torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    assert!(matches!(
+        torrent.state,
+        TorrentState::Completed | TorrentState::Seeding
+    ));
+    assert!(matches!(
+        torrent.seeding_status,
+        SeedingStatus::Queued | SeedingStatus::Active
+    ));
+    assert!(!runtime.explicit_rechecks.lock().await.contains_key(&hash));
+    let persisted = crate::state_store::load(&state_path)
+        .unwrap()
+        .expect("completed cancellation restoration should persist");
+    assert!(matches!(
+        persisted
+            .torrents
+            .iter()
+            .find(|torrent| torrent.info_hash() == hash)
+            .map(|torrent| torrent.state),
+        Some(TorrentState::Completed | TorrentState::Seeding)
+    ));
+    runtime.force_stop_engine(&hash).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn dropped_finalized_explicit_recheck_persists_after_the_normal_write_barrier() {
+    let root = unique_dir("dropped-finalized-recheck");
+    let state_path = root.join("state.json");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.storage.download_dir = Some(root.display().to_string());
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        cfg,
+        health,
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let payload = b"generated finalized explicit recheck fixture";
+    let meta =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "finalized-recheck.bin",
+            payload,
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let hash = meta.info_hash;
+    let storage = swarmotter_core::storage::StorageIo::new(meta.clone(), root.clone());
+    for piece in 0..meta.piece_count() {
+        let start = piece * meta.piece_length as usize;
+        let end = (start + meta.piece_length as usize).min(payload.len());
+        storage
+            .write_piece(piece, &payload[start..end])
+            .await
+            .unwrap();
+    }
+    let mut torrent = Torrent::new(meta, now());
+    torrent.state = TorrentState::Paused;
+    runtime.registry.lock().await.add(torrent).unwrap();
+
+    let (persist_reached, persist_continue) = runtime.pause_explicit_recheck_before_persist().await;
+    let recheck_runtime = runtime.clone();
+    let recheck = tokio::spawn(async move { recheck_runtime.recheck(&hash).await });
+    tokio::time::timeout(Duration::from_secs(1), persist_reached)
+        .await
+        .expect("verification should finalize before the normal persistence barrier")
+        .expect("recheck persistence pause should remain reachable");
+    assert_eq!(
+        runtime
+            .registry
+            .lock()
+            .await
+            .get(&hash)
+            .map(|torrent| torrent.state),
+        Some(TorrentState::Completed)
+    );
+
+    recheck.abort();
+    let _ = recheck.await;
+    drop(persist_continue);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if !runtime.explicit_rechecks.lock().await.contains_key(&hash) && state_path.exists() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("drop cleanup should persist the already-finalized recheck state");
+
+    let persisted = crate::state_store::load(&state_path)
+        .unwrap()
+        .expect("drop cleanup should write daemon state");
+    assert_eq!(
+        persisted
+            .torrents
+            .iter()
+            .find(|torrent| torrent.info_hash() == hash)
+            .map(|torrent| torrent.state),
+        Some(TorrentState::Completed)
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn root_control_replacement_keeps_active_engine_and_wakes_new_admission() {
+    let root = unique_dir("root-control-replacement");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.queue.max_active_downloads = 0;
+    cfg.storage.download_dir = Some(root.display().to_string());
+    cfg.storage.root_controls = vec![swarmotter_core::config::StorageRootControl {
+        path: root.display().to_string(),
+        max_active_downloads: 1,
+        max_active_bytes: 0,
+        max_write_bytes_per_second: 0,
+        max_concurrent_rechecks: 0,
+    }];
+    let mut health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    health.traffic_allowed = true;
+    let runtime = DaemonRuntime::new(cfg.clone(), health);
+    let first =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "grandfathered-active.bin",
+            b"first active root-control fixture",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let second =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "replacement-admission.bin",
+            b"second root-control fixture",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let first_hash = first.info_hash;
+    let second_hash = second.info_hash;
+    let mut active = Torrent::new(first.clone(), now());
+    active.state = TorrentState::Downloading;
+    {
+        let mut registry = runtime.registry.lock().await;
+        registry.add(active).unwrap();
+        registry.add(Torrent::new(second, now())).unwrap();
+    }
+    {
+        let mut queue = runtime.queue.lock().await;
+        queue.add(first_hash);
+        queue.add(second_hash);
+        queue.start_now(&second_hash);
+    }
+    let old_admission = storage_root_admission_for_path(&cfg, &root).unwrap();
+    runtime
+        .storage_admissions
+        .reserve(first_hash, &old_admission, first.total_length)
+        .await
+        .unwrap();
+    let (engine_tx, mut engine_rx) = tokio::sync::mpsc::channel(1);
+    let fake_engine = tokio::spawn(async move { while engine_rx.recv().await.is_some() {} });
+    runtime
+        .engine_cmds
+        .lock()
+        .await
+        .insert(first_hash, engine_tx);
+    runtime
+        .engine_handles
+        .write()
+        .await
+        .insert(first_hash, fake_engine);
+
+    assert_eq!(runtime.desired_download_hashes().await, vec![first_hash]);
+    let admissions = runtime.storage_admissions.clone();
+    let (woken_tx, woken_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        admissions.changed().await;
+        let _ = woken_tx.send(());
+    });
+    tokio::task::yield_now().await;
+
+    let mut replacement = cfg.clone();
+    replacement.storage.root_controls[0].max_active_downloads = 2;
+    assert!(!data_plane_config_changed(&cfg, &replacement));
+    runtime.replace_config(replacement).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(1), woken_rx)
+        .await
+        .expect("root-control replacement should wake admission waiters")
+        .expect("admission wake task should remain alive");
+    assert!(
+        runtime
+            .engine_handles
+            .read()
+            .await
+            .contains_key(&first_hash),
+        "root-control-only replacement must not tear down active engines"
+    );
+    let desired = runtime.desired_download_hashes().await;
+    assert!(
+        desired.contains(&first_hash) && desired.contains(&second_hash),
+        "the replacement capacity should admit the waiting queued torrent"
+    );
+
+    runtime.force_stop_engine(&first_hash).await;
+    runtime.force_stop_engine(&second_hash).await;
+    runtime.storage_admissions.release(&first_hash).await;
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn root_control_replace_config_restores_file_after_post_rename_sync_failure() {
+    let root = unique_dir("root-control-config-rollback");
+    let config_path = root.join("swarmotter.toml");
+    let mut config = Config::default();
+    config.network.mode = NetworkContainmentMode::Disabled;
+    config.storage.download_dir = Some(root.display().to_string());
+    config.storage.root_controls = vec![swarmotter_core::config::StorageRootControl {
+        path: root.display().to_string(),
+        max_active_downloads: 1,
+        max_active_bytes: 0,
+        max_write_bytes_per_second: 0,
+        max_concurrent_rechecks: 0,
+    }];
+    write_config_atomically(&config_path, &config).unwrap();
+    let mut health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    health.traffic_allowed = true;
+    let runtime = DaemonRuntime::with_paths_and_broker(
+        config.clone(),
+        health,
+        Some(config_path.clone()),
+        None,
+        EventBroker::default(),
+    );
+    let previous_file = std::fs::read(&config_path).unwrap();
+    let mut replacement = config.clone();
+    replacement.storage.root_controls[0].max_active_downloads = 2;
+
+    runtime.inject_generic_config_persistence_failure_after_rename();
+    let error = runtime
+        .replace_config(replacement.clone())
+        .await
+        .unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("configuration persistence failed"));
+    assert!(error.to_string().contains("after rename"));
+    assert_eq!(std::fs::read(&config_path).unwrap(), previous_file);
+    assert_eq!(
+        runtime.config.read().await.storage.root_controls[0].max_active_downloads,
+        1
+    );
+    assert_eq!(
+        Config::from_file(&config_path)
+            .unwrap()
+            .storage
+            .root_controls[0]
+            .max_active_downloads,
+        1
+    );
+
+    // A second update demonstrates both configuration locks were released
+    // after the failed persistence attempt.
+    runtime.replace_config(replacement).await.unwrap();
+    assert_eq!(
+        runtime.config.read().await.storage.root_controls[0].max_active_downloads,
+        2
+    );
+    assert_eq!(
+        Config::from_file(&config_path)
+            .unwrap()
+            .storage
+            .root_controls[0]
+            .max_active_downloads,
+        2
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn tightening_root_controls_serializes_an_inflight_engine_admission() {
+    let root = unique_dir("root-control-admission-race");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.dht.enabled = false;
+    cfg.pex.enabled = false;
+    cfg.storage.download_dir = Some(root.display().to_string());
+    cfg.storage.root_controls = vec![swarmotter_core::config::StorageRootControl {
+        path: root.display().to_string(),
+        max_active_downloads: 2,
+        max_active_bytes: 0,
+        max_write_bytes_per_second: 0,
+        max_concurrent_rechecks: 0,
+    }];
+    let mut health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    health.traffic_allowed = true;
+    let runtime = DaemonRuntime::new(cfg.clone(), health);
+    let first =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "race-first.bin",
+            b"first root admission race fixture",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let second =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "race-second.bin",
+            b"second root admission race fixture",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let third =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "race-third.bin",
+            b"third root admission race fixture",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let first_hash = first.info_hash;
+    let second_hash = second.info_hash;
+    let third_hash = third.info_hash;
+    let mut active = Torrent::new(first.clone(), now());
+    active.state = TorrentState::Downloading;
+    {
+        let mut registry = runtime.registry.lock().await;
+        registry.add(active).unwrap();
+        registry.add(Torrent::new(second, now())).unwrap();
+        registry.add(Torrent::new(third, now())).unwrap();
+    }
+    {
+        let mut queue = runtime.queue.lock().await;
+        queue.add(first_hash);
+        queue.add(second_hash);
+        queue.add(third_hash);
+    }
+    let old_admission = storage_root_admission_for_path(&cfg, &root).unwrap();
+    runtime
+        .storage_admissions
+        .reserve(first_hash, &old_admission, first.total_length)
+        .await
+        .unwrap();
+    let (first_tx, mut first_rx) = tokio::sync::mpsc::channel(1);
+    let first_handle = tokio::spawn(async move { while first_rx.recv().await.is_some() {} });
+    runtime
+        .engine_cmds
+        .lock()
+        .await
+        .insert(first_hash, first_tx);
+    runtime
+        .engine_handles
+        .write()
+        .await
+        .insert(first_hash, first_handle);
+
+    let (start_reached, start_continue) =
+        runtime.pause_engine_start_before_storage_admission().await;
+    let starting_runtime = runtime.clone();
+    let start = tokio::spawn(async move {
+        starting_runtime.start_engine(second_hash).await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), start_reached)
+        .await
+        .expect("second engine should own the transition lock before admission")
+        .expect("engine-start pause should remain reachable");
+
+    let (mut replacement_reached, replacement_continue) = runtime
+        .pause_root_control_replacement_after_transition_lock()
+        .await;
+    let mut tightening = cfg.clone();
+    tightening.storage.root_controls[0].max_active_downloads = 1;
+    let replacing_runtime = runtime.clone();
+    let replacement =
+        tokio::spawn(async move { replacing_runtime.replace_config(tightening).await });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut replacement_reached)
+            .await
+            .is_err(),
+        "a root-control PUT must wait for the in-flight engine admission lock"
+    );
+    assert_eq!(
+        runtime.config.read().await.storage.root_controls[0].max_active_downloads,
+        2
+    );
+
+    let _ = start_continue.send(());
+    tokio::time::timeout(Duration::from_secs(1), start)
+        .await
+        .expect("engine start should finish after admission pause releases")
+        .expect("engine-start task should not panic");
+    tokio::time::timeout(Duration::from_secs(1), &mut replacement_reached)
+        .await
+        .expect("root-control PUT should take the transition lock after start")
+        .expect("root-control replacement pause should remain reachable");
+    assert!(
+        runtime
+            .storage_admissions
+            .records()
+            .await
+            .iter()
+            .any(|record| record.hash == second_hash),
+        "the already-started engine is grandfathered under the old admission"
+    );
+
+    let _ = replacement_continue.send(());
+    tokio::time::timeout(Duration::from_secs(1), replacement)
+        .await
+        .expect("root-control replacement should complete")
+        .expect("root-control replacement task should not panic")
+        .expect("root-control replacement should be valid");
+    assert_eq!(
+        runtime.config.read().await.storage.root_controls[0].max_active_downloads,
+        1
+    );
+
+    runtime.start_engine(third_hash).await;
+    assert!(
+        !runtime
+            .storage_admissions
+            .records()
+            .await
+            .iter()
+            .any(|record| record.hash == third_hash),
+        "a post-PUT engine start must use the tightened root limit"
+    );
+
+    runtime.force_stop_engine(&first_hash).await;
+    runtime.force_stop_engine(&second_hash).await;
+    runtime.force_stop_engine(&third_hash).await;
+    runtime.storage_admissions.release(&first_hash).await;
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]
@@ -5635,6 +7039,7 @@ fn watch_test_config(
         recursive: false,
         download_dir: None,
         label: None,
+        profile: None,
         start_behavior,
         archive_dir: None,
         failure_dir: None,
@@ -5649,6 +7054,63 @@ fn disabled_health() -> NetworkHealth {
         swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
         "disabled",
     )
+}
+
+#[tokio::test]
+async fn watch_profile_captures_storage_before_registration() {
+    use swarmotter_core::config::StartBehavior;
+    use swarmotter_core::policy::{PolicyProfile, PolicyStorage};
+
+    let root = unique_dir("watch-profile-storage");
+    let complete = root.join("profile-complete");
+    let incomplete = root.join("profile-incomplete");
+    std::fs::create_dir_all(&complete).unwrap();
+    std::fs::create_dir_all(&incomplete).unwrap();
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "watch-profile.bin",
+        b"watch profile payload",
+        8,
+        None,
+        false,
+    );
+    std::fs::write(root.join("watch-profile.torrent"), bytes).unwrap();
+    let mut config = watch_test_config(&root, StartBehavior::Paused);
+    config.profiles.profiles.insert(
+        "archive".into(),
+        PolicyProfile {
+            storage: PolicyStorage {
+                download_dir: Some(complete.display().to_string()),
+                incomplete_dir: Some(incomplete.display().to_string()),
+            },
+            ..Default::default()
+        },
+    );
+    config.watch[0].profile = Some("archive".into());
+    let runtime = DaemonRuntime::new(config, disabled_health());
+
+    runtime.watch_scan().await.unwrap();
+    runtime.watch_scan().await.unwrap();
+    let torrent = {
+        let registry = runtime.registry.lock().await;
+        registry
+            .list()
+            .first()
+            .map(|torrent| (*torrent).clone())
+            .unwrap()
+    };
+    assert_eq!(torrent.policy.profile.as_deref(), Some("archive"));
+    assert_eq!(
+        torrent.policy.profile_origin,
+        Some(swarmotter_core::policy::PolicyProfileOrigin::WatchFolder)
+    );
+    assert_eq!(
+        runtime.policy_storage_paths(&torrent).await,
+        (
+            complete.display().to_string(),
+            incomplete.display().to_string(),
+        )
+    );
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[tokio::test]
@@ -6211,6 +7673,7 @@ async fn overlapping_watch_roots_have_distinct_composite_observation_keys() {
         recursive: false,
         download_dir: None,
         label: None,
+        profile: None,
         start_behavior: StartBehavior::Paused,
         archive_dir: None,
         failure_dir: None,
@@ -6248,6 +7711,7 @@ async fn watch_action_exclusion_does_not_hide_separately_configured_overlapping_
         recursive: false,
         download_dir: None,
         label: None,
+        profile: None,
         start_behavior: StartBehavior::Paused,
         archive_dir: None,
         failure_dir: None,

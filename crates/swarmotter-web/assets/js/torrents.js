@@ -831,6 +831,35 @@ export function chooseTorrentRemoval(name) {
   });
 }
 // --- Add ---
+export function profileLabels(value) {
+  return String(value || "")
+    .split(",")
+    .map(label => label.trim())
+    .filter(Boolean);
+}
+
+export function renderProfileChoices(selectors, profiles) {
+  const names = Object.keys(profiles?.profiles || {}).sort((a, b) => a.localeCompare(b));
+  selectors.forEach(selector => {
+    const select = $(selector);
+    if (!select) return;
+    const selected = select.value;
+    select.innerHTML = [
+      `<option value="">Use label or global defaults</option>`,
+      ...names.map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`),
+    ].join("");
+    select.value = names.includes(selected) ? selected : "";
+  });
+}
+
+export async function refreshProfileChoices() {
+  try {
+    renderProfileChoices(["#magnet-profile", "#file-profile"], await api("/profiles"));
+  } catch (error) {
+    log("profile choices error: " + error.message);
+  }
+}
+
 $("#add-magnet-btn").addEventListener("click", async () => {
   if (state.magnetAddInFlight) return;
   const button = $("#add-magnet-btn");
@@ -846,8 +875,15 @@ $("#add-magnet-btn").addEventListener("click", async () => {
     button.setAttribute("aria-busy", "true");
     showToast("Adding magnet", "", "info");
     const dir = $("#magnet-dir").value.trim();
-    const body = { magnet, paused: $("#magnet-paused").checked };
+    const body = { magnet };
     if (dir) body.download_dir = dir;
+    const profile = $("#magnet-profile").value;
+    if (profile) body.profile = profile;
+    const labels = profileLabels($("#magnet-labels").value);
+    if (labels.length) body.labels = labels;
+    // Leaving this unchecked intentionally lets the selected profile or
+    // global queue setting decide the initial start behavior.
+    if ($("#magnet-paused").checked) body.paused = true;
     const h = await api("/torrents/magnet", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
     showToast("Torrent added", h, "success");
     input.value = "";
@@ -871,15 +907,25 @@ $("#add-file-btn").addEventListener("click", async () => {
   try {
     const file = $("#torrent-file").files[0];
     if (!file) { showToast("Choose a .torrent file", "", "warning"); return; }
-    const h = await uploadTorrentFile(file, $("#file-paused").checked);
+    const h = await uploadTorrentFile(
+      file,
+      $("#file-paused").checked,
+      $("#file-profile").value,
+      profileLabels($("#file-labels").value),
+    );
     showToast("Torrent added", h, "success");
     refreshTorrents();
   } catch (e) { showError("Upload failed", e); }
 });
 
-export async function uploadTorrentFile(file, paused = false) {
+export async function uploadTorrentFile(file, paused = false, profile = "", labels = []) {
   const buf = await file.arrayBuffer();
-  return api(`/torrents/file?paused=${paused}`, {
+  const query = new URLSearchParams();
+  if (paused) query.set("paused", "true");
+  if (profile) query.set("profile", profile);
+  if (labels.length) query.set("labels", labels.join(","));
+  const suffix = query.toString();
+  return api(`/torrents/file${suffix ? `?${suffix}` : ""}`, {
     method: "POST",
     headers: { "content-type": "application/octet-stream" },
     body: buf

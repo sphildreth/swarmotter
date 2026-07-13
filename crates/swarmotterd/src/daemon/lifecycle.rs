@@ -1,11 +1,222 @@
 // SPDX-License-Identifier: Apache-2.0
 
+use super::policy_runtime::validate_explicit_profile_assignments;
 use super::*;
+
+#[derive(Clone, Copy)]
+pub(super) struct ExplicitRecheckRestoreState {
+    pub(super) was_completed: bool,
+    pub(super) was_manually_paused: bool,
+}
+
+/// A dropped API request must not strand the torrent in `checking`. The guard
+/// schedules the same cancellation cleanup used by pause/stop/move, while the
+/// root permit itself is released by the recheck executor's RAII scope.
+struct ExplicitRecheckDropGuard {
+    runtime: DaemonRuntime,
+    hash: InfoHash,
+    operation: ExplicitRecheckOperation,
+    restore: Option<ExplicitRecheckRestoreState>,
+}
+
+impl ExplicitRecheckDropGuard {
+    fn new(
+        runtime: DaemonRuntime,
+        hash: InfoHash,
+        operation: ExplicitRecheckOperation,
+        restore: ExplicitRecheckRestoreState,
+    ) -> Self {
+        Self {
+            runtime,
+            hash,
+            operation,
+            restore: Some(restore),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.restore = None;
+    }
+}
+
+impl Drop for ExplicitRecheckDropGuard {
+    fn drop(&mut self) {
+        let Some(restore) = self.restore.take() else {
+            return;
+        };
+        self.operation.cancel();
+        let runtime = self.runtime.clone();
+        let hash = self.hash;
+        let operation = self.operation.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                runtime
+                    .finish_cancelled_explicit_recheck(hash, operation, restore)
+                    .await;
+            });
+        } else {
+            // A daemon operation normally always runs on Tokio. Do not leave
+            // a concurrent stop waiting forever if a caller drops it during
+            // runtime teardown, even though registry restoration cannot run.
+            operation.finish();
+        }
+    }
+}
+
+impl DaemonRuntime {
+    #[cfg(test)]
+    pub(super) async fn pause_root_control_replacement_after_transition_lock(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        *self.root_control_replacement_pause.lock().await = Some((reached_tx, continue_rx));
+        (reached_rx, continue_tx)
+    }
+
+    async fn wait_at_root_control_replacement_test_pause(&self) {
+        #[cfg(test)]
+        if let Some((reached, continue_rx)) =
+            self.root_control_replacement_pause.lock().await.take()
+        {
+            let _ = reached.send(());
+            let _ = continue_rx.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_generic_config_persistence_failure_after_rename(&self) {
+        self.generic_config_fail_after_rename
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn generic_config_persistence_failure_after_rename_injected(&self) -> bool {
+        self.generic_config_fail_after_rename
+            .swap(false, Ordering::AcqRel)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn pause_explicit_recheck_before_persist(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        *self.explicit_recheck_before_persist_pause.lock().await = Some((reached_tx, continue_rx));
+        (reached_rx, continue_tx)
+    }
+
+    async fn wait_at_explicit_recheck_before_persist_test_pause(&self) {
+        #[cfg(test)]
+        if let Some((reached, continue_rx)) = self
+            .explicit_recheck_before_persist_pause
+            .lock()
+            .await
+            .take()
+        {
+            let _ = reached.send(());
+            let _ = continue_rx.await;
+        }
+    }
+
+    pub(super) async fn cancel_explicit_recheck(
+        &self,
+        hash: &InfoHash,
+    ) -> Option<ExplicitRecheckOperation> {
+        let operation = self.explicit_rechecks.lock().await.get(hash).cloned();
+        if let Some(operation) = &operation {
+            operation.cancel();
+        }
+        operation
+    }
+
+    async fn finish_explicit_recheck_operation(
+        &self,
+        hash: InfoHash,
+        operation: ExplicitRecheckOperation,
+    ) {
+        let mut operations = self.explicit_rechecks.lock().await;
+        if operations
+            .get(&hash)
+            .is_some_and(|current| current.is_same_operation(&operation))
+        {
+            operations.remove(&hash);
+        }
+        drop(operations);
+        operation.finish();
+    }
+
+    pub(super) async fn finish_cancelled_explicit_recheck(
+        &self,
+        hash: InfoHash,
+        operation: ExplicitRecheckOperation,
+        restore: ExplicitRecheckRestoreState,
+    ) {
+        let owns_operation = self
+            .explicit_rechecks
+            .lock()
+            .await
+            .get(&hash)
+            .is_some_and(|current| current.is_same_operation(&operation));
+        if !owns_operation {
+            operation.finish();
+            return;
+        }
+
+        let (restored_state, should_persist) = {
+            let mut registry = self.registry.lock().await;
+            match registry.get_mut(&hash) {
+                None => (None, false),
+                // Verification may have already finalized the state when the
+                // caller is dropped at the first persistence await. Preserve
+                // that final state durably instead of treating it as a no-op.
+                Some(torrent) if torrent.state != TorrentState::Checking => (None, true),
+                Some(torrent) if restore.was_completed => {
+                    torrent.containment_recovery_intent = None;
+                    if restore.was_manually_paused {
+                        torrent.state = TorrentState::Paused;
+                        torrent.seeding_status = SeedingStatus::StoppedManual;
+                        (Some(TorrentState::Paused), true)
+                    } else {
+                        torrent.state = TorrentState::Completed;
+                        torrent.seeding_status = SeedingStatus::Queued;
+                        (Some(TorrentState::Completed), true)
+                    }
+                }
+                Some(torrent) => {
+                    torrent.containment_recovery_intent = None;
+                    torrent.state = TorrentState::Paused;
+                    torrent.seeding_status = SeedingStatus::NotEligible;
+                    (Some(TorrentState::Paused), true)
+                }
+            }
+        };
+
+        if should_persist {
+            self.persist_state_best_effort("recheck_cancelled").await;
+        }
+        if let Some(state) = restored_state {
+            self.publish_torrent_event("torrent_changed", hash, state);
+            self.publish_event(stats_updated_event());
+            if state == TorrentState::Completed {
+                self.reconcile_seeders().await;
+            }
+        }
+        self.finish_explicit_recheck_operation(hash, operation)
+            .await;
+    }
+}
 
 #[async_trait]
 impl DaemonOps for DaemonRuntime {
     async fn list_torrents(&self) -> Vec<TorrentSummary> {
-        let global_seeding = self.config.read().await.seeding.clone();
+        let config = self.config.read().await.clone();
         let positions: HashMap<InfoHash, usize> = self
             .queue
             .lock()
@@ -24,22 +235,32 @@ impl DaemonOps for DaemonRuntime {
             .map(|t| {
                 let mut summary = t.to_summary();
                 summary.queue_position = positions.get(&t.info_hash()).copied();
-                summary.effective_ratio_limit = t.seeding.effective_ratio_limit(&global_seeding);
-                summary.effective_idle_limit = t.seeding.effective_idle_limit(&global_seeding);
+                let policy = Self::effective_policy_with_config(&config, t);
+                summary.effective_ratio_limit = (!policy.seed_forever.value)
+                    .then_some(policy.ratio_limit.value)
+                    .flatten();
+                summary.effective_idle_limit = (!policy.seed_forever.value)
+                    .then_some(policy.idle_limit.value)
+                    .flatten();
                 summary
             })
             .collect()
     }
 
     async fn get_torrent(&self, hash: &InfoHash) -> Option<TorrentSummary> {
-        let global_seeding = self.config.read().await.seeding.clone();
+        let config = self.config.read().await.clone();
         let position = self.queue.lock().await.position(hash);
         let _lifecycle = self.seeder_lifecycle_lock.lock().await;
         self.registry.lock().await.get(hash).map(|t| {
             let mut summary = t.to_summary();
             summary.queue_position = position;
-            summary.effective_ratio_limit = t.seeding.effective_ratio_limit(&global_seeding);
-            summary.effective_idle_limit = t.seeding.effective_idle_limit(&global_seeding);
+            let policy = Self::effective_policy_with_config(&config, t);
+            summary.effective_ratio_limit = (!policy.seed_forever.value)
+                .then_some(policy.ratio_limit.value)
+                .flatten();
+            summary.effective_idle_limit = (!policy.seed_forever.value)
+                .then_some(policy.idle_limit.value)
+                .flatten();
             summary
         })
     }
@@ -175,51 +396,82 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn recheck(&self, hash: &InfoHash) -> Result<()> {
-        let was_completed = self
-            .registry
+        self.stop_engine(hash).await;
+        let torrent = {
+            let reg = self.registry.lock().await;
+            reg.get(hash)
+                .cloned()
+                .ok_or_else(|| CoreError::NotFound("torrent".into()))?
+        };
+        // A selected-file completion can be `Completed` even when the full
+        // piece set is not complete. Keep the logical lifecycle state
+        // separate from the physical location decision below, which still
+        // follows whether all payload pieces had been completed/moved.
+        let payload_in_complete_dir = torrent.progress.is_complete();
+        let restore = ExplicitRecheckRestoreState {
+            was_completed: matches!(
+                torrent.state,
+                TorrentState::Completed | TorrentState::Seeding
+            ) || payload_in_complete_dir,
+            was_manually_paused: torrent.state == TorrentState::Paused
+                || torrent.seeding_status == SeedingStatus::StoppedManual,
+        };
+        let complete_dir = self.resolve_download_dir(&torrent).await;
+        let storage_dir = if payload_in_complete_dir {
+            complete_dir
+        } else {
+            self.resolve_incomplete_dir_for(&torrent).await
+        };
+        let operation = ExplicitRecheckOperation::new();
+        let mut drop_guard =
+            ExplicitRecheckDropGuard::new(self.clone(), *hash, operation.clone(), restore);
+        self.explicit_rechecks
             .lock()
             .await
-            .get(hash)
-            .map(|torrent| torrent.progress.is_complete())
-            .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
-        self.stop_engine(hash).await;
-        {
+            .insert(*hash, operation.clone());
+        let marked_checking = {
             let mut reg = self.registry.lock().await;
             match reg.get_mut(hash) {
                 Some(t) => {
                     t.containment_recovery_intent = None;
                     t.state = TorrentState::Checking;
                     t.seeding_status = SeedingStatus::NotEligible;
+                    true
                 }
-                None => return Err(CoreError::NotFound("torrent".into())),
+                None => false,
             }
+        };
+        if !marked_checking {
+            drop_guard.disarm();
+            self.finish_explicit_recheck_operation(*hash, operation)
+                .await;
+            return Err(CoreError::NotFound("torrent".into()));
         }
         self.publish_torrent_event("torrent_changed", *hash, TorrentState::Checking);
         self.publish_event(stats_updated_event());
-        // Run a real storage recheck on disk.
-        let (meta, storage_dir) = {
-            let reg = self.registry.lock().await;
-            let Some(t) = reg.get(hash) else {
-                return Err(CoreError::NotFound("torrent".into()));
-            };
-            let complete_dir = self.resolve_download_dir(t).await;
-            let storage_dir = if was_completed {
-                complete_dir
-            } else {
-                self.resolve_incomplete_dir(&complete_dir).await
-            };
-            (t.meta.clone(), storage_dir)
-        };
+
+        // Run a real storage recheck on disk through the root-scoped executor.
         let storage = swarmotter_core::storage::StorageIo::new(
-            meta.clone(),
+            torrent.meta.clone(),
             std::path::PathBuf::from(&storage_dir),
         );
-        match storage.recheck().await {
+        let cancellation = operation.cancellation();
+        match self
+            .recheck_storage_under_root_control(&storage, Some(&cancellation))
+            .await
+        {
             Ok(bf) => {
+                if cancellation.is_cancelled() {
+                    drop_guard.disarm();
+                    self.finish_cancelled_explicit_recheck(*hash, operation, restore)
+                        .await;
+                    return Ok(());
+                }
                 let mut final_state = None;
                 let mut reg = self.registry.lock().await;
                 if let Some(t) = reg.get_mut(hash) {
-                    t.progress.replace_from_bitfield(&bf, meta.piece_count());
+                    t.progress
+                        .replace_from_bitfield(&bf, torrent.meta.piece_count());
                     t.recompute_file_bytes_completed();
                     if torrent_selection_complete(t, &bf)? {
                         t.state = TorrentState::Completed;
@@ -244,10 +496,19 @@ impl DaemonOps for DaemonRuntime {
                     }
                     self.publish_event(stats_updated_event());
                 }
+                self.wait_at_explicit_recheck_before_persist_test_pause()
+                    .await;
                 self.persist_state().await?;
                 self.reconcile_seeders().await;
             }
+            Err(e) if is_storage_work_cancelled(&e) || cancellation.is_cancelled() => {
+                drop_guard.disarm();
+                self.finish_cancelled_explicit_recheck(*hash, operation, restore)
+                    .await;
+                return Ok(());
+            }
             Err(e) => {
+                drop_guard.disarm();
                 let mut reg = self.registry.lock().await;
                 if let Some(t) = reg.get_mut(hash) {
                     t.state = TorrentState::StorageError;
@@ -257,9 +518,14 @@ impl DaemonOps for DaemonRuntime {
                 self.publish_torrent_event("torrent_error", *hash, TorrentState::StorageError);
                 self.publish_event(stats_updated_event());
                 self.persist_state_best_effort("recheck_failed").await;
+                self.finish_explicit_recheck_operation(*hash, operation)
+                    .await;
                 return Err(e);
             }
         }
+        drop_guard.disarm();
+        self.finish_explicit_recheck_operation(*hash, operation)
+            .await;
         Ok(())
     }
 
@@ -289,8 +555,19 @@ impl DaemonOps for DaemonRuntime {
             .get(hash)
             .cloned()
             .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
-        self.ensure_storage_paths_available_except(&torrent.meta, Some(&path), Some(*hash))
-            .await?;
+        let cfg = self.config.read().await.clone();
+        let (old_complete, old_active) = Self::policy_storage_paths_with_config(&cfg, &torrent);
+        let mut destination_policy = torrent.clone();
+        destination_policy.download_dir = Some(path.clone());
+        let (destination_complete, destination_active) =
+            Self::policy_storage_paths_with_config(&cfg, &destination_policy);
+        self.ensure_storage_paths_available_at_paths_except(
+            &torrent.meta,
+            &destination_complete,
+            &destination_active,
+            Some(*hash),
+        )
+        .await?;
         let was_active = matches!(
             torrent.state,
             TorrentState::Downloading | TorrentState::DownloadingMetadata
@@ -301,17 +578,15 @@ impl DaemonOps for DaemonRuntime {
         );
         let payload_in_complete = torrent.progress.is_complete();
         self.stop_engine(hash).await;
-        let cfg = self.config.read().await.clone();
-        let old_complete = resolve_download_dir_from_config(torrent.download_dir.as_deref(), &cfg);
         let source = if payload_in_complete {
             old_complete
         } else {
-            resolve_incomplete_dir_from_config(&old_complete, &cfg)
+            old_active
         };
         let destination = if payload_in_complete {
-            path.clone()
+            destination_complete
         } else {
-            resolve_incomplete_dir_from_config(&path, &cfg)
+            destination_active
         };
         let source_path = PathBuf::from(source);
         let storage =
@@ -376,9 +651,12 @@ impl DaemonOps for DaemonRuntime {
         }
         let mut renamed_meta = torrent.meta.clone();
         renamed_meta.files[file_index].path = components;
-        self.ensure_storage_paths_available_except(
+        let cfg = self.config.read().await.clone();
+        let (complete_dir, active_dir) = Self::policy_storage_paths_with_config(&cfg, &torrent);
+        self.ensure_storage_paths_available_at_paths_except(
             &renamed_meta,
-            torrent.download_dir.as_deref(),
+            &complete_dir,
+            &active_dir,
             Some(*hash),
         )
         .await?;
@@ -396,7 +674,7 @@ impl DaemonOps for DaemonRuntime {
         let storage_dir = if payload_in_complete {
             complete_dir
         } else {
-            self.resolve_incomplete_dir(&complete_dir).await
+            self.resolve_incomplete_dir_for(&torrent).await
         };
         let old_storage = swarmotter_core::storage::StorageIo::new(
             torrent.meta.clone(),
@@ -458,15 +736,40 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn set_labels(&self, hash: &InfoHash, labels: Vec<String>) -> Result<()> {
-        let result = match self.registry.lock().await.get_mut(hash) {
-            Some(t) => {
-                t.labels = labels;
-                Ok(())
-            }
-            None => Err(CoreError::NotFound("torrent".into())),
+        // Labels can select a profile, so hold the same transaction boundary
+        // as profile replacement through the durable torrent-state write.
+        let _config_transaction = self.config_write_lock.lock().await;
+        let config = self.config.read().await.clone();
+        let previous = {
+            let mut registry = self.registry.lock().await;
+            let torrent = registry
+                .get_mut(hash)
+                .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+            let previous = torrent.clone();
+            // Labels can select a profile. Snapshot before changing labels so
+            // that selection can affect only live fields for existing data.
+            Self::snapshot_initial_admission(&config, torrent);
+            Self::snapshot_existing_storage(&config, torrent);
+            torrent.labels = labels;
+            previous
         };
-        result?;
-        self.persist_state().await
+        // Profile selection can change as a consequence of label updates.
+        // Persist the record before applying its live queue, seeding, and
+        // bandwidth effects; a failed write restores the exact old labels.
+        if let Err(error) = self.persist_state().await {
+            if let Some(torrent) = self.registry.lock().await.get_mut(hash) {
+                *torrent = previous;
+            }
+            return Err(error);
+        }
+        // Label-derived storage is intentionally creation-time only. Existing
+        // torrents retain their resolved/snapshotted storage while these live
+        // profile fields are re-evaluated.
+        self.refresh_profile_runtime_fields().await;
+        self.schedule_reconcile_queue("torrent_labels_changed")
+            .await;
+        self.reconcile_seeders().await;
+        Ok(())
     }
 
     async fn set_torrent_limits(
@@ -480,6 +783,8 @@ impl DaemonOps for DaemonRuntime {
                 Some(t) => {
                     t.download_limit = limits.download;
                     t.upload_limit = limits.upload;
+                    t.policy.overrides.download_limit = Some(limits.download);
+                    t.policy.overrides.upload_limit = Some(limits.upload);
                 }
                 None => return Err(CoreError::NotFound("torrent".into())),
             }
@@ -523,16 +828,24 @@ impl DaemonOps for DaemonRuntime {
                 .get_mut(hash)
                 .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
             let previous = torrent.seeding.clone();
+            let previous_overrides = torrent.policy.overrides.clone();
             // Persist policy independently of runtime lifecycle. A live
             // registry entry remains Seeding+Active until synchronized
             // reconciliation stops it after the durable write succeeds.
             torrent.seeding = seeding;
-            previous
+            // The native policy setter is a per-torrent override. Preserve a
+            // nullable ratio/idle target as inheritance and retain the bool
+            // explicitly so `false` can override a seed-forever profile.
+            torrent.policy.overrides.ratio_limit = torrent.seeding.ratio_limit;
+            torrent.policy.overrides.idle_limit = torrent.seeding.idle_limit;
+            torrent.policy.overrides.seed_forever = Some(torrent.seeding.seed_forever);
+            (previous, previous_overrides)
         };
 
         if let Err(error) = self.persist_state().await {
             if let Some(torrent) = self.registry.lock().await.get_mut(hash) {
-                torrent.seeding = previous;
+                torrent.seeding = previous.0;
+                torrent.policy.overrides = previous.1;
             }
             return Err(error);
         }
@@ -542,6 +855,22 @@ impl DaemonOps for DaemonRuntime {
         self.get_torrent(hash)
             .await
             .ok_or_else(|| CoreError::NotFound("torrent".into()))
+    }
+
+    async fn torrent_policy(
+        &self,
+        hash: &InfoHash,
+    ) -> Option<swarmotter_core::policy::EffectiveTorrentPolicy> {
+        let config = self.config.read().await.clone();
+        self.registry
+            .lock()
+            .await
+            .get(hash)
+            .map(|torrent| Self::effective_policy_with_config(&config, torrent))
+    }
+
+    async fn set_torrent_profile(&self, hash: &InfoHash, profile: Option<String>) -> Result<()> {
+        self.assign_torrent_profile(hash, profile).await
     }
 
     async fn list_files(&self, hash: &InfoHash) -> Option<Vec<TorrentFile>> {
@@ -735,6 +1064,18 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn list_peers(&self, hash: &InfoHash) -> Option<Vec<Peer>> {
+        // Manual bans are a global operator action, and this read-only lookup
+        // intentionally does not call `PeerFilter::admit_ip`: rendering peer
+        // rows must not increment admission/audit counters.
+        let manual_ban_ips = {
+            let config = self.config.read().await;
+            config
+                .peer_filter
+                .manual_bans
+                .iter()
+                .filter_map(|ban| ban.ip.trim().parse::<std::net::IpAddr>().ok())
+                .collect::<HashSet<_>>()
+        };
         let states = self.engine_states.read().await;
         let state = states.get(hash)?;
         let s = state.lock().await;
@@ -751,10 +1092,79 @@ impl DaemonOps for DaemonRuntime {
                 rate_down: 0,
                 rate_up: 0,
                 flags: swarmotter_core::models::peer::PeerFlags::default(),
-                banned: false,
+                banned: manual_ban_ips.contains(&pa.ip),
             })
             .collect();
         Some(peers)
+    }
+
+    async fn peer_filter_status(&self) -> swarmotter_core::peer_filter::PeerFilterStatus {
+        self.peer_filter.read().await.status()
+    }
+
+    async fn replace_peer_filter(
+        &self,
+        peer_filter: swarmotter_core::peer_filter::PeerFilterConfig,
+    ) -> Result<swarmotter_core::peer_filter::PeerFilterStatus> {
+        let _config_transaction = self.config_write_lock.lock().await;
+        let mut next = self.config.read().await.clone();
+        next.peer_filter = peer_filter;
+        self.apply_peer_filter_mutation_locked(next).await
+    }
+
+    async fn ban_peer(
+        &self,
+        hash: &InfoHash,
+        ban: swarmotter_core::peer_filter::ManualPeerBan,
+    ) -> Result<swarmotter_core::peer_filter::PeerFilterStatus> {
+        let _config_transaction = self.config_write_lock.lock().await;
+        if self.registry.lock().await.get(hash).is_none() {
+            return Err(CoreError::NotFound("torrent".into()));
+        }
+        let ip = ban.ip.trim().parse::<std::net::IpAddr>().map_err(|error| {
+            CoreError::InvalidArgument(format!("manual peer ban IP '{}': {error}", ban.ip))
+        })?;
+        let ban = swarmotter_core::peer_filter::ManualPeerBan {
+            ip: ip.to_string(),
+            reason: ban.reason.map(|reason| reason.trim().to_string()),
+        };
+        let mut next = self.config.read().await.clone();
+        // A manual operator ban must take effect rather than being retained in
+        // a disabled policy section. It is global by design, so future
+        // candidate sources and inbound sessions receive it as well.
+        next.peer_filter.enabled = true;
+        if let Some(existing) = next.peer_filter.manual_bans.iter_mut().find(|existing| {
+            existing
+                .ip
+                .trim()
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|current| current == ip)
+        }) {
+            *existing = ban;
+        } else {
+            next.peer_filter.manual_bans.push(ban);
+        }
+        self.apply_peer_filter_mutation_locked(next).await
+    }
+
+    async fn unban_peer(
+        &self,
+        hash: &InfoHash,
+        ip: String,
+    ) -> Result<swarmotter_core::peer_filter::PeerFilterStatus> {
+        let _config_transaction = self.config_write_lock.lock().await;
+        if self.registry.lock().await.get(hash).is_none() {
+            return Err(CoreError::NotFound("torrent".into()));
+        }
+        self.remove_global_manual_ban_locked(ip).await
+    }
+
+    async fn unban_global_peer(
+        &self,
+        ip: String,
+    ) -> Result<swarmotter_core::peer_filter::PeerFilterStatus> {
+        let _config_transaction = self.config_write_lock.lock().await;
+        self.remove_global_manual_ban_locked(ip).await
     }
 
     async fn queue_move_up(&self, hash: &InfoHash) -> Result<()> {
@@ -853,6 +1263,12 @@ impl DaemonOps for DaemonRuntime {
             next.api.auth_token = previous.api.auth_token.clone();
         }
         next.validate()?;
+        // Compile the candidate before a config file write or live state
+        // mutation. This turns a changed/deleted local blocklist into a
+        // clean failed update instead of a partially installed policy.
+        let next_peer_filter = Arc::new(swarmotter_core::peer_filter::PeerFilter::from_config(
+            &next.peer_filter,
+        )?);
         let next_network_health = net::evaluate(&next.network, self.interface_probe.as_ref());
         let recovering_latched_failure = self.bind_failure_latched.read().await.is_some();
         if recovering_latched_failure {
@@ -870,7 +1286,7 @@ impl DaemonOps for DaemonRuntime {
                 "configuration update disables API and Web UI authentication on a non-loopback listener; every client that can reach this address can control SwarmOtter"
             );
         }
-        let torrents = self
+        let mut torrents = self
             .registry
             .lock()
             .await
@@ -878,30 +1294,126 @@ impl DaemonOps for DaemonRuntime {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        // Older records predate durable policy snapshots. Build their
+        // candidate migration from the pre-replacement configuration before
+        // validation, so a new label/profile mapping cannot redirect old
+        // payloads during this same PUT.
+        let legacy_policy_migration =
+            Self::prepare_legacy_policy_snapshot_migration(&previous, &next, &mut torrents);
+        validate_explicit_profile_assignments(&next, &torrents)?;
         validate_storage_config_transition(&previous, &next, &torrents)?;
 
         let peer_limits_changed = peer_limits_changed(&previous, &next);
-        let restart_required_fields = restart_required_fields(&previous, &next);
-        if peer_limits_changed {
-            let peer_permits = self.build_peer_permit_configuration(&next).await?;
-            self.apply_peer_budget_runtime_update(
-                next.clone(),
-                peer_permits,
-                config_path.as_deref(),
-                recovering_latched_failure,
-            )
-            .await?;
+        // A peer-policy replacement needs the same transactional lifecycle as
+        // a permit replacement: persist only after the newly compiled policy
+        // has reconstructed its sessions, and restore the exact old policy if
+        // either reconstruction or persistence fails. Build this fallible
+        // candidate before the legacy state migration is made durable.
+        let peer_policy_changed = previous.peer_filter != next.peer_filter;
+        let next_peer_permits = if peer_limits_changed || peer_policy_changed {
+            Some(self.build_peer_permit_configuration(&next).await?)
         } else {
-            if let Some(path) = &config_path {
-                write_config_atomically(path, &next)?;
-            }
+            None
+        };
+        // Capture this fallible rollback input before installing a legacy
+        // state migration. The generic path can then fail only at its
+        // explicitly handled persistence boundary.
+        let generic_config_file_snapshot = if next_peer_permits.is_none() {
+            config_path
+                .as_deref()
+                .map(capture_config_file)
+                .transpose()?
+        } else {
+            None
+        };
+        let restart_required_fields = restart_required_fields(&previous, &next);
 
+        if !legacy_policy_migration.is_empty() {
+            self.install_legacy_policy_snapshot_migration(&legacy_policy_migration)
+                .await?;
+            // This state write occurs before either config replacement path.
+            // Its own file snapshot protects the post-rename sync error case;
+            // if it fails, disk is back on the old generation and only the
+            // two migration fields need restoring in memory.
+            if let Err(error) = self.persist_state_with_file_rollback().await {
+                let runtime_rollback = self
+                    .rollback_legacy_policy_snapshot_migration(&legacy_policy_migration)
+                    .await;
+                return Err(CoreError::Internal(format!(
+                    "legacy policy migration persistence failed: {error}; runtime rollback: {runtime_rollback:?}"
+                )));
+            }
+        }
+
+        if let Some(peer_permits) = next_peer_permits {
+            if let Err(error) = self
+                .apply_peer_budget_runtime_update(
+                    next.clone(),
+                    peer_permits,
+                    config_path.as_deref(),
+                    recovering_latched_failure,
+                )
+                .await
+            {
+                let state_rollback = self
+                    .restore_legacy_policy_snapshot_migration(&legacy_policy_migration)
+                    .await;
+                return Err(CoreError::Internal(format!(
+                    "configuration replacement failed: {error}; legacy policy rollback: {state_rollback:?}"
+                )));
+            }
+        } else {
+            // `write_config_bytes_atomically` can report a directory-sync
+            // error after its rename has made the candidate visible. Capture
+            // the old bytes before this generic transaction touches the file
+            // so that failure cannot leave disk on a generation runtime did
+            // not install.
             let rebuild_data_plane = data_plane_config_changed(&previous, &next);
-            let data_plane_transition = if rebuild_data_plane {
+            // Root-control replacement has no reason to tear down healthy
+            // engines, but it does change the admission decision made while
+            // an engine is being constructed. Serialize that decision with
+            // the config install so a tightening PUT cannot race a start that
+            // reads the old limits after the replacement is committed.
+            let root_controls_changed =
+                previous.storage.root_controls != next.storage.root_controls;
+            let serialize_data_plane_admission = rebuild_data_plane || root_controls_changed;
+            let data_plane_transition = if serialize_data_plane_admission {
                 Some(self.data_plane_transition_lock.lock().await)
             } else {
                 None
             };
+            // Persist only after obtaining the same transition lock that
+            // protects storage admission. This makes a root-control update's
+            // on-disk generation and its live admission decision change at
+            // one serialized commit point. A write failure attempts to
+            // restore the previous file generation while runtime remains
+            // unchanged.
+            if let Some(path) = &config_path {
+                #[cfg(test)]
+                let persisted = if self.generic_config_persistence_failure_after_rename_injected() {
+                    write_config_atomically_with_post_rename_sync_failure(path, &next)
+                } else {
+                    write_config_atomically(path, &next)
+                };
+                #[cfg(not(test))]
+                let persisted = write_config_atomically(path, &next);
+
+                if let Err(error) = persisted {
+                    let file_rollback = generic_config_file_snapshot
+                        .as_ref()
+                        .map_or(Ok(()), |snapshot| restore_config_file(path, snapshot));
+                    drop(data_plane_transition);
+                    let state_rollback = self
+                        .restore_legacy_policy_snapshot_migration(&legacy_policy_migration)
+                        .await;
+                    return Err(CoreError::Internal(format!(
+                        "configuration persistence failed: {error}; configuration rollback: {file_rollback:?}; legacy policy rollback: {state_rollback:?}"
+                    )));
+                }
+            }
+            if root_controls_changed {
+                self.wait_at_root_control_replacement_test_pause().await;
+            }
             if rebuild_data_plane {
                 // Snapshot progress before stopping every task created from the old
                 // containment policy. No old binder, DHT runner, listener, tracker
@@ -945,6 +1457,10 @@ impl DaemonOps for DaemonRuntime {
                 let mut cfg = self.config.write().await;
                 *cfg = next.clone();
             }
+            // Engines/listeners are reconstructed while the transition lock
+            // is held, so every newly admitted peer sees this same immutable
+            // policy generation as the config snapshot.
+            *self.peer_filter.write().await = next_peer_filter;
             self.selfish_completion_enabled
                 .store(next.torrent.selfish, Ordering::Release);
             drop(data_plane_transition);
@@ -979,6 +1495,7 @@ impl DaemonOps for DaemonRuntime {
                 "torrent.listen_port".into(),
                 "torrent.encryption_mode".into(),
                 "torrent.selfish".into(),
+                "peer_filter".into(),
                 "dht".into(),
                 "storage".into(),
                 "watch".into(),
@@ -1008,7 +1525,7 @@ impl DaemonOps for DaemonRuntime {
         let mut storage_paths = Vec::new();
         for torrent in &torrents {
             let complete_dir = self.resolve_download_dir(torrent).await;
-            let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
+            let active_dir = self.resolve_incomplete_dir_for(torrent).await;
             for dir in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
                 let storage =
                     swarmotter_core::storage::StorageIo::new(torrent.meta.clone(), dir.clone());
@@ -1169,6 +1686,21 @@ impl DaemonOps for DaemonRuntime {
     async fn storage_roots(&self) -> StorageDiagnostics {
         let cfg = self.config.read().await.clone();
         let mut roots: HashMap<String, StorageRootAccumulator> = HashMap::new();
+        let configured_control_roots = cfg
+            .storage
+            .root_controls
+            .iter()
+            .filter_map(|control| control.normalized_path().ok())
+            .collect::<HashSet<_>>();
+        for path in &configured_control_roots {
+            add_storage_root_role(
+                &mut roots,
+                path.display().to_string(),
+                StorageRootRole::Policy,
+            );
+        }
+        let admission_records = self.storage_admissions.records().await;
+        let active_rechecks = self.storage_rechecks.active_counts();
 
         let download_dir = resolve_download_dir_from_config(None, &cfg);
         add_storage_root_role(
@@ -1193,39 +1725,84 @@ impl DaemonOps for DaemonRuntime {
             }
         }
 
+        let mut control_usage: HashMap<PathBuf, (usize, u64, u64)> = HashMap::new();
         {
             let reg = self.registry.lock().await;
             for torrent in reg.torrents.values() {
-                let complete_dir =
-                    resolve_download_dir_from_config(torrent.download_dir.as_deref(), &cfg);
+                let policy = Self::effective_policy_with_config(&cfg, torrent);
+                let (complete_dir, active_dir) =
+                    Self::policy_storage_paths_with_config(&cfg, torrent);
                 if torrent.download_dir.is_some() {
                     add_storage_root_role(
                         &mut roots,
                         complete_dir.clone(),
                         StorageRootRole::TorrentOverride,
                     );
+                } else if !matches!(
+                    policy.download_dir.source,
+                    swarmotter_core::policy::PolicyValueSource::Global
+                ) {
+                    add_storage_root_role(
+                        &mut roots,
+                        complete_dir.clone(),
+                        StorageRootRole::Policy,
+                    );
                 }
                 add_storage_root_usage(&mut roots, complete_dir.clone(), torrent);
-                let active_dir = resolve_incomplete_dir_from_config(&complete_dir, &cfg);
                 add_storage_root_role(&mut roots, active_dir.clone(), StorageRootRole::Incomplete);
+                if !matches!(
+                    policy.incomplete_dir.source,
+                    swarmotter_core::policy::PolicyValueSource::Global
+                ) {
+                    add_storage_root_role(&mut roots, active_dir.clone(), StorageRootRole::Policy);
+                }
                 if active_dir != complete_dir {
                     add_storage_root_usage(&mut roots, active_dir, torrent);
                 }
+            }
+            for record in &admission_records {
+                let entry = control_usage.entry(record.root.clone()).or_default();
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = entry.1.saturating_add(record.declared_bytes);
+                entry.2 = entry.2.saturating_add(
+                    reg.get(&record.hash)
+                        .map(|torrent| torrent.rate_down)
+                        .unwrap_or(0),
+                );
             }
         }
 
         let mut roots = roots
             .into_iter()
             .map(|(path, acc)| {
+                let normalized_path =
+                    swarmotter_core::config::lexical_absolute_path(Path::new(&path)).ok();
+                let controlled_usage = normalized_path
+                    .as_ref()
+                    .filter(|path| configured_control_roots.contains(*path))
+                    .and_then(|path| control_usage.get(path));
+                let active_rechecks = normalized_path
+                    .as_ref()
+                    .and_then(|path| active_rechecks.get(path))
+                    .copied()
+                    .unwrap_or(0);
                 swarmotter_core::storage::inspect_storage_root(
                     Path::new(&path),
                     acc.roles,
                     &cfg.storage,
                     swarmotter_core::storage::StorageRootUsage {
                         torrent_count: acc.torrent_count,
-                        active_torrents: acc.active_torrents,
-                        active_write_rate: acc.active_write_rate,
+                        active_torrents: controlled_usage
+                            .map(|usage| usage.0)
+                            .unwrap_or(acc.active_torrents),
+                        active_bytes: controlled_usage
+                            .map(|usage| usage.1)
+                            .unwrap_or(acc.active_bytes),
+                        active_write_rate: controlled_usage
+                            .map(|usage| usage.2)
+                            .unwrap_or(acc.active_write_rate),
                         active_recheck_rate: Some(0),
+                        active_rechecks,
                     },
                 )
             })
@@ -1521,5 +2098,40 @@ impl DaemonOps for DaemonRuntime {
 
     async fn watch_history(&self) -> Vec<watch::ImportResult> {
         self.watch_imports.lock().await.iter().cloned().collect()
+    }
+}
+
+impl DaemonRuntime {
+    /// Remove a manual ban while the caller owns `config_write_lock`.
+    async fn remove_global_manual_ban_locked(
+        &self,
+        ip: String,
+    ) -> Result<swarmotter_core::peer_filter::PeerFilterStatus> {
+        let ip = ip.trim().parse::<std::net::IpAddr>().map_err(|error| {
+            CoreError::InvalidArgument(format!("manual peer ban IP '{ip}': {error}"))
+        })?;
+        let mut next = self.config.read().await.clone();
+        next.peer_filter
+            .manual_bans
+            .retain(|existing| existing.ip.trim().parse::<std::net::IpAddr>() != Ok(ip));
+        self.apply_peer_filter_mutation_locked(next).await
+    }
+
+    /// Commit a peer-policy-only configuration mutation while the caller holds
+    /// `config_write_lock`. The peer reconfiguration transaction writes the
+    /// config only after policy/session reconstruction and restores both the
+    /// prior file and the exact prior immutable policy on failure.
+    async fn apply_peer_filter_mutation_locked(
+        &self,
+        next: Config,
+    ) -> Result<swarmotter_core::peer_filter::PeerFilterStatus> {
+        next.validate()?;
+        let peer_permits = self.build_peer_permit_configuration(&next).await?;
+        let config_path = self.config_path.clone();
+        self.apply_peer_budget_runtime_update(next, peer_permits, config_path.as_deref(), false)
+            .await?;
+        self.publish_event(Event::new("settings_changed", json!({})));
+        self.publish_event(stats_updated_event());
+        Ok(self.peer_filter.read().await.status())
     }
 }

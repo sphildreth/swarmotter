@@ -13,8 +13,10 @@ use crate::models::storage::{StorageRootDiagnostics, StorageRootRole};
 pub struct StorageRootUsage {
     pub torrent_count: usize,
     pub active_torrents: usize,
+    pub active_bytes: u64,
     pub active_write_rate: u64,
     pub active_recheck_rate: Option<u64>,
+    pub active_rechecks: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +54,22 @@ pub fn inspect_storage_root(
     );
     let reserve_satisfied = space.map(|s| s.available >= required_free_space_bytes);
     let writable = storage_path_writable(path, metadata.as_ref(), probe_path.as_deref());
+    let root_control = config.root_control_for_path(path);
+    let root_control_path = root_control
+        .and_then(|control| control.normalized_path().ok())
+        .map(|path| path.display().to_string());
+    let max_active_downloads = root_control
+        .map(|control| control.max_active_downloads)
+        .unwrap_or(0);
+    let max_active_bytes = root_control
+        .map(|control| control.max_active_bytes)
+        .unwrap_or(0);
+    let max_write_bytes_per_second = root_control
+        .map(|control| control.max_write_bytes_per_second)
+        .unwrap_or(0);
+    let max_concurrent_rechecks = root_control
+        .map(|control| control.max_concurrent_rechecks)
+        .unwrap_or(0);
     let mut warnings = Vec::new();
     if !exists {
         warnings.push("storage path does not exist; nearest existing parent was inspected".into());
@@ -65,6 +83,15 @@ pub fn inspect_storage_root(
         warnings.push("free space could not be inspected for this path".into());
     } else if reserve_satisfied == Some(false) {
         warnings.push("configured free-space reserve is not currently satisfied".into());
+    }
+    if max_active_downloads > 0 && usage.active_torrents >= max_active_downloads {
+        warnings.push("configured active-download control is currently saturated".into());
+    }
+    if max_active_bytes > 0 && usage.active_bytes >= max_active_bytes {
+        warnings.push("configured active-byte control is currently saturated".into());
+    }
+    if max_concurrent_rechecks > 0 && usage.active_rechecks >= max_concurrent_rechecks {
+        warnings.push("configured recheck control is currently saturated".into());
     }
 
     StorageRootDiagnostics {
@@ -81,8 +108,15 @@ pub fn inspect_storage_root(
         reserve_satisfied,
         torrent_count: usage.torrent_count,
         active_torrents: usage.active_torrents,
+        active_bytes: usage.active_bytes,
         active_write_rate: usage.active_write_rate,
         active_recheck_rate: usage.active_recheck_rate,
+        active_rechecks: usage.active_rechecks,
+        root_control_path,
+        max_active_downloads,
+        max_active_bytes,
+        max_write_bytes_per_second,
+        max_concurrent_rechecks,
         warnings,
     }
 }

@@ -493,8 +493,20 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
     let args = request.args();
     let download_dir = string_arg(&args, &["download_dir", "download-dir"]);
     let labels = string_array_arg(&args, &["labels"]).unwrap_or_default();
-    let paused = bool_arg(&args, &["paused"]).unwrap_or(false);
-    let add_options = AddTorrentOptions::new(download_dir.clone(), paused);
+    let paused = bool_arg(&args, &["paused"]);
+    // Transmission omits `paused` when it delegates initial admission to the
+    // daemon. Preserve that distinction so a label-mapped profile can decide
+    // whether this new torrent starts; an explicit boolean remains
+    // authoritative.
+    let add_options = AddTorrentOptions::request(
+        download_dir.clone(),
+        paused.unwrap_or(false),
+        paused.is_some(),
+        None,
+        // Labels must be present during registration so a label-mapped profile
+        // can capture its storage paths before any payload is created.
+        labels.clone(),
+    );
 
     let add_result = if let Some(metainfo) = string_arg(&args, &["metainfo"]) {
         let bytes = super::torrents::decode_torrent_metainfo_base64(&metainfo).map_err(
@@ -540,7 +552,10 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
         Err(error) => return Err(RpcFailure::from_core(error)),
     };
 
-    if !labels.is_empty() {
+    // A duplicate keeps its existing labels; preserve the historical adapter
+    // behavior by applying the supplied labels only in that case. New torrents
+    // already received them before profile resolution above.
+    if duplicate && !labels.is_empty() {
         state
             .daemon
             .set_labels(&hash, labels)

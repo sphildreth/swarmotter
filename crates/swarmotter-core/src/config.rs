@@ -11,9 +11,12 @@ use crate::autopilot::AutopilotConfig;
 use crate::bandwidth::BandwidthLimits;
 use crate::error::{CoreError, Result};
 use crate::net::NetworkConfig;
+use crate::peer_filter::PeerFilterConfig;
+use crate::policy::{validate_profiles, PolicyProfilesConfig};
 use crate::queue::QueueLimits;
 use crate::ratio::SeedingPolicy;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 
 /// Lexically normalize a path into an absolute path without resolving any
@@ -61,12 +64,21 @@ pub struct Config {
     pub queue: QueueLimits,
     #[serde(default)]
     pub seeding: SeedingPolicy,
+    /// Named reusable policies and label assignments. Resolved storage and
+    /// initial admission are selected when a torrent is created; queue,
+    /// seeding, and per-torrent caps inherit live.
+    #[serde(default)]
+    pub profiles: PolicyProfilesConfig,
     #[serde(default)]
     pub autopilot: AutopilotConfig,
     #[serde(default)]
     pub dht: DhtConfig,
     #[serde(default)]
     pub pex: PexConfig,
+    /// Global peer-admission filtering for abuse mitigation. This is separate
+    /// from, and never relaxes, the contained torrent network path.
+    #[serde(default)]
+    pub peer_filter: PeerFilterConfig,
     #[serde(default)]
     pub watch: Vec<WatchFolderConfig>,
     #[serde(default)]
@@ -153,6 +165,62 @@ pub struct StorageConfig {
     /// Use sparse files where supported.
     #[serde(default = "default_true")]
     pub sparse: bool,
+    /// Per-root admission, write-pressure, and recheck controls. A control
+    /// applies to its lexical path and descendants; the most specific matching
+    /// control wins.
+    #[serde(default)]
+    pub root_controls: Vec<StorageRootControl>,
+}
+
+/// Disk-scheduling controls for one lexical storage-root boundary.
+///
+/// A value of `0` leaves the corresponding control unlimited. The daemon
+/// applies controls to the active write directory, so an `incomplete_dir`
+/// beneath this path shares one budget with all of its descendants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageRootControl {
+    /// Lexical storage-root path. Relative paths are resolved from the daemon
+    /// working directory during validation.
+    pub path: String,
+    /// Maximum active torrent engines using this root (0 = unlimited).
+    #[serde(default)]
+    pub max_active_downloads: usize,
+    /// Maximum declared payload bytes across active engines (0 = unlimited).
+    #[serde(default)]
+    pub max_active_bytes: u64,
+    /// Shared sustained payload-write ceiling for this root in bytes/sec
+    /// (0 = unlimited).
+    #[serde(default)]
+    pub max_write_bytes_per_second: u64,
+    /// Maximum simultaneous full rechecks using this root (0 = unlimited).
+    #[serde(default)]
+    pub max_concurrent_rechecks: usize,
+}
+
+impl StorageRootControl {
+    /// Return the lexical absolute version of this configured root.
+    pub fn normalized_path(&self) -> Result<PathBuf> {
+        lexical_absolute_path(Path::new(&self.path))
+    }
+}
+
+impl StorageConfig {
+    /// Find the most-specific configured root containing `path`.
+    ///
+    /// Validation rejects duplicate normalized roots, while nested roots are
+    /// intentional and deterministic: the longest lexical boundary wins.
+    pub fn root_control_for_path(&self, path: &Path) -> Option<&StorageRootControl> {
+        let path = lexical_absolute_path(path).ok()?;
+        self.root_controls
+            .iter()
+            .filter_map(|control| {
+                let root = control.normalized_path().ok()?;
+                path.starts_with(&root).then_some((root, control))
+            })
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, control)| control)
+    }
 }
 
 fn default_true() -> bool {
@@ -168,6 +236,7 @@ impl Default for StorageConfig {
             minimum_free_space_percent: 0,
             preallocate: false,
             sparse: true,
+            root_controls: Vec::new(),
         }
     }
 }
@@ -305,6 +374,9 @@ pub struct WatchFolderConfig {
     pub download_dir: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+    /// Optional named profile assigned to imports from this folder.
+    #[serde(default)]
+    pub profile: Option<String>,
     /// "start" or "paused".
     #[serde(default)]
     pub start_behavior: StartBehavior,
@@ -316,7 +388,7 @@ pub struct WatchFolderConfig {
     pub delete_after_import: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartBehavior {
     #[default]
@@ -428,6 +500,7 @@ impl Config {
     /// Validate the full configuration.
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
+        self.peer_filter.validate()?;
         if self
             .seeding
             .global_ratio_limit
@@ -504,11 +577,43 @@ impl Config {
                 "storage.minimum_free_space_percent must be between 0 and 100".into(),
             ));
         }
+        let mut normalized_storage_roots = BTreeSet::new();
+        for control in &self.storage.root_controls {
+            if control.path.trim().is_empty() {
+                return Err(CoreError::InvalidConfig(
+                    "storage.root_controls.path must not be empty".into(),
+                ));
+            }
+            let path = control.normalized_path().map_err(|error| {
+                CoreError::InvalidConfig(format!(
+                    "storage.root_controls.path could not be normalized: {error}"
+                ))
+            })?;
+            if !normalized_storage_roots.insert(path.clone()) {
+                return Err(CoreError::InvalidConfig(format!(
+                    "storage.root_controls contains duplicate path {}",
+                    path.display()
+                )));
+            }
+        }
+        validate_profiles(&self.profiles).map_err(CoreError::InvalidConfig)?;
         for w in &self.watch {
             if w.path.trim().is_empty() {
                 return Err(CoreError::InvalidConfig(
                     "watch folder path must not be empty".into(),
                 ));
+            }
+            if let Some(profile) = w.profile.as_deref() {
+                if profile.trim().is_empty() {
+                    return Err(CoreError::InvalidConfig(
+                        "watch folder profile must not be empty when set".into(),
+                    ));
+                }
+                if !self.profiles.profiles.contains_key(profile) {
+                    return Err(CoreError::InvalidConfig(format!(
+                        "watch folder references unknown profile {profile}"
+                    )));
+                }
             }
             let root = lexical_absolute_path(Path::new(&w.path)).map_err(|error| {
                 CoreError::InvalidConfig(format!(
@@ -618,6 +723,7 @@ mod tests {
             recursive: true,
             download_dir: None,
             label: None,
+            profile: None,
             start_behavior: StartBehavior::Paused,
             archive_dir: Some(root.join("archive").display().to_string()),
             failure_dir: Some(root.join("failure").display().to_string()),
@@ -857,6 +963,66 @@ minimum_free_space_percent = 101
             .unwrap();
         assert_eq!(cfg.storage.minimum_free_space_bytes, 4096);
         assert_eq!(cfg.storage.minimum_free_space_percent, 7);
+    }
+
+    #[test]
+    fn storage_root_controls_use_most_specific_lexical_root() {
+        let cfg = Config::from_toml_str(
+            r#"
+[network]
+mode = "disabled"
+
+[[storage.root_controls]]
+path = "/srv/torrents"
+max_active_downloads = 2
+max_active_bytes = 100
+
+[[storage.root_controls]]
+path = "/srv/torrents/ssd"
+max_active_downloads = 1
+max_write_bytes_per_second = 1024
+"#,
+        )
+        .unwrap();
+
+        let broad = cfg
+            .storage
+            .root_control_for_path(Path::new("/srv/torrents/hdd/incomplete"))
+            .unwrap();
+        assert_eq!(broad.max_active_downloads, 2);
+        let nested = cfg
+            .storage
+            .root_control_for_path(Path::new("/srv/torrents/ssd/incomplete"))
+            .unwrap();
+        assert_eq!(nested.max_active_downloads, 1);
+        assert_eq!(nested.max_write_bytes_per_second, 1024);
+        assert!(cfg
+            .storage
+            .root_control_for_path(Path::new("/var/lib/swarmotter"))
+            .is_none());
+    }
+
+    #[test]
+    fn storage_root_controls_reject_empty_and_duplicate_paths() {
+        for controls in [
+            r#"
+[[storage.root_controls]]
+path = "  "
+"#,
+            r#"
+[[storage.root_controls]]
+path = "/srv/torrents"
+
+[[storage.root_controls]]
+path = "/srv/torrents/child/.."
+"#,
+        ] {
+            let error =
+                Config::from_toml_str(&format!("[network]\nmode = \"disabled\"\n\n{controls}"))
+                    .unwrap_err();
+            assert_eq!(error.code().as_str(), "invalid_config");
+            assert!(error.to_string().contains("storage.root_controls"));
+        }
     }
 
     #[test]

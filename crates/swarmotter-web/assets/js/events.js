@@ -106,6 +106,7 @@ export function renderWatchFolderRow(folder) {
   const defaults = [
     cfg.download_dir ? `dir ${cfg.download_dir}` : "",
     cfg.label ? `label ${cfg.label}` : "",
+    cfg.profile ? `profile ${cfg.profile}` : "",
     cfg.start_behavior ? `start ${cfg.start_behavior}` : "",
     cfg.recursive ? "recursive" : "",
     cfg.delete_after_import ? "delete after import" : "leave source",
@@ -306,6 +307,15 @@ export function renderDoctorStorageRoots(storageRoots = {}) {
     const free = `${fmtBytes(root.free_space_bytes)} / ${fmtBytes(root.available_space_bytes)}`;
     const total = fmtBytes(root.total_space_bytes);
     const required = fmtBytes(root.required_free_space_bytes);
+    const activeWork = `${fmtCount(root.active_torrents)} / ${fmtBytes(root.active_bytes)}`;
+    const limit = (value, format = String) => Number(value) > 0 ? format(value) : "unlimited";
+    const controls = root.root_control_path ? [
+      root.root_control_path,
+      `downloads ${limit(root.max_active_downloads, fmtCount)}`,
+      `bytes ${limit(root.max_active_bytes, fmtBytes)}`,
+      `writes ${limit(root.max_write_bytes_per_second, fmtRate)}`,
+      `rechecks ${limit(root.max_concurrent_rechecks, fmtCount)}`,
+    ].join("; ") : "none";
     const warnings = renderStorageRootWarnings(root);
     const status = [
       root.exists ? "exists" : "missing",
@@ -323,8 +333,10 @@ export function renderDoctorStorageRoots(storageRoots = {}) {
         <td>${escapeHtml(required || "")}</td>
         <td>${renderStatus(root.reserve_satisfied ? "ok" : "warning")}</td>
         <td>${fmtCount(root.torrent_count)}</td>
-        <td>${fmtCount(root.active_torrents)}</td>
+        <td>${escapeHtml(activeWork)}</td>
         <td>${fmtRate(root.active_write_rate)} / ${fmtRate(root.active_recheck_rate)}</td>
+        <td>${fmtCount(root.active_rechecks)}</td>
+        <td>${escapeHtml(controls)}</td>
         <td>${warnings || ""}</td>
       </tr>`;
   }).join("");
@@ -343,8 +355,10 @@ export function renderDoctorStorageRoots(storageRoots = {}) {
           <th>Required free</th>
           <th>Reserve</th>
           <th>Torrents</th>
-          <th>Active</th>
+          <th>Active / Declared</th>
           <th>Rates</th>
+          <th>Rechecks</th>
+          <th>Root controls</th>
           <th>Warnings</th>
         </tr>
       </thead>

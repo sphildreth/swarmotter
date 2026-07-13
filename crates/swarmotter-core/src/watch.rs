@@ -14,6 +14,7 @@ pub use crate::config::lexical_absolute_path as lexical_absolute;
 use crate::config::{StartBehavior, WatchFolderConfig};
 use crate::error::{CoreError, Result};
 use crate::meta::{self, TorrentMeta, MAX_TORRENT_METADATA_BYTES};
+use crate::policy::PolicyProfileOrigin;
 use crate::torrent::Torrent;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -411,6 +412,10 @@ pub fn apply_folder_defaults(torrent: &mut Torrent, cfg: &WatchFolderConfig) {
     if let Some(label) = &cfg.label {
         torrent.labels.push(label.clone());
     }
+    if let Some(profile) = &cfg.profile {
+        torrent.policy.profile = Some(profile.clone());
+        torrent.policy.profile_origin = Some(PolicyProfileOrigin::WatchFolder);
+    }
     match cfg.start_behavior {
         StartBehavior::Start => {}
         StartBehavior::Paused => torrent.state = crate::models::torrent::TorrentState::Paused,
@@ -504,6 +509,7 @@ mod tests {
             recursive: true,
             download_dir: None,
             label: None,
+            profile: None,
             start_behavior: StartBehavior::Paused,
             archive_dir: Some(archive.display().to_string()),
             failure_dir: Some(failure.display().to_string()),
@@ -528,6 +534,7 @@ mod tests {
             recursive: true,
             download_dir: None,
             label: None,
+            profile: None,
             start_behavior: StartBehavior::Paused,
             archive_dir: None,
             failure_dir: None,
@@ -660,6 +667,7 @@ mod tests {
             recursive: false,
             download_dir: None,
             label: None,
+            profile: None,
             start_behavior: StartBehavior::Start,
             archive_dir: None,
             failure_dir: None,
@@ -727,6 +735,7 @@ mod tests {
             recursive: false,
             download_dir: Some("/downloads".into()),
             label: Some("linux".into()),
+            profile: Some("linux-release".into()),
             start_behavior: StartBehavior::Paused,
             archive_dir: None,
             failure_dir: None,
@@ -735,6 +744,11 @@ mod tests {
         apply_folder_defaults(&mut t, &cfg);
         assert_eq!(t.download_dir.as_deref(), Some("/downloads"));
         assert!(t.labels.contains(&"linux".to_string()));
+        assert_eq!(t.policy.profile.as_deref(), Some("linux-release"));
+        assert_eq!(
+            t.policy.profile_origin,
+            Some(PolicyProfileOrigin::WatchFolder)
+        );
         assert_eq!(t.state, crate::models::torrent::TorrentState::Paused);
     }
 

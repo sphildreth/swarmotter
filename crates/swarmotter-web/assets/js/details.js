@@ -18,6 +18,7 @@ export function beginDetailsLoad() {
   $("#details-title").textContent = "Loading torrent details";
   $("#details-health").innerHTML = "";
   $("#details-summary").innerHTML = "";
+  $("#details-policy").innerHTML = "";
   $$("#details-seeding-summary dd").forEach(field => { field.textContent = ""; });
   $("#details-autopilot").innerHTML = "";
   $("#details-activity").innerHTML = `<h3>Activity</h3><p class="muted">Loading activity...</p>`;
@@ -36,18 +37,22 @@ export async function openDetails(hash) {
   $("#view-details").classList.remove("hidden");
   beginDetailsLoad();
   try {
-    const [t, stats, decision, autopilotStatus, networkDiag] = await Promise.all([
+    const [t, stats, decision, autopilotStatus, networkDiag, policy, profiles] = await Promise.all([
       api(`/torrents/${hash}`),
       api(`/torrents/${hash}/stats`).catch(() => null),
       api(`/torrents/${hash}/autopilot`).catch(() => null),
       api("/autopilot/status").catch(() => null),
       api("/network/diagnostics").catch(() => null),
+      api(`/torrents/${hash}/policy`).catch(() => null),
+      api("/profiles").catch(() => null),
     ]);
     if (!detailsRequestIsCurrent(hash)) return;
     $("#details-title").textContent = t.name;
     renderDetailsHealth(t.health);
     renderDetailsSummary(t);
+    renderDetailsPolicy(policy);
     renderDetailsControls(t);
+    renderDetailsProfileSelector(policy, profiles);
     renderDetailsActivity(stats || t);
     renderAutopilotDiagnostics({
       torrent: t,
@@ -68,6 +73,7 @@ export async function openDetails(hash) {
     renderDetailsActivity(null);
     renderAutopilotDiagnostics({ torrent: null, decision: null, globalAutopilot: null, networkDiagnostics: null });
     $("#details-summary").innerHTML = "";
+    $("#details-policy").innerHTML = "";
     showError("Open torrent details failed", e);
   }
 }
@@ -123,6 +129,74 @@ export function renderDetailsSummary(t) {
       ["Labels", (t.labels || []).join(", ")],
     ])}
   `;
+}
+
+export function policySourceLabel(source) {
+  if (!source) return "unavailable";
+  if (source.kind === "global") return "global setting";
+  if (source.kind === "torrent") return "torrent override";
+  if (source.kind === "legacy_torrent") return "stored torrent setting";
+  if (source.kind === "registration_storage_snapshot") return "storage fixed at registration";
+  if (source.kind === "existing_storage_snapshot") return "existing storage snapshot";
+  if (source.kind === "profile_storage_snapshot") return `profile storage snapshot (${source.profile || "profile"})`;
+  if (source.kind === "initial_admission_snapshot") return "initial admission decision";
+  if (source.kind === "label") return `label ${source.label || ""} → ${source.profile || ""}`.trim();
+  if (source.kind === "profile") return `${source.profile || "profile"} (${source.origin || "assignment"})`;
+  return source.kind || "unavailable";
+}
+
+export function policyValueLabel(value, formatter = value => String(value)) {
+  return value === null || value === undefined ? "not set" : formatter(value);
+}
+
+export function policyRateLabel(value) {
+  const limit = finiteNumber(value) ?? 0;
+  return limit === 0 ? "unlimited" : fmtRate(limit);
+}
+
+export function renderDetailsPolicy(policy) {
+  const panel = $("#details-policy");
+  if (!panel) return;
+  if (!policy) {
+    panel.innerHTML = `<h3>Effective policy</h3><p class="muted">Policy details are unavailable from this daemon.</p>`;
+    return;
+  }
+  const profile = policy.profile;
+  const selected = profile
+    ? `${profile.name} · ${policySourceLabel(profile.source)}`
+    : "label/global defaults";
+  const field = (entry, formatter) => `${policyValueLabel(entry?.value, formatter)} · ${policySourceLabel(entry?.source)}`;
+  panel.innerHTML = `
+    <h3>Effective policy</h3>
+    ${renderKv([
+      ["Selected profile", selected],
+      ["Completed data", field(policy.download_dir)],
+      ["Incomplete data", field(policy.incomplete_dir)],
+      ["Queue priority", field(policy.queue_priority)],
+      ["Initial start behavior", field(policy.start_behavior)],
+      ["Ratio target", field(policy.ratio_limit, value => String(value))],
+      ["Idle target", field(policy.idle_limit, value => `${value} s`)],
+      ["Seed forever", field(policy.seed_forever, value => value ? "yes" : "no")],
+      ["Download cap", field(policy.download_limit, policyRateLabel)],
+      ["Upload cap", field(policy.upload_limit, policyRateLabel)],
+    ])}
+    <p class="muted">Storage paths are fixed when a torrent is added or reassigned; queue priority, seeding, and rate limits update while they inherit. Start behavior controls initial admission and never stops running work.</p>`;
+}
+
+export function explicitProfileName(policy) {
+  return policy?.profile?.source?.kind === "profile" ? policy.profile.name : "";
+}
+
+export function renderDetailsProfileSelector(policy, profiles) {
+  const select = $("#details-profile");
+  if (!select) return;
+  const names = Object.keys(profiles?.profiles || {}).sort((a, b) => a.localeCompare(b));
+  const selected = explicitProfileName(policy);
+  select.innerHTML = [
+    `<option value="">Use label or global defaults</option>`,
+    ...names.map(name => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`),
+  ].join("");
+  select.value = names.includes(selected) ? selected : "";
 }
 
 export function renderDetailsControls(t) {
@@ -378,9 +452,41 @@ export async function loadPeers(hash) {
     tbody.innerHTML = "";
     peers.forEach(p => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${escapeHtml(p.address)}</td><td>${escapeHtml(p.client)}</td><td>${fmtPercentFromFraction(p.progress, 0)}</td><td>${fmtRate(p.rate_down)}</td><td>${fmtRate(p.rate_up)}</td>`;
+      const ip = String(p.ip || "").trim();
+      const action = !ip
+        ? ""
+        : p.banned
+          ? `<span class="status-pill status-invalid" title="This IP is globally manually banned">Banned globally</span>`
+          : `<button type="button" class="peer-ban secondary" data-peer-ip="${escapeHtml(ip)}">Ban IP</button>`;
+      tr.innerHTML = `<td>${escapeHtml(p.address)}</td><td>${escapeHtml(p.client)}</td><td>${fmtPercentFromFraction(p.progress, 0)}</td><td>${fmtRate(p.rate_down)}</td><td>${fmtRate(p.rate_up)}</td><td>${action}</td>`;
       tbody.appendChild(tr);
     });
+    $$("#peers-table .peer-ban").forEach(button => button.addEventListener("click", async () => {
+      const ip = button.dataset.peerIp;
+      if (!ip) return;
+      const reason = window.prompt(`Ban ${ip} globally? Optional reason:`);
+      if (reason === null) return;
+      button.disabled = true;
+      try {
+        const status = await api(`/torrents/${hash}/peers/ban`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ip, reason: reason.trim() || null }),
+        });
+        if (state.fullConfigSnapshot) {
+          state.fullConfigSnapshot.peer_filter ||= {};
+          state.fullConfigSnapshot.peer_filter.manual_bans = status.manual_bans || [];
+        }
+        if (!detailsRequestIsCurrent(hash)) return;
+        showToast("Peer IP banned", `${ip} is now blocked globally`, "success");
+        await loadPeers(hash);
+        refreshTorrentsHandler();
+      } catch (e) {
+        if (detailsRequestIsCurrent(hash)) showError("Peer ban failed", e);
+      } finally {
+        button.disabled = false;
+      }
+    }));
   } catch (e) { log("peers error: " + e.message); }
 }
 
@@ -515,6 +621,29 @@ $("#details-move-btn").addEventListener("click", event => {
 $("#details-labels-btn").addEventListener("click", event => {
   const labels = $("#details-labels").value.split(",").map(label => label.trim()).filter(Boolean);
   runDetailsCommand(event.currentTarget, "/labels", "Torrent labels saved", { labels });
+});
+
+$("#details-profile-save-btn").addEventListener("click", async event => {
+  if (!state.currentHash) return;
+  const hash = state.currentHash;
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    const profile = $("#details-profile").value || null;
+    await api(`/torrents/${hash}/policy`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ profile }),
+    });
+    if (!detailsRequestIsCurrent(hash)) return;
+    showToast("Policy profile saved", profile || "Using label or global defaults", "success");
+    await openDetails(hash);
+    refreshTorrentsHandler();
+  } catch (error) {
+    if (detailsRequestIsCurrent(hash)) showError("Save policy profile failed", error);
+  } finally {
+    button.disabled = false;
+  }
 });
 
 $("#details-limits-btn").addEventListener("click", event => {

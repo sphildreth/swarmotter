@@ -43,6 +43,7 @@ use swarmotter_core::net::NetworkBinder;
 use swarmotter_core::peer::{
     self, block_requests, Bitfield, Handshake, Message, PeerAddr, PeerReader,
 };
+use swarmotter_core::peer_filter::PeerFilter;
 use swarmotter_core::storage::resume::PieceBitfield;
 use swarmotter_core::storage::{piece_file_ranges, verify_piece, StorageIo};
 use swarmotter_core::tracker::{self, AnnounceEvent, AnnounceRequest};
@@ -160,6 +161,13 @@ pub struct MagnetParams {
 
 pub type MetadataPreflight =
     Arc<dyn Fn(TorrentMeta) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
+
+/// Daemon-owned execution hook for full on-disk verification. The standalone
+/// engine remains usable without it; the daemon installs one so every startup
+/// and fast-resume recheck observes root-scoped concurrency controls.
+pub type StorageRecheckExecutor = Arc<
+    dyn Fn(StorageIo) -> Pin<Box<dyn Future<Output = Result<PieceBitfield>> + Send>> + Send + Sync,
+>;
 
 #[derive(Debug, Default)]
 struct TrackerAnnounceOutcome {
@@ -351,6 +359,7 @@ pub struct TorrentEngine {
     limiter: ShapedLimiter,
     magnet: Option<MagnetParams>,
     metadata_preflight: Option<MetadataPreflight>,
+    storage_recheck_executor: Option<StorageRecheckExecutor>,
     /// Optional DHT runner for trackerless peer discovery (disabled for
     /// private torrents).
     dht: Option<Arc<crate::dht::DhtRunner>>,
@@ -363,8 +372,14 @@ pub struct TorrentEngine {
     sparse: bool,
     minimum_free_space_bytes: u64,
     minimum_free_space_percent: u8,
+    /// Optional shared local-storage payload-write limiter supplied by the
+    /// daemon for the configured active storage root.
+    storage_write_limiter: Option<RateLimiter>,
     max_peer_workers: Arc<AtomicUsize>,
     allow_ipv6: bool,
+    /// Immutable peer-admission rules for this data-plane configuration
+    /// generation. Socket creation still goes through `binder`.
+    peer_filter: Arc<PeerFilter>,
     pex_enabled: bool,
     pex_max_peers: usize,
     file_priorities: Vec<FilePriority>,
@@ -432,6 +447,7 @@ impl TorrentEngine {
             limiter: ShapedLimiter::from_shared_rate_limiter(limiter.into()),
             magnet,
             metadata_preflight: None,
+            storage_recheck_executor: None,
             dht: None,
             utp_enabled: true,
             utp_prefer_tcp: true,
@@ -440,8 +456,10 @@ impl TorrentEngine {
             sparse: true,
             minimum_free_space_bytes: 0,
             minimum_free_space_percent: 0,
+            storage_write_limiter: None,
             max_peer_workers: Arc::new(AtomicUsize::new(DEFAULT_PEER_WORKER_LIMIT)),
             allow_ipv6: true,
+            peer_filter: Arc::new(PeerFilter::default()),
             pex_enabled: true,
             pex_max_peers: 0,
             file_priorities: vec![FilePriority::Normal; file_count],
@@ -508,6 +526,14 @@ impl TorrentEngine {
         self
     }
 
+    /// Configure a shared root-level limiter for verified payload writes.
+    /// This is intentionally separate from peer bandwidth shaping: it delays
+    /// only local disk writes and leaves all network containment unchanged.
+    pub fn with_storage_write_limiter(mut self, limiter: Option<RateLimiter>) -> Self {
+        self.storage_write_limiter = limiter;
+        self
+    }
+
     /// Configure the maximum simultaneous peer download workers. A value of 0
     /// means no operator cap was configured, so the engine uses its operational
     /// default.
@@ -520,6 +546,14 @@ impl TorrentEngine {
     /// connections.
     pub fn with_allow_ipv6(mut self, allow_ipv6: bool) -> Self {
         self.allow_ipv6 = allow_ipv6;
+        self
+    }
+
+    /// Attach global IP/client-id peer admission rules. The engine checks the
+    /// rules before every outbound connection and at every discovery ingress;
+    /// this does not replace or relax containment binding.
+    pub fn with_peer_filter(mut self, peer_filter: Arc<PeerFilter>) -> Self {
+        self.peer_filter = peer_filter;
         self
     }
 
@@ -552,6 +586,13 @@ impl TorrentEngine {
     /// any payload path is created.
     pub fn with_metadata_preflight(mut self, preflight: MetadataPreflight) -> Self {
         self.metadata_preflight = Some(preflight);
+        self
+    }
+
+    /// Route startup and fast-resume verification through daemon-owned local
+    /// storage controls. This covers both active and completed directories.
+    pub fn with_storage_recheck_executor(mut self, executor: StorageRecheckExecutor) -> Self {
+        self.storage_recheck_executor = Some(executor);
         self
     }
 

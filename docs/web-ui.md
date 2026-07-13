@@ -132,7 +132,35 @@ SwarmOtter can negotiate MSE/PE peer encryption. The Settings screen exposes
 
 The default is `preferred`. The UI keeps this control in the same Settings edit
 flow as other daemon config because it changes peer-wire compatibility behavior.
-Per-profile and per-torrent override controls are planned for a later phase.
+
+## Policy profiles
+
+Settings includes a **Policy profiles** editor for the persisted `profiles`
+configuration section. The Add screen can choose a profile and labels before
+registration. Torrent Details shows every effective profile value with its
+source and can set or clear an explicit profile assignment. Storage paths and
+the initial start-or-paused decision are shown as create-time snapshots:
+profile reassignment does not move existing data or revoke a queued torrent's
+admission. Queue priority, seeding, and bandwidth values remain explainable
+live inheritance.
+
+## Peer admission
+
+Settings includes a **Peer admission** panel for the global local-rule,
+blocklist-path, manual-ban, and peer-ID-prefix policy. It reads the live policy
+from `GET /api/v1/peer-filter`, showing the effective direct rules, local-source
+load/skipped-line results, manual bans, rejection counters, and any fail-closed
+detail. The editable fields remain part of the full Settings configuration
+snapshot, so reloading or saving Settings preserves the complete peer-admission
+configuration rather than overwriting it with status data.
+
+The torrent Details **Peers** tab can ban an IP. These are global manual bans,
+not torrent-local exceptions, and the Settings panel lists them with a global
+Unban action through `POST /api/v1/peer-filter/unban`. A peer row is marked
+**banned** only when its IP is in that explicit manual-ban list; merely viewing
+the table does not perform a new admission decision or change rejection
+counters. Peer admission rejects unwanted candidates but does not replace the
+required contained network path.
 
 ## Storage root diagnostics
 
@@ -141,12 +169,19 @@ so operators can:
 
 - review per-root free/available bytes before large add bursts,
 - identify which roots are close to configured reserve thresholds, and
-- diagnose storage pressure alongside active write/recheck activity in future views.
+- diagnose storage pressure alongside active write/recheck activity and
+  configured root controls.
 
 Storage reserve fields in configuration are `[storage].minimum_free_space_bytes`
 and `[storage].minimum_free_space_percent`. When configured, add operations are
 rejected before writing data when the target root cannot satisfy the configured
 reserve.
+
+The Storage settings panel also manages repeatable `[[storage.root_controls]]`
+entries. Each row exposes a lexical path plus active-download, active-byte,
+write-rate, and concurrent-recheck limits. The Doctor table shows the matching
+control root, declared active bytes, active rechecks, and saturation warnings
+so an operator can distinguish a local root budget from global queue limits.
 
 ## Performance diagnostics and autopilot visibility
 

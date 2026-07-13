@@ -48,7 +48,12 @@ impl DaemonRuntime {
                 torrent.state,
                 TorrentState::Downloading | TorrentState::DownloadingMetadata
             );
-            if !(queue.limits.auto_start || bypass || already_active) {
+            let policy = Self::effective_policy_with_config(&cfg, torrent);
+            let profile_auto_start = matches!(
+                policy.start_behavior.value,
+                swarmotter_core::config::StartBehavior::Start
+            );
+            if !(profile_auto_start || bypass || already_active) {
                 continue;
             }
             if !matches!(
@@ -173,6 +178,8 @@ impl DaemonRuntime {
     ) -> Vec<InfoHash> {
         let cfg = self.config.read().await.clone();
         let retry_after = self.engine_retry_after.read().await.clone();
+        let mut storage_plan =
+            StorageAdmissionPlan::from_records(self.storage_admissions.records().await);
         let mut queue = self.queue.lock().await;
         queue.limits = cfg.queue.clone();
         let reg = self.registry.lock().await;
@@ -193,7 +200,33 @@ impl DaemonRuntime {
         let mut active_downloads = 0usize;
         let mut active_metadata_fetches = 0usize;
         let bypass_set = queue.bypass.iter().copied().collect::<HashSet<_>>();
-        for hash in queue.bypass.iter().chain(queue.order.iter()) {
+        // Preserve user queue order within a priority band. Profile priorities
+        // are resolved live, so editing a profile takes effect at the next
+        // reconciliation without rewriting durable queue order.
+        let mut prioritized_order = queue
+            .order
+            .iter()
+            .enumerate()
+            .map(|(position, hash)| {
+                let priority = reg
+                    .get(hash)
+                    .map(|torrent| {
+                        Self::effective_policy_with_config(&cfg, torrent)
+                            .queue_priority
+                            .value
+                            .weight()
+                    })
+                    .unwrap_or(swarmotter_core::policy::QueuePriority::Normal.weight());
+                (*hash, position, priority)
+            })
+            .collect::<Vec<_>>();
+        prioritized_order
+            .sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.1.cmp(&right.1)));
+        for hash in queue
+            .bypass
+            .iter()
+            .chain(prioritized_order.iter().map(|(hash, _, _)| hash))
+        {
             if excluded.is_some_and(|excluded| &excluded == hash) {
                 continue;
             }
@@ -220,7 +253,12 @@ impl DaemonRuntime {
                 t.state,
                 TorrentState::Downloading | TorrentState::DownloadingMetadata
             );
-            let auto_startable = queue.limits.auto_start || bypass || already_active;
+            let policy = Self::effective_policy_with_config(&cfg, t);
+            let profile_auto_start = matches!(
+                policy.start_behavior.value,
+                swarmotter_core::config::StartBehavior::Start
+            );
+            let auto_startable = profile_auto_start || bypass || already_active;
             let metadata_fetch = t.needs_metadata;
             if auto_startable
                 && matches!(
@@ -234,11 +272,26 @@ impl DaemonRuntime {
                     if metadata_slots_full {
                         continue;
                     }
-                    active_metadata_fetches += 1;
                 } else {
                     if download_slots_full {
                         continue;
                     }
+                }
+                if let Some(admission) = storage_root_admission_for_torrent(&cfg, t) {
+                    // A configured root controls the complete engine lifetime,
+                    // including a magnet's metadata phase. This avoids a burst
+                    // of metadata resolutions silently exceeding a root's
+                    // later payload budget.
+                    if storage_plan
+                        .admit(*hash, &admission, t.meta.total_length)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                }
+                if metadata_fetch {
+                    active_metadata_fetches += 1;
+                } else {
                     active_downloads += 1;
                 }
                 active.push(*hash);
@@ -419,6 +472,8 @@ impl DaemonRuntime {
     pub(super) async fn engine_task_finished(&self, hash: InfoHash) {
         self.engine_cmds.lock().await.remove(&hash);
         self.engine_handles.write().await.remove(&hash);
+        self.engine_storage_cancellations.lock().await.remove(&hash);
+        self.storage_admissions.release(&hash).await;
     }
 
     pub(super) async fn record_engine_containment_cancellation(
@@ -571,6 +626,27 @@ impl DaemonRuntime {
         self.start_engine_while_transition_locked(hash).await;
     }
 
+    #[cfg(test)]
+    pub(super) async fn pause_engine_start_before_storage_admission(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (continue_tx, continue_rx) = tokio::sync::oneshot::channel();
+        *self.storage_admission_pause.lock().await = Some((reached_tx, continue_rx));
+        (reached_rx, continue_tx)
+    }
+
+    async fn wait_at_storage_admission_test_pause(&self) {
+        #[cfg(test)]
+        if let Some((reached, continue_rx)) = self.storage_admission_pause.lock().await.take() {
+            let _ = reached.send(());
+            let _ = continue_rx.await;
+        }
+    }
+
     /// Start one engine while the caller owns `data_plane_transition_lock`.
     /// This is used only by serialized reconstruction transactions so normal
     /// API/queue starts cannot interleave with a partially rebuilt live set.
@@ -600,12 +676,14 @@ impl DaemonRuntime {
         }
         self.engine_retry_after.write().await.remove(&hash);
 
+        let config = self.config.read().await.clone();
+        let peer_filter = self.peer_filter.read().await.clone();
         let snapshot = {
             let reg = self.registry.lock().await;
             let Some(t) = reg.get(&hash) else {
                 return;
             };
-            EngineStartSnapshot::from_torrent(t)
+            EngineStartSnapshot::from_torrent(t, &config)
         };
 
         let (
@@ -624,12 +702,10 @@ impl DaemonRuntime {
             magnet,
             needs_metadata,
         ) = {
-            let complete_dir = self
-                .resolve_download_dir_override(snapshot.download_dir.as_deref())
-                .await;
-            let active_dir = self.resolve_incomplete_dir(&complete_dir).await;
+            let complete_dir = snapshot.complete_dir.clone();
+            let active_dir = snapshot.active_dir.clone();
             let magnet = snapshot.magnet_params();
-            let cfg = self.config.read().await;
+            let cfg = &config;
             let preallocate = cfg.storage.preallocate;
             let sparse = cfg.storage.sparse;
             let allow_ipv6 = cfg.torrent.allow_ipv6 && cfg.network.allow_ipv6;
@@ -693,8 +769,59 @@ impl DaemonRuntime {
             }
         }
 
+        self.wait_at_storage_admission_test_pause().await;
+        let storage_admission = {
+            let cfg = self.config.read().await;
+            storage_root_admission_for_path(&cfg, Path::new(&active_dir))
+        };
+        let storage_write_limiter = if let Some(admission) = &storage_admission {
+            if let Err(error) = self
+                .storage_admissions
+                .reserve(hash, admission, preflight_content_bytes)
+                .await
+            {
+                // This is queue admission, not a payload/storage failure. Keep
+                // the torrent eligible for a later reconcile when root work
+                // finishes rather than turning a bounded queue into an error.
+                tracing::debug!(
+                    info_hash = %hash,
+                    error = %error,
+                    root = %admission.root.display(),
+                    "engine start deferred by storage-root admission"
+                );
+                let mut changed = false;
+                if let Some(torrent) = self.registry.lock().await.get_mut(&hash) {
+                    if matches!(
+                        torrent.state,
+                        TorrentState::Queued
+                            | TorrentState::Downloading
+                            | TorrentState::DownloadingMetadata
+                    ) {
+                        torrent.state = TorrentState::Queued;
+                        torrent.error = Some(error.to_string());
+                        changed = true;
+                    }
+                }
+                if changed {
+                    self.publish_torrent_event("torrent_changed", hash, TorrentState::Queued);
+                    self.publish_event(stats_updated_event());
+                }
+                return;
+            }
+            self.storage_admissions.write_limiter(admission).await
+        } else {
+            None
+        };
+
         let state = Arc::new(Mutex::new(EngineState::default()));
         self.engine_states.write().await.insert(hash, state.clone());
+        // Installed before task visibility so lifecycle operations can cancel
+        // a saturated metadata-admission or startup-recheck wait.
+        let storage_work_cancellation = StorageWorkCancellation::new();
+        self.engine_storage_cancellations
+            .lock()
+            .await
+            .insert(hash, storage_work_cancellation.clone());
 
         let binder: Arc<dyn swarmotter_core::net::NetworkBinder> = self.make_binder().await;
         let peer_id = make_peer_id();
@@ -733,6 +860,7 @@ impl DaemonRuntime {
         let registry = self.registry.clone();
         let selfish_completion_enabled = self.selfish_completion_enabled.clone();
         let runtime_for_task = self.clone();
+        let storage_work_cancellation_for_task = storage_work_cancellation.clone();
         // DHT runner for trackerless peer discovery. Gated by config and
         // containment; the engine disables DHT for private torrents.
         let dht_runner = self.shared_dht_runner(binder.clone(), peer_id).await;
@@ -754,7 +882,8 @@ impl DaemonRuntime {
         .with_encryption_mode(encryption_mode)
         .with_preallocate(preallocate)
         .with_sparse(sparse)
-        .with_storage_reserve(minimum_free_space_bytes, minimum_free_space_percent);
+        .with_storage_reserve(minimum_free_space_bytes, minimum_free_space_percent)
+        .with_storage_write_limiter(storage_write_limiter);
         engine = match engine
             .with_file_selection(snapshot.priorities.clone(), snapshot.wanted.clone())
         {
@@ -765,6 +894,8 @@ impl DaemonRuntime {
                     torrent.state = TorrentState::StorageError;
                     torrent.error = Some(error.to_string());
                 }
+                self.engine_storage_cancellations.lock().await.remove(&hash);
+                self.storage_admissions.release(&hash).await;
                 self.publish_torrent_event("torrent_changed", hash, TorrentState::StorageError);
                 self.publish_event(stats_updated_event());
                 return;
@@ -774,16 +905,40 @@ impl DaemonRuntime {
             .with_peer_worker_limit(max_peer_workers)
             .with_peer_session_budget(peer_session_budget)
             .with_allow_ipv6(allow_ipv6)
+            .with_peer_filter(peer_filter)
             .with_pex(pex_enabled, pex_max_peers);
-        if needs_metadata {
+        {
             let runtime = self.clone();
-            let metadata_download_dir = snapshot.download_dir.clone();
-            engine = engine.with_metadata_preflight(Arc::new(move |resolved| {
+            let cancellation = storage_work_cancellation.clone();
+            engine = engine.with_storage_recheck_executor(Arc::new(move |storage| {
                 let runtime = runtime.clone();
-                let metadata_download_dir = metadata_download_dir.clone();
+                let cancellation = cancellation.clone();
                 Box::pin(async move {
                     runtime
-                        .reserve_resolved_magnet_metadata(hash, resolved, metadata_download_dir)
+                        .recheck_storage_under_root_control(&storage, Some(&cancellation))
+                        .await
+                })
+            }));
+        }
+        if needs_metadata {
+            let runtime = self.clone();
+            let metadata_complete_dir = snapshot.complete_dir.clone();
+            let metadata_active_dir = snapshot.active_dir.clone();
+            let cancellation = storage_work_cancellation.clone();
+            engine = engine.with_metadata_preflight(Arc::new(move |resolved| {
+                let runtime = runtime.clone();
+                let metadata_complete_dir = metadata_complete_dir.clone();
+                let metadata_active_dir = metadata_active_dir.clone();
+                let cancellation = cancellation.clone();
+                Box::pin(async move {
+                    runtime
+                        .reserve_resolved_magnet_metadata(
+                            hash,
+                            resolved,
+                            metadata_complete_dir,
+                            metadata_active_dir,
+                            cancellation,
+                        )
                         .await
                 })
             }));
@@ -799,6 +954,7 @@ impl DaemonRuntime {
         let containment_generation = containment_gate.generation();
         let handle = tokio::spawn(async move {
             if task_start_rx.await.is_err() {
+                runtime_for_task.engine_task_finished(hash_for_task).await;
                 return;
             }
             let engine_result = tokio::select! {
@@ -909,14 +1065,21 @@ impl DaemonRuntime {
                     }
                 }
                 Err(e) => {
-                    let retry_metadata = runtime_for_task
-                        .handle_engine_task_error(hash_for_task, needs_metadata, e)
-                        .await;
-                    if retry_metadata {
-                        runtime_for_task.schedule_delayed_reconcile_queue(
-                            "magnet_metadata_no_peers",
-                            MAGNET_METADATA_NO_PEERS_RETRY_DELAY,
+                    if storage_work_cancellation_for_task.is_cancelled() {
+                        tracing::debug!(
+                            info_hash = %hash_for_task,
+                            "engine storage work cancelled by lifecycle operation"
                         );
+                    } else {
+                        let retry_metadata = runtime_for_task
+                            .handle_engine_task_error(hash_for_task, needs_metadata, e)
+                            .await;
+                        if retry_metadata {
+                            runtime_for_task.schedule_delayed_reconcile_queue(
+                                "magnet_metadata_no_peers",
+                                MAGNET_METADATA_NO_PEERS_RETRY_DELAY,
+                            );
+                        }
                     }
                 }
             }
@@ -975,8 +1138,22 @@ impl DaemonRuntime {
         let _ = task_start_tx.send(());
     }
 
+    async fn cancel_engine_storage_work(&self, hash: &InfoHash) {
+        if let Some(cancellation) = self
+            .engine_storage_cancellations
+            .lock()
+            .await
+            .get(hash)
+            .cloned()
+        {
+            cancellation.cancel();
+        }
+    }
+
     pub(super) async fn stop_engine(&self, hash: &InfoHash) {
         self.engine_retry_after.write().await.remove(hash);
+        self.cancel_engine_storage_work(hash).await;
+        let explicit_recheck = self.cancel_explicit_recheck(hash).await;
         if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
             let _ = tx.send(EngineCommand::Stop).await;
         }
@@ -984,14 +1161,21 @@ impl DaemonRuntime {
         if let Some(handle) = handle {
             let _ = handle.await;
         }
+        if let Some(recheck) = explicit_recheck {
+            recheck.wait_finished().await;
+        }
         // Stop the inbound peer listener / seeder too.
         self.stop_seeder(hash).await;
         self.engine_states.write().await.remove(hash);
         self.rate_samples.write().await.remove(hash);
+        self.engine_storage_cancellations.lock().await.remove(hash);
+        self.storage_admissions.release(hash).await;
     }
 
     pub(super) async fn force_stop_engine(&self, hash: &InfoHash) {
         self.engine_retry_after.write().await.remove(hash);
+        self.cancel_engine_storage_work(hash).await;
+        let explicit_recheck = self.cancel_explicit_recheck(hash).await;
         if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
             let _ = tx.try_send(EngineCommand::Stop);
         }
@@ -1000,9 +1184,14 @@ impl DaemonRuntime {
             handle.abort();
             let _ = handle.await;
         }
+        if let Some(recheck) = explicit_recheck {
+            recheck.wait_finished().await;
+        }
         self.force_stop_seeder(hash).await;
         self.engine_states.write().await.remove(hash);
         self.rate_samples.write().await.remove(hash);
+        self.engine_storage_cancellations.lock().await.remove(hash);
+        self.storage_admissions.release(hash).await;
     }
 
     pub(super) async fn restart_engine_for_settings(&self, hash: &InfoHash) {
@@ -1028,6 +1217,7 @@ impl DaemonRuntime {
         let mut hashes = registry_hashes.to_vec();
         hashes.extend(self.engine_handles.read().await.keys().copied());
         hashes.extend(self.seeder_shutdowns.lock().await.keys().copied());
+        hashes.extend(self.explicit_rechecks.lock().await.keys().copied());
         hashes.sort();
         hashes.dedup();
         for hash in hashes {
@@ -1047,6 +1237,8 @@ impl DaemonRuntime {
         self.engine_states.write().await.clear();
         self.engine_cmds.lock().await.clear();
         self.engine_handles.write().await.clear();
+        self.engine_storage_cancellations.lock().await.clear();
+        self.explicit_rechecks.lock().await.clear();
         self.torrent_limiters.write().await.clear();
         self.torrent_peer_permit_pools.write().await.clear();
         self.seeder_shutdowns.lock().await.clear();
@@ -1057,5 +1249,6 @@ impl DaemonRuntime {
         self.engine_retry_after.write().await.clear();
         self.autopilot_decisions.write().await.clear();
         self.autopilot_last_action.write().await.clear();
+        self.storage_admissions.clear().await;
     }
 }

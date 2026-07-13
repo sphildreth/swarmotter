@@ -138,13 +138,35 @@ impl DaemonRuntime {
         let hash = parsed.info_hash;
         let mut torrent = Torrent::new(parsed, now());
         watch::apply_folder_defaults(&mut torrent, folder);
-        let paused = matches!(
-            folder.start_behavior,
-            swarmotter_core::config::StartBehavior::Paused
-        );
-        let mutation = self
-            .add_torrent_mutation(torrent, paused, "watch_import_added")
-            .await;
+        let labels = torrent.labels.clone();
+        // Watch-folder start behavior remains an explicit creation choice;
+        // the optional profile supplies storage snapshot and all live policy
+        // fields without being copied into per-torrent overrides.
+        let mutation = {
+            // Profile resolution and durable registration must share the
+            // profile/config transaction. A concurrent profile replacement
+            // cannot delete a profile after this watch import validates it.
+            let _config_transaction = self.config_write_lock.lock().await;
+            match self
+                .apply_add_profile(
+                    &mut torrent,
+                    None,
+                    labels,
+                    true,
+                    matches!(
+                        folder.start_behavior,
+                        swarmotter_core::config::StartBehavior::Paused
+                    ),
+                )
+                .await
+            {
+                Ok(paused) => {
+                    self.add_torrent_mutation(torrent, paused, "watch_import_added")
+                        .await
+                }
+                Err(error) => Err(error),
+            }
+        };
         self.finish_watch_attempt(file, folder, Some(hash), mutation)
             .await;
         tracing::debug!(path = %path.display(), "watch torrent attempt finished");

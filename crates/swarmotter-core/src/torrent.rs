@@ -9,6 +9,7 @@ use crate::meta::TorrentMeta;
 use crate::models::torrent::{
     FilePriority, SeedingStatus, TorrentFile, TorrentHealth, TorrentState, TorrentSummary,
 };
+use crate::policy::TorrentPolicy;
 use crate::ratio::TorrentSeeding;
 use crate::storage::PieceProgress;
 use serde::{Deserialize, Serialize};
@@ -56,6 +57,10 @@ pub struct Torrent {
     pub active_peer_workers: usize,
     pub known_peers: usize,
     pub labels: Vec<String>,
+    /// Named profile assignment and explicit policy overrides. Missing from
+    /// pre-profile state means normal global inheritance.
+    #[serde(default)]
+    pub policy: TorrentPolicy,
     pub download_dir: Option<String>,
     pub date_added: u64,
     pub date_completed: Option<u64>,
@@ -116,6 +121,7 @@ impl Torrent {
             active_peer_workers: 0,
             known_peers: 0,
             labels: Vec::new(),
+            policy: TorrentPolicy::default(),
             download_dir: None,
             date_added,
             date_completed: None,

@@ -14,6 +14,10 @@ pub struct AddTorrentsBody {
     pub paused: Option<bool>,
     #[serde(default)]
     pub start_behavior: Option<StartBehavior>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +64,11 @@ pub async fn add_torrents(
         Ok(options) => options,
         Err(e) => return err_response(e),
     };
+    let options =
+        match super::add::apply_policy_add_options(options, body.profile, body.labels, &query) {
+            Ok(options) => options,
+            Err(e) => return err_response(e),
+        };
 
     let mut added = Vec::new();
     let mut failed = Vec::new();

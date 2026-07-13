@@ -438,6 +438,81 @@ impl NetworkBinder for PanickingScrapeBinder {
     }
 }
 
+struct CountingConnectBinder {
+    connect_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl NetworkBinder for CountingConnectBinder {
+    async fn connect_peer(&self, _addr: SocketAddr) -> Result<tokio::net::TcpStream> {
+        self.connect_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Err(CoreError::Internal(
+            "test binder must not be reached for a blocked peer".into(),
+        ))
+    }
+
+    async fn resolve_host(&self, _host: &str, _port: u16) -> Result<SocketAddr> {
+        Err(CoreError::Internal("unused in peer-filter test".into()))
+    }
+
+    async fn udp_socket(&self) -> Result<Box<dyn ContainedUdpSocket>> {
+        Err(CoreError::Internal("unused in peer-filter test".into()))
+    }
+
+    async fn bind_peer_listener(&self, _port: u16) -> Result<Box<dyn PeerListener>> {
+        Err(CoreError::Internal("unused in peer-filter test".into()))
+    }
+
+    fn traffic_allowed(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn blocked_peer_never_reaches_contained_binder() {
+    let binder = Arc::new(CountingConnectBinder {
+        connect_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let filter = swarmotter_core::peer_filter::PeerFilter::from_config(
+        &swarmotter_core::peer_filter::PeerFilterConfig {
+            enabled: true,
+            rules: vec!["203.0.113.0/24".into()],
+            blocklist_paths: Vec::new(),
+            manual_bans: Vec::new(),
+            blocked_client_ids: Vec::new(),
+        },
+    )
+    .unwrap();
+    let peer = PeerAddr::from_socket_addr("203.0.113.7:6881".parse().unwrap());
+
+    let result = connect_peer_wire_with_transport(
+        binder.clone(),
+        peer,
+        InfoHash::from_bytes([7; 20]),
+        [0; 20],
+        false,
+        true,
+        PeerEncryptionMode::Disabled,
+        &filter,
+    )
+    .await;
+
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("blocked peer unexpectedly reached the contained transport"),
+    };
+
+    assert!(error.to_string().contains("configured rule"));
+    assert_eq!(
+        binder
+            .connect_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "admission must reject before NetworkBinder::connect_peer"
+    );
+}
+
 #[tokio::test]
 async fn scrape_task_panic_is_retained_for_the_exact_tracker() {
     let hash = InfoHash::from_bytes([0x72; 20]);
@@ -568,8 +643,13 @@ fn peer_candidate_classification_marks_all_filtered_as_unusable() {
         PeerAddr::from_socket_addr("[2001:db8::2]:6002".parse().unwrap()),
     ];
 
-    let (eligible, counts) =
-        classify_peer_candidates(&peers, &HashMap::new(), &HashMap::new(), false);
+    let (eligible, counts) = classify_peer_candidates(
+        &peers,
+        &HashMap::new(),
+        &HashMap::new(),
+        false,
+        &swarmotter_core::peer_filter::PeerFilter::default(),
+    );
 
     assert!(eligible.is_empty());
     assert_eq!(counts.discovered, 2);
@@ -593,8 +673,13 @@ fn peer_candidate_classification_does_not_stop_for_idle_backoff_only() {
         Duration::from_secs(60),
     );
 
-    let (eligible, counts) =
-        classify_peer_candidates(&peers, &HashMap::new(), &peer_backoff, false);
+    let (eligible, counts) = classify_peer_candidates(
+        &peers,
+        &HashMap::new(),
+        &peer_backoff,
+        false,
+        &swarmotter_core::peer_filter::PeerFilter::default(),
+    );
 
     assert!(eligible.is_empty());
     assert_eq!(counts.discovered, 1);
@@ -884,6 +969,52 @@ async fn stale_fast_resume_rechecks_resume_ahead_of_payload() {
 }
 
 #[tokio::test]
+async fn startup_recheck_uses_daemon_supplied_executor() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let payload = b"executor-backed recheck";
+    let bytes = build_single_file_torrent("executor.bin", payload, 8, None, false);
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let dir = unique_dir("root-scoped-recheck-executor");
+    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let expected = {
+        let mut bitfield = PieceBitfield::new(meta.piece_count());
+        bitfield.set(0);
+        bitfield
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let executor_calls = calls.clone();
+    let executor_bitfield = expected.clone();
+    let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let engine = TorrentEngine::new(
+        meta,
+        dir.clone(),
+        [0u8; 20],
+        binder,
+        state,
+        rx,
+        vec![],
+        6881,
+    )
+    .with_storage_recheck_executor(Arc::new(move |_storage| {
+        let calls = executor_calls.clone();
+        let bitfield = executor_bitfield.clone();
+        Box::pin(async move {
+            calls.fetch_add(1, Ordering::AcqRel);
+            Ok(bitfield)
+        })
+    }));
+
+    let recovered = engine.load_or_recheck(&storage).await.unwrap();
+
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(recovered, expected);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
 async fn same_size_external_payload_change_invalidates_fast_resume() {
     let payload = b"abcdefgh";
     let bytes = build_single_file_torrent("same-size.bin", payload, 8, None, false);
@@ -993,6 +1124,7 @@ fn pex_import_respects_ipv6_and_cap() {
         .into_iter()
         .map(PeerAddr::from_socket_addr),
         false,
+        &swarmotter_core::peer_filter::PeerFilter::default(),
         1,
     );
 

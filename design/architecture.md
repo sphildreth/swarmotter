@@ -8,8 +8,9 @@ SwarmOtter is a Rust async daemon with these layers:
 
 - **Core engine** (`swarmotter-core`): bencode, torrent/magnet parsing, info
   hash, domain models, network containment logic, queue/bandwidth/ratio
-  logic, storage layout and fast-resume, watch-folder import logic, and the
-  torrent registry. Pure, testable logic with no direct socket creation. The
+  logic, storage layout and fast-resume, watch-folder import logic, named
+  policy resolution, peer-admission filter compilation, and the torrent
+  registry. Pure, testable logic with no direct socket creation. The
   bencode decoder in `swarmotter-core::bencode` and the metainfo builder in
   `swarmotter-core::meta` form the shared bencoded-input trust boundary
   (ADR-0050). `.torrent` uploads, bulk base64 metainfo, magnet `info` dicts
@@ -35,7 +36,10 @@ SwarmOtter is a Rust async daemon with these layers:
   files, piece read/write and verification, fast resume, forced recheck,
   move/rename, missing/changed file detection logic. Runtime storage I/O reuses
   per-torrent file handles and flushes cached writes at read/verification and
-  move/remove boundaries rather than after every block write; see ADR-0043.
+  move/remove boundaries rather than after every block write. The daemon owns
+  root-scoped atomic active-work admission, shared verified-write limiters, and
+  RAII recheck permits; these local controls never create or alter torrent
+  network paths (ADR-0043, ADR-0056).
 - **API layer** (`swarmotter-api`): REST endpoints plus SSE/WebSocket events
   built on `axum`. The API is a first-class product surface (see ADR-0004 and
   `api.md`). It talks to the daemon through the `DaemonOps` trait, so the
@@ -46,7 +50,8 @@ SwarmOtter is a Rust async daemon with these layers:
 - **Daemon** (`swarmotterd`): owns torrent state, networking, disk I/O,
   queueing, settings, durable registry state, and lifecycle. Implements
   `DaemonOps`, wires the API + Web UI into a single `axum::serve`, runs the
-  network health monitor and watch-folder scanner, and spawns the live
+  network health monitor and watch-folder scanner, compiles immutable
+  peer-admission policy generations, resolves live profile values, and spawns the live
   `TorrentEngine` task per active torrent (`swarmotterd::engine`). A single
   process-wide `SeederHub` (`swarmotterd::seeder`) owns the contained inbound
   peer listener, routes plaintext and encrypted handshakes to registered
@@ -72,7 +77,7 @@ crates/
 ├── swarmotterd/      # daemon binary + lib (runtime, DaemonOps impl, live engine, seeder, metadata, dht, netbinder)
 ├── swarmotter-core/  # core types and engine logic
 │   └── src/ bencode, dht, endgame, error, extensions, hash, magnet, meta, models/, net/ (binder, config, probe),
-│            peer, tracker, udp_tracker, utp/ (mod, header, sack, congestion, stream), queue, ratio, bandwidth, storage/ (io, layout, resume),
+│            peer, peer_filter, policy, tracker, udp_tracker, utp/ (mod, header, sack, congestion, stream), queue, ratio, bandwidth, storage/ (io, layout, resume),
 │            torrent, watch, config
 ├── swarmotter-api/   # API layer (routes, handlers, envelope, events)
 └── swarmotter-web/   # embedded static Web UI
@@ -89,6 +94,8 @@ swarmotterd/src/
 │   ├── lifecycle.rs                   # DaemonOps lifecycle implementation
 │   ├── scheduler.rs, seeding.rs       # queue and seeder ownership
 │   ├── settings.rs, watch.rs          # reconfiguration and watch ingestion
+│   ├── policy_runtime.rs              # effective profile resolution + durable assignment
+│   ├── storage_controls.rs            # root admission, write pressure, recheck permits
 │   ├── containment.rs, diagnostics.rs # gate/recovery and observations
 │   ├── persistence.rs                 # restore, checkpoints, rollback
 │   └── tests.rs
@@ -191,6 +198,15 @@ are created or scheduled only after the durable checkpoint succeeds. Watch
 duplicates use this primitive's non-mutating duplicate result; the API maps it
 to its existing conflict contract while watch processing treats it as success.
 
+Before registration, explicit add/watch profiles and labels resolve against the
+current profile configuration. The resolved storage paths and start-or-paused
+admission decision are captured in the durable torrent record so later
+profile, label, or global-auto-start edits cannot relocate payload data or
+change a snapshot-bearing torrent's admission intent. Queue priority, seeding,
+and bandwidth continue to resolve from the current profile for torrents that
+inherit them; legacy records are migrated transactionally when profile
+configuration is replaced (ADR-0057).
+
 The watch runtime owns one whole-scan mutex and a non-durable observation map
 keyed by normalized absolute root plus normalized relative path. Complete
 directory walks and bounded file reads run in blocking tasks. Walks use
@@ -218,6 +234,15 @@ peer sessions. Network, listen-port, IP-family, uTP, encryption, or DHT changes
 stop the complete old task set before the new configuration is installed and
 eligible torrents are reconciled with fresh binders. This prevents a task from
 retaining an obsolete containment policy (ADR-0047).
+
+Peer-admission filtering is a separate, global admission layer (ADR-0058).
+The daemon compiles a bounded immutable generation from local rules/imports
+before installation. Tracker, DHT, PEX, direct, metadata, and inbound paths
+ask it whether an IP may be admitted before an outbound connection or inbound
+service; a peer-ID-prefix check follows the handshake. A rejected candidate
+never weakens or replaces `NetworkBinder`: an accepted candidate still receives
+only a contained socket. Replacing the policy reconstructs peer-bearing work
+transactionally, restoring the previous generation on failure.
 
 Peer-session ownership is a separate runtime resource boundary (ADR-0053).
 Every outbound metadata, serial, parallel, or endgame TCP/uTP connection holds

@@ -59,7 +59,8 @@ impl TorrentEngine {
             }
         }
 
-        let storage = StorageIo::new(self.meta.clone(), self.download_dir.clone());
+        let storage = StorageIo::new(self.meta.clone(), self.download_dir.clone())
+            .with_write_limiter(self.storage_write_limiter.clone());
         let selected_files = self
             .file_priorities
             .iter()
@@ -87,7 +88,7 @@ impl TorrentEngine {
         let mut discovered = self.announce(AnnounceEvent::Started).await;
         // Merge any directly-supplied seed peers (local swarm / PEX / DHT).
         for p in &self.seed_peers {
-            if !discovered.contains(p) {
+            if self.peer_allowed(p) && !discovered.contains(p) {
                 discovered.push(*p);
             }
         }
@@ -157,8 +158,13 @@ impl TorrentEngine {
             let remaining = self.piece_selection.remaining(&have);
             prune_peer_backoff(&mut bad_peers);
             prune_peer_backoff(&mut peer_backoff);
-            let (mut eligible, candidate_counts) =
-                classify_peer_candidates(&discovered, &bad_peers, &peer_backoff, self.allow_ipv6);
+            let (mut eligible, candidate_counts) = classify_peer_candidates(
+                &discovered,
+                &bad_peers,
+                &peer_backoff,
+                self.allow_ipv6,
+                self.peer_filter.as_ref(),
+            );
             balance_peer_families(&mut eligible);
             let mut scheduler = PeerSchedulerDiagnostics {
                 discovered_peers: candidate_counts.discovered,
@@ -279,6 +285,7 @@ impl TorrentEngine {
                     &bad_peers,
                     &peer_backoff,
                     self.allow_ipv6,
+                    self.peer_filter.as_ref(),
                 );
                 if no_usable_peer_candidates(&latest_counts) {
                     // No usable peers; back off briefly and retry announce.
@@ -292,6 +299,7 @@ impl TorrentEngine {
                         &bad_peers,
                         &peer_backoff,
                         self.allow_ipv6,
+                        self.peer_filter.as_ref(),
                     );
                     if no_usable_peer_candidates(&refreshed_counts) {
                         no_peer_rounds = no_peer_rounds.saturating_add(1);
@@ -405,10 +413,18 @@ impl TorrentEngine {
                     stamps_match,
                     "fast resume does not match on-disk payload; rechecking storage"
                 );
-                storage.recheck().await
+                self.recheck_storage(storage).await
             } else {
                 Ok(resume.piece_bitfield)
             }
+        } else {
+            self.recheck_storage(storage).await
+        }
+    }
+
+    async fn recheck_storage(&self, storage: &StorageIo) -> Result<PieceBitfield> {
+        if let Some(executor) = &self.storage_recheck_executor {
+            executor(storage.clone()).await
         } else {
             storage.recheck().await
         }

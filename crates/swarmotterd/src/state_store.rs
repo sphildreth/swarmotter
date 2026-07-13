@@ -23,6 +23,16 @@ pub struct DaemonState {
     pub queue: QueueState,
 }
 
+/// Exact pre-write state-file contents used by a higher-level transaction.
+/// Keeping raw bytes preserves both the prior versioned representation and a
+/// deliberately absent state file when a later directory sync reports an
+/// error after rename.
+#[derive(Debug, Clone)]
+pub(crate) enum StateFileSnapshot {
+    Bytes(Vec<u8>),
+    Missing,
+}
+
 impl DaemonState {
     pub fn new(torrents: Vec<Torrent>, queue: QueueState) -> Self {
         Self {
@@ -121,11 +131,41 @@ pub fn load(path: &Path) -> Result<Option<DaemonState>> {
 pub fn save(path: &Path, state: &DaemonState) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(state)
         .map_err(|error| CoreError::Storage(format!("serialize daemon state: {error}")))?;
+    write_bytes_atomically(path, &bytes)
+}
+
+pub(crate) fn capture_file(path: &Path) -> Result<StateFileSnapshot> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(StateFileSnapshot::Bytes(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(StateFileSnapshot::Missing)
+        }
+        Err(error) => Err(CoreError::Storage(format!("read daemon state: {error}"))),
+    }
+}
+
+pub(crate) fn restore_file(path: &Path, snapshot: &StateFileSnapshot) -> Result<()> {
+    match snapshot {
+        StateFileSnapshot::Bytes(bytes) => write_bytes_atomically(path, bytes),
+        StateFileSnapshot::Missing => match fs::remove_file(path) {
+            Ok(()) => {
+                let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(|error| CoreError::Storage(format!("sync state directory: {error}")))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(CoreError::Storage(format!("remove daemon state: {error}"))),
+        },
+    }
+}
+
+fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
         .map_err(|error| CoreError::Storage(format!("create state directory: {error}")))?;
     let temp = temp_path(path);
-    let result = write_and_replace(&temp, path, parent, &bytes);
+    let result = write_and_replace(&temp, path, parent, bytes);
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
@@ -189,6 +229,24 @@ mod tests {
         let loaded = load(&path).unwrap().unwrap();
         assert!(loaded.torrents.is_empty());
         assert!(loaded.queue.order.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn state_file_snapshot_restores_exact_prior_generation() {
+        let path = unique_path("daemon-state-snapshot");
+        let prior = DaemonState::new(Vec::new(), QueueState::new(QueueLimits::default()));
+        save(&path, &prior).unwrap();
+        let prior_bytes = fs::read(&path).unwrap();
+        let snapshot = capture_file(&path).unwrap();
+
+        let mut changed_queue = QueueState::new(QueueLimits::default());
+        changed_queue.add(swarmotter_core::hash::InfoHash::from_bytes([7; 20]));
+        save(&path, &DaemonState::new(Vec::new(), changed_queue)).unwrap();
+        assert_ne!(fs::read(&path).unwrap(), prior_bytes);
+
+        restore_file(&path, &snapshot).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), prior_bytes);
         let _ = fs::remove_file(path);
     }
 

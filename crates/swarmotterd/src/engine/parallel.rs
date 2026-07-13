@@ -59,6 +59,7 @@ impl TorrentEngine {
                 self.encryption_mode,
                 self.pex_enabled && !self.meta.is_private(),
                 self.allow_ipv6,
+                self.peer_filter.clone(),
                 self.pex_max_peers,
                 planned_session_count,
                 self.peer_session_budget.clone(),
@@ -131,9 +132,9 @@ impl TorrentEngine {
                 &mut seen_candidates,
                 &mut discovered_pex,
                 &pex_peers,
-                bad_peers,
-                peer_backoff,
+                ParallelCandidateSuppression::new(bad_peers, peer_backoff),
                 self.allow_ipv6,
+                self.peer_filter.as_ref(),
             )
             .await;
             if Instant::now() >= next_discovery_refresh {
@@ -145,6 +146,7 @@ impl TorrentEngine {
                     bad_peers,
                     peer_backoff,
                     self.allow_ipv6,
+                    self.peer_filter.as_ref(),
                 );
                 next_discovery_refresh = Instant::now() + PEER_REFRESH_INTERVAL;
             }
@@ -169,6 +171,7 @@ impl TorrentEngine {
                     self.encryption_mode,
                     self.pex_enabled && !self.meta.is_private(),
                     self.allow_ipv6,
+                    self.peer_filter.clone(),
                     self.pex_max_peers,
                     planned_session_count,
                     self.peer_session_budget.clone(),
@@ -198,30 +201,55 @@ impl TorrentEngine {
             &mut seen_candidates,
             &mut discovered_pex,
             &pex_peers,
-            bad_peers,
-            peer_backoff,
+            ParallelCandidateSuppression::new(bad_peers, peer_backoff),
             self.allow_ipv6,
+            self.peer_filter.as_ref(),
         )
         .await;
         (progressed, discovered_pex)
     }
 }
 
-pub(super) async fn merge_dynamic_parallel_candidates(
+struct ParallelCandidateSuppression<'a> {
+    bad_peers: &'a HashMap<SocketAddr, Instant>,
+    peer_backoff: &'a HashMap<SocketAddr, Instant>,
+}
+
+impl<'a> ParallelCandidateSuppression<'a> {
+    fn new(
+        bad_peers: &'a HashMap<SocketAddr, Instant>,
+        peer_backoff: &'a HashMap<SocketAddr, Instant>,
+    ) -> Self {
+        Self {
+            bad_peers,
+            peer_backoff,
+        }
+    }
+}
+
+async fn merge_dynamic_parallel_candidates(
     candidates: &mut Vec<PeerAddr>,
     seen: &mut HashSet<SocketAddr>,
     discovered_pex: &mut Vec<PeerAddr>,
     pex_peers: &Arc<Mutex<Vec<PeerAddr>>>,
-    bad_peers: &HashMap<SocketAddr, Instant>,
-    peer_backoff: &HashMap<SocketAddr, Instant>,
+    suppression: ParallelCandidateSuppression<'_>,
     allow_ipv6: bool,
+    peer_filter: &swarmotter_core::peer_filter::PeerFilter,
 ) {
     let peers = {
         let mut peers = pex_peers.lock().await;
         std::mem::take(&mut *peers)
     };
     for peer in peers {
-        if push_parallel_candidate(candidates, seen, peer, bad_peers, peer_backoff, allow_ipv6) {
+        if push_parallel_candidate(
+            candidates,
+            seen,
+            peer,
+            suppression.bad_peers,
+            suppression.peer_backoff,
+            allow_ipv6,
+            peer_filter,
+        ) {
             discovered_pex.push(peer);
         }
     }
@@ -234,11 +262,20 @@ pub(super) fn merge_parallel_candidate_iter<I>(
     bad_peers: &HashMap<SocketAddr, Instant>,
     peer_backoff: &HashMap<SocketAddr, Instant>,
     allow_ipv6: bool,
+    peer_filter: &swarmotter_core::peer_filter::PeerFilter,
 ) where
     I: IntoIterator<Item = PeerAddr>,
 {
     for peer in peers {
-        push_parallel_candidate(candidates, seen, peer, bad_peers, peer_backoff, allow_ipv6);
+        push_parallel_candidate(
+            candidates,
+            seen,
+            peer,
+            bad_peers,
+            peer_backoff,
+            allow_ipv6,
+            peer_filter,
+        );
     }
 }
 
@@ -249,8 +286,9 @@ pub(super) fn push_parallel_candidate(
     bad_peers: &HashMap<SocketAddr, Instant>,
     peer_backoff: &HashMap<SocketAddr, Instant>,
     allow_ipv6: bool,
+    peer_filter: &swarmotter_core::peer_filter::PeerFilter,
 ) -> bool {
-    if !allow_ipv6 && peer.ip.is_ipv6() {
+    if !peer_allowed_by_config(&peer, allow_ipv6) || !peer_filter.admit_ip(peer.ip).is_allowed() {
         return false;
     }
     let addr = peer.socket_addr();
@@ -429,6 +467,7 @@ pub(super) fn spawn_parallel_peer_task(
     encryption_mode: PeerEncryptionMode,
     pex_enabled: bool,
     allow_ipv6: bool,
+    peer_filter: Arc<swarmotter_core::peer_filter::PeerFilter>,
     pex_max_peers: usize,
     candidate_count: usize,
     peer_session_budget: PeerSessionBudget,
@@ -451,6 +490,7 @@ pub(super) fn spawn_parallel_peer_task(
             encryption_mode,
             pex_enabled,
             allow_ipv6,
+            peer_filter,
             pex_max_peers,
             candidate_count,
             peer_session_budget,
@@ -674,6 +714,7 @@ pub(super) async fn parallel_peer_session(
     encryption_mode: PeerEncryptionMode,
     pex_enabled: bool,
     allow_ipv6: bool,
+    peer_filter: Arc<swarmotter_core::peer_filter::PeerFilter>,
     pex_max_peers: usize,
     candidate_count: usize,
     peer_session_budget: PeerSessionBudget,
@@ -692,6 +733,16 @@ pub(super) async fn parallel_peer_session(
         );
         return Ok(PeerSessionOutcome::NoProgress);
     }
+    let decision = peer_filter.admit_ip(peer_addr.ip);
+    if !decision.is_allowed() {
+        tracing::info!(
+            peer = %peer_addr.socket_addr(),
+            reason = decision.audit_reason(),
+            detail = ?decision.rejection_message(),
+            "parallel peer rejected before contained outbound admission"
+        );
+        return Ok(PeerSessionOutcome::NoProgress);
+    }
     let _peer_permit = peer_session_budget.acquire_outbound().await?;
     let mut no_progress_reason: &'static str = "session_in_progress";
 
@@ -703,6 +754,7 @@ pub(super) async fn parallel_peer_session(
         utp_enabled,
         utp_prefer_tcp,
         encryption_mode,
+        peer_filter.as_ref(),
     )
     .await?;
     tracing::debug!(
@@ -992,6 +1044,7 @@ pub(super) async fn parallel_peer_session(
                                 pex_enabled,
                                 &mut remote_pex_id,
                                 allow_ipv6,
+                                peer_filter.as_ref(),
                                 pex_max_peers,
                                 &pex_peers,
                                 &state,
@@ -1087,6 +1140,7 @@ pub(super) async fn parallel_peer_session(
                     pex_enabled,
                     &mut remote_pex_id,
                     allow_ipv6,
+                    peer_filter.as_ref(),
                     pex_max_peers,
                     &pex_peers,
                     &state,
@@ -1146,6 +1200,7 @@ pub(super) async fn handle_parallel_pex_message(
     pex_enabled: bool,
     remote_pex_id: &mut Option<u8>,
     allow_ipv6: bool,
+    peer_filter: &swarmotter_core::peer_filter::PeerFilter,
     pex_max_peers: usize,
     pex_peers: &Arc<Mutex<Vec<PeerAddr>>>,
     state: &Arc<Mutex<EngineState>>,
@@ -1175,6 +1230,7 @@ pub(super) async fn handle_parallel_pex_message(
         &mut peers,
         pex.added.into_iter().chain(pex.added6),
         allow_ipv6,
+        peer_filter,
         pex_max_peers,
     );
     if peers.len() > before {
