@@ -33,7 +33,7 @@ use tokio::time::timeout;
 use swarmotter_core::bandwidth::{RateDirection, RateLimiter, ShapedLimiter};
 use swarmotter_core::config::{CowStrategy, PeerEncryptionMode};
 use swarmotter_core::error::{CoreError, Result};
-use swarmotter_core::hash::InfoHash;
+use swarmotter_core::hash::{InfoHash, PeerInfoHash, TorrentKey};
 use swarmotter_core::meta::TorrentMeta;
 use swarmotter_core::models::peer::EnginePeerHealth;
 use swarmotter_core::models::stats::PeerSchedulerDiagnostics;
@@ -44,6 +44,7 @@ use swarmotter_core::peer::{
     self, block_requests, Bitfield, Handshake, Message, PeerAddr, PeerReader,
 };
 use swarmotter_core::peer_filter::PeerFilter;
+use swarmotter_core::policy::{IntakePolicySnapshot, TrackerHostRule};
 use swarmotter_core::storage::resume::PieceBitfield;
 use swarmotter_core::storage::{piece_file_ranges, verify_piece, StorageIo, StorageIoMetrics};
 use swarmotter_core::tracker::{self, AnnounceEvent, AnnounceRequest};
@@ -154,9 +155,21 @@ impl PieceSelection {
 /// fetched and the meta rebuilt.
 #[derive(Debug, Clone)]
 pub struct MagnetParams {
+    /// Full parsed v1/v2/hybrid identity from the magnet exact topics.
+    pub identity: swarmotter_core::hash::TorrentIdentity,
+    /// v1 compatibility hash when the magnet has one; pure-v2 magnets retain
+    /// [`InfoHash::ZERO`] here and use `wire_info_hash` for all peer,
+    /// tracker, and DHT traffic.
     pub info_hash: swarmotter_core::hash::InfoHash,
+    /// The exact 20-byte peer/tracker/DHT wire identity. For pure-v2 magnets
+    /// this is the prescribed truncation of the full SHA-256 identity, never
+    /// a synthetic placeholder hash.
+    pub wire_info_hash: PeerInfoHash,
     pub name: String,
     pub trackers: Vec<String>,
+    /// Deferred BEP 53 select-only file indices. They are checked against the
+    /// resolved metadata before any payload-side piece selection is built.
+    pub select_only_file_indices: Vec<usize>,
 }
 
 pub type MetadataPreflight =
@@ -344,6 +357,9 @@ pub enum EngineCommand {
 /// completes when the engine should terminate (remove).
 pub struct TorrentEngine {
     meta: TorrentMeta,
+    /// Canonical registry/durable identity. This is intentionally separate
+    /// from `meta.info_hash`, which has no v1 value for pure BEP 52 torrents.
+    torrent_key: TorrentKey,
     /// Active write directory. For daemon-managed downloads this is the
     /// configured incomplete directory when present.
     download_dir: PathBuf,
@@ -358,6 +374,16 @@ pub struct TorrentEngine {
     listen_port: u16,
     limiter: ShapedLimiter,
     magnet: Option<MagnetParams>,
+    /// Stop after contained BEP 9 metadata retrieval, before any payload
+    /// storage, tracker payload announce, or piece requests are started.
+    metadata_only: bool,
+    /// File selection captured before a magnet's real metadata was known.
+    /// It is applied immediately after metadata resolves and before payload
+    /// piece selection is constructed.
+    intake_selection: Option<IntakePolicySnapshot>,
+    /// Live profile-scoped tracker host enablement and priority rules. They
+    /// shape discovery only; every resulting request still uses the binder.
+    tracker_host_rules: Vec<TrackerHostRule>,
     metadata_preflight: Option<MetadataPreflight>,
     storage_recheck_executor: Option<StorageRecheckExecutor>,
     /// Optional DHT runner for trackerless peer discovery (disabled for
@@ -372,6 +398,10 @@ pub struct TorrentEngine {
     sparse: bool,
     cow_strategy: CowStrategy,
     resume_dir: Option<PathBuf>,
+    /// Active-only filename suffix selected at intake. The active storage
+    /// handle uses it for every v1/v2 file path; completion restores canonical
+    /// metainfo names before the engine reports success.
+    partial_file_suffix: Option<String>,
     minimum_free_space_bytes: u64,
     minimum_free_space_percent: u8,
     /// Optional shared local-storage payload-write limiter supplied by the
@@ -437,8 +467,13 @@ impl TorrentEngine {
     ) -> Self {
         let piece_selection = PieceSelection::all(&meta);
         let file_count = meta.files.len();
+        let torrent_key = meta
+            .identity
+            .primary_key()
+            .unwrap_or_else(|| TorrentKey::v1(meta.info_hash));
         Self {
             meta,
+            torrent_key,
             complete_dir: download_dir.clone(),
             download_dir,
             peer_id,
@@ -449,6 +484,9 @@ impl TorrentEngine {
             listen_port,
             limiter: ShapedLimiter::from_shared_rate_limiter(limiter.into()),
             magnet,
+            metadata_only: false,
+            intake_selection: None,
+            tracker_host_rules: Vec::new(),
             metadata_preflight: None,
             storage_recheck_executor: None,
             dht: None,
@@ -459,6 +497,7 @@ impl TorrentEngine {
             sparse: true,
             cow_strategy: CowStrategy::Conservative,
             resume_dir: None,
+            partial_file_suffix: None,
             minimum_free_space_bytes: 0,
             minimum_free_space_percent: 0,
             storage_write_limiter: None,
@@ -530,6 +569,14 @@ impl TorrentEngine {
     /// Configure a dedicated fast-resume metadata root.
     pub fn with_resume_dir(mut self, resume_dir: Option<PathBuf>) -> Self {
         self.resume_dir = resume_dir;
+        self
+    }
+
+    /// Attach the canonical daemon key used by storage, resume, and runtime
+    /// ownership. Scheduler callers always pass the registry-canonical value
+    /// so a hybrid alias cannot create a second resume record.
+    pub fn with_torrent_key(mut self, torrent_key: TorrentKey) -> Self {
+        self.torrent_key = torrent_key;
         self
     }
 
@@ -606,6 +653,29 @@ impl TorrentEngine {
         Ok(self)
     }
 
+    /// Fetch a magnet's metadata through the existing contained binder and
+    /// return before payload-side storage or transfer begins.
+    pub fn with_metadata_only(mut self) -> Self {
+        self.metadata_only = true;
+        self
+    }
+
+    /// Apply a captured add-time file selection after a magnet replaces its
+    /// placeholder metadata. This prevents a default-all-files reset from
+    /// racing payload transfer.
+    pub fn with_intake_selection(mut self, selection: IntakePolicySnapshot) -> Self {
+        self.intake_selection = Some(selection);
+        self
+    }
+
+    /// Apply deterministic profile tracker-host controls to announce and
+    /// magnet metadata discovery. Rules affect only tracker ordering and
+    /// eligibility, never the contained network path.
+    pub fn with_tracker_host_rules(mut self, rules: Vec<TrackerHostRule>) -> Self {
+        self.tracker_host_rules = rules;
+        self
+    }
+
     /// Validate and reserve resolved magnet metadata with the daemon before
     /// any payload path is created.
     pub fn with_metadata_preflight(mut self, preflight: MetadataPreflight) -> Self {
@@ -640,6 +710,14 @@ impl TorrentEngine {
         self.complete_dir = complete_dir;
         self
     }
+
+    /// Configure an active-only payload filename suffix such as `.part`.
+    /// Input is validated by the durable intake policy before an engine is
+    /// constructed; `StorageIo` validates again at path resolution.
+    pub fn with_partial_file_suffix(mut self, partial_file_suffix: Option<String>) -> Self {
+        self.partial_file_suffix = partial_file_suffix;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -665,6 +743,7 @@ mod endgame;
 mod parallel;
 mod peer_session;
 mod progress;
+mod v2;
 mod webseed;
 
 pub(crate) use discovery::run_tracker_scrapes;

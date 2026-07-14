@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use swarmotter_core::config::StartBehavior;
 use swarmotter_core::error::{CoreError, Result};
-use swarmotter_core::hash::InfoHash;
+use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::meta::MAX_TORRENT_METADATA_BYTES;
 use swarmotter_core::models::torrent::{HealthLabel, TorrentState, TorrentSummary};
 
@@ -29,6 +29,7 @@ use crate::state::{AddTorrentOptions, SharedState};
 mod add;
 mod bulk;
 mod lifecycle;
+mod metainfo;
 mod query;
 mod settings;
 
@@ -43,6 +44,7 @@ pub use lifecycle::{
     get_torrent, pause, reannounce, recheck, remove_torrent, remove_torrents, resume, start_now,
     stop, RemoveTorrentsBody, RemoveTorrentsResult,
 };
+pub use metainfo::export_metainfo;
 pub use query::{
     list_torrents, query_torrents, TorrentListCounts, TorrentListDirection, TorrentListGroup,
     TorrentListGroupBy, TorrentListQuery, TorrentListResponse, TorrentListSort,

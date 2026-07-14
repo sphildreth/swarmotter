@@ -20,7 +20,7 @@ use tower::ServiceExt;
 
 use swarmotter_api::state::{AddTorrentOptions, AppState, BuildInfo, DaemonOps};
 use swarmotter_core::config::{Config, PeerEncryptionMode};
-use swarmotter_core::hash::InfoHash;
+use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::meta::{build_single_file_torrent, parse_torrent, TorrentMeta};
 use swarmotter_core::models::network::{
     NetworkContainmentMode as Mode, NetworkContainmentStatus, NetworkHealth,
@@ -264,7 +264,7 @@ struct ActiveTransfer {
     runtime: Arc<DaemonRuntime>,
     config: Config,
     probe: FakeInterfaceProbe,
-    hash: InfoHash,
+    hash: TorrentKey,
     bytes_served: Arc<AtomicU64>,
     root: std::path::PathBuf,
     state_path: std::path::PathBuf,
@@ -573,7 +573,12 @@ async fn recovery_consumes_only_durable_formerly_live_intent() {
         TorrentState::Queued,
         "ordinary queued work was incorrectly started by containment recovery"
     );
-    assert!(!fixture.runtime.engine_running_for_test(&queued).await);
+    assert!(
+        !fixture
+            .runtime
+            .engine_running_for_key_for_test(queued)
+            .await
+    );
     assert_eq!(
         fixture.runtime.get_torrent(&paused).await.unwrap().state,
         TorrentState::Paused
@@ -615,7 +620,12 @@ async fn recovery_consumes_only_durable_formerly_live_intent() {
         TorrentState::NetworkBlocked,
         "stale modeled activity was incorrectly granted recovery intent"
     );
-    assert!(!fixture.runtime.engine_running_for_test(&stale_active).await);
+    assert!(
+        !fixture
+            .runtime
+            .engine_running_for_key_for_test(stale_active)
+            .await
+    );
     fixture.runtime.shutdown().await.unwrap();
     std::fs::remove_dir_all(&fixture.root).ok();
 }
@@ -664,7 +674,7 @@ async fn recovery_intent_survives_restart_while_path_remains_blocked() {
         restored.get_torrent(&hash).await.unwrap().state,
         TorrentState::NetworkBlocked
     );
-    assert!(!restored.engine_running_for_test(&hash).await);
+    assert!(!restored.engine_running_for_key_for_test(hash).await);
 
     blocked_probe.set_interface(
         "lo",
@@ -674,7 +684,7 @@ async fn recovery_intent_survives_restart_while_path_remains_blocked() {
     restored.network_health_tick().await;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if restored.engine_running_for_test(&hash).await {
+            if restored.engine_running_for_key_for_test(hash).await {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;

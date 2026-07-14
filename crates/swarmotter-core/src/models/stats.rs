@@ -2,7 +2,7 @@
 
 //! Statistics models.
 
-use crate::hash::InfoHash;
+use crate::hash::TorrentKey;
 use crate::models::torrent::TorrentState;
 use serde::{Deserialize, Serialize};
 
@@ -113,7 +113,9 @@ pub struct PeerSchedulerDiagnostics {
 /// Per-torrent operational diagnostics for API/UI troubleshooting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentDiagnostics {
-    pub info_hash: InfoHash,
+    /// Canonical full API locator; serialized in the same 40/64-character
+    /// form as `TorrentSummary.info_hash`.
+    pub info_hash: TorrentKey,
     pub name: String,
     pub state: TorrentState,
     pub total_length: u64,

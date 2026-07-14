@@ -19,8 +19,8 @@ containment requirements are satisfied.
 
 - `P0`: Immediate, ordered foundation work. The order is intentional because
   later P0 programs depend on the preceding ones.
-- `P1`: High-value work that follows the P0 foundations or can proceed when
-  its direct dependencies are already being changed.
+- `P1`: High-value work that can build on the completed compatibility,
+  policy-intake, and durable-library foundations.
 - `P2`: Useful, bounded, or niche work that should not displace P0/P1 work.
 - `P3`: Research work that needs a clear architecture, security, legal,
   dependency, or containment case before acceptance.
@@ -40,22 +40,18 @@ duplicated. Within a priority, a lower sequence number is preferred. A
 conditional feature does not advance merely because its technical prerequisites
 are available.
 
-The P0 sequence favors compatibility and durable operator correctness before
-new shared-server product scope: current metadata and identity handling are
-v1/SHA-1-centric; metadata-first selection requires a complete and explicit
-policy model; and the current atomically rewritten state document is not the
-right long-term query foundation for library operations. The grouped P0
-programs address those constraints directly.
+The completed compatibility, policy-intake, and durable-library foundations
+now make lawful distribution creation, portability, cleanup, and operational
+interfaces the highest-value work. The remaining map favors capabilities that
+build directly on those foundations before introducing shared-server scope or
+new external integrations.
 
 ## Feature Map
 
 | Priority | Sequence | Feature | User Value | Source Signals |
 | --- | --- | --- | --- | --- |
-| P0 | 1 | BEP 52 v2/hybrid identity and interoperability | Consume, preserve, and operate interoperably with current v1, v2, and hybrid torrents without weakening containment | [BEP 52](https://www.bittorrent.org/beps/bep_0052.html), qBittorrent v2 support, Transmission v2 requests |
-| P0 | 2 | Policy-driven metadata-first intake | Preview metadata, select or exclude files, organize output, and apply deterministic policy before payload transfer | [BEP 53](https://www.bittorrent.org/beps/bep_0053.html), Transmission metadata-first requests, qBittorrent file-selection requests |
-| P0 | 3 | Durable library operations foundation (SQLite) | Replace the monolithic state-document limitation with indexed, migratable library state, histories, and raw-metainfo retention | Server-oriented operator workflows; supports audit, history, and portability |
-| P1 | 1 | Torrent creation for lawful distribution | Create v1, v2, and hybrid torrents after P0 v2/hybrid support establishes the shared metadata model | BiglyBT, aria2, Transmission [#5794](https://github.com/transmission/transmission/issues/5794) |
-| P1 | 2 | Library provenance and portability | Surface stored metadata and offer deterministic magnet and original-metainfo export | qBittorrent, Transmission, Deluge, and BiglyBT torrent detail/export workflows |
+| P1 | 1 | Torrent creation for lawful distribution | Create v1, v2, and hybrid torrents using the completed shared metadata model | BiglyBT, aria2, Transmission [#5794](https://github.com/transmission/transmission/issues/5794) |
+| P1 | 2 | Library provenance and portability | Surface stored source metadata, generate deterministic magnets, and complete UI/batch exact-metainfo portability | qBittorrent, Transmission, Deluge, and BiglyBT torrent detail/export workflows |
 | P1 | 3 | File cleanup, trash, and retention safety | Remove unwanted data safely without accidental loss | qBittorrent and Transmission cleanup requests |
 | P1 | 4 | Scriptable CLI (`swarmotterctl`) | Provide API-backed SSH and automation workflows with stable JSON output | `transmission-remote`, rTorrent, aria2 |
 | P1 | 5 | OpenAPI specification and interactive API docs | Make native and compatibility APIs discoverable and safer to automate | Flood, Deluge, self-hosting automation |
@@ -81,7 +77,7 @@ programs address those constraints directly.
 | P2 | 10 | Seedbox pre-seed warm-up | Pre-read and verify a lawful release before announce | BiglyBT-related warm-up concepts |
 | P2 | 11 | Disk cache / I/O buffer configuration | Tune storage behavior for specialized deployments | qBittorrent, Deluge, Transmission |
 | P2 | 12 | Sequential download / streaming / file preview | Add explicitly opt-in ordered fetching and local preview behavior | qBittorrent, aria2, WebTorrent, Deluge |
-| P2 | 13 | Protocol compatibility follow-ons | Track protocol gaps beyond the P0 BEP 52 foundation | qBittorrent and Transmission protocol requests |
+| P2 | 13 | Protocol compatibility follow-ons | Track protocol gaps beyond the completed BEP 52 foundation | qBittorrent and Transmission protocol requests |
 | P2 | 14 | Long-horizon observability | Retain useful history beyond current status | Transmission and qBittorrent requests |
 | P2 | 15 | Settings search and low-risk UI personalization | Improve configuration usability without making visual polish the product focus | qBittorrent and Transmission requests |
 | P2 | 16 | Time-of-day and adaptive bandwidth policies | Extend the implemented adaptive controls with explicit schedules | qBittorrent, aria2, Deluge |
@@ -104,82 +100,6 @@ programs address those constraints directly.
 The Feature Map above is the authoritative priority and ordering. The detailed
 sections remain grouped by technical domain, and their priority notes describe
 how each fits the map.
-
-### Protocol Modernization: BEP 52 v2/hybrid Identity and Interoperability
-
-**Priority: P0, sequence 1.**
-
-Problem: SwarmOtter's current torrent identity and metadata model is
-v1/SHA-1-centric. Current clients and lawful distributors increasingly use v2
-and hybrid torrents, which use SHA-256-based structures and cannot be modeled
-by simply treating a v2 identifier as another 20-byte v1 info hash. Supporting
-them as a foundation avoids compatibility gaps and gives later creation,
-selection, portability, and state work one coherent metadata model.
-
-SwarmOtter feature shape:
-
-- Introduce explicit v1, v2, and hybrid torrent identity rather than overloading
-  the existing v1 `InfoHash` representation.
-- Parse and validate the BEP 52 file tree, piece layers, SHA-256 hashes, and
-  v2/hybrid magnet forms while preserving existing v1 behavior.
-- Update peer, tracker, DHT, metadata exchange, fast-resume, persistence, API,
-  and UI surfaces as one compatibility program; all network activity continues
-  to go through the central binder and fails closed.
-- Preserve canonical raw metainfo where needed for exact identity, recovery,
-  and later export rather than silently reserializing data into a different
-  info dictionary.
-- Add generated local v1, v2, and hybrid fixtures and local-swarm coverage
-  before enabling behavior by default.
-
-Acceptance direction:
-
-- Existing v1 torrents and magnets remain compatible.
-- Invalid, incomplete, or ambiguous v2/hybrid metadata is rejected with a
-  meaningful error; it never falls back to an unrelated v1 interpretation.
-- No new protocol path may bypass containment or use the default route.
-- Implementing this requires an ADR because it changes identity, persistence,
-  and compatibility surfaces.
-
-### Advanced Policy-Profile Rules
-
-**Priority: P0, sequence 2.** This is one part of the policy-driven
-metadata-first intake program, alongside metadata preview and content
-organization controls.
-
-Problem: named profiles now resolve deterministic storage, queue, initial-start,
-seeding, and bandwidth policy for adds, labels, watch folders, and explicit
-torrent assignment. Advanced tracker, file-selection, and completion rules
-still require one-off operations. Metadata-first intake needs those rules to be
-decided before any payload transfer begins.
-
-Requested elsewhere:
-
-- qBittorrent users requested boolean logic for seed limits in
-  [qbittorrent#24500](https://github.com/qbittorrent/qBittorrent/issues/24500).
-- qBittorrent users requested category-level filename exclusions in
-  [qbittorrent#23722](https://github.com/qbittorrent/qBittorrent/issues/23722).
-- Transmission users requested per-tracker seed ratio and tracker priority in
-  [transmission#1461](https://github.com/transmission/transmission/issues/1461)
-  and [transmission#6425](https://github.com/transmission/transmission/issues/6425).
-
-SwarmOtter feature shape:
-
-- Add profile-scoped tracker-host matching, tracker priority, and tracker
-  policy controls.
-- Add profile-scoped file exclusion patterns, content-organization rules, and
-  completion actions.
-- Apply preview-time file selection and exclusion rules before an explicit
-  payload-start decision; expose the resolved decision to the API and UI.
-- Retain the existing deterministic effective-policy API/UI so the source of
-  each new field remains explainable.
-
-Acceptance direction:
-
-- Effective values must be deterministic and explainable.
-- New fields must clearly distinguish between live inheritance and create-time
-  snapshots.
-- Further persistent policy or runtime-scheduling decisions require an ADR
-  update.
 
 ### Per-Profile / Per-Torrent Network-Path Binding
 
@@ -268,51 +188,6 @@ Acceptance direction:
 - Implementing this requires an ADR (new auth model + user isolation semantics).
 
 ## Intake, Library, and Operations Details
-
-### Metadata-First Magnet Preview and Intake Rules
-
-**Priority: P0, sequence 2.** This is the runtime entry point for the
-policy-driven metadata-first intake program.
-
-Problem: users want magnet links to behave like `.torrent` files: inspect
-metadata, choose files, avoid unwanted suffixes, and decide whether to start
-downloading.
-
-Requested elsewhere:
-
-- Transmission requests include magnet file selection
-  [transmission#1611](https://github.com/transmission/transmission/issues/1611),
-  torrent-only magnet intake
-  [transmission#2366](https://github.com/transmission/transmission/issues/2366),
-  metadata before start
-  [transmission#7330](https://github.com/transmission/transmission/issues/7330),
-  suffix-based exclusions
-  [transmission#7399](https://github.com/transmission/transmission/issues/7399),
-  file-tree filtering
-  [transmission#2399](https://github.com/transmission/transmission/issues/2399),
-  BEP 53 select-only magnet URI
-  [transmission#5582](https://github.com/transmission/transmission/issues/5582),
-  and `x.pe` magnet peer support
-  [transmission#8793](https://github.com/transmission/transmission/issues/8793).
-- qBittorrent users requested stop conditions while still downloading metadata
-  in [qbittorrent#23674](https://github.com/qbittorrent/qBittorrent/issues/23674).
-
-SwarmOtter feature shape:
-
-- Add an add-as-preview mode for magnets: fetch metadata, show file tree, do
-  not download payload until the user or API explicitly starts it.
-- Add reusable file exclusion rules by suffix, glob, size, and path segment.
-- Add metadata-only save/export for lawful metadata workflows.
-- Support BEP 53 and `x.pe` where compatible with containment.
-
-Acceptance direction:
-
-- The metadata preview must not start payload transfer until an explicit API or
-  user action resolves the policy and starts the torrent.
-- File-selection, exclusion, and organization results are deterministic,
-  inspectable, and persisted as part of the add decision.
-- Metadata exchange, tracker use, and any direct peer supplied by `x.pe` remain
-  subject to the central containment layer and fail-closed behavior.
 
 ### File Cleanup, Trash, and Retention Safety
 
@@ -434,37 +309,10 @@ SwarmOtter feature shape:
   per-transport rate limits so a noisy upstream cannot exhaust the daemon's
   automation budget.
 
-### Content Organization Controls
-
-**Priority: P0, sequence 2.** This is the storage-placement component of the
-policy-driven metadata-first intake program.
-
-Problem: download directories become hard to navigate unless folder creation,
-renaming, and path rules are deliberate.
-
-Requested elsewhere:
-
-- Transmission users requested forced top-level folder creation and renaming in
-  [transmission#5614](https://github.com/transmission/transmission/issues/5614)
-  and [transmission#8225](https://github.com/transmission/transmission/issues/8225).
-- Transmission users requested multiple preset download paths and relative
-  incomplete paths in [transmission#6044](https://github.com/transmission/transmission/issues/6044)
-  and [transmission#6045](https://github.com/transmission/transmission/issues/6045).
-- qBittorrent users requested per-torrent incomplete directory and incomplete
-  suffix controls in [qbittorrent#24239](https://github.com/qbittorrent/qBittorrent/issues/24239).
-
-SwarmOtter feature shape:
-
-- Add a policy for always creating a top-level folder, including single-file
-  torrents.
-- Add save-path presets and relative path rules.
-- Add per-torrent incomplete-path and partial-suffix overrides.
-- Add path preview before move/rename/apply profile.
-
 ### Torrent Creation (BEP 52 v2/hybrid)
 
-**Priority: P1, sequence 1.** Begin only after the P0 BEP 52 v2/hybrid
-foundation supplies one shared identity and metadata model.
+**Priority: P1, sequence 1.** The completed BEP 52 v2/hybrid foundation
+supplies one shared identity and metadata model.
 
 Problem: lawful distributors who create `.torrent` files from their own content
 currently need external tooling. SwarmOtter could create and immediately seed
@@ -668,7 +516,8 @@ SwarmOtter research direction:
 - Define a threat model for tracker trust, content provenance, imported keys,
   revocation, and how a failed check affects an add request.
 - Evaluate whether manual tracker allow/deny policy can stand independently of
-  a signed-torrent scheme, and whether it belongs in the P0 policy program.
+  a signed-torrent scheme, and how it should extend the completed policy-intake
+  program.
 - Evaluate external signed-release manifests without inventing a proprietary
   torrent signature format or creating a bundled discovery surface.
 - Retain the rule that any eventual network fetch for verification uses the
@@ -1086,51 +935,6 @@ Acceptance direction:
 - No silent data loss; a misrecognized re-add falls back to normal
   download/verify.
 
-### Durable State Store (SQLite)
-
-**Priority: P0, sequence 3.**
-
-Problem: SwarmOtter currently persists a single atomically replaced JSON state
-document alongside fast-resume state. That is reliable for a compact state
-snapshot, but it is not an indexed query foundation for library history,
-queue/health queries, raw metainfo retention, or later audit work at large
-library scale. A durable local store gives those surfaces one migration and
-query model rather than a collection of unrelated side files.
-
-Requested elsewhere:
-
-- No mainstream torrent client ships a queryable historical state store;
-  this is a SwarmOtter opportunity enabled by the API-first, server
-  positioning.
-- Self-hosting operators managing large libraries expect fast list,
-  filter, and history queries that resume files do not provide.
-
-SwarmOtter feature shape:
-
-- Introduce a durable SQLite state store as the backing
-  store for the registry, queue state, health snapshots, audit events,
-  and rolling metrics.
-- Define the durable relationship between fast-resume state, the queryable
-  library record, and canonical raw metainfo. Original metainfo must be
-  retained without changing its identity; fast resume remains optimized for
-  restart recovery.
-- Provide migration from the current state-document model so existing
-  deployments upgrade without losing state.
-- Integrate with long-horizon observability (P2), the conditional operator
-  audit log (P1), and the implemented large-library operations
-  console.
-
-Acceptance direction:
-
-- Crash recovery, database rebuild, and raw-metainfo recovery behavior are
-  explicitly defined and tested; no storage layer silently changes a torrent
-  identity.
-- The store never weakens network containment; it is local-only and not
-  network-addressable.
-- Schema changes are versioned and migrated.
-- Implementing this requires an ADR (new persistent format, migration
-  path, and a query model decision).
-
 ### Torrent Metadata Display (Comments, Created By, Creation Date)
 
 **Priority: P1, sequence 2.** Together with magnet generation and metainfo
@@ -1201,8 +1005,8 @@ Requested elsewhere:
 SwarmOtter feature shape:
 
 - Generate a standards-compliant magnet URI from any torrent in the library,
-  including v1 `xt=urn:btih:` and, after P0, v2 `xt=urn:btmh:` identity where
-  applicable, display name (`dn=`), tracker URLs (`tr=`), and webseed URLs
+  including v1 `xt=urn:btih:` and v2 `xt=urn:btmh:` identity where applicable,
+  display name (`dn=`), tracker URLs (`tr=`), and webseed URLs
   (`ws=`).
 - Support configurable tracker inclusion: all trackers, primary tier only,
   or no trackers.
@@ -1211,7 +1015,7 @@ SwarmOtter feature shape:
 - Add a "Copy Magnet Link" action in the Web UI torrent detail and context
   menu.
 - Support BEP 53 `so=` (select-only) parameter for partial-torrent magnet
-  generation when combined with the P0 metadata-first intake program.
+  generation using the completed metadata-first intake model.
 
 Acceptance direction:
 
@@ -1223,16 +1027,14 @@ Acceptance direction:
 - The generation is deterministic: the same torrent always produces the
   same magnet URI given the same tracker inclusion setting.
 
-### Torrent File Export
+### Extended Torrent File Export
 
 **Priority: P1, sequence 2.** Part of Library Provenance and Portability.
 
-Problem: operators need to export the `.torrent` file for torrents in their
-library — for backup, for migration to another client, for sharing the
-torrent file itself (not just the magnet), or for archival of the original
-metadata. Every mainstream client allows downloading or exporting the
-`.torrent` file. SwarmOtter accepts `.torrent` files as input but does not
-provide them as output.
+Problem: the native API now returns exact retained original metainfo when it is
+available. Operators still need convenient Web UI and batch portability
+workflows, while preserving the distinction between original bytes and any
+future reconstruction.
 
 Requested elsewhere:
 
@@ -1247,29 +1049,22 @@ Requested elsewhere:
 
 SwarmOtter feature shape:
 
-- Persist the original `.torrent` file bytes at add time and return those
-  original bytes for export. Do not reserialize an original torrent in a way
-  that could change its info dictionary or identity.
-- Add a `GET /api/v1/torrents/:hash/torrent` endpoint that returns the
-  `.torrent` file as a binary download with `Content-Disposition:
-  attachment`.
-- For magnet-fetched torrents where no original `.torrent` exists, offer a
-  clearly marked reconstructed export only when the fetched canonical metadata
-  is sufficient; it is never represented as the original uploaded file.
-- Add a "Download .torrent" action in the Web UI torrent detail view.
-- Support batch export of multiple `.torrent` files as a zip archive via
-  `POST /api/v1/torrents/export`.
+- Add a "Download original metainfo" action in the Web UI torrent detail view
+  that uses the native exact-original endpoint.
+- Support batch archive export of the exact original metainfo bytes that are
+  available; each unavailable item is reported explicitly rather than silently
+  reconstructed or omitted.
+- If a reconstructed export is ever accepted, make it a separately named,
+  explicitly non-original operation with its provenance and limitations in the
+  API/UI response.
 
 Acceptance direction:
 
-- Exported `.torrent` files are valid and can be imported into SwarmOtter
-  or any BEP 3-compliant client.
-- Reconstructed `.torrent` files from magnet metadata are clearly marked as
-  reconstructed and include only the metadata that was fetched.
-- Original metainfo retention survives daemon restart as part of the durable
-  library record or its explicitly documented companion storage.
-- Batch export respects the same auth and permission model as individual
-  export.
+- Exact-original exports never substitute altered or reconstructed bytes.
+- An unavailable original metainfo value has a clear, non-networking error
+  path (for example, a metadata-only magnet).
+- Batch export respects the same authorization and permission model as
+  individual export.
 
 ### Anonymous Mode
 
@@ -1378,7 +1173,7 @@ Acceptance direction:
 
 ### Protocol Compatibility Follow-Ons
 
-**Priority: P2, sequence 13.** The P0 BEP 52 v2/hybrid identity and
+**Priority: P2, sequence 13.** The completed BEP 52 v2/hybrid identity and
 interoperability program is the prerequisite foundation; this entry covers
 distinct follow-on proposals only.
 
@@ -1403,7 +1198,7 @@ SwarmOtter feature shape:
 - Prioritize changes that improve lawful public swarms and do not compromise
   containment.
 - Add local-swarm fixtures before enabling new protocol behavior by default.
-- Keep new proposals separate from the P0 v1/v2/hybrid identity model so a
+- Keep new proposals separate from the completed v1/v2/hybrid identity model so a
   compatibility preference cannot silently alter torrent identity or routing.
 
 ### Long-Horizon Observability
@@ -1466,7 +1261,7 @@ Requested elsewhere:
 
 - qBittorrent and aria2 ship sequential download controls.
 - WebTorrent and Deluge support streaming playback.
-- Metadata-first preview (P0) complements this for magnet intake.
+- The completed metadata-first intake model complements this for magnet intake.
 
 SwarmOtter feature shape:
 
@@ -1474,7 +1269,7 @@ SwarmOtter feature shape:
   per file.
 - Add in-place preview and verify: check media integrity before committing to
   download.
-- Tie to metadata-first preview (P0) for magnet workflows.
+- Tie to the completed metadata-first intake model for magnet workflows.
 
 Acceptance direction:
 

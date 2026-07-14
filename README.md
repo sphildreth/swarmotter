@@ -70,7 +70,14 @@ infringement.
 - UI operations-console updates for large libraries, with
   a sortable/filterable Tabulator table, theme toggle, and efficient large-list
   workflows.
-- Magnet links and `.torrent` file intake.
+- Magnet links and `.torrent` file intake, including metadata-first previews
+  with deterministic profile/request file exclusions, BEP 53 selection,
+  contained literal `x.pe` hints, and explainable content organization.
+- BEP 52 v2/hybrid support: explicit full SHA-1/SHA-256 identities, `btmh`
+  magnets, SHA-256 file-tree/piece-layer verification, contained pure-v2 peer
+  transfer and discovery, and collision-safe 40/64-character API and durable
+  locators. Hybrid records retain their v1 primary locator and resolve their
+  full v2 identity as an alias.
 - TCP and uTP peer wire protocol support.
 - Contained TCP/uTP peer-wire protocol encryption (MSE/PE) with configurable
   global, profile, and durable per-torrent modes: `disabled`, `preferred`
@@ -80,12 +87,18 @@ infringement.
   direct fallback. Proxy mode intentionally blocks DHT, uTP, and UDP trackers.
 - DHT, PEX, HTTP/HTTPS trackers, UDP trackers, and webseeds.
 - BEP 9 magnet metadata fetching.
-- Fast resume and forced recheck.
+- Fast resume and forced recheck for v1, v2, and hybrid records.
+- Versioned local SQLite durable library state with migration from legacy JSON
+  state, full v1/v2 keys, retained exact original metainfo, bounded audit and
+  metric history, and an integrity-checked projection rebuild command.
 - Watch-folder import.
 - File selection, file prioritization, and path rename controls.
 - Queue, bandwidth, ratio, and seeding controls.
 - Named policy profiles with deterministic label selection, durable resolved
   storage and initial-admission snapshots, and explainable effective values.
+- Profile-scoped tracker-host enablement/priority, force-top-level folders,
+  per-torrent incomplete paths, active-only partial suffixes, and storage-path
+  previews before move or organization changes.
 - Adaptive swarm performance autopilot with per-torrent diagnostics and
   override controls.
 - Disk-aware storage controls: storage-root diagnostics, add-time free-space

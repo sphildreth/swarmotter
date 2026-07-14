@@ -29,6 +29,7 @@ The Web UI supports:
 - Magnet link entry.
 - File picker upload for `.torrent` files.
 - Drag-and-drop upload for `.torrent` files anywhere in the app window.
+- Metadata-preview checkboxes for magnet and `.torrent` intake.
 
 Dropped `.torrent` files are sent to:
 
@@ -37,6 +38,13 @@ POST /api/v1/torrents/file
 ```
 
 The app refreshes the torrent list after successful upload.
+
+Selecting **Metadata preview** adds a `.torrent` in a paused state, or lets a
+magnet fetch and verify only its metadata through the contained daemon path.
+Once a magnet preview has its file list, Torrent Details shows the captured
+intake policy and the payload gate. Choose file priorities as needed, then use
+**Start** or **Resume** to allow normal payload transfer. A preview never turns
+into a payload download merely because a profile or queue setting changes.
 
 ## Torrent list
 
@@ -47,6 +55,11 @@ column. Per-row torrent actions are icon buttons with accessible labels. The
 Details action opens keyboard-accessible lifecycle, queue, move, label,
 bandwidth-limit, file-rename, and tracker-edit controls. Removing one torrent
 offers separate Cancel, keep-data, and delete-data choices.
+
+Torrent Details displays an explicit identity row. Hybrid torrents show both
+their v1 SHA-1 and v2 SHA-256 identifiers; this avoids presenting the v2 value
+as if it were a v1 registry hash. Older daemon responses retain the legacy
+v1-hash fallback during an upgrade.
 
 The torrent list is an interactive table. Click a column header to sort by
 that column, and click it again to reverse the direction. Header filters can
@@ -147,6 +160,15 @@ start-or-paused decision are shown as create-time snapshots: profile
 reassignment does not move existing data or revoke a queued torrent's
 admission. Queue priority, seeding, bandwidth, and peer encryption remain
 explainable live inheritance.
+
+Profiles can also define ordered tracker-host enablement/priority plus
+create-time intake exclusions, complete/incomplete content organization,
+single-file top-level folders, and active-only partial suffixes. Torrent
+Details displays the effective live tracker policy, stored structured exclusion
+rules, organization values, resolved complete/incomplete path preview,
+explicitly unwanted file indices, and whether a metadata-preview gate remains
+active. Those intake choices are fixed at registration; later profile edits do
+not silently alter an existing torrent, while tracker-host policy remains live.
 
 ## Peer admission
 

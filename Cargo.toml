@@ -39,6 +39,11 @@ http-body-util = "0.1"
 
 # Hashing
 sha1 = "0.10"
+sha2 = "0.10"
+
+# Durable local state. `bundled` keeps deployment behavior independent of a
+# host SQLite package while still using SQLite's public-domain amalgamation.
+rusqlite = { version = "0.37", features = ["bundled"] }
 
 # Hex/encoding
 hex = "0.4"

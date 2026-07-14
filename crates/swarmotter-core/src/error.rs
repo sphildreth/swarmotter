@@ -44,6 +44,8 @@ pub enum CoreError {
     MalformedTorrent(String),
     #[error("invalid info hash: {0}")]
     InvalidInfoHash(String),
+    #[error("unsupported torrent feature: {0}")]
+    UnsupportedTorrentFeature(String),
     #[error("duplicate torrent: {0}")]
     DuplicateTorrent(String),
     #[error("torrent not found: {0}")]
@@ -81,6 +83,9 @@ impl CoreError {
             CoreError::MalformedMagnet(_) => ErrorCode::new("malformed_magnet"),
             CoreError::MalformedTorrent(_) => ErrorCode::new("malformed_torrent"),
             CoreError::InvalidInfoHash(_) => ErrorCode::new("invalid_info_hash"),
+            CoreError::UnsupportedTorrentFeature(_) => {
+                ErrorCode::new("unsupported_torrent_feature")
+            }
             CoreError::DuplicateTorrent(_) => ErrorCode::new("duplicate_torrent"),
             CoreError::NotFound(_) => ErrorCode::new("not_found"),
             CoreError::InvalidConfig(_) => ErrorCode::new("invalid_config"),

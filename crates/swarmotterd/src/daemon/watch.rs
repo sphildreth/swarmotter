@@ -135,10 +135,20 @@ impl DaemonRuntime {
                 return;
             }
         };
-        let hash = parsed.info_hash;
         let mut torrent = Torrent::new(parsed, now());
+        let hash = torrent.key();
         watch::apply_folder_defaults(&mut torrent, folder);
         let labels = torrent.labels.clone();
+        let add_options = AddTorrentOptions::request(
+            None,
+            matches!(
+                folder.start_behavior,
+                swarmotter_core::config::StartBehavior::Paused
+            ),
+            true,
+            None,
+            labels,
+        );
         // Watch-folder start behavior remains an explicit creation choice;
         // the optional profile supplies storage snapshot and all live policy
         // fields without being copied into per-torrent overrides.
@@ -147,22 +157,15 @@ impl DaemonRuntime {
             // profile/config transaction. A concurrent profile replacement
             // cannot delete a profile after this watch import validates it.
             let _config_transaction = self.config_write_lock.lock().await;
-            match self
-                .apply_add_profile(
-                    &mut torrent,
-                    None,
-                    labels,
-                    true,
-                    matches!(
-                        folder.start_behavior,
-                        swarmotter_core::config::StartBehavior::Paused
-                    ),
-                )
-                .await
-            {
+            match self.apply_add_profile(&mut torrent, &add_options).await {
                 Ok(paused) => {
-                    self.add_torrent_mutation(torrent, paused, "watch_import_added")
-                        .await
+                    self.add_torrent_mutation_with_original_metainfo(
+                        torrent,
+                        paused,
+                        "watch_import_added",
+                        Some(bytes),
+                    )
+                    .await
                 }
                 Err(error) => Err(error),
             }
@@ -215,7 +218,7 @@ impl DaemonRuntime {
         &self,
         file: &watch::ScannedTorrentFile,
         folder: &swarmotter_core::config::WatchFolderConfig,
-        parsed_hash: Option<InfoHash>,
+        parsed_hash: Option<TorrentKey>,
         result: Result<TorrentAddMutationOutcome>,
     ) {
         let path = file.path();
@@ -274,7 +277,7 @@ impl DaemonRuntime {
                 outcome,
                 watch::ImportOutcome::Imported | watch::ImportOutcome::Duplicate
             ),
-            info_hash_hex: info_hash.map(|hash| hash.to_hex()),
+            info_hash_hex: info_hash.map(|hash| hash.to_locator()),
             error,
             duplicate: outcome == watch::ImportOutcome::Duplicate,
             post_action_error,

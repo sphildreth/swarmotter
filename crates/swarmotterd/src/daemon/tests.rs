@@ -19,14 +19,306 @@ fn unique_dir(label: &str) -> PathBuf {
     p
 }
 
+/// A self-contained, structurally valid pure-BEP-52 fixture with a file no
+/// larger than its piece length, so no piece-layer entries are required. The
+/// daemon test only exercises metainfo admission; no payload is transferred.
+fn pure_v2_single_file_fixture() -> Vec<u8> {
+    let mut torrent = Vec::new();
+    torrent.extend_from_slice(b"d4:infod9:file treed10:lawful.bind0:d6:lengthi1e11:pieces root32:");
+    torrent.extend_from_slice(&[0x42; 32]);
+    torrent.extend_from_slice(
+        b"eee12:meta versioni2e4:name10:lawful.bin12:piece lengthi16384ee12:piece layersdee",
+    );
+    torrent
+}
+
+/// A small hybrid fixture whose v1 piece layout is usable by the current
+/// transfer engine while retaining an independently hashed BEP 52 identity.
+fn hybrid_v1_compatible_fixture() -> Vec<u8> {
+    let mut torrent = Vec::new();
+    torrent.extend_from_slice(b"d4:infod9:file treed10:hybrid.bind0:d6:lengthi1e11:pieces root32:");
+    // SHA-256 of the lawful generated single-byte payload `x`.
+    torrent.extend_from_slice(&[
+        0x2d, 0x71, 0x16, 0x42, 0xb7, 0x26, 0xb0, 0x44, 0x01, 0x62, 0x7c, 0xa9, 0xfb, 0xac, 0x32,
+        0xf5, 0xc8, 0x53, 0x0f, 0xb1, 0x90, 0x3c, 0xc4, 0xdb, 0x02, 0x25, 0x87, 0x17, 0x92, 0x1a,
+        0x48, 0x81,
+    ]);
+    torrent.extend_from_slice(
+        b"eee6:lengthi1e12:meta versioni2e4:name10:hybrid.bin12:piece lengthi16384e6:pieces20:",
+    );
+    // SHA-1 of the same lawful generated single-byte payload `x`.
+    torrent.extend_from_slice(&[
+        0x11, 0xf6, 0xad, 0x8e, 0xc5, 0x2a, 0x29, 0x84, 0xab, 0xaa, 0xfd, 0x7c, 0x3b, 0x51, 0x65,
+        0x03, 0x78, 0x5c, 0x20, 0x72,
+    ]);
+    torrent.extend_from_slice(b"e12:piece layersdee");
+    torrent
+}
+
+#[tokio::test]
+async fn pure_v2_inputs_register_with_their_full_v2_identity() {
+    let runtime = DaemonRuntime::new(Config::default(), disabled_health());
+    let torrent = pure_v2_single_file_fixture();
+    let parsed = swarmotter_core::meta::parse_torrent(&torrent).unwrap();
+    assert!(parsed.requires_v2_data_plane());
+    let expected_file_key = TorrentKey::v2(parsed.identity.v2_info_hash().unwrap());
+
+    let file_key = runtime
+        .add_torrent_file_with_options(torrent, AddTorrentOptions::new(None, true))
+        .await
+        .unwrap();
+    assert_eq!(file_key, expected_file_key);
+    assert_eq!(
+        runtime.get_torrent(&file_key).await.unwrap().info_hash,
+        expected_file_key
+    );
+
+    let v2_magnet = format!("magnet:?xt=urn:btmh:1220{}", "a".repeat(64));
+    let expected_magnet_key = TorrentKey::v2(
+        swarmotter_core::magnet::Magnet::parse(&v2_magnet)
+            .unwrap()
+            .v2_info_hash()
+            .unwrap(),
+    );
+    let magnet_key = runtime
+        .add_magnet_with_options(&v2_magnet, AddTorrentOptions::new(None, true))
+        .await
+        .unwrap();
+    assert_eq!(magnet_key, expected_magnet_key);
+    assert_eq!(
+        runtime.get_torrent(&magnet_key).await.unwrap().info_hash,
+        expected_magnet_key
+    );
+    assert_eq!(runtime.registry.lock().await.torrents.len(), 2);
+    assert!(runtime.engine_handles.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn hybrid_metainfo_preserves_v1_and_v2_identity_through_registration_and_restore() {
+    let root = unique_dir("hybrid-identity-state");
+    let state_path = root.join("state.sqlite");
+    let mut config = Config::default();
+    config.network.mode = NetworkContainmentMode::Disabled;
+    config.storage.download_dir = Some(root.join("payload").display().to_string());
+    let mut health = disabled_health();
+    health.traffic_allowed = true;
+
+    let bytes = hybrid_v1_compatible_fixture();
+    let expected = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    assert!(expected.identity.supports_v1_data_plane());
+    assert!(matches!(
+        expected.identity,
+        swarmotter_core::hash::TorrentIdentity::Hybrid { .. }
+    ));
+    let expected_identity = expected.identity.clone();
+    let expected_hash = TorrentKey::v1(expected.info_hash);
+    let v2_alias = TorrentKey::v2(expected_identity.v2_info_hash().unwrap());
+
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        config.clone(),
+        health.clone(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let hash = runtime
+        .add_torrent_file_with_options(bytes, AddTorrentOptions::new(None, true))
+        .await
+        .unwrap();
+    assert_eq!(hash, expected_hash);
+    let summary = runtime.get_torrent(&hash).await.unwrap();
+    assert_eq!(summary.identity, expected_identity);
+    assert_eq!(summary.identity.v1_info_hash(), hash.as_v1());
+    assert!(summary.identity.v2_info_hash().is_some());
+    assert_eq!(
+        runtime.get_torrent(&v2_alias).await.unwrap().info_hash,
+        expected_hash,
+        "a hybrid v2 locator must resolve to its canonical v1 owner"
+    );
+    runtime
+        .set_labels(&v2_alias, vec!["hybrid-alias".into()])
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.get_torrent(&hash).await.unwrap().labels,
+        vec!["hybrid-alias"]
+    );
+    drop(runtime);
+
+    let restored = DaemonRuntime::with_paths_broker_and_state(
+        config,
+        health,
+        None,
+        None,
+        Some(state_path),
+        EventBroker::default(),
+    );
+    assert_eq!(restored.restore_persisted_state().await.unwrap(), 1);
+    let summary = restored.get_torrent(&hash).await.unwrap();
+    assert_eq!(summary.identity, expected_identity);
+    assert_eq!(summary.identity.v1_info_hash(), hash.as_v1());
+    assert!(summary.identity.v2_info_hash().is_some());
+    assert_eq!(
+        restored.get_torrent(&v2_alias).await.unwrap().labels,
+        vec!["hybrid-alias"]
+    );
+    restored.remove_torrent(&v2_alias, false).await.unwrap();
+    assert!(restored.get_torrent(&hash).await.is_none());
+    drop(restored);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn hybrid_magnet_keeps_claimed_identity_separate_from_placeholder_metainfo() {
+    let root = unique_dir("hybrid-magnet-identity-state");
+    let state_path = root.join("state.sqlite");
+    let mut config = Config::default();
+    config.network.mode = NetworkContainmentMode::Disabled;
+    config.storage.download_dir = Some(root.join("payload").display().to_string());
+    let mut health = disabled_health();
+    health.traffic_allowed = true;
+    let magnet_uri = format!(
+        "magnet:?xt=urn:btih:{}&xt=urn:btmh:1220{}&dn=hybrid-magnet.bin&so=0&x.pe=192.0.2.25:51413",
+        "1".repeat(40),
+        "2".repeat(64),
+    );
+    let expected = swarmotter_core::magnet::Magnet::parse(&magnet_uri).unwrap();
+    let hash = TorrentKey::v1(expected.v1_info_hash().unwrap());
+    let expected_identity = expected.identity.clone();
+
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        config.clone(),
+        health.clone(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    assert_eq!(
+        runtime
+            .add_magnet_with_options(&magnet_uri, AddTorrentOptions::new(None, true))
+            .await
+            .unwrap(),
+        hash
+    );
+    let torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    assert!(torrent.needs_metadata);
+    assert_eq!(torrent.magnet_identity, Some(expected_identity.clone()));
+    assert_eq!(torrent.magnet_select_only_file_indices, vec![0]);
+    assert_eq!(torrent.magnet_direct_peers, expected.direct_peers);
+    assert_eq!(torrent.key(), hash);
+    assert_ne!(torrent.meta.identity, expected_identity);
+    assert_eq!(
+        InfoHash::from_info_bencoded(torrent.meta.raw_info.as_deref().unwrap()),
+        torrent.meta.info_hash
+    );
+    assert_eq!(
+        runtime.get_torrent(&hash).await.unwrap().identity,
+        expected_identity
+    );
+    drop(runtime);
+
+    let restored = DaemonRuntime::with_paths_broker_and_state(
+        config,
+        health,
+        None,
+        None,
+        Some(state_path),
+        EventBroker::default(),
+    );
+    assert_eq!(restored.restore_persisted_state().await.unwrap(), 1);
+    let torrent = restored.registry.lock().await.get(&hash).cloned().unwrap();
+    assert_eq!(torrent.magnet_identity, Some(expected_identity.clone()));
+    assert_eq!(torrent.magnet_select_only_file_indices, vec![0]);
+    assert_eq!(torrent.magnet_direct_peers, expected.direct_peers);
+    assert_eq!(
+        InfoHash::from_info_bencoded(torrent.meta.raw_info.as_deref().unwrap()),
+        torrent.meta.info_hash
+    );
+    assert_eq!(
+        restored.get_torrent(&hash).await.unwrap().identity,
+        expected_identity
+    );
+    drop(restored);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn retained_original_metainfo_is_exact_for_file_adds_and_unavailable_for_magnets() {
+    let root = unique_dir("retained-original-metainfo");
+    let state_path = root.join("state.sqlite");
+    let mut config = Config::default();
+    config.network.mode = NetworkContainmentMode::Disabled;
+    config.storage.download_dir = Some(root.join("payload").display().to_string());
+    let mut health = disabled_health();
+    health.traffic_allowed = true;
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "original-export.bin",
+        b"generated original metainfo export fixture",
+        8,
+        None,
+        false,
+    );
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        config.clone(),
+        health.clone(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let file_hash = runtime
+        .add_torrent_file_with_options(bytes.clone(), AddTorrentOptions::new(None, true))
+        .await
+        .unwrap();
+    assert_eq!(
+        runtime.retained_original_metainfo(file_hash).await.unwrap(),
+        bytes
+    );
+
+    let magnet_hash = "3".repeat(40);
+    let magnet = format!("magnet:?xt=urn:btih:{magnet_hash}&dn=magnet-only.bin");
+    let magnet_hash = runtime
+        .add_magnet_with_options(&magnet, AddTorrentOptions::new(None, true))
+        .await
+        .unwrap();
+    let error = runtime
+        .retained_original_metainfo(magnet_hash)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CoreError::NotFound(_)));
+    assert!(error.to_string().contains("unavailable"));
+    drop(runtime);
+
+    let restored = DaemonRuntime::with_paths_broker_and_state(
+        config,
+        health,
+        None,
+        None,
+        Some(state_path),
+        EventBroker::default(),
+    );
+    assert_eq!(restored.restore_persisted_state().await.unwrap(), 2);
+    assert_eq!(
+        restored
+            .retained_original_metainfo(file_hash)
+            .await
+            .unwrap(),
+        bytes
+    );
+    drop(restored);
+    std::fs::remove_dir_all(root).ok();
+}
+
 async fn add_complete_seed_fixture(
     runtime: &DaemonRuntime,
     name: &str,
     content: &[u8],
-) -> (InfoHash, Arc<swarmotter_core::bandwidth::RateLimiter>) {
+) -> (TorrentKey, Arc<swarmotter_core::bandwidth::RateLimiter>) {
     let bytes = swarmotter_core::meta::build_single_file_torrent(name, content, 8, None, false);
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let root = runtime
         .config
         .read()
@@ -61,7 +353,7 @@ async fn add_complete_seed_fixture(
 
 async fn assert_seeder_state_registry_invariant(runtime: &DaemonRuntime) {
     let _lifecycle = runtime.seeder_lifecycle_lock.lock().await;
-    let live = runtime.seeder_registry.info_hashes().await;
+    let live = runtime.seeder_registry.keys().await;
     let registry = runtime.registry.lock().await;
     for hash in &live {
         let torrent = registry.get(hash).expect("live seeder has a torrent");
@@ -78,7 +370,9 @@ async fn assert_seeder_state_registry_invariant(runtime: &DaemonRuntime) {
     }
 }
 
-async fn peer_reconfiguration_fixture(label: &str) -> (DaemonRuntime, InfoHash, PathBuf, PathBuf) {
+async fn peer_reconfiguration_fixture(
+    label: &str,
+) -> (DaemonRuntime, TorrentKey, PathBuf, PathBuf) {
     let root = unique_dir(label);
     let config_path = root.join("swarmotter.toml");
     let mut cfg = Config::default();
@@ -120,7 +414,7 @@ async fn peer_reconfiguration_fixture(label: &str) -> (DaemonRuntime, InfoHash, 
 
 async fn active_engine_reconfiguration_fixture(
     label: &str,
-) -> (DaemonRuntime, InfoHash, PathBuf, PathBuf) {
+) -> (DaemonRuntime, TorrentKey, PathBuf, PathBuf) {
     let root = unique_dir(label);
     let config_path = root.join("swarmotter.toml");
     let mut cfg = Config::default();
@@ -157,14 +451,14 @@ async fn active_engine_reconfiguration_fixture(
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut torrent = Torrent::new(meta, now());
     torrent.state = TorrentState::Downloading;
     runtime.registry.lock().await.add(torrent).unwrap();
     runtime.queue.lock().await.add(hash);
     runtime.ensure_torrent_peer_permit_pool(hash).await;
     runtime.start_engine(hash).await;
-    assert!(runtime.engine_running_for_test(&hash).await);
+    assert!(runtime.engine_running_for_key_for_test(hash).await);
     (runtime, hash, root, config_path)
 }
 
@@ -172,6 +466,18 @@ fn scale_hash_bytes(n: u32) -> [u8; 20] {
     let mut bytes = [0u8; 20];
     bytes[..4].copy_from_slice(&n.to_be_bytes());
     bytes
+}
+
+/// Give a synthetic metadata-placeholder torrent the same canonical owner as
+/// the v1 magnet it represents. These scale fixtures deliberately reuse one
+/// parsed placeholder metainfo record, so its raw metainfo identity must not
+/// become the registry key.
+fn set_test_v1_magnet_identity(torrent: &mut Torrent, key: TorrentKey) {
+    let info_hash = key
+        .as_v1()
+        .expect("synthetic magnet fixtures use a v1 torrent key");
+    torrent.magnet_info_hash = Some(info_hash);
+    torrent.magnet_identity = Some(swarmotter_core::hash::TorrentIdentity::v1(info_hash));
 }
 
 #[tokio::test]
@@ -200,7 +506,7 @@ async fn durable_state_restores_torrents_settings_and_queue() {
         false,
     );
     let hash = runtime
-        .add_torrent_file_with_options(bytes, AddTorrentOptions::new(None, true))
+        .add_torrent_file_with_options(bytes.clone(), AddTorrentOptions::new(None, true))
         .await
         .unwrap();
     runtime
@@ -218,6 +524,18 @@ async fn durable_state_restores_torrents_settings_and_queue() {
         .await
         .unwrap();
     drop(runtime);
+
+    let connection = rusqlite::Connection::open(&state_path).unwrap();
+    let original: Vec<u8> = connection
+        .query_row(
+            "SELECT metainfo FROM torrent_metainfo
+             WHERE info_hash = ?1 AND representation = 'original_torrent'",
+            rusqlite::params![hash.to_locator()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(original, bytes);
+    drop(connection);
 
     let restored = DaemonRuntime::with_paths_broker_and_state(
         cfg,
@@ -309,7 +627,7 @@ async fn profile_assignment_preserves_existing_storage_and_rolls_back_on_persist
             false,
         ))
         .unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut torrent = Torrent::new(meta, now());
     torrent.state = TorrentState::Paused;
     // This models a legacy explicit completed-data path with an inherited
@@ -466,7 +784,7 @@ fn profile_encryption_mode_changes_only_select_affected_effective_torrents() {
         .encryption_mode = Some(PeerEncryptionMode::Preferred);
     assert_eq!(
         DaemonRuntime::effective_encryption_mode_changes(&previous, &next, &torrents),
-        vec![inherited.info_hash()],
+        vec![inherited.key()],
     );
 }
 
@@ -507,7 +825,7 @@ async fn torrent_encryption_override_is_durable_and_rolls_back_with_state_write_
             false,
         ))
         .unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut torrent = Torrent::new(meta, now());
     torrent.state = TorrentState::Paused;
     torrent.labels = vec!["encrypted".into()];
@@ -596,7 +914,7 @@ async fn profile_replacement_migrates_legacy_label_storage_and_initial_admission
             false,
         ))
         .unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut legacy = Torrent::new(meta, now());
     legacy.state = TorrentState::Queued;
     legacy.labels = vec!["linux".into()];
@@ -661,7 +979,7 @@ async fn profile_replacement_migrates_legacy_label_storage_and_initial_admission
     let persisted = persisted
         .torrents
         .into_iter()
-        .find(|torrent| torrent.info_hash() == hash)
+        .find(|torrent| torrent.key() == hash)
         .unwrap();
     assert!(persisted.policy.storage_snapshot.is_some());
     assert_eq!(
@@ -720,7 +1038,7 @@ async fn failed_profile_replacement_restores_legacy_policy_state_and_config() {
             false,
         ))
         .unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut legacy = Torrent::new(meta, now());
     legacy.state = TorrentState::Paused;
     legacy.labels = vec!["linux".into()];
@@ -753,7 +1071,7 @@ async fn failed_profile_replacement_restores_legacy_policy_state_and_config() {
     let restored_disk = restored_disk
         .torrents
         .iter()
-        .find(|torrent| torrent.info_hash() == hash)
+        .find(|torrent| torrent.key() == hash)
         .unwrap();
     assert!(restored_disk.policy.storage_snapshot.is_none());
     assert!(restored_disk.policy.initial_start_behavior.is_none());
@@ -955,7 +1273,7 @@ async fn boundary_file_bytes_are_exact_after_restore_and_each_recheck() {
     let bytes =
         swarmotter_core::meta::build_multi_file_torrent("boundary", &files, &contents, 4, None);
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let storage = swarmotter_core::storage::StorageIo::new(meta.clone(), payload_root.clone());
     storage.write_piece(0, b"abcd").await.unwrap();
     storage.write_piece(2, b"i").await.unwrap();
@@ -1044,7 +1362,7 @@ async fn single_file_final_piece_bytes_are_exact_after_restore_and_recheck() {
     let bytes =
         swarmotter_core::meta::build_single_file_torrent("nine.bin", content, 4, None, false);
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let storage = swarmotter_core::storage::StorageIo::new(meta.clone(), payload_root.clone());
     storage.write_piece(2, b"9").await.unwrap();
     let mut torrent = Torrent::new(meta.clone(), now());
@@ -1175,7 +1493,7 @@ async fn concurrent_torrent_adds_cannot_claim_the_same_storage_path() {
 }
 
 #[tokio::test]
-async fn distinct_same_name_magnets_cannot_share_placeholder_paths() {
+async fn distinct_same_name_magnets_can_coexist_without_placeholder_payload_paths() {
     let root = unique_dir("magnet-path-collision");
     let mut cfg = Config::default();
     cfg.storage.download_dir = Some(root.display().to_string());
@@ -1188,16 +1506,24 @@ async fn distinct_same_name_magnets_cannot_share_placeholder_paths() {
     let first = "magnet:?xt=urn:btih:0000000000000000000000000000000000000001&dn=shared.bin";
     let second = "magnet:?xt=urn:btih:0000000000000000000000000000000000000002&dn=shared.bin";
 
-    runtime
+    let first_key = runtime
         .add_magnet_with_options(first, AddTorrentOptions::new(None, true))
         .await
         .unwrap();
-    let error = runtime
+    let second_key = runtime
         .add_magnet_with_options(second, AddTorrentOptions::new(None, true))
         .await
-        .unwrap_err();
-    assert!(matches!(error, CoreError::Storage(_)));
-    assert_eq!(runtime.registry.lock().await.torrents.len(), 1);
+        .unwrap();
+    assert_ne!(first_key, second_key);
+    let registry = runtime.registry.lock().await;
+    assert_eq!(registry.torrents.len(), 2);
+    assert!(registry.get(&first_key).unwrap().needs_metadata);
+    assert!(registry.get(&second_key).unwrap().needs_metadata);
+    drop(registry);
+    assert!(
+        !root.join("shared.bin").exists(),
+        "unresolved metadata previews must not reserve or create payload paths"
+    );
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -1279,6 +1605,56 @@ async fn durable_restore_rejects_colliding_paths_and_invalid_progress() {
 }
 
 #[tokio::test]
+async fn durable_restore_rejects_legacy_zero_v1_magnet_identity() {
+    let root = unique_dir("restore-zero-v1-magnet");
+    let state_path = root.join("state.sqlite");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    let placeholder =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "magnet-placeholder.bin",
+            b"generated legacy magnet placeholder",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let mut unresolved = Torrent::new(placeholder, now());
+    let key = unresolved.key();
+    unresolved.needs_metadata = true;
+    // This represents a malformed legacy record: it has neither a full
+    // identity nor a usable v1 hash. Restore must fail closed rather than
+    // issuing metadata discovery on an all-zero swarm identity.
+    unresolved.magnet_info_hash = Some(InfoHash::ZERO);
+    unresolved.magnet_identity = None;
+    crate::state_store::save(
+        &state_path,
+        &crate::state_store::DaemonState::new(vec![unresolved], QueueState::new(cfg.queue.clone())),
+    )
+    .unwrap();
+
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        cfg,
+        health,
+        None,
+        None,
+        Some(state_path),
+        EventBroker::default(),
+    );
+    let error = runtime.restore_persisted_state().await.unwrap_err();
+    assert!(matches!(error, CoreError::Storage(_)));
+    assert!(error.to_string().contains(&key.to_locator()));
+    assert!(error.to_string().contains("inconsistent magnet identity"));
+    assert!(runtime.registry.lock().await.torrents.is_empty());
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn state_save_failure_rolls_back_move_and_rename() {
     let root = unique_dir("storage-state-rollback");
     let state_path = root.join("state-target");
@@ -1305,7 +1681,7 @@ async fn state_save_failure_rolls_back_move_and_rename() {
         &swarmotter_core::meta::build_single_file_torrent("rollback.bin", payload, 8, None, false),
     )
     .unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut torrent = Torrent::new(meta.clone(), 1);
     torrent.state = TorrentState::Paused;
     torrent.download_dir = Some(old_root.display().to_string());
@@ -1544,7 +1920,7 @@ async fn durable_restore_rejects_invalid_per_torrent_ratio_policy_with_context()
         false,
     );
     let mut torrent = Torrent::new(swarmotter_core::meta::parse_torrent(&bytes).unwrap(), now());
-    let hash = torrent.info_hash();
+    let hash = torrent.key();
     torrent.seeding.ratio_limit = Some(-1.0);
     crate::state_store::save(
         &state_path,
@@ -1566,13 +1942,13 @@ async fn durable_restore_rejects_invalid_per_torrent_ratio_policy_with_context()
     );
     let error = runtime.restore_persisted_state().await.unwrap_err();
     assert!(matches!(error, CoreError::Storage(_)));
-    assert!(error.to_string().contains(&hash.to_hex()));
+    assert!(error.to_string().contains(&hash.to_locator()));
     assert!(error.to_string().contains("seeding.ratio_limit"));
     std::fs::remove_dir_all(root).ok();
 }
 
 #[tokio::test]
-async fn rename_rejects_the_torrents_own_resume_path() {
+async fn rename_rejects_the_torrents_own_torrent_key_resume_path() {
     let root = unique_dir("rename-resume-collision");
     let mut cfg = Config::default();
     cfg.storage.download_dir = Some(root.display().to_string());
@@ -1595,7 +1971,7 @@ async fn rename_rejects_the_torrents_own_resume_path() {
         .unwrap();
 
     let error = runtime
-        .rename_path(&hash, 0, "resume-name.bin.swarmotter.resume".into())
+        .rename_path(&hash, 0, format!("{hash}.swarmotter.resume"))
         .await
         .unwrap_err();
     assert!(matches!(error, CoreError::Storage(_)));
@@ -1998,7 +2374,7 @@ async fn peer_rows_mark_only_manual_bans_without_recording_admission_checks() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     runtime
         .registry
         .lock()
@@ -2112,7 +2488,7 @@ async fn late_persistence_failure_restores_candidate_only_queued_torrent() {
     runtime.reconcile_seeders().await;
     let prior_live = runtime
         .seeder_registry
-        .info_hashes()
+        .keys()
         .await
         .into_iter()
         .collect::<HashSet<_>>();
@@ -2145,7 +2521,7 @@ async fn late_persistence_failure_restores_candidate_only_queued_torrent() {
     assert_eq!(
         runtime
             .seeder_registry
-            .info_hashes()
+            .keys()
             .await
             .into_iter()
             .collect::<HashSet<_>>(),
@@ -2216,7 +2592,7 @@ async fn failed_candidate_seeder_ownership_does_not_survive_state_reload() {
     runtime.reconcile_seeders().await;
     runtime.persist_state().await.unwrap();
     assert_eq!(runtime.seeder_registry.len().await, 1);
-    let prior_live = runtime.seeder_registry.info_hashes().await[0];
+    let prior_live = runtime.seeder_registry.keys().await[0];
     let candidate_only = [first, second]
         .into_iter()
         .find(|hash| *hash != prior_live)
@@ -2233,12 +2609,12 @@ async fn failed_candidate_seeder_ownership_does_not_survive_state_reload() {
     let stored_live = stored
         .torrents
         .iter()
-        .find(|torrent| torrent.info_hash() == prior_live)
+        .find(|torrent| torrent.key() == prior_live)
         .unwrap();
     let stored_candidate = stored
         .torrents
         .iter()
-        .find(|torrent| torrent.info_hash() == candidate_only)
+        .find(|torrent| torrent.key() == candidate_only)
         .unwrap();
     assert_eq!(stored_live.state, TorrentState::Seeding);
     assert_eq!(stored_live.seeding_status, SeedingStatus::Active);
@@ -2325,7 +2701,7 @@ async fn fast_candidate_completion_cannot_selfish_remove_before_failed_persisten
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let storage = swarmotter_core::storage::StorageIo::new(meta.clone(), root.clone());
     for piece in 0..meta.piece_count() {
         let start = piece * meta.piece_length as usize;
@@ -2457,7 +2833,7 @@ async fn active_engine_patch_reconstructs_on_commit_and_exactly_rolls_back_failu
     let committed = runtime.current_peer_permit_configuration().await;
     assert!(!Arc::ptr_eq(&initial.global, &committed.global));
     assert_eq!(committed.global.snapshot().limit, 1);
-    assert!(runtime.engine_running_for_test(&hash).await);
+    assert!(runtime.engine_running_for_key_for_test(hash).await);
 
     let committed_config = runtime.config.read().await.clone();
     let committed_torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
@@ -2476,7 +2852,7 @@ async fn active_engine_patch_reconstructs_on_commit_and_exactly_rolls_back_failu
         .verify_peer_permit_configuration_identity(&committed)
         .await
         .unwrap();
-    assert!(runtime.engine_running_for_test(&hash).await);
+    assert!(runtime.engine_running_for_key_for_test(hash).await);
     let torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
     assert_eq!(torrent.state, committed_torrent.state);
     assert_eq!(torrent.error, committed_torrent.error);
@@ -2504,7 +2880,7 @@ async fn unrelated_engine_start_cannot_enter_mid_peer_reconstruction() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let unrelated_hash = meta.info_hash;
+    let unrelated_hash = TorrentKey::v1(meta.info_hash);
     runtime
         .registry
         .lock()
@@ -2536,12 +2912,20 @@ async fn unrelated_engine_start_cannot_enter_mid_peer_reconstruction() {
         tokio::spawn(async move { start_runtime.start_engine(unrelated_hash).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!unrelated_start.is_finished());
-    assert!(!runtime.engine_running_for_test(&unrelated_hash).await);
+    assert!(
+        !runtime
+            .engine_running_for_key_for_test(unrelated_hash)
+            .await
+    );
     continue_reconstruction.send(()).unwrap();
     update.await.unwrap().unwrap();
     unrelated_start.await.unwrap();
-    assert!(runtime.engine_running_for_test(&active_hash).await);
-    assert!(runtime.engine_running_for_test(&unrelated_hash).await);
+    assert!(runtime.engine_running_for_key_for_test(active_hash).await);
+    assert!(
+        runtime
+            .engine_running_for_key_for_test(unrelated_hash)
+            .await
+    );
     runtime.force_stop_engine(&active_hash).await;
     runtime.force_stop_engine(&unrelated_hash).await;
     std::fs::remove_dir_all(root).ok();
@@ -2560,7 +2944,7 @@ async fn active_engine_put_reconstructs_persists_and_rolls_back_failure() {
     let committed_file = std::fs::read(&config_path).unwrap();
     let committed_torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
     assert_eq!(committed.global.snapshot().limit, 1);
-    assert!(runtime.engine_running_for_test(&hash).await);
+    assert!(runtime.engine_running_for_key_for_test(hash).await);
     assert_eq!(
         Config::from_file(&config_path).unwrap().bandwidth.max_peers,
         1
@@ -2576,7 +2960,7 @@ async fn active_engine_put_reconstructs_persists_and_rolls_back_failure() {
         .await
         .unwrap();
     assert_eq!(std::fs::read(&config_path).unwrap(), committed_file);
-    assert!(runtime.engine_running_for_test(&hash).await);
+    assert!(runtime.engine_running_for_key_for_test(hash).await);
     let torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
     assert_eq!(torrent.state, committed_torrent.state);
     assert_eq!(torrent.error, committed_torrent.error);
@@ -2599,7 +2983,7 @@ async fn active_engine_put_reconstructs_persists_and_rolls_back_failure() {
         .await
         .unwrap();
     assert_eq!(std::fs::read(&config_path).unwrap(), committed_file);
-    assert!(runtime.engine_running_for_test(&hash).await);
+    assert!(runtime.engine_running_for_key_for_test(hash).await);
     runtime.force_stop_engine(&hash).await;
     std::fs::remove_dir_all(root).ok();
 }
@@ -2623,7 +3007,7 @@ async fn valid_blocked_peer_reconfiguration_commits_recovery_intent_without_live
     let current = runtime.current_peer_permit_configuration().await;
     assert!(!Arc::ptr_eq(&current.global, &previous.global));
     assert_eq!(current.global.snapshot().limit, 1);
-    assert!(!runtime.engine_running_for_test(&hash).await);
+    assert!(!runtime.engine_running_for_key_for_test(hash).await);
     assert!(runtime.seeder_registry.is_empty().await);
     let torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
     assert_eq!(torrent.state, TorrentState::NetworkBlocked);
@@ -2675,7 +3059,7 @@ async fn combined_peer_and_blocked_to_healthy_update_recovers_under_transition_l
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut torrent = Torrent::new(meta, now());
     torrent.state = TorrentState::NetworkBlocked;
     torrent.error = Some(health.detail);
@@ -2693,7 +3077,7 @@ async fn combined_peer_and_blocked_to_healthy_update_recovers_under_transition_l
     runtime.replace_config(next).await.unwrap();
 
     assert!(runtime.network_health.read().await.traffic_allowed);
-    assert!(runtime.engine_running_for_test(&hash).await);
+    assert!(runtime.engine_running_for_key_for_test(hash).await);
     let torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
     assert_eq!(torrent.state, TorrentState::Downloading);
     assert_eq!(torrent.containment_recovery_intent, None);
@@ -2766,7 +3150,7 @@ async fn failed_shared_listener_bind_does_not_register_or_announce_seeder() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut torrent = Torrent::new(meta.clone(), 1);
     torrent.state = TorrentState::Completed;
     torrent.seeding.seed_forever = true;
@@ -2898,7 +3282,7 @@ async fn complete_seeding_lifecycle_policy_slots_tasks_and_limiter_identity_are_
             .unwrap()
             .unwrap();
         if event.kind == "torrent_changed"
-            && event.info_hash.as_deref() == Some(first.to_hex().as_str())
+            && event.info_hash.as_deref() == Some(first.to_locator().as_str())
         {
             break event;
         }
@@ -3117,7 +3501,7 @@ async fn active_seeding_containment_block_preserves_status_and_recovery_rebuilds
             .unwrap()
             .unwrap();
         if event.kind == "torrent_changed"
-            && event.info_hash.as_deref() == Some(hash.to_hex().as_str())
+            && event.info_hash.as_deref() == Some(hash.to_locator().as_str())
         {
             break event;
         }
@@ -3158,7 +3542,7 @@ async fn active_seeding_containment_block_preserves_status_and_recovery_rebuilds
             .unwrap()
             .unwrap();
         if event.kind == "torrent_changed"
-            && event.info_hash.as_deref() == Some(hash.to_hex().as_str())
+            && event.info_hash.as_deref() == Some(hash.to_locator().as_str())
         {
             break event;
         }
@@ -3213,7 +3597,7 @@ async fn daemon_limit_update_changes_active_registered_upload_without_replacemen
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let storage = swarmotter_core::storage::StorageIo::new(meta.clone(), root.clone());
     storage.write_piece(0, &content).await.unwrap();
     let mut torrent = Torrent::new(meta.clone(), now());
@@ -3251,7 +3635,7 @@ async fn daemon_limit_update_changes_active_registered_upload_without_replacemen
     peer::write_handshake(
         &mut write,
         &Handshake {
-            info_hash: hash,
+            info_hash: hash.as_v1().unwrap(),
             peer_id: make_peer_id(),
             reserved: swarmotter_core::extensions::EXTENSION_RESERVED,
         },
@@ -3333,7 +3717,7 @@ async fn daemon_limit_update_changes_active_registered_upload_without_replacemen
         .unwrap()
         .torrents
         .into_iter()
-        .find(|torrent| torrent.info_hash() == hash)
+        .find(|torrent| torrent.key() == hash)
         .unwrap();
     assert_eq!(persisted.upload_limit, 4096);
     assert!(Arc::ptr_eq(
@@ -3394,17 +3778,17 @@ async fn torrent_add_publishes_event() {
         .await
         .unwrap();
 
-    assert_eq!(hash, meta.info_hash);
+    assert_eq!(hash, TorrentKey::v1(meta.info_hash));
     let event = tokio::time::timeout(Duration::from_secs(1), events.next())
         .await
         .unwrap()
         .unwrap()
         .unwrap();
     assert_eq!(event.kind, "torrent_added");
-    assert_eq!(event.info_hash.as_deref(), Some(hash.to_hex().as_str()));
+    assert_eq!(event.info_hash.as_deref(), Some(hash.to_locator().as_str()));
     let payload: serde_json::Value = serde_json::from_str(&event.json).unwrap();
-    assert_eq!(payload["info_hash"], hash.to_hex());
-    assert_eq!(payload["payload"]["info_hash"], hash.to_hex());
+    assert_eq!(payload["info_hash"], hash.to_locator());
+    assert_eq!(payload["payload"]["info_hash"], hash.to_locator());
     assert_eq!(payload["payload"]["state"], "paused");
 }
 
@@ -3431,7 +3815,7 @@ async fn reconcile_publishes_completion_events() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut torrent = Torrent::new(meta.clone(), 1);
     torrent.state = TorrentState::Downloading;
     runtime.registry.lock().await.add(torrent).unwrap();
@@ -3504,7 +3888,7 @@ async fn reconcile_updates_transfer_rates_and_global_stats() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
 
     runtime
         .registry
@@ -3584,7 +3968,7 @@ async fn reconcile_applies_resolved_magnet_metadata_while_engine_runs() {
         false,
     );
     let real_meta = swarmotter_core::meta::parse_torrent(&real_bytes).unwrap();
-    let hash = real_meta.info_hash;
+    let hash = TorrentKey::v1(real_meta.info_hash);
     let placeholder_bytes = swarmotter_core::meta::build_single_file_torrent(
         "magnet placeholder",
         b"placeholder",
@@ -3596,7 +3980,7 @@ async fn reconcile_applies_resolved_magnet_metadata_while_engine_runs() {
     let mut torrent = Torrent::new(placeholder_meta, 1);
     torrent.state = TorrentState::DownloadingMetadata;
     torrent.needs_metadata = true;
-    torrent.magnet_info_hash = Some(hash);
+    set_test_v1_magnet_identity(&mut torrent, hash);
     runtime.registry.lock().await.add(torrent).unwrap();
     runtime.engine_handles.write().await.insert(
         hash,
@@ -3655,13 +4039,14 @@ async fn reconcile_keeps_unresolved_magnet_in_metadata_state() {
         false,
     );
     let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
-    let hash =
+    let magnet_info_hash =
         swarmotter_core::hash::InfoHash::from_hex("95c6c298c84fee2eee10c044d673537da158f0f8")
             .unwrap();
+    let hash = TorrentKey::v1(magnet_info_hash);
     let mut torrent = Torrent::new(placeholder_meta, 1);
     torrent.state = TorrentState::Queued;
     torrent.needs_metadata = true;
-    torrent.magnet_info_hash = Some(hash);
+    set_test_v1_magnet_identity(&mut torrent, hash);
     runtime.registry.lock().await.add(torrent).unwrap();
     runtime.engine_handles.write().await.insert(
         hash,
@@ -3686,6 +4071,442 @@ async fn reconcile_keeps_unresolved_magnet_in_metadata_state() {
 }
 
 #[tokio::test]
+async fn profile_intake_preview_snapshots_selection_and_organization_before_payload() {
+    use swarmotter_core::policy::{PolicyIntake, PolicyProfile};
+
+    let root = unique_dir("profile-intake-preview");
+    let complete = root.join("complete");
+    let incomplete = root.join("incomplete");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.storage.download_dir = Some(complete.display().to_string());
+    cfg.storage.incomplete_dir = Some(incomplete.display().to_string());
+    cfg.profiles.profiles.insert(
+        "review".into(),
+        PolicyProfile {
+            intake: PolicyIntake {
+                excluded_file_patterns: vec!["samples/*".into(), "*.nfo".into()],
+                excluded_file_rules: Vec::new(),
+                organization_subdirectory: Some("lawful/releases".into()),
+                incomplete_subdirectory: Some("staging/review".into()),
+                force_top_level_folder: false,
+                partial_file_suffix: Some(".part".into()),
+            },
+            ..Default::default()
+        },
+    );
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::new(cfg, health);
+    let sample = b"sample".as_slice();
+    let release = b"release".as_slice();
+    let notes = b"notes".as_slice();
+    let bytes = swarmotter_core::meta::build_multi_file_torrent(
+        "lawful-release",
+        &[
+            (
+                vec!["samples".into(), "clip.bin".into()],
+                sample.len() as u64,
+            ),
+            (vec!["release.bin".into()], release.len() as u64),
+            (vec!["readme.nfo".into()], notes.len() as u64),
+        ],
+        &[sample, release, notes],
+        8,
+        None,
+    );
+    let mut options =
+        AddTorrentOptions::request(None, false, false, Some("review".into()), Vec::new());
+    options.preview = true;
+    options.unwanted_file_indices = vec![1];
+    let hash = runtime
+        .add_torrent_file_with_options(bytes, options)
+        .await
+        .unwrap();
+
+    let torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    assert_eq!(torrent.state, TorrentState::Paused);
+    assert!(torrent.policy.preview_until_started);
+    let intake = torrent.policy.intake_snapshot.as_ref().unwrap();
+    assert_eq!(intake.profile, "review");
+    assert_eq!(intake.unwanted_file_indices, vec![1]);
+    assert_eq!(
+        intake.organization_subdirectory.as_deref(),
+        Some("lawful/releases")
+    );
+    assert_eq!(
+        torrent.priorities,
+        vec![
+            FilePriority::Unwanted,
+            FilePriority::Unwanted,
+            FilePriority::Unwanted,
+        ]
+    );
+    assert_eq!(torrent.wanted, vec![false, false, false]);
+    assert_eq!(
+        runtime.policy_storage_paths(&torrent).await,
+        (
+            complete.join("lawful/releases").display().to_string(),
+            incomplete.join("staging/review").display().to_string(),
+        )
+    );
+    assert!(
+        runtime.desired_download_hashes().await.is_empty(),
+        "a known .torrent preview must not admit payload work before Start"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn request_structured_intake_rules_apply_before_known_payload_admission() {
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    let runtime = DaemonRuntime::new(
+        cfg,
+        NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        ),
+    );
+    let release = b"lawful release".as_slice();
+    let proof = b"checksum proof".as_slice();
+    let bytes = swarmotter_core::meta::build_multi_file_torrent(
+        "structured-intake-release",
+        &[
+            (vec!["release.bin".into()], release.len() as u64),
+            (
+                vec!["proof".into(), "checksum.txt".into()],
+                proof.len() as u64,
+            ),
+        ],
+        &[release, proof],
+        8,
+        None,
+    );
+    let mut options = AddTorrentOptions::request(None, false, false, None, Vec::new());
+    options.preview = true;
+    options.file_exclusion_rules = vec![swarmotter_core::policy::PolicyFileExclusionRule {
+        path_segment: Some("proof".into()),
+        ..Default::default()
+    }];
+    let hash = runtime
+        .add_torrent_file_with_options(bytes, options)
+        .await
+        .unwrap();
+
+    let torrent = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    assert_eq!(torrent.state, TorrentState::Paused);
+    assert_eq!(
+        torrent.priorities,
+        vec![FilePriority::Normal, FilePriority::Unwanted]
+    );
+    assert_eq!(torrent.wanted, vec![true, false]);
+    assert_eq!(
+        torrent
+            .policy
+            .intake_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.excluded_file_rules.len()),
+        Some(1)
+    );
+    assert!(runtime.desired_download_hashes().await.is_empty());
+}
+
+#[tokio::test]
+async fn metadata_preview_resolution_commits_selection_before_public_state() {
+    use swarmotter_core::policy::IntakePolicySnapshot;
+
+    let root = unique_dir("metadata-preview-commit");
+    let state_path = root.join("state.sqlite");
+    let complete = root.join("complete");
+    let incomplete = root.join("incomplete");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.storage.download_dir = Some(complete.display().to_string());
+    cfg.storage.incomplete_dir = Some(incomplete.display().to_string());
+    cfg.storage.root_controls = vec![swarmotter_core::config::StorageRootControl {
+        path: complete.display().to_string(),
+        max_active_downloads: 1,
+        max_active_bytes: 1,
+        max_write_bytes_per_second: 0,
+        max_concurrent_rechecks: 0,
+    }];
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        cfg.clone(),
+        health.clone(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let content = b"generated lawful metadata preview content".as_slice();
+    let resolved =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_multi_file_torrent(
+            "preview-release",
+            &[
+                (vec!["release.bin".into()], content.len() as u64),
+                (vec!["samples".into(), "clip.bin".into()], 1),
+            ],
+            &[content, b"x"],
+            8,
+            None,
+        ))
+        .unwrap();
+    let hash = TorrentKey::v1(resolved.info_hash);
+    let placeholder =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "metadata-placeholder",
+            b"placeholder",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let mut torrent = Torrent::new(placeholder, now());
+    torrent.state = TorrentState::DownloadingMetadata;
+    torrent.needs_metadata = true;
+    set_test_v1_magnet_identity(&mut torrent, hash);
+    // `so=0` requests the first file, while the local add-time exclusion for
+    // that same index remains authoritative. The second file is removed by
+    // the magnet allow-list, proving the precedence is deterministic.
+    torrent.magnet_select_only_file_indices = vec![0];
+    torrent.magnet_direct_peers = vec![swarmotter_core::magnet::MagnetDirectPeer {
+        ip: "192.0.2.25".parse().unwrap(),
+        port: 51413,
+    }];
+    torrent.policy.preview_until_started = true;
+    torrent.policy.intake_snapshot = Some(IntakePolicySnapshot {
+        profile: "review".into(),
+        excluded_file_patterns: Vec::new(),
+        excluded_file_rules: Vec::new(),
+        organization_subdirectory: Some("lawful/releases".into()),
+        incomplete_subdirectory: Some("staging/review".into()),
+        force_top_level_folder: false,
+        partial_file_suffix: Some(".part".into()),
+        unwanted_file_indices: vec![0],
+    });
+    runtime.registry.lock().await.add(torrent).unwrap();
+    runtime.queue.lock().await.add(hash);
+
+    assert_eq!(
+        runtime.desired_download_hashes().await,
+        vec![hash],
+        "metadata-only preview discovery must not consume payload-root admission"
+    );
+
+    runtime
+        .commit_metadata_preview_resolution(hash, resolved.clone())
+        .await
+        .unwrap();
+    let committed = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    assert_eq!(committed.state, TorrentState::Paused);
+    assert!(!committed.needs_metadata);
+    assert!(committed.magnet_select_only_file_indices.is_empty());
+    assert_eq!(committed.magnet_direct_peers.len(), 1);
+    assert!(committed.policy.preview_until_started);
+    assert_eq!(committed.files.len(), 2);
+    assert_eq!(
+        committed.priorities,
+        vec![FilePriority::Unwanted, FilePriority::Unwanted]
+    );
+    assert_eq!(committed.wanted, vec![false, false]);
+    assert!(
+        runtime.storage_admissions.records().await.is_empty(),
+        "metadata-only preview resolution must not reserve payload storage"
+    );
+    let persisted = crate::state_store::load(&state_path)
+        .unwrap()
+        .unwrap()
+        .torrents
+        .into_iter()
+        .find(|torrent| torrent.key() == hash)
+        .unwrap();
+    assert_eq!(persisted.state, TorrentState::Paused);
+    assert!(!persisted.needs_metadata);
+    assert!(persisted.magnet_select_only_file_indices.is_empty());
+    assert_eq!(persisted.magnet_direct_peers, committed.magnet_direct_peers);
+    assert_eq!(persisted.priorities, committed.priorities);
+    assert_eq!(
+        runtime.policy_storage_paths(&committed).await,
+        (
+            complete.join("lawful/releases").display().to_string(),
+            incomplete.join("staging/review").display().to_string(),
+        )
+    );
+    assert_eq!(
+        DaemonRuntime::partial_file_suffix_for_active_storage(&committed),
+        Some(".part".into())
+    );
+
+    // Metadata resolution freezes the intake decision before it is exposed
+    // publicly. A restart must retain both the organized complete root and
+    // the distinct incomplete `.part` path rather than recomputing either.
+    drop(runtime);
+    let restarted = DaemonRuntime::with_paths_broker_and_state(
+        cfg.clone(),
+        health,
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    assert_eq!(restarted.restore_persisted_state().await.unwrap(), 1);
+    let restored = restarted.registry.lock().await.get(&hash).cloned().unwrap();
+    assert_eq!(
+        restarted.policy_storage_paths(&restored).await,
+        (
+            complete.join("lawful/releases").display().to_string(),
+            incomplete.join("staging/review").display().to_string(),
+        )
+    );
+    assert_eq!(
+        DaemonRuntime::partial_file_suffix_for_active_storage(&restored),
+        Some(".part".into())
+    );
+    let active_storage = storage_io_with_config(
+        restored.meta.clone(),
+        incomplete.join("staging/review"),
+        &cfg,
+    )
+    .with_partial_file_suffix(DaemonRuntime::partial_file_suffix_for_active_storage(
+        &restored,
+    ));
+    assert_eq!(
+        active_storage.file_path(0).unwrap(),
+        incomplete.join("staging/review/preview-release/release.bin.part")
+    );
+    drop(restarted);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn metadata_preview_rejects_out_of_range_deferred_selection_durably() {
+    use swarmotter_core::policy::IntakePolicySnapshot;
+
+    let root = unique_dir("metadata-preview-invalid-selection");
+    let state_path = root.join("state.sqlite");
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        Config::default(),
+        health,
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let resolved =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "one-file-release.bin",
+            b"generated lawful metadata fixture",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let hash = TorrentKey::v1(resolved.info_hash);
+    let placeholder =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "metadata-placeholder",
+            b"placeholder",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let mut torrent = Torrent::new(placeholder, now());
+    torrent.state = TorrentState::DownloadingMetadata;
+    torrent.needs_metadata = true;
+    set_test_v1_magnet_identity(&mut torrent, hash);
+    torrent.policy.preview_until_started = true;
+    torrent.policy.intake_snapshot = Some(IntakePolicySnapshot {
+        unwanted_file_indices: vec![4],
+        ..Default::default()
+    });
+    runtime.registry.lock().await.add(torrent).unwrap();
+    runtime.queue.lock().await.add(hash);
+
+    let error = runtime
+        .commit_metadata_preview_resolution(hash, resolved)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CoreError::InvalidArgument(_)));
+    let rejected = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    assert_eq!(rejected.state, TorrentState::Error);
+    assert!(rejected.needs_metadata);
+    assert!(rejected.policy.preview_until_started);
+    assert!(rejected
+        .error
+        .as_deref()
+        .is_some_and(|message| message.contains("index 4")));
+    let persisted = crate::state_store::load(&state_path)
+        .unwrap()
+        .unwrap()
+        .torrents
+        .into_iter()
+        .find(|torrent| torrent.key() == hash)
+        .unwrap();
+    assert_eq!(persisted.state, TorrentState::Error);
+    assert!(persisted.needs_metadata);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+async fn preview_start_rolls_back_gate_when_state_persistence_fails() {
+    let root = unique_dir("preview-start-state-rollback");
+    let state_path = root.join("state-target");
+    std::fs::create_dir_all(&state_path).unwrap();
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        Config::default(),
+        health,
+        None,
+        None,
+        Some(state_path),
+        EventBroker::default(),
+    );
+    let meta =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "preview-start.bin",
+            b"generated lawful preview-start fixture",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let hash = TorrentKey::v1(meta.info_hash);
+    let mut torrent = Torrent::new(meta, now());
+    torrent.state = TorrentState::Paused;
+    torrent.policy.preview_until_started = true;
+    runtime.registry.lock().await.add(torrent).unwrap();
+    runtime.queue.lock().await.add(hash);
+
+    assert!(runtime.resume(&hash).await.is_err());
+    assert!(runtime.start_now(&hash).await.is_err());
+    let restored = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    assert!(restored.policy.preview_until_started);
+    assert_eq!(restored.state, TorrentState::Paused);
+    assert!(runtime.engine_handles_empty().await);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn retryable_magnet_metadata_no_peers_stays_queued_after_progress_reconcile() {
     let cfg = Config::default();
     let health = NetworkHealth::blocked(
@@ -3702,15 +4523,16 @@ async fn retryable_magnet_metadata_no_peers_stays_queued_after_progress_reconcil
         false,
     );
     let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
-    let hash =
+    let magnet_info_hash =
         swarmotter_core::hash::InfoHash::from_hex("95c6c298c84fee2eee10c044d673537da158f0f8")
             .unwrap();
+    let hash = TorrentKey::v1(magnet_info_hash);
     let piece_count = placeholder_meta.piece_count();
     let total_length = placeholder_meta.total_length;
     let mut torrent = Torrent::new(placeholder_meta, 1);
     torrent.state = TorrentState::DownloadingMetadata;
     torrent.needs_metadata = true;
-    torrent.magnet_info_hash = Some(hash);
+    set_test_v1_magnet_identity(&mut torrent, hash);
     runtime.registry.lock().await.add(torrent).unwrap();
     runtime.queue.lock().await.add(hash);
     runtime.engine_states.write().await.insert(
@@ -3812,9 +4634,9 @@ async fn storage_root_declared_byte_control_defers_only_the_over_budget_queue_en
             false,
         ))
         .unwrap();
-    let first_hash = first.info_hash;
-    let blocked_hash = blocked.info_hash;
-    let fitting_hash = fitting.info_hash;
+    let first_hash = TorrentKey::v1(first.info_hash);
+    let blocked_hash = TorrentKey::v1(blocked.info_hash);
+    let fitting_hash = TorrentKey::v1(fitting.info_hash);
     let mut first_torrent = Torrent::new(first.clone(), 1);
     first_torrent.state = TorrentState::Downloading;
     {
@@ -3927,13 +4749,13 @@ async fn metadata_root_admission_wait_observes_lifecycle_cancellation() {
             false,
         ))
         .unwrap();
-    let hash = resolved.info_hash;
+    let hash = TorrentKey::v1(resolved.info_hash);
     let mut torrent = Torrent::new(resolved.clone(), now());
     torrent.state = TorrentState::DownloadingMetadata;
     torrent.needs_metadata = true;
     runtime.registry.lock().await.add(torrent).unwrap();
     let admission = storage_root_admission_for_path(&cfg, &root).unwrap();
-    let blocker = InfoHash::from_bytes([0x42; 20]);
+    let blocker = TorrentKey::v1(InfoHash::from_bytes([0x42; 20]));
     runtime
         .storage_admissions
         .reserve(blocker, &admission, 0)
@@ -4006,7 +4828,7 @@ async fn dropped_explicit_recheck_restores_and_persists_incomplete_state() {
             false,
         ))
         .unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut torrent = Torrent::new(meta, now());
     torrent.state = TorrentState::Paused;
     runtime.registry.lock().await.add(torrent).unwrap();
@@ -4063,7 +4885,7 @@ async fn dropped_explicit_recheck_restores_and_persists_incomplete_state() {
         persisted
             .torrents
             .iter()
-            .find(|torrent| torrent.info_hash() == hash)
+            .find(|torrent| torrent.key() == hash)
             .map(|torrent| torrent.state),
         Some(TorrentState::Paused)
     );
@@ -4102,7 +4924,7 @@ async fn cancelled_explicit_recheck_restores_completed_torrent_to_seeding_queue(
             false,
         ))
         .unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut torrent = Torrent::new(meta.clone(), now());
     for piece in 0..meta.piece_count() {
         torrent.progress.have_piece(piece);
@@ -4145,7 +4967,7 @@ async fn cancelled_explicit_recheck_restores_completed_torrent_to_seeding_queue(
         persisted
             .torrents
             .iter()
-            .find(|torrent| torrent.info_hash() == hash)
+            .find(|torrent| torrent.key() == hash)
             .map(|torrent| torrent.state),
         Some(TorrentState::Completed | TorrentState::Seeding)
     ));
@@ -4183,7 +5005,7 @@ async fn dropped_finalized_explicit_recheck_persists_after_the_normal_write_barr
             false,
         ))
         .unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let storage = swarmotter_core::storage::StorageIo::new(meta.clone(), root.clone());
     for piece in 0..meta.piece_count() {
         let start = piece * meta.piece_length as usize;
@@ -4235,7 +5057,7 @@ async fn dropped_finalized_explicit_recheck_persists_after_the_normal_write_barr
         persisted
             .torrents
             .iter()
-            .find(|torrent| torrent.info_hash() == hash)
+            .find(|torrent| torrent.key() == hash)
             .map(|torrent| torrent.state),
         Some(TorrentState::Completed)
     );
@@ -4281,8 +5103,8 @@ async fn root_control_replacement_keeps_active_engine_and_wakes_new_admission() 
             false,
         ))
         .unwrap();
-    let first_hash = first.info_hash;
-    let second_hash = second.info_hash;
+    let first_hash = TorrentKey::v1(first.info_hash);
+    let second_hash = TorrentKey::v1(second.info_hash);
     let mut active = Torrent::new(first.clone(), now());
     active.state = TorrentState::Downloading;
     {
@@ -4476,9 +5298,9 @@ async fn tightening_root_controls_serializes_an_inflight_engine_admission() {
             false,
         ))
         .unwrap();
-    let first_hash = first.info_hash;
-    let second_hash = second.info_hash;
-    let third_hash = third.info_hash;
+    let first_hash = TorrentKey::v1(first.info_hash);
+    let second_hash = TorrentKey::v1(second.info_hash);
+    let third_hash = TorrentKey::v1(third.info_hash);
     let mut active = Torrent::new(first.clone(), now());
     active.state = TorrentState::Downloading;
     {
@@ -4558,7 +5380,7 @@ async fn tightening_root_controls_serializes_an_inflight_engine_admission() {
             .records()
             .await
             .iter()
-            .any(|record| record.hash == second_hash),
+            .any(|record| record.key == second_hash),
         "the already-started engine is grandfathered under the old admission"
     );
 
@@ -4580,7 +5402,7 @@ async fn tightening_root_controls_serializes_an_inflight_engine_admission() {
             .records()
             .await
             .iter()
-            .any(|record| record.hash == third_hash),
+            .any(|record| record.key == third_hash),
         "a post-PUT engine start must use the tightened root limit"
     );
 
@@ -4617,8 +5439,8 @@ async fn unfinished_engine_exit_requeues_and_releases_active_slot() {
     );
     let first = swarmotter_core::meta::parse_torrent(&first_bytes).unwrap();
     let second = swarmotter_core::meta::parse_torrent(&second_bytes).unwrap();
-    let first_hash = first.info_hash;
-    let second_hash = second.info_hash;
+    let first_hash = TorrentKey::v1(first.info_hash);
+    let second_hash = TorrentKey::v1(second.info_hash);
     let mut first_torrent = Torrent::new(first, 1);
     first_torrent.state = TorrentState::Downloading;
     {
@@ -4688,8 +5510,8 @@ async fn stale_active_without_engine_is_requeued_and_releases_active_slot() {
     );
     let stale_meta = swarmotter_core::meta::parse_torrent(&stale_bytes).unwrap();
     let queued_meta = swarmotter_core::meta::parse_torrent(&queued_bytes).unwrap();
-    let stale_hash = stale_meta.info_hash;
-    let queued_hash = queued_meta.info_hash;
+    let stale_hash = TorrentKey::v1(stale_meta.info_hash);
+    let queued_hash = TorrentKey::v1(queued_meta.info_hash);
     let mut stale_torrent = Torrent::new(stale_meta, 1);
     stale_torrent.state = TorrentState::Downloading;
     {
@@ -4746,11 +5568,11 @@ async fn stale_metadata_progress_does_not_reactivate_large_queue_above_limit() {
         let mut queue = runtime.queue.lock().await;
         let mut states = runtime.engine_states.write().await;
         for idx in 1..=100u8 {
-            let hash = InfoHash::from_bytes([idx; 20]);
+            let hash = TorrentKey::v1(InfoHash::from_bytes([idx; 20]));
             let mut torrent = Torrent::new(placeholder_meta.clone(), idx as u64);
             torrent.state = TorrentState::DownloadingMetadata;
             torrent.needs_metadata = true;
-            torrent.magnet_info_hash = Some(hash);
+            set_test_v1_magnet_identity(&mut torrent, hash);
             reg.add(torrent).unwrap();
             queue.add(hash);
             states.insert(
@@ -4812,7 +5634,7 @@ async fn ten_thousand_stale_metadata_records_recover_without_active_leak() {
     );
     let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
     let hashes = (0..TOTAL_TORRENTS)
-        .map(|idx| InfoHash::from_bytes(scale_hash_bytes(idx as u32)))
+        .map(|idx| TorrentKey::v1(InfoHash::from_bytes(scale_hash_bytes(idx as u32))))
         .collect::<Vec<_>>();
 
     {
@@ -4821,7 +5643,7 @@ async fn ten_thousand_stale_metadata_records_recover_without_active_leak() {
             let mut torrent = Torrent::new(placeholder_meta.clone(), (idx + 1) as u64);
             torrent.state = TorrentState::DownloadingMetadata;
             torrent.needs_metadata = true;
-            torrent.magnet_info_hash = Some(hash);
+            set_test_v1_magnet_identity(&mut torrent, hash);
             reg.add(torrent).unwrap();
         }
     }
@@ -4876,7 +5698,7 @@ async fn ten_thousand_metadata_retry_backoffs_leave_no_active_desired_slots() {
     );
     let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
     let hashes = (0..TOTAL_TORRENTS)
-        .map(|idx| InfoHash::from_bytes(scale_hash_bytes(idx as u32)))
+        .map(|idx| TorrentKey::v1(InfoHash::from_bytes(scale_hash_bytes(idx as u32))))
         .collect::<Vec<_>>();
 
     {
@@ -4885,7 +5707,7 @@ async fn ten_thousand_metadata_retry_backoffs_leave_no_active_desired_slots() {
             let mut torrent = Torrent::new(placeholder_meta.clone(), (idx + 1) as u64);
             torrent.state = TorrentState::Queued;
             torrent.needs_metadata = true;
-            torrent.magnet_info_hash = Some(hash);
+            set_test_v1_magnet_identity(&mut torrent, hash);
             reg.add(torrent).unwrap();
         }
     }
@@ -4964,7 +5786,7 @@ async fn ignored_thousand_mixed_state_torrents_keep_scheduler_bounds() {
     );
     let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
     let hashes = (0..TOTAL_TORRENTS)
-        .map(|idx| InfoHash::from_bytes(scale_hash_bytes(idx as u32)))
+        .map(|idx| TorrentKey::v1(InfoHash::from_bytes(scale_hash_bytes(idx as u32))))
         .collect::<Vec<_>>();
     let backoff_start = Instant::now();
 
@@ -4972,7 +5794,7 @@ async fn ignored_thousand_mixed_state_torrents_keep_scheduler_bounds() {
         let mut reg = runtime.registry.lock().await;
         for (idx, hash) in hashes.iter().copied().enumerate() {
             let mut torrent = Torrent::new(placeholder_meta.clone(), (idx + 1) as u64);
-            torrent.magnet_info_hash = Some(hash);
+            set_test_v1_magnet_identity(&mut torrent, hash);
             if idx < LIVE_DOWNLOAD_COUNT {
                 torrent.state = TorrentState::Downloading;
                 torrent.needs_metadata = false;
@@ -5248,11 +6070,11 @@ async fn metadata_fetch_limit_is_separate_from_download_slot_limit() {
         let mut reg = runtime.registry.lock().await;
         let mut queue = runtime.queue.lock().await;
         for idx in 0..6u32 {
-            let hash = InfoHash::from_bytes(scale_hash_bytes(idx));
+            let hash = TorrentKey::v1(InfoHash::from_bytes(scale_hash_bytes(idx)));
             let mut torrent = Torrent::new(placeholder_meta.clone(), idx as u64 + 1);
             torrent.state = TorrentState::Queued;
             torrent.needs_metadata = true;
-            torrent.magnet_info_hash = Some(hash);
+            set_test_v1_magnet_identity(&mut torrent, hash);
             reg.add(torrent).unwrap();
             queue.add(hash);
             metadata_hashes.push(hash);
@@ -5268,7 +6090,7 @@ async fn metadata_fetch_limit_is_separate_from_download_slot_limit() {
                 false,
             );
             let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-            let hash = meta.info_hash;
+            let hash = TorrentKey::v1(meta.info_hash);
             reg.add(Torrent::new(meta, idx as u64 + 10)).unwrap();
             queue.add(hash);
             download_hashes.push(hash);
@@ -5322,7 +6144,7 @@ async fn queued_torrent_with_stale_engine_handle_is_cleared_for_restart() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     runtime
         .registry
         .lock()
@@ -5394,8 +6216,8 @@ async fn reconcile_queue_force_clears_over_limit_active_engine() {
     );
     let first_meta = swarmotter_core::meta::parse_torrent(&first_bytes).unwrap();
     let second_meta = swarmotter_core::meta::parse_torrent(&second_bytes).unwrap();
-    let first_hash = first_meta.info_hash;
-    let second_hash = second_meta.info_hash;
+    let first_hash = TorrentKey::v1(first_meta.info_hash);
+    let second_hash = TorrentKey::v1(second_meta.info_hash);
     let mut first_torrent = Torrent::new(first_meta, 1);
     first_torrent.state = TorrentState::Downloading;
     let mut second_torrent = Torrent::new(second_meta, 2);
@@ -5491,7 +6313,7 @@ async fn assert_large_queue_recovery_keeps_configured_active_slots_startable(
                 false,
             );
             let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-            let hash = meta.info_hash;
+            let hash = TorrentKey::v1(meta.info_hash);
             let mut torrent = Torrent::new(meta, (idx + 1) as u64);
             if idx < 18 {
                 torrent.state = TorrentState::Downloading;
@@ -5560,9 +6382,10 @@ async fn engine_task_finished_clears_restart_blocking_runtime_bookkeeping() {
         "disabled",
     );
     let runtime = DaemonRuntime::new(cfg, health);
-    let hash =
+    let hash = TorrentKey::v1(
         swarmotter_core::hash::InfoHash::from_hex("95c6c298c84fee2eee10c044d673537da158f0f8")
-            .unwrap();
+            .unwrap(),
+    );
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     runtime.engine_cmds.lock().await.insert(hash, tx);
     runtime
@@ -5631,7 +6454,7 @@ async fn runtime_config_sweeps_existing_completed_torrents_when_selfish() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut torrent = Torrent::new(meta.clone(), 1);
     torrent.state = TorrentState::Completed;
     torrent.date_completed = Some(2);
@@ -5694,7 +6517,7 @@ async fn torrent_stats_includes_live_engine_diagnostics() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut torrent = Torrent::new(meta.clone(), 1);
     torrent.state = TorrentState::Downloading;
     runtime.registry.lock().await.add(torrent).unwrap();
@@ -5820,7 +6643,7 @@ async fn autopilot_decision_uses_live_engine_telemetry() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut torrent = Torrent::new(meta.clone(), 1);
     torrent.state = TorrentState::Downloading;
     runtime.registry.lock().await.add(torrent).unwrap();
@@ -5889,8 +6712,8 @@ async fn torrent_autopilot_decision_does_not_refresh_unrelated_torrents() {
     );
     let first = swarmotter_core::meta::parse_torrent(&first_bytes).unwrap();
     let second = swarmotter_core::meta::parse_torrent(&second_bytes).unwrap();
-    let first_hash = first.info_hash;
-    let second_hash = second.info_hash;
+    let first_hash = TorrentKey::v1(first.info_hash);
+    let second_hash = TorrentKey::v1(second.info_hash);
     {
         let mut reg = runtime.registry.lock().await;
         reg.add(Torrent::new(first, 1)).unwrap();
@@ -5933,7 +6756,7 @@ async fn torrent_autopilot_decision_recomputes_stale_cached_snapshot() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     let mut torrent = Torrent::new(meta.clone(), 1);
     torrent.state = TorrentState::Downloading;
     runtime.registry.lock().await.add(torrent).unwrap();
@@ -6006,7 +6829,7 @@ async fn torrent_autopilot_override_is_persisted_and_used() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     runtime
         .registry
         .lock()
@@ -6046,7 +6869,7 @@ async fn autopilot_act_mode_expands_discovery_through_engine_command() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     runtime
         .registry
         .lock()
@@ -6118,8 +6941,8 @@ async fn autopilot_act_mode_releases_stalled_active_queue_slot() {
     );
     let stalled_meta = swarmotter_core::meta::parse_torrent(&stalled_bytes).unwrap();
     let queued_meta = swarmotter_core::meta::parse_torrent(&queued_bytes).unwrap();
-    let stalled_hash = stalled_meta.info_hash;
-    let queued_hash = queued_meta.info_hash;
+    let stalled_hash = TorrentKey::v1(stalled_meta.info_hash);
+    let queued_hash = TorrentKey::v1(queued_meta.info_hash);
     let mut stalled = Torrent::new(stalled_meta.clone(), 1);
     stalled.state = TorrentState::Downloading;
     runtime.registry.lock().await.add(stalled).unwrap();
@@ -6237,7 +7060,7 @@ async fn autopilot_act_mode_skips_queue_release_without_eligible_replacement() {
         false,
     );
     let stalled_meta = swarmotter_core::meta::parse_torrent(&stalled_bytes).unwrap();
-    let stalled_hash = stalled_meta.info_hash;
+    let stalled_hash = TorrentKey::v1(stalled_meta.info_hash);
     let mut stalled = Torrent::new(stalled_meta.clone(), 1);
     stalled.state = TorrentState::Downloading;
     runtime.registry.lock().await.add(stalled).unwrap();
@@ -6352,7 +7175,7 @@ async fn list_trackers_exposes_scrape_state_and_falls_back_without_announce_succ
     );
     let mut meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
     meta.announce_list = vec![vec![primary.into(), secondary.into()]];
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     runtime
         .registry
         .lock()
@@ -6495,7 +7318,7 @@ async fn seeder_announce_schedules_scrape_into_the_shared_engine_state() {
     let state = Arc::new(Mutex::new(EngineState::default()));
     let interval = DaemonRuntime::seeder_announce_once(
         &[vec![url.clone()]],
-        hash,
+        TorrentKey::v1(hash),
         [0u8; 20],
         6881,
         Arc::new(swarmotter_core::net::binder::LoopbackBinder),
@@ -6542,7 +7365,7 @@ async fn tracker_scrape_snapshot_serializes_through_the_real_native_router() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     runtime
         .registry
         .lock()
@@ -6665,7 +7488,7 @@ async fn reset_downloads_clears_storage_roots_registry_and_logs() {
         false,
     );
     let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
-    let hash = meta.info_hash;
+    let hash = TorrentKey::v1(meta.info_hash);
     runtime
         .registry
         .lock()
@@ -7070,8 +7893,8 @@ async fn queue_scheduler_respects_auto_start_and_moves() {
         swarmotter_core::meta::build_single_file_torrent("q2.bin", b"queue-two", 4, None, false);
     let first = swarmotter_core::meta::parse_torrent(&first_bytes).unwrap();
     let second = swarmotter_core::meta::parse_torrent(&second_bytes).unwrap();
-    let first_hash = first.info_hash;
-    let second_hash = second.info_hash;
+    let first_hash = TorrentKey::v1(first.info_hash);
+    let second_hash = TorrentKey::v1(second.info_hash);
 
     {
         let mut reg = runtime.registry.lock().await;
@@ -7305,7 +8128,9 @@ async fn bulk_remove_clears_many_torrents_and_queue_entries() {
         let hash = runtime.add_magnet(&magnet, None).await.unwrap();
         hashes.push(hash);
     }
-    hashes.push(InfoHash::from_hex("ffffffffffffffffffffffffffffffffffffffff").unwrap());
+    hashes.push(TorrentKey::v1(
+        InfoHash::from_hex("ffffffffffffffffffffffffffffffffffffffff").unwrap(),
+    ));
 
     let removed = runtime.remove_torrents(hashes, false).await.unwrap();
 
@@ -7335,14 +8160,14 @@ async fn bulk_remove_clears_ten_thousand_torrents_and_runtime_indexes() {
     );
     let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
     let hashes = (0..REMOVE_COUNT)
-        .map(|idx| InfoHash::from_bytes(scale_hash_bytes(idx as u32)))
+        .map(|idx| TorrentKey::v1(InfoHash::from_bytes(scale_hash_bytes(idx as u32))))
         .collect::<Vec<_>>();
 
     {
         let mut reg = runtime.registry.lock().await;
         for (idx, hash) in hashes.iter().copied().enumerate() {
             let mut torrent = Torrent::new(placeholder_meta.clone(), (idx + 1) as u64);
-            torrent.magnet_info_hash = Some(hash);
+            set_test_v1_magnet_identity(&mut torrent, hash);
             reg.add(torrent).unwrap();
         }
     }
@@ -7690,7 +8515,7 @@ async fn watch_restart_duplicate_runs_success_action_once_without_mutation() {
     assert_eq!(history[0].outcome, watch::ImportOutcome::Duplicate);
     assert_eq!(
         history[0].info_hash_hex.as_deref(),
-        Some(hash.to_hex().as_str())
+        Some(hash.to_locator().as_str())
     );
     let event = tokio::time::timeout(Duration::from_secs(1), events.next())
         .await
@@ -7766,7 +8591,7 @@ async fn shared_add_persistence_failure_restores_exact_state_and_has_no_side_eff
         None,
         false,
     );
-    let hash = meta::parse_torrent(&bytes).unwrap().info_hash;
+    let hash = TorrentKey::v1(meta::parse_torrent(&bytes).unwrap().info_hash);
     std::fs::write(&source, bytes).unwrap();
     let broker = EventBroker::default();
     let runtime = DaemonRuntime::with_paths_broker_and_state(
@@ -7777,8 +8602,8 @@ async fn shared_add_persistence_failure_restores_exact_state_and_has_no_side_eff
         None,
         broker.clone(),
     );
-    let first = InfoHash::from_bytes([0x11; 20]);
-    let last = InfoHash::from_bytes([0x22; 20]);
+    let first = TorrentKey::v1(InfoHash::from_bytes([0x11; 20]));
+    let last = TorrentKey::v1(InfoHash::from_bytes([0x22; 20]));
     {
         let mut queue = runtime.queue.lock().await;
         queue.add_many([first, hash, last]);
@@ -7832,7 +8657,7 @@ async fn api_add_uses_shared_injected_rollback_without_event_or_schedule() {
         None,
         false,
     );
-    let hash = meta::parse_torrent(&bytes).unwrap().info_hash;
+    let hash = TorrentKey::v1(meta::parse_torrent(&bytes).unwrap().info_hash);
     let before_order = runtime.queue.lock().await.order.clone();
     let mut events = runtime.event_broker.subscribe();
     runtime.inject_add_mutation_persistence_failure();

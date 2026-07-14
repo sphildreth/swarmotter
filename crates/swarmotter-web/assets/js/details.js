@@ -37,7 +37,7 @@ export async function openDetails(hash) {
   $("#view-details").classList.remove("hidden");
   beginDetailsLoad();
   try {
-    const [t, stats, decision, autopilotStatus, networkDiag, policy, profiles] = await Promise.all([
+    const [t, stats, decision, autopilotStatus, networkDiag, policy, profiles, storagePreview] = await Promise.all([
       api(`/torrents/${hash}`),
       api(`/torrents/${hash}/stats`).catch(() => null),
       api(`/torrents/${hash}/autopilot`).catch(() => null),
@@ -45,12 +45,17 @@ export async function openDetails(hash) {
       api("/network/diagnostics").catch(() => null),
       api(`/torrents/${hash}/policy`).catch(() => null),
       api("/profiles").catch(() => null),
+      api(`/torrents/${hash}/storage-preview`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      }).catch(() => null),
     ]);
     if (!detailsRequestIsCurrent(hash)) return;
     $("#details-title").textContent = t.name;
     renderDetailsHealth(t.health);
     renderDetailsSummary(t);
-    renderDetailsPolicy(policy);
+    renderDetailsPolicy(policy, storagePreview);
     renderDetailsControls(t);
     renderDetailsProfileSelector(policy, profiles);
     renderDetailsEncryptionSelector(policy);
@@ -103,6 +108,19 @@ export function renderDetailsHealth(h) {
   `;
 }
 
+// Keep the full v2 SHA-256 identity visible instead of treating it as the
+// legacy v1 registry hash. Older daemon responses omit `identity`, so retain
+// the v1 fallback for a rolling upgrade.
+export function formatTorrentIdentity(identity, legacyInfoHash) {
+  const kind = String(identity?.kind || "unknown");
+  const v1 = identity?.v1 || legacyInfoHash || "";
+  const v2 = identity?.v2 || "";
+  if (kind === "hybrid") return `hybrid — v1 ${v1}; v2 ${v2}`;
+  if (kind === "v2") return v2 ? `v2 — ${v2}` : "v2";
+  if (kind === "v1") return v1 ? `v1 — ${v1}` : "v1";
+  return v1 ? `legacy v1 — ${v1}` : "unknown";
+}
+
 export function renderDetailsSummary(t) {
   if (!t) {
     $("#details-summary").innerHTML = "";
@@ -112,6 +130,7 @@ export function renderDetailsSummary(t) {
     <h3>Details</h3>
     ${renderKv([
       ["State", t.state],
+      ["Identity", formatTorrentIdentity(t.identity, t.info_hash)],
       ["Last error", t.error || ""],
       ["Peers", `${fmtCount(t.active_peer_workers)} active / ${fmtCount(t.known_peers)} known`],
       ["Rate down", fmtRate(t.rate_down)],
@@ -141,6 +160,7 @@ export function policySourceLabel(source) {
   if (source.kind === "existing_storage_snapshot") return "existing storage snapshot";
   if (source.kind === "profile_storage_snapshot") return `profile storage snapshot (${source.profile || "profile"})`;
   if (source.kind === "initial_admission_snapshot") return "initial admission decision";
+  if (source.kind === "intake_snapshot") return `intake policy fixed at registration (${source.profile || "global defaults"})`;
   if (source.kind === "label") return `label ${source.label || ""} → ${source.profile || ""}`.trim();
   if (source.kind === "profile") return `${source.profile || "profile"} (${source.origin || "assignment"})`;
   return source.kind || "unavailable";
@@ -155,7 +175,23 @@ export function policyRateLabel(value) {
   return limit === 0 ? "unlimited" : fmtRate(limit);
 }
 
-export function renderDetailsPolicy(policy) {
+export function intakeRuleLabel(rule) {
+  const parts = [];
+  if (rule?.path_pattern) parts.push(`path ${rule.path_pattern}`);
+  if (rule?.suffix) parts.push(`suffix ${rule.suffix}`);
+  if (rule?.path_segment) parts.push(`segment ${rule.path_segment}`);
+  if (rule?.min_size_bytes !== null && rule?.min_size_bytes !== undefined) parts.push(`≥ ${fmtBytes(rule.min_size_bytes)}`);
+  if (rule?.max_size_bytes !== null && rule?.max_size_bytes !== undefined) parts.push(`≤ ${fmtBytes(rule.max_size_bytes)}`);
+  return parts.length ? parts.join(" and ") : "invalid rule";
+}
+
+export function trackerHostRuleLabel(rule) {
+  const enabled = rule?.enabled === false ? "disabled" : "enabled";
+  const priority = rule?.priority || "normal";
+  return `${rule?.host_pattern || "invalid host"}: ${enabled}, ${priority} priority`;
+}
+
+export function renderDetailsPolicy(policy, storagePreview = null) {
   const panel = $("#details-policy");
   if (!panel) return;
   if (!policy) {
@@ -167,6 +203,9 @@ export function renderDetailsPolicy(policy) {
     ? `${profile.name} · ${policySourceLabel(profile.source)}`
     : "label/global defaults";
   const field = (entry, formatter) => `${policyValueLabel(entry?.value, formatter)} · ${policySourceLabel(entry?.source)}`;
+  const intake = policy.intake;
+  const tracker = policy.tracker;
+  const unwantedFileIndices = intake?.unwanted_file_indices || [];
   panel.innerHTML = `
     <h3>Effective policy</h3>
     ${renderKv([
@@ -181,8 +220,31 @@ export function renderDetailsPolicy(policy) {
       ["Download cap", field(policy.download_limit, policyRateLabel)],
       ["Upload cap", field(policy.upload_limit, policyRateLabel)],
       ["Peer encryption", field(policy.encryption_mode)],
+      ["Tracker host policy", tracker ? field(tracker.host_rules, value => value.length ? value.map(trackerHostRuleLabel).join("; ") : "none") : "not configured"],
+      ["Intake exclusions", intake ? field(intake.excluded_file_patterns, value => value.length ? value.join(", ") : "none") : "not recorded"],
+      ["Structured intake rules", intake ? field(intake.excluded_file_rules, value => value.length ? value.map(intakeRuleLabel).join("; ") : "none") : "not recorded"],
+      ["Content organization", intake ? field(intake.organization_subdirectory, value => value || "none") : "not recorded"],
+      ["Incomplete content organization", intake ? field(intake.incomplete_subdirectory, value => value || "same as completed organization") : "not recorded"],
+      ["Forced top-level folder", intake ? field(intake.force_top_level_folder, value => value ? "yes (single-file torrents)" : "no") : "not recorded"],
+      ["Partial file suffix", intake ? field(intake.partial_file_suffix, value => value || "none") : "not recorded"],
+      ["Explicit unwanted files", intake ? (unwantedFileIndices.length ? unwantedFileIndices.join(", ") : "none") : "not recorded"],
+      ["Resolved completed path", storagePreview?.complete_dir || "unavailable"],
+      ["Resolved incomplete path", storagePreview?.incomplete_dir || "unavailable"],
+      ["Payload gate", intake?.preview_until_started ? "metadata preview — select files, then use Start to allow payload transfer" : "none"],
     ])}
-    <p class="muted">Storage paths are fixed when a torrent is added or reassigned; queue priority, seeding, rate limits, and peer encryption update while they inherit. Start behavior controls initial admission and never stops running work.</p>`;
+    <p class="muted">Storage paths and intake choices are fixed when a torrent is added. Queue priority, seeding, rate limits, peer encryption, and safe seeding outcomes (continue, stop on ratio, or stop on idle) update while they inherit. Start behavior controls initial admission and never stops running work.</p>`;
+}
+
+async function confirmStoragePreview(hash, proposal, action) {
+  const preview = await api(`/torrents/${hash}/storage-preview`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(proposal),
+  });
+  const complete = preview.complete_dir || "(unavailable)";
+  const incomplete = preview.incomplete_dir || "(unavailable)";
+  const count = Number.isFinite(preview.file_count) ? `${preview.file_count} file${preview.file_count === 1 ? "" : "s"}` : "the torrent files";
+  return window.confirm(`${action}\n\nCompleted: ${complete}\nIncomplete: ${incomplete}\nPreview: ${count}${preview.truncated ? " (list truncated)" : ""}\n\nContinue?`);
 }
 
 export function explicitProfileName(policy) {
@@ -624,13 +686,20 @@ export async function runDetailsCommand(button, suffix, title, body = null) {
   $("#" + id).addEventListener("click", event => runDetailsCommand(event.currentTarget, path, title));
 });
 
-$("#details-move-btn").addEventListener("click", event => {
+$("#details-move-btn").addEventListener("click", async event => {
   const path = $("#details-move-path").value.trim();
   if (!path) {
     showToast("Enter a destination path", "", "warning");
     return;
   }
-  runDetailsCommand(event.currentTarget, "/move", "Torrent data moved", { path });
+  const hash = state.currentHash;
+  if (!hash) return;
+  try {
+    if (!(await confirmStoragePreview(hash, { download_dir: path }, "Move torrent data to these paths?"))) return;
+    await runDetailsCommand(event.currentTarget, "/move", "Torrent data moved", { path });
+  } catch (error) {
+    if (detailsRequestIsCurrent(hash)) showError("Storage path preview failed", error);
+  }
 });
 
 $("#details-labels-btn").addEventListener("click", event => {
@@ -645,6 +714,11 @@ $("#details-profile-save-btn").addEventListener("click", async event => {
   button.disabled = true;
   try {
     const profile = $("#details-profile").value || null;
+    if (!(await confirmStoragePreview(
+      hash,
+      profile ? { profile } : {},
+      "Apply this policy profile? Existing payload locations remain fixed.",
+    ))) return;
     await api(`/torrents/${hash}/policy`, {
       method: "PUT",
       headers: { "content-type": "application/json" },

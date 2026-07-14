@@ -46,7 +46,7 @@ use swarmotter_api::state::{AddTorrentOptions, DaemonOps};
 use swarmotter_core::autopilot::{AutopilotAnalyzer, AutopilotConfig, AutopilotMode};
 use swarmotter_core::config::Config;
 use swarmotter_core::error::{CoreError, Result};
-use swarmotter_core::hash::InfoHash;
+use swarmotter_core::hash::{InfoHash, TorrentKey};
 use swarmotter_core::magnet::Magnet;
 use swarmotter_core::meta;
 use swarmotter_core::models::health::{HealthCalculator, HealthInput};
@@ -112,7 +112,7 @@ static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 struct PeerPermitConfiguration {
     global: Arc<PeerPermitPool>,
-    per_torrent: HashMap<InfoHash, Arc<PeerPermitPool>>,
+    per_torrent: HashMap<TorrentKey, Arc<PeerPermitPool>>,
 }
 
 #[cfg(test)]
@@ -134,8 +134,13 @@ struct WatchObservation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TorrentAddMutationOutcome {
-    Inserted { hash: InfoHash, state: TorrentState },
-    Duplicate { hash: InfoHash },
+    Inserted {
+        hash: TorrentKey,
+        state: TorrentState,
+    },
+    Duplicate {
+        hash: TorrentKey,
+    },
 }
 
 enum WatchReadOutcome {
@@ -157,7 +162,7 @@ impl LivePeerWorkSnapshot {
 
 #[derive(Debug, Clone)]
 struct LiveTorrentTaskSnapshot {
-    hash: InfoHash,
+    key: TorrentKey,
     state: TorrentState,
     seeding_status: SeedingStatus,
     error: Option<String>,
@@ -172,9 +177,9 @@ struct RecoveredSeederStart {
 }
 
 impl LiveTorrentTaskSnapshot {
-    fn from_torrent(hash: InfoHash, torrent: &Torrent) -> Self {
+    fn from_torrent(key: TorrentKey, torrent: &Torrent) -> Self {
         Self {
-            hash,
+            key,
             state: torrent.state,
             seeding_status: torrent.seeding_status,
             error: torrent.error.clone(),
@@ -231,14 +236,14 @@ pub struct DaemonRuntime {
     /// Cancellation signals for daemon-managed engine storage waits and
     /// startup verification. Lifecycle operations signal these before asking
     /// the engine to stop, so a saturated root cannot block command polling.
-    engine_storage_cancellations: Arc<Mutex<HashMap<InfoHash, StorageWorkCancellation>>>,
+    engine_storage_cancellations: Arc<Mutex<HashMap<TorrentKey, StorageWorkCancellation>>>,
     /// Explicit API rechecks have no engine task while their disk work runs.
     /// Track them separately so move/pause/stop can cancel and await cleanup.
-    explicit_rechecks: Arc<Mutex<HashMap<InfoHash, ExplicitRecheckOperation>>>,
-    engine_states: Arc<RwLock<HashMap<InfoHash, Arc<Mutex<EngineState>>>>>,
-    engine_cmds: Arc<Mutex<HashMap<InfoHash, tokio::sync::mpsc::Sender<EngineCommand>>>>,
-    engine_handles: Arc<RwLock<HashMap<InfoHash, JoinHandle<()>>>>,
-    seeder_shutdowns: Arc<Mutex<HashMap<InfoHash, tokio::sync::watch::Sender<bool>>>>,
+    explicit_rechecks: Arc<Mutex<HashMap<TorrentKey, ExplicitRecheckOperation>>>,
+    engine_states: Arc<RwLock<HashMap<TorrentKey, Arc<Mutex<EngineState>>>>>,
+    engine_cmds: Arc<Mutex<HashMap<TorrentKey, tokio::sync::mpsc::Sender<EngineCommand>>>>,
+    engine_handles: Arc<RwLock<HashMap<TorrentKey, JoinHandle<()>>>>,
+    seeder_shutdowns: Arc<Mutex<HashMap<TorrentKey, tokio::sync::watch::Sender<bool>>>>,
     seeder_registry: SeedRegistry,
     /// Serializes the live registry with coarse/fine lifecycle transitions.
     seeder_lifecycle_lock: Arc<Mutex<()>>,
@@ -246,12 +251,12 @@ pub struct DaemonRuntime {
     seeder_listener_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Per-torrent tracker announce sidecars. The TCP listener itself is
     /// process-wide and stored in `seeder_listener_handle`.
-    seeder_handles: Arc<Mutex<HashMap<InfoHash, JoinHandle<()>>>>,
+    seeder_handles: Arc<Mutex<HashMap<TorrentKey, JoinHandle<()>>>>,
     /// Runtime-owned process-wide peer budget plus retained per-torrent
     /// budgets shared by inbound, metadata, serial, parallel, endgame, TCP,
     /// and uTP sessions. See ADR-0053.
     peer_permit_pool: Arc<RwLock<Arc<PeerPermitPool>>>,
-    torrent_peer_permit_pools: Arc<RwLock<HashMap<InfoHash, Arc<PeerPermitPool>>>>,
+    torrent_peer_permit_pools: Arc<RwLock<HashMap<TorrentKey, Arc<PeerPermitPool>>>>,
     peer_sessions_denied: Arc<AtomicU64>,
     /// Last committed selfish-completion policy. Provisional configuration
     /// reconstruction must not perform irreversible removals before a full
@@ -296,12 +301,13 @@ pub struct DaemonRuntime {
     global_limiter: swarmotter_core::bandwidth::RateLimiter,
     /// One retained live limiter per torrent. The same buckets are shared by
     /// downloader and seeder tasks and survive lifecycle transitions.
-    torrent_limiters: Arc<RwLock<HashMap<InfoHash, Arc<swarmotter_core::bandwidth::RateLimiter>>>>,
-    rate_samples: Arc<RwLock<HashMap<InfoHash, RateSample>>>,
-    engine_retry_after: Arc<RwLock<HashMap<InfoHash, Instant>>>,
-    autopilot_decisions: Arc<RwLock<HashMap<InfoHash, AutopilotDecision>>>,
-    autopilot_last_action: Arc<RwLock<HashMap<InfoHash, Instant>>>,
-    queue: Arc<Mutex<QueueState>>,
+    torrent_limiters:
+        Arc<RwLock<HashMap<TorrentKey, Arc<swarmotter_core::bandwidth::RateLimiter>>>>,
+    rate_samples: Arc<RwLock<HashMap<TorrentKey, RateSample>>>,
+    engine_retry_after: Arc<RwLock<HashMap<TorrentKey, Instant>>>,
+    autopilot_decisions: Arc<RwLock<HashMap<TorrentKey, AutopilotDecision>>>,
+    autopilot_last_action: Arc<RwLock<HashMap<TorrentKey, Instant>>>,
+    queue: Arc<Mutex<QueueState<TorrentKey>>>,
     dht_runner: Arc<Mutex<Option<Arc<crate::dht::DhtRunner>>>>,
     queue_reconcile: Arc<Mutex<QueueReconcileState>>,
     event_broker: EventBroker,
@@ -322,6 +328,21 @@ pub struct DaemonRuntime {
 }
 
 impl DaemonRuntime {
+    /// Resolve a requested full locator to the canonical runtime owner key.
+    ///
+    /// Hybrid v2 aliases must be normalized before accessing queue entries,
+    /// engine tasks, seeders, rate limiters, or storage reservations: those
+    /// maps deliberately contain one entry under the hybrid's v1 primary.
+    pub(super) async fn canonical_torrent_key(&self, key: TorrentKey) -> Option<TorrentKey> {
+        self.registry.lock().await.canonical_key(&key)
+    }
+
+    pub(super) async fn require_torrent_key(&self, key: TorrentKey) -> Result<TorrentKey> {
+        self.canonical_torrent_key(key)
+            .await
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))
+    }
+
     /// Borrow the process-wide containment gate. See ADR-0051.
     #[allow(dead_code)]
     pub fn containment_gate(&self) -> &ContainmentGate {
@@ -347,10 +368,21 @@ impl DaemonRuntime {
     /// Whether a non-finished engine task is registered for one torrent.
     #[allow(dead_code)]
     pub async fn engine_running_for_test(&self, hash: &InfoHash) -> bool {
+        self.engine_running_for_key_for_test(TorrentKey::v1(*hash))
+            .await
+    }
+
+    /// Test-only task-map inspection through the same canonical alias path
+    /// used by lifecycle operations.
+    #[allow(dead_code)]
+    pub async fn engine_running_for_key_for_test(&self, key: TorrentKey) -> bool {
+        let Some(key) = self.canonical_torrent_key(key).await else {
+            return false;
+        };
         self.engine_handles
             .read()
             .await
-            .get(hash)
+            .get(&key)
             .is_some_and(|handle| !handle.is_finished())
     }
 
@@ -375,7 +407,7 @@ impl DaemonRuntime {
     #[allow(dead_code)]
     pub async fn peer_permit_pools_for_test(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
     ) -> Option<(Arc<PeerPermitPool>, Arc<PeerPermitPool>)> {
         Some((
             self.peer_permit_pool.read().await.clone(),
@@ -461,9 +493,16 @@ struct EngineStartSnapshot {
     upload_limit: u64,
     encryption_mode: swarmotter_core::config::PeerEncryptionMode,
     needs_metadata: bool,
+    metadata_only: bool,
+    intake_selection: Option<swarmotter_core::policy::IntakePolicySnapshot>,
+    partial_file_suffix: Option<String>,
+    tracker_host_rules: Vec<swarmotter_core::policy::TrackerHostRule>,
     magnet_info_hash: Option<InfoHash>,
+    magnet_identity: Option<swarmotter_core::hash::TorrentIdentity>,
     magnet_name: Option<String>,
     magnet_trackers: Vec<String>,
+    magnet_select_only_file_indices: Vec<usize>,
+    magnet_direct_peers: Vec<swarmotter_core::magnet::MagnetDirectPeer>,
     priorities: Vec<FilePriority>,
     wanted: Vec<bool>,
 }
@@ -471,16 +510,8 @@ struct EngineStartSnapshot {
 impl EngineStartSnapshot {
     fn from_torrent(torrent: &Torrent, config: &Config) -> Self {
         let policy = DaemonRuntime::effective_policy_with_config(config, torrent);
-        let complete_dir = policy.download_dir.value.unwrap_or_else(|| {
-            std::env::temp_dir()
-                .join("swarmotter-downloads")
-                .display()
-                .to_string()
-        });
-        let active_dir = policy
-            .incomplete_dir
-            .value
-            .unwrap_or_else(|| complete_dir.clone());
+        let (complete_dir, active_dir) =
+            DaemonRuntime::policy_storage_paths_with_config(config, torrent);
         Self {
             meta: torrent.meta.clone(),
             complete_dir,
@@ -489,23 +520,75 @@ impl EngineStartSnapshot {
             upload_limit: policy.upload_limit.value,
             encryption_mode: policy.encryption_mode.value,
             needs_metadata: torrent.needs_metadata,
+            metadata_only: torrent.needs_metadata && torrent.policy.preview_until_started,
+            intake_selection: torrent
+                .needs_metadata
+                .then(|| torrent.policy.intake_snapshot.clone())
+                .flatten(),
+            partial_file_suffix: torrent
+                .policy
+                .intake_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.partial_file_suffix.clone()),
+            tracker_host_rules: policy.tracker.host_rules.value,
             magnet_info_hash: torrent.magnet_info_hash,
+            magnet_identity: torrent.magnet_identity.clone(),
             magnet_name: torrent.magnet_name.clone(),
             magnet_trackers: torrent.magnet_trackers.clone(),
+            magnet_select_only_file_indices: torrent.magnet_select_only_file_indices.clone(),
+            magnet_direct_peers: torrent.magnet_direct_peers.clone(),
             priorities: torrent.priorities.clone(),
             wanted: torrent.wanted.clone(),
         }
     }
 
-    fn magnet_params(&self) -> Option<crate::engine::MagnetParams> {
-        self.needs_metadata.then(|| crate::engine::MagnetParams {
-            info_hash: self.magnet_info_hash.unwrap_or(self.meta.info_hash),
+    fn magnet_params(&self) -> Result<Option<crate::engine::MagnetParams>> {
+        if !self.needs_metadata {
+            return Ok(None);
+        }
+
+        // Legacy v1 records may predate `magnet_identity`, but they must
+        // still carry a real v1 magnet hash. Never synthesize a metadata
+        // session from the placeholder's synthetic hash (or its zero v2
+        // compatibility field): that could make a corrupted restore issue
+        // tracker/DHT/peer requests for an unrelated swarm.
+        let identity = match self.magnet_identity.clone() {
+            Some(identity) if identity.primary_key().is_some() => identity,
+            Some(_) | None => {
+                let info_hash = self
+                    .magnet_info_hash
+                    .filter(|hash| *hash != InfoHash::ZERO)
+                    .ok_or_else(|| {
+                        CoreError::MalformedTorrent(
+                            "unresolved magnet is missing an explicit nonzero identity".into(),
+                        )
+                    })?;
+                swarmotter_core::hash::TorrentIdentity::v1(info_hash)
+            }
+        };
+        let wire_info_hash = identity
+            .primary_key()
+            .map(TorrentKey::peer_info_hash)
+            .ok_or_else(|| {
+                CoreError::MalformedTorrent(
+                    "unresolved magnet does not provide a usable peer-wire identity".into(),
+                )
+            })?;
+
+        Ok(Some(crate::engine::MagnetParams {
+            // Pure-v2 magnets do not have a v1 compatibility value. Keep the
+            // legacy field visibly zero rather than leaking the placeholder's
+            // synthetic hash into a future caller.
+            info_hash: self.magnet_info_hash.unwrap_or(InfoHash::ZERO),
+            wire_info_hash,
+            identity,
             name: self
                 .magnet_name
                 .clone()
                 .unwrap_or_else(|| self.meta.name.clone()),
             trackers: self.magnet_trackers.clone(),
-        })
+            select_only_file_indices: self.magnet_select_only_file_indices.clone(),
+        }))
     }
 }
 
@@ -624,8 +707,8 @@ fn storage_root_admission_for_torrent(
     storage_root_admission_for_path(cfg, Path::new(&active_dir))
 }
 
-fn torrent_event(kind: &'static str, hash: InfoHash, state: TorrentState) -> Event {
-    let info_hash = hash.to_hex();
+fn torrent_event(kind: &'static str, key: TorrentKey, state: TorrentState) -> Event {
+    let info_hash = key.to_locator();
     Event::new(
         kind,
         json!({
@@ -636,8 +719,8 @@ fn torrent_event(kind: &'static str, hash: InfoHash, state: TorrentState) -> Eve
     .with_info_hash(info_hash)
 }
 
-fn torrent_removed_event(hash: InfoHash, delete_data: bool) -> Event {
-    let info_hash = hash.to_hex();
+fn torrent_removed_event(key: TorrentKey, delete_data: bool) -> Event {
+    let info_hash = key.to_locator();
     Event::new(
         "torrent_removed",
         json!({
@@ -648,8 +731,8 @@ fn torrent_removed_event(hash: InfoHash, delete_data: bool) -> Event {
     .with_info_hash(info_hash)
 }
 
-fn torrent_metadata_event(hash: InfoHash) -> Event {
-    let info_hash = hash.to_hex();
+fn torrent_metadata_event(key: TorrentKey) -> Event {
+    let info_hash = key.to_locator();
     Event::new(
         "torrent_metadata_received",
         json!({

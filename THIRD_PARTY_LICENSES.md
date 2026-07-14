@@ -39,6 +39,9 @@ foundational dependency stack rationale.
 | hyper-util | 0.1 | MIT | Tokio I/O adapter for Hyper over an already-connected contained TCP/TLS stream; no connector is enabled or used |
 | http-body-util | 0.1 | MIT | Empty GET request bodies and framed decoded-body streaming for the bounded contained HTTP client |
 | sha1 | 0.10 | BSD-3-Clause | Info-hash and piece-hash computation (pure Rust) |
+| sha2 | 0.10 | MIT/Apache-2.0 | SHA-256 computation for BEP 52 v2 and hybrid torrent identity and piece-layer validation (pure Rust) |
+| rusqlite | 0.37 | MIT | Maintained Rust bindings for the local SQLite durable-state store; it creates no network traffic |
+| SQLite (bundled by `libsqlite3-sys`) | 3.x | Public Domain | Embedded local durable-state engine, bundled so supported deployments do not depend on a host SQLite package |
 | hex | 0.4 | MIT/Apache-2.0 | Hex encoding/decoding |
 | url | 2 | MIT/Apache-2.0 | Magnet link and tracker URL parsing |
 | once_cell | 1 | MIT/Apache-2.0 | Lazy statics |

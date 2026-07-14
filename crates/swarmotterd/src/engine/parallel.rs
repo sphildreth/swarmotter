@@ -1057,6 +1057,10 @@ pub(super) async fn parallel_peer_session(
                         | Message::NotInterested
                         | Message::Request { .. }
                         | Message::Cancel { .. }
+                        | Message::Reject { .. }
+                        | Message::HashRequest { .. }
+                        | Message::Hashes { .. }
+                        | Message::HashReject { .. }
                         | Message::Unknown { .. } => {}
                     }
                 }
@@ -1154,6 +1158,10 @@ pub(super) async fn parallel_peer_session(
             | Message::Request { .. }
             | Message::Piece { .. }
             | Message::Cancel { .. }
+            | Message::Reject { .. }
+            | Message::HashRequest { .. }
+            | Message::Hashes { .. }
+            | Message::HashReject { .. }
             | Message::Unknown { .. } => {}
         }
     }

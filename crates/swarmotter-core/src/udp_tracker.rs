@@ -302,7 +302,7 @@ fn random_txn_id() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::InfoHash;
+    use crate::hash::PeerInfoHash;
     use async_trait::async_trait;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -343,7 +343,7 @@ mod tests {
     fn req() -> AnnounceRequest {
         AnnounceRequest {
             tracker_url: "udp://127.0.0.1:0/announce".into(),
-            info_hash: InfoHash::from_bytes([0x12u8; 20]),
+            info_hash: PeerInfoHash::from_bytes([0x12u8; 20]),
             peer_id: *b"-SW0010-abcdefghij12",
             port: 6881,
             uploaded: 0,

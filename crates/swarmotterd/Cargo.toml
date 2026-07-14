@@ -33,6 +33,7 @@ url = { workspace = true }
 rustls = { workspace = true }
 libc = { workspace = true }
 socket2 = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 swarmotter-core = { path = "../swarmotter-core", features = ["test-binder"] }

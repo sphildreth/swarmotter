@@ -5,7 +5,7 @@ use super::*;
 impl DaemonRuntime {
     pub(super) async fn start_seeder(
         &self,
-        hash: InfoHash,
+        hash: TorrentKey,
         meta: swarmotter_core::meta::TorrentMeta,
         active_dir: String,
         complete_dir: String,
@@ -18,7 +18,7 @@ impl DaemonRuntime {
 
     pub(super) async fn start_seeder_while_transition_locked(
         &self,
-        hash: InfoHash,
+        hash: TorrentKey,
         meta: swarmotter_core::meta::TorrentMeta,
         active_dir: String,
         complete_dir: String,
@@ -95,8 +95,9 @@ impl DaemonRuntime {
             self.peer_session_budget(hash).await,
             shutdown_rx,
         )
+        .with_key(hash)
         .with_encryption_mode(encryption_mode);
-        self.seeder_registry.register(registration).await;
+        self.seeder_registry.register(registration).await?;
         if let Err(error) = self.ensure_seeder_listener().await {
             if let Some(shutdown) = self.seeder_shutdowns.lock().await.remove(&hash) {
                 let _ = shutdown.send(true);
@@ -210,7 +211,7 @@ impl DaemonRuntime {
     /// and pre-existing blocked torrents receive no recovery intent.
     pub(super) async fn live_containment_recovery_intents(
         &self,
-    ) -> HashMap<InfoHash, ContainmentRecoveryIntent> {
+    ) -> HashMap<TorrentKey, ContainmentRecoveryIntent> {
         let running_engines = self
             .engine_handles
             .read()
@@ -224,7 +225,7 @@ impl DaemonRuntime {
         let _lifecycle = self.seeder_lifecycle_lock.lock().await;
         let running_seeders = self
             .seeder_registry
-            .info_hashes()
+            .keys()
             .await
             .into_iter()
             .collect::<HashSet<_>>();
@@ -284,10 +285,10 @@ impl DaemonRuntime {
     /// caller reconciles already-reported progress.
     pub(super) async fn abort_data_plane_tasks_for_containment(
         &self,
-        recovery_intents: &HashMap<InfoHash, ContainmentRecoveryIntent>,
-        preserved_seeding_statuses: &HashMap<InfoHash, SeedingStatus>,
+        recovery_intents: &HashMap<TorrentKey, ContainmentRecoveryIntent>,
+        preserved_seeding_statuses: &HashMap<TorrentKey, SeedingStatus>,
         detail: &str,
-    ) -> Vec<InfoHash> {
+    ) -> Vec<TorrentKey> {
         self.engine_cmds.lock().await.clear();
         let engine_handles = {
             let mut handles = self.engine_handles.write().await;
@@ -311,7 +312,7 @@ impl DaemonRuntime {
             let _lifecycle = self.seeder_lifecycle_lock.lock().await;
             let live_seeders = self
                 .seeder_registry
-                .info_hashes()
+                .keys()
                 .await
                 .into_iter()
                 .collect::<HashSet<_>>();
@@ -527,7 +528,7 @@ impl DaemonRuntime {
         self.publish_event(stats_updated_event());
     }
 
-    pub(super) async fn start_recovered_containment_seeder(&self, hash: InfoHash) -> Result<()> {
+    pub(super) async fn start_recovered_containment_seeder(&self, hash: TorrentKey) -> Result<()> {
         let Some(start) = self.prepare_recovered_seeder_start(hash).await? else {
             return Ok(());
         };
@@ -543,7 +544,7 @@ impl DaemonRuntime {
 
     pub(super) async fn start_recovered_seeder_while_transition_locked(
         &self,
-        hash: InfoHash,
+        hash: TorrentKey,
     ) -> Result<()> {
         let Some(start) = self.prepare_recovered_seeder_start(hash).await? else {
             return Ok(());
@@ -560,7 +561,7 @@ impl DaemonRuntime {
 
     pub(super) async fn prepare_recovered_seeder_start(
         &self,
-        hash: InfoHash,
+        hash: TorrentKey,
     ) -> Result<Option<RecoveredSeederStart>> {
         let mut torrent = self
             .registry
@@ -586,7 +587,10 @@ impl DaemonRuntime {
         let complete_dir = self.resolve_download_dir(&torrent).await;
         let active_dir = self.resolve_incomplete_dir_for(&torrent).await;
         let state = Arc::new(Mutex::new(EngineState {
-            piece_count: torrent.meta.piece_count(),
+            piece_count: torrent
+                .meta
+                .data_piece_count()
+                .unwrap_or_else(|_| torrent.meta.piece_count()),
             total_length: torrent.meta.total_length,
             downloaded: torrent.downloaded,
             uploaded: torrent.uploaded,
@@ -609,7 +613,7 @@ impl DaemonRuntime {
     /// so the sidecar cannot outlive the seeder lifecycle.
     pub(super) async fn spawn_seeder_announce(
         &self,
-        hash: InfoHash,
+        hash: TorrentKey,
         meta: swarmotter_core::meta::TorrentMeta,
         peer_id: [u8; 20],
         listen_port: u16,
@@ -690,7 +694,7 @@ impl DaemonRuntime {
         }))
     }
 
-    pub(super) async fn stop_seeder(&self, hash: &InfoHash) {
+    pub(super) async fn stop_seeder(&self, hash: &TorrentKey) {
         let _lifecycle = self.seeder_lifecycle_lock.lock().await;
         if let Some(tx) = self.seeder_shutdowns.lock().await.remove(hash) {
             let _ = tx.send(true);
@@ -722,7 +726,7 @@ impl DaemonRuntime {
     /// unreachable tracker cannot stall the announce loop.
     pub(super) async fn seeder_announce_once(
         tracker_tiers: &[Vec<String>],
-        hash: InfoHash,
+        hash: TorrentKey,
         peer_id: [u8; 20],
         port: u16,
         binder: Arc<dyn swarmotter_core::net::NetworkBinder>,
@@ -736,7 +740,7 @@ impl DaemonRuntime {
             for url in tier {
                 let req = AnnounceRequest {
                     tracker_url: url.clone(),
-                    info_hash: hash,
+                    info_hash: hash.peer_info_hash(),
                     peer_id,
                     port,
                     uploaded: 0,
@@ -874,7 +878,8 @@ impl DaemonRuntime {
         }
         state.lock().await.tracker_ok = any_success;
         if event != AnnounceEvent::Stopped {
-            crate::engine::run_tracker_scrapes(state, binder, hash, scrape_urls).await;
+            crate::engine::run_tracker_scrapes(state, binder, hash.peer_info_hash(), scrape_urls)
+                .await;
         }
         if interval_seconds == 0 {
             300
@@ -883,7 +888,7 @@ impl DaemonRuntime {
         }
     }
 
-    pub(super) async fn force_stop_seeder(&self, hash: &InfoHash) {
+    pub(super) async fn force_stop_seeder(&self, hash: &TorrentKey) {
         let _lifecycle = self.seeder_lifecycle_lock.lock().await;
         if let Some(tx) = self.seeder_shutdowns.lock().await.remove(hash) {
             let _ = tx.send(true);
@@ -913,7 +918,7 @@ impl DaemonRuntime {
 
     pub(super) async fn deactivate_seeders_after_listener_failure(
         &self,
-        hashes: &[InfoHash],
+        hashes: &[TorrentKey],
         error: &CoreError,
     ) {
         let _lifecycle = self.seeder_lifecycle_lock.lock().await;
@@ -959,7 +964,7 @@ impl DaemonRuntime {
         let samples = self.rate_samples.read().await.clone();
         let mut running_seeders = {
             let _lifecycle = self.seeder_lifecycle_lock.lock().await;
-            self.seeder_registry.info_hashes().await
+            self.seeder_registry.keys().await
         };
         if !running_seeders.is_empty() {
             if let Err(error) = self.ensure_seeder_listener().await {
@@ -970,39 +975,38 @@ impl DaemonRuntime {
             }
         }
 
-        let completed: Vec<Torrent> = {
+        let completed: Vec<(TorrentKey, Torrent)> = {
             let _lifecycle = self.seeder_lifecycle_lock.lock().await;
             let reg = self.registry.lock().await;
             reg.torrents
-                .values()
-                .filter(|torrent| {
+                .iter()
+                .filter(|(_, torrent)| {
                     torrent.progress.is_complete()
                         && matches!(
                             torrent.state,
                             TorrentState::Completed | TorrentState::Seeding
                         )
                 })
-                .cloned()
+                .map(|(key, torrent)| (*key, torrent.clone()))
                 .collect()
         };
 
         let mut allowed = Vec::new();
         let mut desired_status = HashMap::new();
-        for torrent in &completed {
-            let hash = torrent.info_hash();
+        for (hash, torrent) in &completed {
             let idle_seconds = samples
-                .get(&hash)
+                .get(hash)
                 .and_then(|sample| sample.last_upload_at)
                 .map(|at| Instant::now().saturating_duration_since(at).as_secs())
                 .unwrap_or_else(|| {
                     now_secs.saturating_sub(torrent.date_completed.unwrap_or(torrent.date_added))
                 });
             let status = automatic_seeding_status(torrent, &cfg, idle_seconds);
-            desired_status.insert(hash, status);
+            desired_status.insert(*hash, status);
             if status == SeedingStatus::Queued
                 && (seeding_limit == 0 || allowed.len() < seeding_limit)
             {
-                allowed.push(hash);
+                allowed.push(*hash);
             }
         }
 
@@ -1025,14 +1029,13 @@ impl DaemonRuntime {
 
         {
             let _lifecycle = self.seeder_lifecycle_lock.lock().await;
-            let live = self.seeder_registry.info_hashes().await;
+            let live = self.seeder_registry.keys().await;
             let mut reg = self.registry.lock().await;
-            for torrent in reg.torrents.values_mut() {
-                let hash = torrent.info_hash();
-                if live.contains(&hash) {
+            for (hash, torrent) in &mut reg.torrents {
+                if live.contains(hash) {
                     torrent.state = TorrentState::Seeding;
                     torrent.seeding_status = SeedingStatus::Active;
-                } else if let Some(status) = desired_status.get(&hash).copied() {
+                } else if let Some(status) = desired_status.get(hash).copied() {
                     torrent.state = TorrentState::Completed;
                     torrent.seeding_status = status;
                 } else if torrent.state != TorrentState::NetworkBlocked
@@ -1055,8 +1058,8 @@ impl DaemonRuntime {
             }
             let Some(torrent_for_dir) = completed
                 .iter()
-                .find(|torrent| torrent.info_hash() == hash)
-                .cloned()
+                .find(|(key, _)| *key == hash)
+                .map(|(_, torrent)| torrent.clone())
             else {
                 continue;
             };
@@ -1068,7 +1071,10 @@ impl DaemonRuntime {
             } else {
                 let pieces_have = torrent_for_dir.progress.bitfield().clone();
                 let state = Arc::new(Mutex::new(EngineState {
-                    piece_count: torrent_for_dir.meta.piece_count(),
+                    piece_count: torrent_for_dir
+                        .meta
+                        .data_piece_count()
+                        .unwrap_or_else(|_| torrent_for_dir.meta.piece_count()),
                     total_length: torrent_for_dir.meta.total_length,
                     downloaded: torrent_for_dir.downloaded,
                     uploaded: torrent_for_dir.uploaded,
@@ -1126,12 +1132,12 @@ impl DaemonRuntime {
     pub(super) async fn sweep_selfish_completed_torrents(
         &self,
         reason: &'static str,
-    ) -> Result<Vec<InfoHash>> {
+    ) -> Result<Vec<TorrentKey>> {
         if !self.config.read().await.torrent.selfish {
             return Ok(Vec::new());
         }
 
-        let hashes: Vec<InfoHash> = {
+        let hashes: Vec<TorrentKey> = {
             let reg = self.registry.lock().await;
             reg.torrents
                 .iter()
@@ -1171,7 +1177,7 @@ impl DaemonRuntime {
     /// `delete_data = false`, but safe to call from within the engine task
     /// itself because it does NOT await the engine task's own join handle
     /// (that would deadlock); the already-returning task is simply detached.
-    pub(super) async fn selfish_remove_completed(&self, hash: InfoHash) {
+    pub(super) async fn selfish_remove_completed(&self, hash: TorrentKey) {
         let name = self
             .registry
             .lock()

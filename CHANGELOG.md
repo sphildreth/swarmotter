@@ -19,6 +19,43 @@ date or duration estimates.
 
 ### Added
 
+- **BEP 52 v2/hybrid interoperability:** SwarmOtter now accepts and operates
+  v1, pure-v2, and hybrid magnets and `.torrent` files with explicit SHA-1/
+  SHA-256 identities from exact bencoded `info` bytes. The separate pure-v2
+  engine validates file trees and piece layers, verifies SHA-256 Merkle roots,
+  uses contained v2 peer transfer plus tracker/DHT/metadata discovery, and
+  persists full-key fast resume. Registry, queue, SQLite, native API, Web UI,
+  qBittorrent, and Transmission paths preserve canonical 40/64-character
+  locators; hybrid v2 locators resolve as aliases of their v1-primary record.
+  No durable or API path truncates a v2 identity to a peer-wire hash. See
+  [ADR-0065](design/adr/0065-bep-52-v2-hybrid-torrent-identity.md).
+
+- **Policy-driven metadata-first intake:** add requests and the Web UI can
+  create `.torrent` or magnet previews; a magnet may fetch only contained BEP
+  9 metadata and remains durably paused before payload transfer. Named profiles
+  now support deterministic tracker-host enablement/priority, structured
+  suffix/path-glob/path-segment/size exclusions, content/incomplete
+  organization, forced top-level folders, and active-only partial suffixes.
+  The resolved intake selection is durable and explainable, with a read-only
+  storage-path preview; BEP 53 `so=` can only reduce it, and literal `x.pe`
+  hints still pass through peer admission and the contained binder. Completion
+  continues to use bounded seed-forever, ratio, or idle policy without deletion
+  hooks. The native metainfo endpoint exports only retained byte-exact original
+  `.torrent` inputs. See
+  [ADR-0066](design/adr/0066-policy-driven-metadata-first-intake.md).
+
+- **SQLite durable library state:** the daemon now uses a
+  versioned, local SQLite state store with WAL/full-sync durability, indexed
+  registry/queue/health/current-metric/history/audit records, raw metainfo BLOB
+  retention, deterministic history caps, and crash-safe rollback snapshots.
+  Valid legacy JSON state migrates in place on its first successful save;
+  full v1/v2 keys and exact original `.torrent` documents remain distinct from
+  canonical magnet `info` bytes. The offline projection rebuild validates a
+  supported database and rebuilds only derived indexes, refusing missing,
+  legacy, corrupt, or unsupported state rather than attempting a broad repair.
+  See
+  [ADR-0067](design/adr/0067-sqlite-durable-library-state.md).
+
 - **Contained SOCKS5 TCP proxy:** optional SOCKS5 `CONNECT` support now routes
   outbound peer TCP, HTTP(S) tracker/scrape, and webseed requests through the
   existing fail-closed network path. It supports no-authentication and RFC 1929

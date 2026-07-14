@@ -33,11 +33,13 @@ pub mod torrent;
 pub mod tracker;
 pub mod udp_tracker;
 pub mod utp;
+pub mod v2;
 pub mod watch;
 
 pub use autopilot::{AutopilotAnalyzer, AutopilotConfig, AutopilotMode};
 pub use error::{CoreError, Result};
-pub use hash::InfoHash;
+pub use hash::{InfoHash, TorrentKey};
 pub use magnet::Magnet;
 pub use meta::TorrentMeta;
 pub use models::*;
+pub use v2::{v2_file_root, v2_hash_pair, v2_leaf_hash, v2_piece_root, V2Piece, V2PieceLayout};

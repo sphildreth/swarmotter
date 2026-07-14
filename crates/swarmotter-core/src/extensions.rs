@@ -331,6 +331,25 @@ pub fn encode_metadata_request(piece: u32) -> Vec<u8> {
     out
 }
 
+/// Encode a `ut_metadata` rejection for a requested metadata piece.
+///
+/// A serving peer must answer an out-of-range or unavailable request with a
+/// BEP 9 reject message rather than silently leaving the requester waiting.
+pub fn encode_metadata_reject(piece: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(b'd');
+    write_bytes(&mut out, b"msg_type");
+    out.push(b'i');
+    out.extend_from_slice(b"2");
+    out.push(b'e');
+    write_bytes(&mut out, b"piece");
+    out.push(b'i');
+    out.extend_from_slice(piece.to_string().as_bytes());
+    out.push(b'e');
+    out.push(b'e');
+    out
+}
+
 /// Encode a `ut_metadata` data message (metadata piece bytes + total size).
 pub fn encode_metadata_data(piece: u32, total_size: u64, data: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -560,6 +579,16 @@ mod tests {
         let msg = parse_metadata_message(&enc).unwrap();
         assert_eq!(msg.msg_type, MetadataMsgType::Request);
         assert_eq!(msg.piece, 2);
+        assert!(msg.data.is_empty());
+    }
+
+    #[test]
+    fn metadata_reject_roundtrip() {
+        let enc = encode_metadata_reject(4);
+        let msg = parse_metadata_message(&enc).unwrap();
+        assert_eq!(msg.msg_type, MetadataMsgType::Reject);
+        assert_eq!(msg.piece, 4);
+        assert!(msg.total_size.is_none());
         assert!(msg.data.is_empty());
     }
 

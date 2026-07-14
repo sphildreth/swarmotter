@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::peer_permits::{PeerPermitPool, PeerSessionBudget};
+use crate::seeder::{SeedRegistration, SeedRegistry, SeederHub};
 use async_trait::async_trait;
-use swarmotter_core::meta::{build_multi_file_torrent, build_single_file_torrent};
+use swarmotter_core::hash::{InfoHash, PeerInfoHash, TorrentIdentity, TorrentKey, V2InfoHash};
+use swarmotter_core::meta::{
+    build_multi_file_torrent, build_single_file_torrent, parse_info_dict_with_piece_layers,
+    v2_piece_layer_root, MetaFile, TorrentMeta, V2PieceLayer, V2TorrentMeta, V2_BLOCK_LENGTH,
+};
 use swarmotter_core::net::{ContainedUdpSocket, PeerListener};
+use swarmotter_core::peer::V2Handshake;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[test]
@@ -286,7 +293,13 @@ async fn scrape_failure_retains_last_success_counts_and_is_accounted() {
     let url = format!("http://{address}/announce");
     let state = Arc::new(Mutex::new(EngineState::default()));
     let binder: Arc<dyn NetworkBinder> = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
-    run_tracker_scrapes(state.clone(), binder.clone(), hash, vec![url.clone()]).await;
+    run_tracker_scrapes(
+        state.clone(),
+        binder.clone(),
+        PeerInfoHash::from_v1(hash),
+        vec![url.clone()],
+    )
+    .await;
     {
         let engine = state.lock().await;
         let snapshot = engine.tracker_scrapes.get(&url).unwrap();
@@ -297,7 +310,13 @@ async fn scrape_failure_retains_last_success_counts_and_is_accounted() {
         assert_eq!(engine.tracker_failures_recent, 0);
     }
 
-    run_tracker_scrapes(state.clone(), binder, hash, vec![url.clone()]).await;
+    run_tracker_scrapes(
+        state.clone(),
+        binder,
+        PeerInfoHash::from_v1(hash),
+        vec![url.clone()],
+    )
+    .await;
     server.await.unwrap();
     let engine = state.lock().await;
     let snapshot = engine.tracker_scrapes.get(&url).unwrap();
@@ -442,7 +461,11 @@ async fn magnet_tracker_activity_scrapes_the_real_magnet_info_hash() {
         },
     );
     engine
-        .record_tracker_activity(magnet_hash, &outcome, vec![url.clone()])
+        .record_tracker_activity(
+            PeerInfoHash::from_v1(magnet_hash),
+            &outcome,
+            vec![url.clone()],
+        )
         .await;
     server.await.unwrap();
 
@@ -510,6 +533,97 @@ impl NetworkBinder for CountingConnectBinder {
     }
 }
 
+struct RecordingConnectBinder {
+    connected: std::sync::Mutex<Vec<SocketAddr>>,
+}
+
+#[async_trait]
+impl NetworkBinder for RecordingConnectBinder {
+    async fn connect_peer(&self, addr: SocketAddr) -> Result<tokio::net::TcpStream> {
+        self.connected.lock().unwrap().push(addr);
+        Err(CoreError::Internal(
+            "test direct peer intentionally has no peer-wire service".into(),
+        ))
+    }
+
+    async fn resolve_host(&self, _host: &str, _port: u16) -> Result<SocketAddr> {
+        panic!("literal x.pe peer must not invoke DNS resolution")
+    }
+
+    async fn udp_socket(&self) -> Result<Box<dyn ContainedUdpSocket>> {
+        panic!("test disables uTP for a TCP-only x.pe assertion")
+    }
+
+    async fn bind_peer_listener(&self, _port: u16) -> Result<Box<dyn PeerListener>> {
+        Err(CoreError::Internal(
+            "unused in metadata discovery test".into(),
+        ))
+    }
+
+    fn traffic_allowed(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn literal_seed_peer_uses_contained_binder_for_magnet_metadata_discovery() {
+    let bytes = build_single_file_torrent(
+        "direct-peer-placeholder.bin",
+        b"generated direct peer metadata fixture",
+        8,
+        None,
+        false,
+    );
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let info_hash = InfoHash::from_bytes([0xD5; 20]);
+    let direct_peer: SocketAddr = "192.0.2.25:51413".parse().unwrap();
+    let binder = Arc::new(RecordingConnectBinder {
+        connected: std::sync::Mutex::new(Vec::new()),
+    });
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let magnet = MagnetParams {
+        identity: swarmotter_core::hash::TorrentIdentity::v1(info_hash),
+        info_hash,
+        wire_info_hash: PeerInfoHash::from_v1(info_hash),
+        name: "direct-peer-placeholder.bin".into(),
+        trackers: Vec::new(),
+        select_only_file_indices: Vec::new(),
+    };
+    let engine = TorrentEngine::with_limiter(
+        meta,
+        PathBuf::from("/tmp"),
+        [0; 20],
+        binder.clone(),
+        state.clone(),
+        rx,
+        vec![PeerAddr::from_socket_addr(direct_peer)],
+        6881,
+        RateLimiter::unlimited(),
+        Some(magnet.clone()),
+    )
+    .with_transport(false, true);
+
+    // The fetch retries after a failed peer, so cancel during its first retry
+    // pause once the contained connector has observed the literal endpoint.
+    let result = tokio::time::timeout(
+        Duration::from_millis(250),
+        engine.fetch_magnet_metadata(&magnet),
+    )
+    .await;
+    assert!(result.is_err(), "test should cancel during retry backoff");
+    assert_eq!(
+        *binder.connected.lock().unwrap(),
+        vec![direct_peer],
+        "x.pe must enter metadata discovery through NetworkBinder::connect_peer"
+    );
+    assert_eq!(
+        state.lock().await.peers,
+        vec![PeerAddr::from_socket_addr(direct_peer)],
+        "literal x.pe candidate must be retained in the normal peer set"
+    );
+}
+
 #[tokio::test]
 async fn blocked_peer_never_reaches_contained_binder() {
     let binder = Arc::new(CountingConnectBinder {
@@ -562,7 +676,7 @@ async fn scrape_task_panic_is_retained_for_the_exact_tracker() {
     run_tracker_scrapes(
         state.clone(),
         Arc::new(PanickingScrapeBinder),
-        hash,
+        PeerInfoHash::from_v1(hash),
         vec![url.clone()],
     )
     .await;
@@ -912,7 +1026,7 @@ async fn stale_fast_resume_rechecks_payload_ahead_of_resume() {
         })
         .collect();
     let resume = swarmotter_core::storage::io::build_resume(
-        meta.info_hash,
+        TorrentKey::v1(meta.info_hash),
         meta.name.clone(),
         stale,
         meta.piece_count(),
@@ -971,7 +1085,7 @@ async fn stale_fast_resume_rechecks_resume_ahead_of_payload() {
         })
         .collect();
     let resume = swarmotter_core::storage::io::build_resume(
-        meta.info_hash,
+        TorrentKey::v1(meta.info_hash),
         meta.name.clone(),
         stale,
         meta.piece_count(),
@@ -1066,7 +1180,7 @@ async fn same_size_external_payload_change_invalidates_fast_resume() {
     let mut have = PieceBitfield::new(1);
     have.set(0);
     let mut resume = swarmotter_core::storage::io::build_resume(
-        meta.info_hash,
+        TorrentKey::v1(meta.info_hash),
         meta.name.clone(),
         have,
         1,
@@ -1277,7 +1391,7 @@ async fn completed_single_root_removes_resume_metadata() {
         })
         .collect();
     let resume = swarmotter_core::storage::io::build_resume(
-        meta.info_hash,
+        TorrentKey::v1(meta.info_hash),
         meta.name.clone(),
         have,
         meta.piece_count(),
@@ -1381,4 +1495,398 @@ async fn engine_start_sizes_file_when_sparse_disabled() {
     assert!(path.exists());
     assert_eq!(std::fs::metadata(path).unwrap().len(), payload.len() as u64);
     std::fs::remove_dir_all(&active_dir).ok();
+}
+
+fn pure_v2_local_swarm_meta() -> (TorrentMeta, Vec<Vec<u8>>) {
+    let piece_length = V2_BLOCK_LENGTH;
+    let first = (0..(piece_length as usize + 19))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let second = (0..(piece_length as usize + 7))
+        .map(|index| (255 - (index % 251)) as u8)
+        .collect::<Vec<_>>();
+    let payloads = vec![first, second];
+
+    let mut files = Vec::new();
+    let mut layers = Vec::new();
+    for (index, payload) in payloads.iter().enumerate() {
+        let hashes = payload
+            .chunks(piece_length as usize)
+            .map(|piece| swarmotter_core::v2_piece_root(piece, piece_length).unwrap())
+            .collect::<Vec<_>>();
+        let root = swarmotter_core::v2_hash_pair(hashes[0], hashes[1]);
+        files.push(MetaFile {
+            path: vec![format!("payload-{index}.bin")],
+            length: payload.len() as u64,
+            pieces_root: Some(root),
+        });
+        layers.push(V2PieceLayer {
+            pieces_root: root,
+            hashes,
+        });
+    }
+    let total_length = payloads.iter().map(|payload| payload.len() as u64).sum();
+    let meta = TorrentMeta {
+        info_hash: InfoHash::ZERO,
+        identity: TorrentIdentity::v2(V2InfoHash::from_bytes([0x94; 32])),
+        name: "contained-v2-local-swarm".into(),
+        piece_length,
+        pieces: Vec::new(),
+        files: files.clone(),
+        total_length,
+        private: false,
+        announce: None,
+        announce_list: Vec::new(),
+        webseeds: Vec::new(),
+        comment: None,
+        created_by: None,
+        creation_date: None,
+        is_multi_file: true,
+        v2: Some(V2TorrentMeta {
+            meta_version: 2,
+            files,
+            piece_layers: layers,
+            piece_layers_verified: true,
+        }),
+        raw_info: None,
+    };
+    meta.validate().unwrap();
+    (meta, payloads)
+}
+
+async fn spawn_v2_seed(meta: TorrentMeta, payloads: Vec<Vec<u8>>) -> PeerAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let _ = serve_v2_seed(stream, meta, payloads).await;
+    });
+    PeerAddr::from_socket_addr(addr)
+}
+
+async fn serve_v2_seed(
+    stream: tokio::net::TcpStream,
+    meta: TorrentMeta,
+    payloads: Vec<Vec<u8>>,
+) -> swarmotter_core::Result<()> {
+    let layout = meta.v2_piece_layout()?;
+    let wire_hash = meta
+        .identity
+        .v2_info_hash()
+        .expect("fixture has a v2 identity")
+        .peer_info_hash();
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = PeerReader::new(read_half);
+    let theirs = reader.read_v2_handshake().await?;
+    if theirs.info_hash != wire_hash {
+        return Err(CoreError::Parse(
+            "v2 local seed received wrong wire identity".into(),
+        ));
+    }
+    let ours = V2Handshake {
+        info_hash: wire_hash,
+        peer_id: *b"-SWV2SD-abcdefghij12",
+        reserved: peer::with_v2_support(peer::RESERVED),
+    };
+    peer::write_v2_handshake(&mut write_half, &ours).await?;
+    let mut bitfield = Bitfield::new(layout.piece_count());
+    for index in 0..layout.piece_count() {
+        bitfield.set(index);
+    }
+    peer::write_message(&mut write_half, &bitfield.encode_message()).await?;
+    write_half.flush().await.map_err(CoreError::from)?;
+
+    loop {
+        let Some(message) = reader.read_message().await? else {
+            return Ok(());
+        };
+        match message {
+            Message::Interested => {
+                peer::write_message(&mut write_half, &Message::Unchoke).await?;
+                write_half.flush().await.map_err(CoreError::from)?;
+            }
+            Message::Request {
+                piece,
+                offset,
+                length,
+            } => {
+                let response = (|| -> Option<Vec<u8>> {
+                    let logical = layout.piece(piece as usize)?;
+                    let start = logical.offset.checked_add(offset as u64)?;
+                    let end = start.checked_add(length as u64)?;
+                    if end > logical.offset.checked_add(logical.length)? {
+                        return None;
+                    }
+                    let start = usize::try_from(start).ok()?;
+                    let end = usize::try_from(end).ok()?;
+                    payloads
+                        .get(logical.file_index)?
+                        .get(start..end)
+                        .map(ToOwned::to_owned)
+                })();
+                if let Some(block) = response {
+                    peer::write_message(
+                        &mut write_half,
+                        &Message::Piece {
+                            piece,
+                            offset,
+                            block,
+                        },
+                    )
+                    .await?;
+                } else {
+                    peer::write_message(
+                        &mut write_half,
+                        &Message::Reject {
+                            piece,
+                            offset,
+                            length,
+                        },
+                    )
+                    .await?;
+                }
+                write_half.flush().await.map_err(CoreError::from)?;
+            }
+            Message::Keepalive
+            | Message::NotInterested
+            | Message::Have { .. }
+            | Message::Bitfield { .. }
+            | Message::Choke
+            | Message::Unchoke
+            | Message::Cancel { .. }
+            | Message::Reject { .. }
+            | Message::HashRequest { .. }
+            | Message::Hashes { .. }
+            | Message::HashReject { .. }
+            | Message::Extended { .. }
+            | Message::Unknown { .. }
+            | Message::Piece { .. } => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn pure_v2_engine_completes_a_contained_local_swarm() {
+    let (meta, payloads) = pure_v2_local_swarm_meta();
+    let seed = spawn_v2_seed(meta.clone(), payloads.clone()).await;
+    let output = unique_dir("pure-v2-local-swarm");
+    let binder: Arc<dyn NetworkBinder> = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_commands, receiver) = tokio::sync::mpsc::channel(1);
+    let engine = TorrentEngine::new(
+        meta.clone(),
+        output.clone(),
+        *b"-SWV2DL-abcdefghij12",
+        binder,
+        state,
+        receiver,
+        vec![seed],
+        0,
+    )
+    .with_transport(false, true)
+    .with_encryption_mode(PeerEncryptionMode::Disabled);
+
+    let final_state = tokio::time::timeout(Duration::from_secs(10), engine.run())
+        .await
+        .expect("pure-v2 local swarm must not stall")
+        .unwrap();
+    assert!(final_state.finished);
+    assert_eq!(final_state.piece_count, 4);
+    assert_eq!(final_state.bytes_completed, meta.total_length);
+    assert_eq!(final_state.pieces_have.count(4), 4);
+    for (index, payload) in payloads.iter().enumerate() {
+        assert_eq!(
+            std::fs::read(output.join(&meta.files[index].path[0])).unwrap(),
+            *payload
+        );
+    }
+    std::fs::remove_dir_all(output).ok();
+}
+
+/// Build executable pure-v2 metainfo whose BEP 9 `info` dictionary needs a
+/// top-level piece layer. Three logical pieces exercise the padded BEP 52
+/// hash response instead of treating raw v2 `info` bytes as runnable data.
+fn pure_v2_metadata_candidate_fixture() -> (TorrentMeta, TorrentIdentity) {
+    let piece_length = V2_BLOCK_LENGTH * 2;
+    let content = (0..(piece_length * 2 + 17))
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let hashes = content
+        .chunks(piece_length as usize)
+        .map(|piece| swarmotter_core::v2_piece_root(piece, piece_length).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(hashes.len(), 3);
+    let pieces_root = v2_piece_layer_root(&hashes, piece_length).unwrap();
+    let name = b"v2-metadata-preview.bin";
+
+    fn string(out: &mut Vec<u8>, value: &[u8]) {
+        out.extend_from_slice(value.len().to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(value);
+    }
+
+    fn integer(out: &mut Vec<u8>, value: u64) {
+        out.push(b'i');
+        out.extend_from_slice(value.to_string().as_bytes());
+        out.push(b'e');
+    }
+
+    let mut info = Vec::new();
+    info.push(b'd');
+    string(&mut info, b"file tree");
+    info.push(b'd');
+    string(&mut info, name);
+    info.push(b'd');
+    string(&mut info, b"");
+    info.push(b'd');
+    string(&mut info, b"length");
+    integer(&mut info, content.len() as u64);
+    string(&mut info, b"pieces root");
+    string(&mut info, pieces_root.as_bytes());
+    info.extend_from_slice(b"eee");
+    string(&mut info, b"meta version");
+    integer(&mut info, 2);
+    string(&mut info, b"name");
+    string(&mut info, name);
+    string(&mut info, b"piece length");
+    integer(&mut info, piece_length);
+    info.push(b'e');
+
+    let meta = parse_info_dict_with_piece_layers(
+        &info,
+        &[],
+        &[V2PieceLayer {
+            pieces_root,
+            hashes,
+        }],
+    )
+    .expect("generated pure-v2 candidate must parse with its verified layer");
+    let identity = meta.identity.clone();
+    assert!(meta.requires_v2_data_plane());
+    assert_eq!(meta.raw_info.as_deref(), Some(info.as_slice()));
+    (meta, identity)
+}
+
+/// A pure-v2 magnet preview must resolve a candidate through the contained
+/// peer path, verify BEP 52 layers, and stop before creating payload storage.
+#[tokio::test]
+async fn pure_v2_metadata_only_preview_resolves_verified_candidate_without_payload_work() {
+    let (seed_meta, identity) = pure_v2_metadata_candidate_fixture();
+    let seed_dir = unique_dir("pure-v2-preview-seed");
+    let seed_storage = Arc::new(StorageIo::new(seed_meta.clone(), seed_dir.clone()));
+    let piece_count = seed_meta.data_piece_count().unwrap();
+    let seed_state = Arc::new(Mutex::new(EngineState {
+        piece_count,
+        total_length: seed_meta.total_length,
+        pieces_have: PieceBitfield::new(piece_count),
+        ..EngineState::default()
+    }));
+
+    let registry = SeedRegistry::default();
+    let global_peer_permits = PeerPermitPool::unlimited();
+    let (torrent_shutdown_tx, torrent_shutdown_rx) = tokio::sync::watch::channel(false);
+    registry
+        .register(SeedRegistration::new(
+            seed_meta.clone(),
+            seed_storage,
+            None,
+            seed_state,
+            *b"-SWV2MD-abcdefghij12",
+            RateLimiter::unlimited(),
+            None,
+            PeerSessionBudget::new(global_peer_permits.clone(), PeerPermitPool::unlimited()),
+            torrent_shutdown_rx,
+        ))
+        .await
+        .expect("contained pure-v2 seed registration must succeed");
+    let (hub_shutdown_tx, hub_shutdown_rx) = tokio::sync::watch::channel(false);
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let hub = SeederHub::new(
+        registry,
+        Arc::new(swarmotter_core::net::binder::LoopbackBinder),
+        0,
+        PeerEncryptionMode::Disabled,
+        hub_shutdown_rx,
+        global_peer_permits,
+    )
+    .with_bound_addr(bound_tx);
+    let hub_task = tokio::spawn(hub.run());
+    let seed_addr = tokio::time::timeout(Duration::from_secs(5), bound_rx)
+        .await
+        .expect("contained pure-v2 seeding listener did not bind")
+        .expect("contained pure-v2 seeding listener dropped its address");
+
+    let placeholder_bytes = build_single_file_torrent(
+        "metadata-placeholder.bin",
+        b"generated preview placeholder",
+        16 * 1024,
+        None,
+        false,
+    );
+    let placeholder = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
+    let preview_dir = unique_dir("pure-v2-metadata-preview");
+    std::fs::remove_dir_all(&preview_dir).unwrap();
+    let preview_state = Arc::new(Mutex::new(EngineState::default()));
+    let (_commands, receiver) = tokio::sync::mpsc::channel(1);
+    let wire_info_hash = identity
+        .v2_info_hash()
+        .expect("fixture has full v2 identity")
+        .peer_info_hash();
+    let engine = TorrentEngine::with_limiter(
+        placeholder,
+        preview_dir.clone(),
+        *b"-SWV2PV-abcdefghij12",
+        Arc::new(swarmotter_core::net::binder::LoopbackBinder),
+        preview_state,
+        receiver,
+        vec![PeerAddr::from_socket_addr(seed_addr)],
+        0,
+        RateLimiter::unlimited(),
+        Some(MagnetParams {
+            identity: identity.clone(),
+            info_hash: InfoHash::ZERO,
+            wire_info_hash,
+            name: seed_meta.name.clone(),
+            trackers: Vec::new(),
+            select_only_file_indices: Vec::new(),
+        }),
+    )
+    .with_metadata_only()
+    .with_transport(false, true)
+    .with_encryption_mode(PeerEncryptionMode::Disabled);
+
+    let final_state = tokio::time::timeout(Duration::from_secs(20), engine.run())
+        .await
+        .expect("pure-v2 metadata-only preview did not finish")
+        .expect("pure-v2 metadata-only preview failed");
+    let resolved = final_state
+        .resolved_meta
+        .expect("preview must return resolved pure-v2 metainfo");
+    assert_eq!(resolved.identity, identity);
+    assert!(resolved.requires_v2_data_plane());
+    assert!(resolved
+        .v2
+        .as_ref()
+        .is_some_and(|v2| v2.piece_layers_verified));
+    assert_eq!(resolved.data_piece_count().unwrap(), 3);
+    assert!(!final_state.finished);
+    assert_eq!(final_state.piece_count, 3);
+    assert_eq!(final_state.pieces_have.count(3), 0);
+    assert!(final_state.tracker_announces.is_empty());
+    assert!(final_state.last_announce.is_none());
+    assert!(
+        !preview_dir.exists(),
+        "metadata-only pure-v2 preview must not create payload storage"
+    );
+
+    let _ = torrent_shutdown_tx.send(true);
+    let _ = hub_shutdown_tx.send(true);
+    tokio::time::timeout(Duration::from_secs(5), hub_task)
+        .await
+        .expect("contained pure-v2 seeding listener did not stop")
+        .expect("contained pure-v2 seeding listener task failed")
+        .expect("contained pure-v2 seeding listener returned an error");
+    std::fs::remove_dir_all(seed_dir).ok();
 }

@@ -135,6 +135,8 @@ try {
   const indexHtml = await readFile(join(assetsDirectory, "index.html"), "utf8");
   const { document, elements } = documentFixture(indexHtml);
   assert.ok(elements.has("torrent-table"), "startup fixture must use the production index markup");
+  assert.ok(elements.has("magnet-preview"), "magnet intake must expose metadata-preview control");
+  assert.ok(elements.has("file-preview"), "file intake must expose preview control");
 
   const storage = new Map();
   globalThis.window = globalThis;

@@ -17,12 +17,16 @@ impl DaemonRuntime {
         }
     }
 
-    pub(super) async fn scheduler_diagnostics(&self, desired: &[InfoHash]) -> SchedulerDiagnostics {
+    pub(super) async fn scheduler_diagnostics(
+        &self,
+        desired: &[TorrentKey],
+    ) -> SchedulerDiagnostics {
         let cfg = self.config.read().await.clone();
         let mut queue = self.queue.lock().await.clone();
         queue.limits = cfg.queue.clone();
         let retry_after = self.engine_retry_after.read().await.clone();
-        let running: HashSet<InfoHash> = self.engine_handles.read().await.keys().copied().collect();
+        let running: HashSet<TorrentKey> =
+            self.engine_handles.read().await.keys().copied().collect();
         let now = Instant::now();
         let reg = self.registry.lock().await;
 
@@ -53,7 +57,8 @@ impl DaemonRuntime {
                 policy.start_behavior.value,
                 swarmotter_core::config::StartBehavior::Start
             );
-            if !(profile_auto_start || bypass || already_active) {
+            let metadata_preview = torrent.policy.preview_until_started && torrent.needs_metadata;
+            if !(profile_auto_start || bypass || already_active || metadata_preview) {
                 continue;
             }
             if !matches!(
@@ -152,8 +157,8 @@ impl DaemonRuntime {
         }
     }
 
-    pub(super) async fn active_download_hashes(&self) -> Vec<InfoHash> {
-        let running: Vec<InfoHash> = self.engine_handles.read().await.keys().copied().collect();
+    pub(super) async fn active_download_hashes(&self) -> Vec<TorrentKey> {
+        let running: Vec<TorrentKey> = self.engine_handles.read().await.keys().copied().collect();
         let reg = self.registry.lock().await;
         running
             .into_iter()
@@ -168,14 +173,14 @@ impl DaemonRuntime {
             .collect()
     }
 
-    pub(super) async fn desired_download_hashes(&self) -> Vec<InfoHash> {
+    pub(super) async fn desired_download_hashes(&self) -> Vec<TorrentKey> {
         self.desired_download_hashes_excluding(None).await
     }
 
     pub(super) async fn desired_download_hashes_excluding(
         &self,
-        excluded: Option<InfoHash>,
-    ) -> Vec<InfoHash> {
+        excluded: Option<TorrentKey>,
+    ) -> Vec<TorrentKey> {
         let cfg = self.config.read().await.clone();
         let retry_after = self.engine_retry_after.read().await.clone();
         let mut storage_plan =
@@ -258,7 +263,8 @@ impl DaemonRuntime {
                 policy.start_behavior.value,
                 swarmotter_core::config::StartBehavior::Start
             );
-            let auto_startable = profile_auto_start || bypass || already_active;
+            let metadata_preview = t.policy.preview_until_started && t.needs_metadata;
+            let auto_startable = profile_auto_start || bypass || already_active || metadata_preview;
             let metadata_fetch = t.needs_metadata;
             if auto_startable
                 && matches!(
@@ -277,16 +283,18 @@ impl DaemonRuntime {
                         continue;
                     }
                 }
-                if let Some(admission) = storage_root_admission_for_torrent(&cfg, t) {
-                    // A configured root controls the complete engine lifetime,
-                    // including a magnet's metadata phase. This avoids a burst
-                    // of metadata resolutions silently exceeding a root's
-                    // later payload budget.
-                    if storage_plan
-                        .admit(*hash, &admission, t.meta.total_length)
-                        .is_err()
-                    {
-                        continue;
+                if !metadata_preview {
+                    if let Some(admission) = storage_root_admission_for_torrent(&cfg, t) {
+                        // A configured root controls the complete engine lifetime,
+                        // including a magnet's metadata phase. This avoids a burst
+                        // of metadata resolutions silently exceeding a root's
+                        // later payload budget.
+                        if storage_plan
+                            .admit(*hash, &admission, t.meta.total_length)
+                            .is_err()
+                        {
+                            continue;
+                        }
                     }
                 }
                 if metadata_fetch {
@@ -332,7 +340,8 @@ impl DaemonRuntime {
     }
 
     pub(super) async fn sweep_stale_active_torrents(&self, reason: &'static str) -> usize {
-        let running: HashSet<InfoHash> = self.engine_handles.read().await.keys().copied().collect();
+        let running: HashSet<TorrentKey> =
+            self.engine_handles.read().await.keys().copied().collect();
         let retry_after = self.engine_retry_after.read().await.clone();
         let now = Instant::now();
         let recovered = {
@@ -377,8 +386,8 @@ impl DaemonRuntime {
     }
 
     pub(super) async fn sweep_inactive_engine_handles(&self, reason: &'static str) -> usize {
-        let running: Vec<InfoHash> = self.engine_handles.read().await.keys().copied().collect();
-        let stale: Vec<(InfoHash, Option<TorrentState>)> = {
+        let running: Vec<TorrentKey> = self.engine_handles.read().await.keys().copied().collect();
+        let stale: Vec<(TorrentKey, Option<TorrentState>)> = {
             let reg = self.registry.lock().await;
             running
                 .into_iter()
@@ -469,7 +478,7 @@ impl DaemonRuntime {
         }
     }
 
-    pub(super) async fn engine_task_finished(&self, hash: InfoHash) {
+    pub(super) async fn engine_task_finished(&self, hash: TorrentKey) {
         self.engine_cmds.lock().await.remove(&hash);
         self.engine_handles.write().await.remove(&hash);
         self.engine_storage_cancellations.lock().await.remove(&hash);
@@ -478,7 +487,7 @@ impl DaemonRuntime {
 
     pub(super) async fn record_engine_containment_cancellation(
         &self,
-        hash: InfoHash,
+        hash: TorrentKey,
         needs_metadata: bool,
     ) {
         let mut reg = self.registry.lock().await;
@@ -499,7 +508,7 @@ impl DaemonRuntime {
 
     pub(super) async fn queue_torrent_for_retry(
         &self,
-        hash: InfoHash,
+        hash: TorrentKey,
         message: &'static str,
         delay: Duration,
     ) -> bool {
@@ -544,7 +553,7 @@ impl DaemonRuntime {
 
     pub(super) async fn handle_engine_task_error(
         &self,
-        hash: InfoHash,
+        hash: TorrentKey,
         needs_metadata: bool,
         error: CoreError,
     ) -> bool {
@@ -626,7 +635,7 @@ impl DaemonRuntime {
 
     /// Start the live engine task for a torrent (downloading). No-op if the
     /// torrent is paused, queued, or already running.
-    pub async fn start_engine(&self, hash: InfoHash) {
+    pub async fn start_engine(&self, hash: TorrentKey) {
         let _data_plane_transition = self.data_plane_transition_lock.lock().await;
         self.start_engine_while_transition_locked(hash).await;
     }
@@ -655,7 +664,7 @@ impl DaemonRuntime {
     /// Start one engine while the caller owns `data_plane_transition_lock`.
     /// This is used only by serialized reconstruction transactions so normal
     /// API/queue starts cannot interleave with a partially rebuilt live set.
-    pub(super) async fn start_engine_while_transition_locked(&self, hash: InfoHash) {
+    pub(super) async fn start_engine_while_transition_locked(&self, hash: TorrentKey) {
         let health = self.network_health.read().await.clone();
         if !health.traffic_allowed && health.mode != NetworkContainmentMode::Disabled {
             // Network blocked: do not start the engine; mark torrent.
@@ -690,6 +699,23 @@ impl DaemonRuntime {
             };
             EngineStartSnapshot::from_torrent(t, &config)
         };
+        let magnet = match snapshot.magnet_params() {
+            Ok(magnet) => magnet,
+            Err(error) => {
+                tracing::error!(
+                    info_hash = %hash,
+                    error = %error,
+                    "torrent engine start rejected malformed unresolved magnet"
+                );
+                if let Some(torrent) = self.registry.lock().await.get_mut(&hash) {
+                    torrent.state = TorrentState::Error;
+                    torrent.error = Some(error.to_string());
+                }
+                self.publish_torrent_event("torrent_error", hash, TorrentState::Error);
+                self.publish_event(stats_updated_event());
+                return;
+            }
+        };
 
         let (
             meta,
@@ -704,12 +730,27 @@ impl DaemonRuntime {
             pex_max_peers,
             minimum_free_space_bytes,
             minimum_free_space_percent,
+            direct_peers,
             magnet,
             needs_metadata,
+            metadata_only,
+            intake_selection,
+            partial_file_suffix,
+            tracker_host_rules,
         ) = {
             let complete_dir = snapshot.complete_dir.clone();
             let active_dir = snapshot.active_dir.clone();
-            let magnet = snapshot.magnet_params();
+            // `x.pe` is parsed only as an IP literal. These candidates still
+            // flow through the engine's normal peer filter and contained
+            // binder for both metadata and payload discovery.
+            let direct_peers = snapshot
+                .magnet_direct_peers
+                .iter()
+                .map(|peer| swarmotter_core::peer::PeerAddr {
+                    ip: peer.ip,
+                    port: peer.port,
+                })
+                .collect::<Vec<_>>();
             let cfg = &config;
             let preallocate = cfg.storage.preallocate;
             let sparse = cfg.storage.sparse;
@@ -733,8 +774,13 @@ impl DaemonRuntime {
                 pex_max_peers,
                 minimum_free_space_bytes,
                 minimum_free_space_percent,
+                direct_peers,
                 magnet,
                 snapshot.needs_metadata,
+                snapshot.metadata_only,
+                snapshot.intake_selection.clone(),
+                snapshot.partial_file_suffix.clone(),
+                snapshot.tracker_host_rules.clone(),
             )
         };
 
@@ -743,9 +789,10 @@ impl DaemonRuntime {
         }
 
         let preflight_content_bytes = if needs_metadata { 0 } else { meta.total_length };
-        if preflight_content_bytes > 0
-            || minimum_free_space_bytes > 0
-            || minimum_free_space_percent > 0
+        if !metadata_only
+            && (preflight_content_bytes > 0
+                || minimum_free_space_bytes > 0
+                || minimum_free_space_percent > 0)
         {
             let mut cfg = self.config.read().await.storage.clone();
             cfg.minimum_free_space_bytes = minimum_free_space_bytes;
@@ -774,48 +821,52 @@ impl DaemonRuntime {
             }
         }
 
-        self.wait_at_storage_admission_test_pause().await;
-        let storage_admission = {
-            let cfg = self.config.read().await;
-            storage_root_admission_for_path(&cfg, Path::new(&active_dir))
-        };
-        let storage_write_limiter = if let Some(admission) = &storage_admission {
-            if let Err(error) = self
-                .storage_admissions
-                .reserve(hash, admission, preflight_content_bytes)
-                .await
-            {
-                // This is queue admission, not a payload/storage failure. Keep
-                // the torrent eligible for a later reconcile when root work
-                // finishes rather than turning a bounded queue into an error.
-                tracing::debug!(
-                    info_hash = %hash,
-                    error = %error,
-                    root = %admission.root.display(),
-                    "engine start deferred by storage-root admission"
-                );
-                let mut changed = false;
-                if let Some(torrent) = self.registry.lock().await.get_mut(&hash) {
-                    if matches!(
-                        torrent.state,
-                        TorrentState::Queued
-                            | TorrentState::Downloading
-                            | TorrentState::DownloadingMetadata
-                    ) {
-                        torrent.state = TorrentState::Queued;
-                        torrent.error = Some(error.to_string());
-                        changed = true;
-                    }
-                }
-                if changed {
-                    self.publish_torrent_event("torrent_changed", hash, TorrentState::Queued);
-                    self.publish_event(stats_updated_event());
-                }
-                return;
-            }
-            self.storage_admissions.write_limiter(admission).await
-        } else {
+        let storage_write_limiter = if metadata_only {
             None
+        } else {
+            self.wait_at_storage_admission_test_pause().await;
+            let storage_admission = {
+                let cfg = self.config.read().await;
+                storage_root_admission_for_path(&cfg, Path::new(&active_dir))
+            };
+            if let Some(admission) = &storage_admission {
+                if let Err(error) = self
+                    .storage_admissions
+                    .reserve(hash, admission, preflight_content_bytes)
+                    .await
+                {
+                    // This is queue admission, not a payload/storage failure. Keep
+                    // the torrent eligible for a later reconcile when root work
+                    // finishes rather than turning a bounded queue into an error.
+                    tracing::debug!(
+                        info_hash = %hash,
+                        error = %error,
+                        root = %admission.root.display(),
+                        "engine start deferred by storage-root admission"
+                    );
+                    let mut changed = false;
+                    if let Some(torrent) = self.registry.lock().await.get_mut(&hash) {
+                        if matches!(
+                            torrent.state,
+                            TorrentState::Queued
+                                | TorrentState::Downloading
+                                | TorrentState::DownloadingMetadata
+                        ) {
+                            torrent.state = TorrentState::Queued;
+                            torrent.error = Some(error.to_string());
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        self.publish_torrent_event("torrent_changed", hash, TorrentState::Queued);
+                        self.publish_event(stats_updated_event());
+                    }
+                    return;
+                }
+                self.storage_admissions.write_limiter(admission).await
+            } else {
+                None
+            }
         };
         let resume_dir = config.storage.resume_dir.as_ref().map(PathBuf::from);
         let cow_strategy = config.storage.cow_strategy;
@@ -880,7 +931,7 @@ impl DaemonRuntime {
             binder,
             state.clone(),
             rx,
-            vec![],
+            direct_peers,
             listen_port,
             limiter,
             magnet,
@@ -893,6 +944,8 @@ impl DaemonRuntime {
         .with_sparse(sparse)
         .with_cow_strategy(cow_strategy)
         .with_resume_dir(resume_dir)
+        .with_torrent_key(hash)
+        .with_partial_file_suffix(partial_file_suffix)
         .with_storage_reserve(minimum_free_space_bytes, minimum_free_space_percent)
         .with_storage_write_limiter(storage_write_limiter)
         .with_storage_metrics(storage_metrics);
@@ -919,6 +972,15 @@ impl DaemonRuntime {
             .with_allow_ipv6(allow_ipv6)
             .with_peer_filter(peer_filter)
             .with_pex(pex_enabled, pex_max_peers);
+        if !tracker_host_rules.is_empty() {
+            engine = engine.with_tracker_host_rules(tracker_host_rules);
+        }
+        if let Some(selection) = intake_selection {
+            engine = engine.with_intake_selection(selection);
+        }
+        if metadata_only {
+            engine = engine.with_metadata_only();
+        }
         {
             let runtime = self.clone();
             let cancellation = storage_work_cancellation.clone();
@@ -934,26 +996,41 @@ impl DaemonRuntime {
         }
         if needs_metadata {
             let runtime = self.clone();
-            let metadata_complete_dir = snapshot.complete_dir.clone();
-            let metadata_active_dir = snapshot.active_dir.clone();
-            let cancellation = storage_work_cancellation.clone();
-            engine = engine.with_metadata_preflight(Arc::new(move |resolved| {
-                let runtime = runtime.clone();
-                let metadata_complete_dir = metadata_complete_dir.clone();
-                let metadata_active_dir = metadata_active_dir.clone();
-                let cancellation = cancellation.clone();
-                Box::pin(async move {
-                    runtime
-                        .reserve_resolved_magnet_metadata(
-                            hash,
-                            resolved,
-                            metadata_complete_dir,
-                            metadata_active_dir,
-                            cancellation,
-                        )
-                        .await
-                })
-            }));
+            if metadata_only {
+                // A preview resolves and persists its file tree before the
+                // engine reports metadata success. It intentionally bypasses
+                // payload-root admission: this engine never opens storage,
+                // announces a payload session, or requests pieces.
+                engine = engine.with_metadata_preflight(Arc::new(move |resolved| {
+                    let runtime = runtime.clone();
+                    Box::pin(async move {
+                        runtime
+                            .commit_metadata_preview_resolution(hash, resolved)
+                            .await
+                    })
+                }));
+            } else {
+                let metadata_complete_dir = snapshot.complete_dir.clone();
+                let metadata_active_dir = snapshot.active_dir.clone();
+                let cancellation = storage_work_cancellation.clone();
+                engine = engine.with_metadata_preflight(Arc::new(move |resolved| {
+                    let runtime = runtime.clone();
+                    let metadata_complete_dir = metadata_complete_dir.clone();
+                    let metadata_active_dir = metadata_active_dir.clone();
+                    let cancellation = cancellation.clone();
+                    Box::pin(async move {
+                        runtime
+                            .reserve_resolved_magnet_metadata(
+                                hash,
+                                resolved,
+                                metadata_complete_dir,
+                                metadata_active_dir,
+                                cancellation,
+                            )
+                            .await
+                    })
+                }));
+            }
         }
         if let Some(dht) = dht_runner {
             engine = engine.with_dht(dht);
@@ -987,7 +1064,16 @@ impl DaemonRuntime {
                     let terminal_tracker_error = final_state.terminal_tracker_error();
                     let mut metadata_received = false;
                     let mut changed_state = None;
-                    {
+                    // The metadata-only callback commits the resolved file
+                    // tree before this engine can return success. Do not
+                    // apply it again here: this event is intentionally the
+                    // first public visibility of that durable preview.
+                    let metadata_preview_committed =
+                        metadata_only && final_state.resolved_meta.is_some();
+                    if metadata_preview_committed {
+                        metadata_received = true;
+                        changed_state = Some(TorrentState::Paused);
+                    } else {
                         let mut reg = registry.lock().await;
                         if let Some(t) = reg.get_mut(&hash_for_task) {
                             let previous_state = t.state;
@@ -1018,6 +1104,15 @@ impl DaemonRuntime {
                                 t.state = TorrentState::TrackerError;
                                 t.seeding_status = SeedingStatus::NotEligible;
                                 t.error = Some(error.clone());
+                            } else if metadata_only && metadata_received {
+                                // Metadata-first previews finish their
+                                // contained BEP 9 retrieval without entering
+                                // any payload path. An explicit start/resume
+                                // clears the durable gate and launches a
+                                // normal engine later.
+                                t.state = TorrentState::Paused;
+                                t.seeding_status = SeedingStatus::NotEligible;
+                                t.error = None;
                             } else if t.state == TorrentState::DownloadingMetadata {
                                 // Metadata fetched but download incomplete; mark
                                 // downloading.
@@ -1056,7 +1151,11 @@ impl DaemonRuntime {
                         runtime_for_task
                             .selfish_remove_completed(hash_for_task)
                             .await;
-                    } else if !finished && !stopped_by_command && terminal_tracker_error.is_none() {
+                    } else if !metadata_only
+                        && !finished
+                        && !stopped_by_command
+                        && terminal_tracker_error.is_none()
+                    {
                         let queued = runtime_for_task
                             .queue_torrent_for_retry(
                                 hash_for_task,
@@ -1150,7 +1249,7 @@ impl DaemonRuntime {
         let _ = task_start_tx.send(());
     }
 
-    async fn cancel_engine_storage_work(&self, hash: &InfoHash) {
+    async fn cancel_engine_storage_work(&self, hash: &TorrentKey) {
         if let Some(cancellation) = self
             .engine_storage_cancellations
             .lock()
@@ -1162,7 +1261,7 @@ impl DaemonRuntime {
         }
     }
 
-    pub(super) async fn stop_engine(&self, hash: &InfoHash) {
+    pub(super) async fn stop_engine(&self, hash: &TorrentKey) {
         self.engine_retry_after.write().await.remove(hash);
         self.cancel_engine_storage_work(hash).await;
         let explicit_recheck = self.cancel_explicit_recheck(hash).await;
@@ -1184,7 +1283,7 @@ impl DaemonRuntime {
         self.storage_admissions.release(hash).await;
     }
 
-    pub(super) async fn force_stop_engine(&self, hash: &InfoHash) {
+    pub(super) async fn force_stop_engine(&self, hash: &TorrentKey) {
         self.engine_retry_after.write().await.remove(hash);
         self.cancel_engine_storage_work(hash).await;
         let explicit_recheck = self.cancel_explicit_recheck(hash).await;
@@ -1206,7 +1305,7 @@ impl DaemonRuntime {
         self.storage_admissions.release(hash).await;
     }
 
-    pub(super) async fn restart_engine_for_settings(&self, hash: &InfoHash) {
+    pub(super) async fn restart_engine_for_settings(&self, hash: &TorrentKey) {
         self.stop_engine(hash).await;
         {
             let mut registry = self.registry.lock().await;
@@ -1225,7 +1324,7 @@ impl DaemonRuntime {
         self.reconcile_queue().await;
     }
 
-    pub(super) async fn stop_all_torrent_tasks(&self, registry_hashes: &[InfoHash]) {
+    pub(super) async fn stop_all_torrent_tasks(&self, registry_hashes: &[TorrentKey]) {
         let mut hashes = registry_hashes.to_vec();
         hashes.extend(self.engine_handles.read().await.keys().copied());
         hashes.extend(self.seeder_shutdowns.lock().await.keys().copied());

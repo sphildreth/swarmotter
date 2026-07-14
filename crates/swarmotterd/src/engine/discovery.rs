@@ -2,7 +2,23 @@
 
 use super::*;
 
+use swarmotter_core::hash::PeerInfoHash;
+
 impl TorrentEngine {
+    /// Return the protocol's explicit 20-byte discovery identity. Pure-v2
+    /// torrents use the BEP 52 truncation; v1 and hybrid transfers retain
+    /// their v1 swarm identity.
+    fn discovery_wire_hash(&self) -> PeerInfoHash {
+        if self.meta.requires_v2_data_plane() {
+            self.meta
+                .identity
+                .v2_peer_info_hash()
+                .expect("validated pure-v2 metadata has a v2 identity")
+        } else {
+            PeerInfoHash::from_v1(self.meta.info_hash)
+        }
+    }
+
     pub(super) async fn refresh_discovery_peers(&self, force: bool) -> Vec<PeerAddr> {
         let mut refreshed = Vec::new();
         if force || self.tracker_announce_due().await {
@@ -16,8 +32,12 @@ impl TorrentEngine {
     }
 
     pub(super) async fn tracker_announce_due(&self) -> bool {
-        if tracker::announce_tiers(self.meta.announce.as_deref(), &self.meta.announce_list)
-            .is_empty()
+        if swarmotter_core::policy::prioritized_tracker_tiers(
+            self.meta.announce.as_deref(),
+            &self.meta.announce_list,
+            &self.tracker_host_rules,
+        )
+        .is_empty()
         {
             return false;
         }
@@ -52,7 +72,7 @@ impl TorrentEngine {
         self.state.lock().await.dht_last_lookup = Some(Instant::now());
         let result = tokio::time::timeout(
             DHT_DISCOVERY_TIMEOUT,
-            dht.get_peers_with_stats(self.meta.info_hash, DHT_DISCOVERY_ROUNDS),
+            dht.get_peers_with_stats(self.discovery_wire_hash(), DHT_DISCOVERY_ROUNDS),
         )
         .await;
         match result {
@@ -86,8 +106,11 @@ impl TorrentEngine {
 impl TorrentEngine {
     /// Announce to all HTTP/UDP trackers and return discovered peers.
     pub(super) async fn announce(&self, event: AnnounceEvent) -> Vec<PeerAddr> {
-        let tiers =
-            tracker::announce_tiers(self.meta.announce.as_deref(), &self.meta.announce_list);
+        let tiers = swarmotter_core::policy::prioritized_tracker_tiers(
+            self.meta.announce.as_deref(),
+            &self.meta.announce_list,
+            &self.tracker_host_rules,
+        );
         let scrape_urls = tiers.iter().flatten().cloned().collect::<Vec<_>>();
         let (uploaded, downloaded, left) = {
             let s = self.state.lock().await;
@@ -99,7 +122,7 @@ impl TorrentEngine {
         };
         let outcome = self
             .announce_tracker_tiers(
-                self.meta.info_hash,
+                self.discovery_wire_hash(),
                 tiers,
                 uploaded,
                 downloaded,
@@ -107,7 +130,7 @@ impl TorrentEngine {
                 event,
             )
             .await;
-        self.record_tracker_activity(self.meta.info_hash, &outcome, scrape_urls)
+        self.record_tracker_activity(self.discovery_wire_hash(), &outcome, scrape_urls)
             .await;
         self.filter_allowed_peers(outcome.peers)
     }
@@ -115,7 +138,7 @@ impl TorrentEngine {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn announce_tracker_tiers(
         &self,
-        info_hash: InfoHash,
+        info_hash: PeerInfoHash,
         tiers: Vec<Vec<String>>,
         uploaded: u64,
         downloaded: u64,
@@ -148,7 +171,7 @@ impl TorrentEngine {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn announce_trackers(
         &self,
-        info_hash: InfoHash,
+        info_hash: PeerInfoHash,
         trackers: Vec<String>,
         uploaded: u64,
         downloaded: u64,
@@ -241,7 +264,7 @@ impl TorrentEngine {
     /// metadata discovery.
     pub(super) async fn record_tracker_activity(
         &self,
-        info_hash: InfoHash,
+        info_hash: PeerInfoHash,
         outcome: &TrackerAnnounceOutcome,
         scrape_urls: Vec<String>,
     ) {
@@ -255,7 +278,7 @@ impl TorrentEngine {
         .await;
     }
 
-    pub(super) async fn discover_magnet_dht_peers(&self, info_hash: InfoHash) -> Vec<PeerAddr> {
+    pub(super) async fn discover_magnet_dht_peers(&self, info_hash: PeerInfoHash) -> Vec<PeerAddr> {
         let Some(dht) = &self.dht else {
             return Vec::new();
         };
@@ -310,13 +333,23 @@ impl TorrentEngine {
         }
     }
 
-    /// Fetch magnet metadata via BEP 9. Announces to the magnet's trackers
-    /// (using the real info hash) to discover peers, merges directly-supplied
-    /// seed peers, then fetches the `info` dict from the candidates. All peer
-    /// connections go through the binder.
-    pub(super) async fn fetch_magnet_metadata(&self, magnet: &MagnetParams) -> Result<Vec<u8>> {
+    /// Fetch complete executable magnet metadata through contained peers.
+    ///
+    /// The candidate discovery identity is the magnet's prescribed 20-byte
+    /// wire value. A pure-v2 result continues from BEP 9 on the same contained
+    /// session to retrieve and verify its top-level BEP 52 piece layers before
+    /// this method returns; callers therefore never mistake raw v2 `info`
+    /// bytes for executable metainfo.
+    pub(super) async fn fetch_magnet_metadata(
+        &self,
+        magnet: &MagnetParams,
+    ) -> Result<crate::metadata::ResolvedMagnetMetadata> {
         let mut candidates = Vec::new();
         let mut last_error: Option<CoreError> = None;
+        let discovery_trackers = swarmotter_core::policy::prioritize_tracker_urls(
+            &magnet.trackers,
+            &self.tracker_host_rules,
+        );
 
         for round in 1..=MAGNET_METADATA_MAX_ROUNDS {
             match self.poll_commands().await {
@@ -329,23 +362,33 @@ impl TorrentEngine {
                 | CommandOutcome::Pause => {}
             }
 
-            let outcome = self
-                .announce_trackers(
-                    magnet.info_hash,
-                    magnet.trackers.clone(),
-                    0,
-                    0,
-                    1,
-                    if round == 1 {
-                        AnnounceEvent::Started
-                    } else {
-                        AnnounceEvent::Empty
-                    },
+            // Avoid recording a synthetic announce for a trackerless magnet.
+            // Direct peers and DHT may still resolve contained metadata, but a
+            // metadata-only preview must not look as though payload discovery
+            // announced when there was no tracker request to make.
+            if !discovery_trackers.is_empty() {
+                let outcome = self
+                    .announce_trackers(
+                        magnet.wire_info_hash,
+                        discovery_trackers.clone(),
+                        0,
+                        0,
+                        1,
+                        if round == 1 {
+                            AnnounceEvent::Started
+                        } else {
+                            AnnounceEvent::Empty
+                        },
+                    )
+                    .await;
+                self.record_tracker_activity(
+                    magnet.wire_info_hash,
+                    &outcome,
+                    discovery_trackers.clone(),
                 )
                 .await;
-            self.record_tracker_activity(magnet.info_hash, &outcome, magnet.trackers.clone())
-                .await;
-            merge_unique_peers(&mut candidates, self.filter_allowed_peers(outcome.peers));
+                merge_unique_peers(&mut candidates, self.filter_allowed_peers(outcome.peers));
+            }
 
             for p in &self.seed_peers {
                 if self.peer_allowed(p) && !candidates.contains(p) {
@@ -353,7 +396,7 @@ impl TorrentEngine {
                 }
             }
 
-            let dht_peers = self.discover_magnet_dht_peers(magnet.info_hash).await;
+            let dht_peers = self.discover_magnet_dht_peers(magnet.wire_info_hash).await;
             merge_unique_peers(&mut candidates, dht_peers);
             dedupe_peers(&mut candidates);
             self.state.lock().await.peers = candidates.clone();
@@ -369,11 +412,11 @@ impl TorrentEngine {
                     candidates = candidates.len(),
                     "attempting magnet metadata fetch from discovered peers"
                 );
-                match crate::metadata::fetch_metadata_from_candidates_with_budget(
-                    crate::metadata::MetadataFetchContext::new(
+                match crate::metadata::fetch_resolved_metadata_from_candidates_with_budget(
+                    crate::metadata::MetadataFetchContext::for_identity(
                         self.peer_session_budget.clone(),
                         self.binder.clone(),
-                        magnet.info_hash,
+                        magnet.identity.clone(),
                         self.peer_id,
                         self.utp_enabled,
                         self.utp_prefer_tcp,
@@ -381,17 +424,19 @@ impl TorrentEngine {
                     )
                     .with_peer_filter(self.peer_filter.clone()),
                     &candidates,
+                    &magnet.trackers,
                 )
                 .await
                 {
-                    Ok(info) => {
+                    Ok(metadata) => {
                         tracing::info!(
                             info_hash = %magnet.info_hash,
                             round,
                             candidates = candidates.len(),
+                            metadata_bytes = metadata.raw_info.len(),
                             "magnet metadata fetched"
                         );
-                        return Ok(info);
+                        return Ok(metadata);
                     }
                     Err(e) => {
                         tracing::debug!(
@@ -552,7 +597,7 @@ pub(super) fn merge_tracker_outcome(
 pub(crate) async fn run_tracker_scrapes(
     state: Arc<Mutex<EngineState>>,
     binder: Arc<dyn NetworkBinder>,
-    info_hash: InfoHash,
+    info_hash: PeerInfoHash,
     tracker_urls: Vec<String>,
 ) {
     let mut unique = HashSet::new();

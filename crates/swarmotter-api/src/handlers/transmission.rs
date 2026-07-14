@@ -17,7 +17,7 @@ use serde_json::{json, Map, Value};
 use swarmotter_core::bandwidth::TorrentBandwidth;
 use swarmotter_core::config::Config;
 use swarmotter_core::error::CoreError;
-use swarmotter_core::hash::InfoHash;
+use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::models::peer::{Peer, PeerDirection};
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{TrackerInfo, TrackerStatus};
@@ -530,12 +530,12 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
             return Err(RpcFailure::invalid(
                 "remote torrent URL fetching is not supported by the compatibility adapter",
             ));
-        } else if filename.len() == 40 && filename.chars().all(|c| c.is_ascii_hexdigit()) {
-            let magnet = format!("magnet:?xt=urn:btih:{filename}");
+        } else if let Ok(key) = TorrentKey::from_locator(&filename) {
+            let magnet = magnet_for_key(key, None);
             state.daemon.add_magnet(&magnet, add_options.clone()).await
         } else {
             return Err(RpcFailure::invalid(
-                "filename must be a magnet link; use metainfo for torrent file bytes",
+                "filename must be a magnet link or a 40/64-character torrent locator; use metainfo for torrent file bytes",
             ));
         }
     } else {
@@ -547,7 +547,7 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
     let (hash, duplicate) = match add_result {
         Ok(hash) => (hash, false),
         Err(CoreError::DuplicateTorrent(hash)) => (
-            InfoHash::from_hex(&hash).map_err(RpcFailure::from_core)?,
+            TorrentKey::from_locator(&hash).map_err(RpcFailure::from_core)?,
             true,
         ),
         Err(error) => return Err(RpcFailure::from_core(error)),
@@ -574,8 +574,8 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
     let object = json!({
         "id": id,
         "name": summary.name,
-        "hash_string": summary.info_hash.to_hex(),
-        "hashString": summary.info_hash.to_hex(),
+        "hash_string": summary.info_hash.to_locator(),
+        "hashString": summary.info_hash.to_locator(),
         "status": transmission_status(summary.state),
         "download_dir": summary.download_dir.clone().unwrap_or_default(),
         "downloadDir": summary.download_dir.clone().unwrap_or_default(),
@@ -825,7 +825,10 @@ async fn selected_summaries(state: &SharedState, args: &Value) -> RpcResult<Vec<
             }
             continue;
         }
-        if let Some(hash) = value.as_str().and_then(|s| InfoHash::from_hex(s).ok()) {
+        if let Some(hash) = value
+            .as_str()
+            .and_then(|s| TorrentKey::from_locator(s).ok())
+        {
             hashes.push(hash);
         }
     }
@@ -863,6 +866,41 @@ fn ids_is_recently_active(args: &Value) -> bool {
         .and_then(Value::as_str)
         .map(is_recently_active_selector)
         .unwrap_or(false)
+}
+
+/// Construct a canonical magnet without ever representing a pure-v2 torrent
+/// as a lossy 20-byte v1-style hash. Compatibility APIs expose the same full
+/// identity rules as native routes: v1 is `btih`, v2 is BEP 52 `btmh`, and a
+/// hybrid may carry both exact topics.
+fn magnet_for_key(key: TorrentKey, name: Option<&str>) -> String {
+    let topic = match key {
+        TorrentKey::V1(v1) => format!("xt=urn:btih:{v1}"),
+        TorrentKey::V2(v2) => format!("xt=urn:btmh:{}", v2.to_magnet_multihash()),
+    };
+    append_magnet_name(format!("magnet:?{topic}"), name)
+}
+
+fn magnet_for_summary(summary: &TorrentSummary) -> String {
+    let mut topics = Vec::with_capacity(2);
+    if let Some(v1) = summary.identity.v1_info_hash() {
+        topics.push(format!("xt=urn:btih:{v1}"));
+    }
+    if let Some(v2) = summary.identity.v2_info_hash() {
+        topics.push(format!("xt=urn:btmh:{}", v2.to_magnet_multihash()));
+    }
+    if topics.is_empty() {
+        return magnet_for_key(summary.info_hash, Some(&summary.name));
+    }
+    append_magnet_name(format!("magnet:?{}", topics.join("&")), Some(&summary.name))
+}
+
+fn append_magnet_name(mut magnet: String, name: Option<&str>) -> String {
+    if let Some(name) = name.filter(|name| !name.is_empty()) {
+        let encoded = url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>();
+        magnet.push_str("&dn=");
+        magnet.push_str(&encoded);
+    }
+    magnet
 }
 
 fn is_recently_active_selector(s: &str) -> bool {
@@ -928,7 +966,7 @@ fn torrent_field_value(
     match normalize_key(field).as_str() {
         "id" => json!(id),
         "name" => json!(summary.name),
-        "hash_string" => json!(summary.info_hash.to_hex()),
+        "hash_string" => json!(summary.info_hash.to_locator()),
         "status" => json!(transmission_status(summary.state)),
         "total_size" => json!(summary.total_length),
         "percent_done" | "percent_complete" => json!(clamped_progress(summary)),
@@ -972,11 +1010,7 @@ fn torrent_field_value(
         "honors_session_limits" => json!(true),
         "bandwidth_priority" => json!(0),
         "queue_position" => json!(summary.queue_position.unwrap_or(0)),
-        "magnet_link" => json!(format!(
-            "magnet:?xt=urn:btih:{}&dn={}",
-            summary.info_hash.to_hex(),
-            summary.name
-        )),
+        "magnet_link" => json!(magnet_for_summary(summary)),
         "files" => json!(torrent_files(ctx.files.as_deref().unwrap_or(&[]))),
         "file_stats" => json!(torrent_file_stats(ctx.files.as_deref().unwrap_or(&[]))),
         "priorities" => json!(ctx
@@ -1156,7 +1190,7 @@ fn tracker_list(trackers: &[TrackerInfo]) -> String {
     out
 }
 
-async fn apply_file_args(state: &SharedState, hash: &InfoHash, args: &Value) -> RpcResult<()> {
+async fn apply_file_args(state: &SharedState, hash: &TorrentKey, args: &Value) -> RpcResult<()> {
     if let Some(indices) =
         indices_arg_with_all(state, hash, args, &["files_wanted", "files-wanted"]).await?
     {
@@ -1194,7 +1228,7 @@ async fn apply_file_args(state: &SharedState, hash: &InfoHash, args: &Value) -> 
     Ok(())
 }
 
-async fn apply_tracker_args(state: &SharedState, hash: &InfoHash, args: &Value) -> RpcResult<()> {
+async fn apply_tracker_args(state: &SharedState, hash: &TorrentKey, args: &Value) -> RpcResult<()> {
     if let Some(urls) = string_array_arg(args, &["tracker_add", "tracker-add"]) {
         for url in urls {
             state
@@ -1245,7 +1279,7 @@ async fn apply_tracker_args(state: &SharedState, hash: &InfoHash, args: &Value) 
 
 async fn indices_arg_with_all(
     state: &SharedState,
-    hash: &InfoHash,
+    hash: &TorrentKey,
     args: &Value,
     keys: &[&str],
 ) -> RpcResult<Option<Vec<usize>>> {
@@ -1526,6 +1560,22 @@ mod tests {
             decode_base64("aGVsbG8=").as_deref(),
             Some(b"hello".as_slice())
         );
+    }
+
+    #[test]
+    fn pure_v2_locator_produces_btmh_magnet_without_v1_truncation() {
+        let key = TorrentKey::v2(swarmotter_core::hash::V2InfoHash::from_bytes([0x5a; 32]));
+
+        let magnet = magnet_for_key(key, Some("lawful release"));
+
+        assert_eq!(
+            magnet,
+            format!(
+                "magnet:?xt=urn:btmh:1220{}&dn=lawful+release",
+                "5a".repeat(32)
+            )
+        );
+        assert!(!magnet.contains("btih"));
     }
 
     #[test]

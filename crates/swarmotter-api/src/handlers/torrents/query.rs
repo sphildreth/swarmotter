@@ -321,7 +321,7 @@ pub(super) fn torrent_list_groups(
 }
 
 pub(super) fn torrent_matches_search(row: &TorrentSummary, query: &str) -> bool {
-    let hash = row.info_hash.to_hex();
+    let hash = row.info_hash.to_locator();
     let fields = [
         row.name.as_str(),
         hash.as_str(),

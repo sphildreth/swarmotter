@@ -14,7 +14,7 @@ pub struct RemoveTorrentsResult {
     pub removed: Vec<String>,
     pub not_found: Vec<String>,
 }
-pub(super) async fn require_hash(hash: &str) -> Result<InfoHash> {
+pub(super) async fn require_hash(hash: &str) -> Result<TorrentKey> {
     parse_hash(hash)
 }
 
@@ -56,20 +56,20 @@ pub async fn remove_torrents(
             Err(e) => return err_response(e),
         }
     }
-    let requested: BTreeSet<InfoHash> = hashes.iter().copied().collect();
+    let requested: BTreeSet<TorrentKey> = hashes.iter().copied().collect();
     match state
         .daemon
         .remove_torrents(hashes, body.delete_data.unwrap_or(false))
         .await
     {
         Ok(removed) => {
-            let removed_set: BTreeSet<InfoHash> = removed.iter().copied().collect();
+            let removed_set: BTreeSet<TorrentKey> = removed.iter().copied().collect();
             let not_found = requested
                 .difference(&removed_set)
-                .map(InfoHash::to_hex)
+                .map(|key| key.to_locator())
                 .collect();
             into_response(Ok(RemoveTorrentsResult {
-                removed: removed.into_iter().map(|hash| hash.to_hex()).collect(),
+                removed: removed.into_iter().map(TorrentKey::to_locator).collect(),
                 not_found,
             }))
         }

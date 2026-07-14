@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Superseded by ADR-0067.
 
 ## Context
 
@@ -61,3 +61,5 @@ The state file contains torrent and queue state, not API credentials.
 - ADR-0011 (bencode and fast-resume format)
 - ADR-0016 (task runtime model)
 - ADR-0052 (defaulted persisted seeding policy and runtime lifecycle)
+- ADR-0067 (SQLite durable library state; supersedes this JSON-primary format
+  decision while retaining its durability and recovery requirements)

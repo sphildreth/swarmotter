@@ -149,10 +149,12 @@ mod tests {
             MetaFile {
                 path: vec!["first.bin".into()],
                 length: u64::MAX,
+                pieces_root: None,
             },
             MetaFile {
                 path: vec!["second.bin".into()],
                 length: 1,
+                pieces_root: None,
             },
         ];
 

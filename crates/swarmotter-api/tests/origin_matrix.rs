@@ -12,7 +12,7 @@ use swarmotter_api::app_router;
 use swarmotter_api::routes::app_router_with_body_limit;
 use swarmotter_api::state::{AddTorrentOptions, DaemonOps, SharedState};
 use swarmotter_core::config::Config;
-use swarmotter_core::hash::InfoHash;
+use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::models::network::NetworkContainmentMode;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
@@ -153,8 +153,8 @@ impl ControlRoute {
         }
     }
 
-    fn request(self, state: &SharedState, hash: &InfoHash) -> Request<Body> {
-        let hash = hash.to_hex();
+    fn request(self, state: &SharedState, hash: &TorrentKey) -> Request<Body> {
+        let hash = hash.to_locator();
         let (method, uri, content_type, body) = match self {
             Self::NativeAdd => (
                 "POST",
@@ -521,7 +521,9 @@ fn apply_chrome_extension_origin(request: &mut Request<Body>) {
         .insert("sec-fetch-site", HeaderValue::from_static("none"));
 }
 
-async fn test_context(auth_mode: AuthMode) -> (SharedState, std::sync::Arc<FakeDaemon>, InfoHash) {
+async fn test_context(
+    auth_mode: AuthMode,
+) -> (SharedState, std::sync::Arc<FakeDaemon>, TorrentKey) {
     let mut config = Config::default();
     config.network.mode = NetworkContainmentMode::Disabled;
     config.api.require_auth = matches!(auth_mode, AuthMode::Enabled);
@@ -870,7 +872,7 @@ async fn origin_guard_precedes_auth_session_and_compatibility_enabled_checks() {
     // the origin guard must still return its 403 before body extraction can
     // return 413.
     let app = app_router_with_body_limit(state.clone(), 1);
-    let hash = InfoHash::from_hex("0123456789abcdef0123456789abcdef01234567")
+    let hash = TorrentKey::from_locator("0123456789abcdef0123456789abcdef01234567")
         .expect("fixed test hash must be valid");
 
     for route in [

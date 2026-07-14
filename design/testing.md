@@ -15,9 +15,16 @@ feature completion and acceptance criteria, not by time estimates.
 
 ### Unit tests
 
-- Magnet parsing.
-- Torrent parsing.
-- Info hash handling.
+- Magnet parsing, including v1 `btih`, v2 `btmh`, hybrid exact topics, and
+  conflicting-topic rejection.
+- Torrent parsing, including generated lawful v1, v2, and hybrid fixtures.
+- Explicit v1 SHA-1 and v2 SHA-256 identity handling. A pure-v2 add must
+  retain its full 64-character key through registry, queue, storage, API, and
+  SQLite state without aliasing a v1 value; a hybrid must retain both validated
+  identities, use a v1 primary key for compatibility, and resolve its full v2
+  key as an alias. Generated local v1/v2/hybrid fixtures cover file-tree and
+  piece-layer validation, SHA-256 Merkle edge cases, contained peer transfer,
+  tracker/DHT wire identities, seeding, and fast-resume/recheck behavior.
 - Tracker tier handling.
 - UDP tracker source, action, and transaction correlation.
 - uTP header, connection-ID, extension-chain, and SACK handling.
@@ -34,6 +41,14 @@ feature completion and acceptance criteria, not by time estimates.
   migration on profile replacement, and transactional assignment/config
   rollback. Profile or label-map encryption edits must restart only records
   whose effective mode changes.
+- Metadata-first intake policy: safe profile exclusion glob and organization
+  validation, structured suffix/path-segment/size rules, tracker-host
+  enablement/priority, deterministic create-time snapshots, requested file-index
+  validation, BEP 53 selection that cannot re-enable exclusions, literal-only
+  contained `x.pe` hints, magnet metadata resolution before file selection,
+  preview no-payload behavior, explicit Resume/Start gate clearing, active-only
+  suffix completion, and rollback when the metadata-resolution persistence
+  transition fails.
 - MSE/PE policy: TCP and uTP transport ordering remains independent from
   encryption mode, `required` never retries plaintext after a failed
   negotiation, and inbound routing rejects plaintext after identifying a
@@ -72,13 +87,17 @@ feature completion and acceptance criteria, not by time estimates.
   piece count, non-20-byte-multiple pieces, too many files, too many pieces,
   total-length overflow, and cumulative storage file-offset overflow all
   produce typed `MalformedTorrent` errors without panicking.
-- Durable JSON-state metadata: SHA-1 hashes of 0, 19, 20, and 21 decoded bytes;
-  only 20 succeeds, with the torrent record and piece index in the error and no
-  payload data or content paths. The sequence accepts exactly
-  `MAX_TORRENT_PIECES` hashes and rejects one more. Restored `TorrentMeta`
-  values must also pass the file-count, piece-count, piece-length,
-  total-length, and piece-count consistency checks in `TorrentMeta::validate()`.
-  JSON state does not pass through the bencode byte, depth, or node budgets.
+- Durable SQLite state: legacy JSON detects and migrates only after a complete
+  temporary SQLite generation is checkpointed; state rows, queue indexes,
+  schema-version upgrades, raw canonical `info` BLOB hydration, exact original
+  `.torrent` BLOB retention/export, corruption rejection, retention, and
+  rollback snapshots all round-trip. A pure-v2 record must never alias the
+  all-zero v1 registry key. Projection rebuild tests prove that only verified
+  derived indexes are reconstructed, while raw metainfo/audit/history remain
+  intact and missing, legacy, corrupt, or unsupported databases are refused.
+  Restored `TorrentMeta` values must pass the file-count, piece-count,
+  piece-length, total-length, identity, and piece-layer consistency checks in
+  `TorrentMeta::validate()`.
 - Production metadata ingress bounds: `.torrent` bodies at and one byte over
   `MAX_TORRENT_METADATA_BYTES` through the core parser, dedicated and
   multiplexed raw API add, bulk/Transmission bounded-base64 add, watch import,

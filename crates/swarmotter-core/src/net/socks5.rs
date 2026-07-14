@@ -371,7 +371,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::InfoHash;
+    use crate::hash::PeerInfoHash;
     use crate::net::HttpResponse;
     use crate::tracker::{AnnounceEvent, AnnounceRequest};
     use crate::udp_tracker::udp_announce;
@@ -605,7 +605,7 @@ mod tests {
             &binder,
             &AnnounceRequest {
                 tracker_url: "udp://tracker.example:6969/announce".into(),
-                info_hash: InfoHash::from_bytes([0x42; 20]),
+                info_hash: PeerInfoHash::from_bytes([0x42; 20]),
                 peer_id: *b"-SW0010-socks5udp001",
                 port: 6881,
                 uploaded: 0,

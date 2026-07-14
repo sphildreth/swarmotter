@@ -884,10 +884,12 @@ $("#add-magnet-btn").addEventListener("click", async () => {
     // Leaving this unchecked intentionally lets the selected profile or
     // global queue setting decide the initial start behavior.
     if ($("#magnet-paused").checked) body.paused = true;
+    if ($("#magnet-preview").checked) body.preview = true;
     const h = await api("/torrents/magnet", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-    showToast("Torrent added", h, "success");
+    showToast(body.preview ? "Metadata preview added" : "Torrent added", h, "success");
     input.value = "";
-    refreshTorrents();
+    await refreshTorrents();
+    if (body.preview) await openDetailsHandler(h);
   } catch (e) {
     if (e && e.code === "duplicate_torrent") {
       showToast("Torrent already added", "", "warning");
@@ -912,18 +914,22 @@ $("#add-file-btn").addEventListener("click", async () => {
       $("#file-paused").checked,
       $("#file-profile").value,
       profileLabels($("#file-labels").value),
+      $("#file-preview").checked,
     );
-    showToast("Torrent added", h, "success");
-    refreshTorrents();
+    const preview = $("#file-preview").checked;
+    showToast(preview ? "Torrent preview added" : "Torrent added", h, "success");
+    await refreshTorrents();
+    if (preview) await openDetailsHandler(h);
   } catch (e) { showError("Upload failed", e); }
 });
 
-export async function uploadTorrentFile(file, paused = false, profile = "", labels = []) {
+export async function uploadTorrentFile(file, paused = false, profile = "", labels = [], preview = false) {
   const buf = await file.arrayBuffer();
   const query = new URLSearchParams();
   if (paused) query.set("paused", "true");
   if (profile) query.set("profile", profile);
   if (labels.length) query.set("labels", labels.join(","));
+  if (preview) query.set("preview", "true");
   const suffix = query.toString();
   return api(`/torrents/file${suffix ? `?${suffix}` : ""}`, {
     method: "POST",

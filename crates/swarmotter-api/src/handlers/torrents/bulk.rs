@@ -18,6 +18,16 @@ pub struct AddTorrentsBody {
     pub profile: Option<String>,
     #[serde(default)]
     pub labels: Option<Vec<String>>,
+    #[serde(default)]
+    pub preview: Option<bool>,
+    #[serde(default)]
+    pub unwanted_file_indices: Option<Vec<usize>>,
+    #[serde(default)]
+    pub file_exclusion_rules: Option<Vec<swarmotter_core::policy::PolicyFileExclusionRule>>,
+    #[serde(default)]
+    pub incomplete_dir: Option<String>,
+    #[serde(default)]
+    pub partial_file_suffix: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +79,18 @@ pub async fn add_torrents(
             Ok(options) => options,
             Err(e) => return err_response(e),
         };
+    let options = match super::add::apply_intake_add_options(
+        options,
+        body.preview,
+        body.unwanted_file_indices,
+        body.file_exclusion_rules,
+        body.incomplete_dir,
+        body.partial_file_suffix,
+        &query,
+    ) {
+        Ok(options) => options,
+        Err(e) => return err_response(e),
+    };
 
     let mut added = Vec::new();
     let mut failed = Vec::new();
@@ -77,7 +99,7 @@ pub async fn add_torrents(
             Ok(hash) => added.push(AddTorrentItemResult {
                 kind: "magnet",
                 index,
-                info_hash: hash.to_hex(),
+                info_hash: hash.to_locator(),
             }),
             Err(e) => failed.push(add_failure("magnet", index, e)),
         }
@@ -98,7 +120,7 @@ pub async fn add_torrents(
             Ok(hash) => added.push(AddTorrentItemResult {
                 kind: "torrent_file",
                 index,
-                info_hash: hash.to_hex(),
+                info_hash: hash.to_locator(),
             }),
             Err(e) => failed.push(add_failure("torrent_file", index, e)),
         }

@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 use swarmotter_core::config::Config;
 use swarmotter_core::error::CoreError;
-use swarmotter_core::hash::InfoHash;
+use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::magnet::Magnet;
 use swarmotter_core::models::torrent::{FilePriority, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::TrackerStatus;
@@ -676,7 +676,7 @@ fn is_remote_torrent_url(value: &str) -> bool {
 async fn resolve_hashes(
     state: &SharedState,
     value: Option<&str>,
-) -> Result<Vec<InfoHash>, Response> {
+) -> Result<Vec<TorrentKey>, Response> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Err(text_response(StatusCode::BAD_REQUEST, "missing hashes"));
     };
@@ -713,7 +713,7 @@ fn filter_torrents(rows: Vec<TorrentSummary>, query: &TorrentInfoQuery) -> Vec<T
                 if !hashes.is_empty()
                     && !hashes.iter().any(|hash| {
                         hash.eq_ignore_ascii_case("all")
-                            || hash.eq_ignore_ascii_case(&row.info_hash.to_hex())
+                            || hash.eq_ignore_ascii_case(&row.info_hash.to_locator())
                     })
                 {
                     return false;
@@ -732,7 +732,11 @@ fn filter_torrents(rows: Vec<TorrentSummary>, query: &TorrentInfoQuery) -> Vec<T
 fn qb_torrent_info(row: &TorrentSummary) -> serde_json::Value {
     let amount_left = row.total_length.saturating_sub(row.bytes_completed);
     json!({
-        "hash": row.info_hash.to_hex(),
+        // qBittorrent calls this a hash, but SwarmOtter uses the canonical
+        // full record locator here: 40 hex chars for v1/hybrid and 64 for
+        // pure v2. Truncating a v2 identity would make the compatibility
+        // boundary collision-prone.
+        "hash": row.info_hash.to_locator(),
         "name": row.name,
         "size": row.total_length,
         "progress": row.progress(),
@@ -854,7 +858,8 @@ fn core_error_text(error: CoreError) -> Response {
         CoreError::InvalidArgument(_)
         | CoreError::MalformedMagnet(_)
         | CoreError::MalformedTorrent(_)
-        | CoreError::InvalidInfoHash(_) => StatusCode::BAD_REQUEST,
+        | CoreError::InvalidInfoHash(_)
+        | CoreError::UnsupportedTorrentFeature(_) => StatusCode::BAD_REQUEST,
         CoreError::NetworkBlocked(_) => StatusCode::SERVICE_UNAVAILABLE,
         CoreError::HttpProtocol(_) | CoreError::HttpStatus(_) => StatusCode::BAD_GATEWAY,
         _ => StatusCode::INTERNAL_SERVER_ERROR,

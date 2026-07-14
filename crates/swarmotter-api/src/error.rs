@@ -38,6 +38,7 @@ fn status_for(e: &CoreError) -> StatusCode {
         | CoreError::MalformedMagnet(_)
         | CoreError::MalformedTorrent(_)
         | CoreError::InvalidInfoHash(_)
+        | CoreError::UnsupportedTorrentFeature(_)
         | CoreError::Bencode(_) => StatusCode::BAD_REQUEST,
         CoreError::DuplicateTorrent(_) => StatusCode::CONFLICT,
         CoreError::NetworkBlocked(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -96,6 +97,16 @@ mod tests {
         assert_eq!(
             status_for(&CoreError::HttpStatus("upstream 500".into())),
             StatusCode::BAD_GATEWAY
+        );
+    }
+
+    #[test]
+    fn unsupported_torrent_features_are_client_errors() {
+        assert_eq!(
+            status_for(&CoreError::UnsupportedTorrentFeature(
+                "BEP 52 payload transfer is unavailable".into(),
+            )),
+            StatusCode::BAD_REQUEST
         );
     }
 }

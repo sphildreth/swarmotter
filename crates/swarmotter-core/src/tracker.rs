@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::bencode::{self, Value};
 use crate::error::{CoreError, Result};
-use crate::hash::InfoHash;
+use crate::hash::PeerInfoHash;
 use crate::net::{ContainedHttpClient, NetworkBinder};
 use crate::peer::PeerAddr;
 
@@ -41,7 +41,7 @@ impl AnnounceEvent {
 #[derive(Debug, Clone)]
 pub struct AnnounceRequest {
     pub tracker_url: String,
-    pub info_hash: InfoHash,
+    pub info_hash: PeerInfoHash,
     pub peer_id: [u8; 20],
     pub port: u16,
     pub uploaded: u64,
@@ -156,7 +156,7 @@ pub struct ScrapeCounts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScrapeOutcome {
     Unsupported,
-    Success(HashMap<InfoHash, ScrapeCounts>),
+    Success(HashMap<PeerInfoHash, ScrapeCounts>),
 }
 
 /// Parse a bencoded tracker announce response body.
@@ -319,7 +319,7 @@ pub async fn http_announce(
 /// `info_hash` query pair for each distinct requested hash, in input order.
 /// Existing form-decoded `info_hash` pairs are removed while unrelated raw
 /// query components retain their spelling and order.
-pub fn build_scrape_url(tracker_url: &str, info_hashes: &[InfoHash]) -> Result<Option<String>> {
+pub fn build_scrape_url(tracker_url: &str, info_hashes: &[PeerInfoHash]) -> Result<Option<String>> {
     if info_hashes.is_empty() {
         return Err(CoreError::InvalidArgument(
             "tracker scrape requires at least one info hash".into(),
@@ -383,8 +383,8 @@ fn raw_query_key_is_info_hash(component: &str) -> bool {
 /// or malformed.
 pub fn parse_scrape_response(
     body: &[u8],
-    info_hashes: &[InfoHash],
-) -> Result<HashMap<InfoHash, ScrapeCounts>> {
+    info_hashes: &[PeerInfoHash],
+) -> Result<HashMap<PeerInfoHash, ScrapeCounts>> {
     if info_hashes.is_empty() {
         return Err(CoreError::InvalidArgument(
             "tracker scrape requires at least one info hash".into(),
@@ -436,7 +436,7 @@ pub fn parse_scrape_response(
 fn scrape_nonnegative_count(
     entry: &[(Vec<u8>, Value)],
     field: &[u8],
-    hash: &InfoHash,
+    hash: &PeerInfoHash,
 ) -> Result<u64> {
     let value = entry
         .iter()
@@ -462,7 +462,7 @@ fn scrape_nonnegative_count(
 pub async fn http_scrape(
     binder: &dyn NetworkBinder,
     tracker_url: &str,
-    info_hashes: &[InfoHash],
+    info_hashes: &[PeerInfoHash],
 ) -> Result<ScrapeOutcome> {
     let client = ContainedHttpClient::new(binder);
     http_scrape_with_client(&client, tracker_url, info_hashes).await
@@ -471,7 +471,7 @@ pub async fn http_scrape(
 async fn http_scrape_with_client<B: NetworkBinder + ?Sized>(
     client: &ContainedHttpClient<'_, B>,
     tracker_url: &str,
-    info_hashes: &[InfoHash],
+    info_hashes: &[PeerInfoHash],
 ) -> Result<ScrapeOutcome> {
     let Some(scrape_url) = build_scrape_url(tracker_url, info_hashes)? else {
         return Ok(ScrapeOutcome::Unsupported);
@@ -498,7 +498,7 @@ impl SelfPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::InfoHash;
+    use crate::hash::PeerInfoHash;
     use crate::net::{ContainedUdpSocket, PeerListener};
     use async_trait::async_trait;
     use std::net::SocketAddr;
@@ -509,7 +509,7 @@ mod tests {
     fn req() -> AnnounceRequest {
         AnnounceRequest {
             tracker_url: "http://tracker.example/announce".into(),
-            info_hash: InfoHash::from_bytes([0x12u8; 20]),
+            info_hash: PeerInfoHash::from_bytes([0x12u8; 20]),
             peer_id: *b"-SW0010-abcdefghij12",
             port: 6881,
             uploaded: 0,
@@ -633,7 +633,7 @@ mod tests {
         out.extend_from_slice(value);
     }
 
-    fn scrape_body(entries: &[(InfoHash, i64, i64, i64)]) -> Vec<u8> {
+    fn scrape_body(entries: &[(PeerInfoHash, i64, i64, i64)]) -> Vec<u8> {
         let mut body = b"d5:filesd".to_vec();
         for (hash, complete, incomplete, downloaded) in entries {
             push_bstring(&mut body, hash.as_bytes());
@@ -649,10 +649,10 @@ mod tests {
 
     #[test]
     fn scrape_url_derivation_preserves_raw_query_and_orders_binary_hashes() {
-        let first = InfoHash::from_bytes([
+        let first = PeerInfoHash::from_bytes([
             0x00, 0x20, 0x2f, 0x3f, 0xff, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
         ]);
-        let second = InfoHash::from_bytes([0x22; 20]);
+        let second = PeerInfoHash::from_bytes([0x22; 20]);
         let url = build_scrape_url(
             "https://tracker.test/nested/path/announce.php?pass=%2f+Keep&info_hash=old&%69nfo_hash=old2&x=1#ignored",
             &[first, second],
@@ -674,7 +674,7 @@ mod tests {
 
     #[test]
     fn scrape_url_derivation_handles_exact_suffix_relative_directory_and_unsupported() {
-        let hash = InfoHash::from_bytes([0x11; 20]);
+        let hash = PeerInfoHash::from_bytes([0x11; 20]);
         assert_eq!(
             build_scrape_url("http://tracker.test/announce", &[hash])
                 .unwrap()
@@ -707,9 +707,9 @@ mod tests {
 
     #[test]
     fn scrape_parser_requires_every_exact_hash_and_all_nonnegative_counts() {
-        let first = InfoHash::from_bytes([0x31; 20]);
-        let second = InfoHash::from_bytes([0x32; 20]);
-        let unrelated = InfoHash::from_bytes([0x77; 20]);
+        let first = PeerInfoHash::from_bytes([0x31; 20]);
+        let second = PeerInfoHash::from_bytes([0x32; 20]);
+        let unrelated = PeerInfoHash::from_bytes([0x77; 20]);
         let parsed = parse_scrape_response(
             &scrape_body(&[(unrelated, 9, 8, 7), (first, 1, 2, 3), (second, 4, 5, 6)]),
             &[first, second],
@@ -737,7 +737,7 @@ mod tests {
 
     #[test]
     fn scrape_parser_rejects_missing_wrong_and_out_of_range_matching_fields() {
-        let hash = InfoHash::from_bytes([0x41; 20]);
+        let hash = PeerInfoHash::from_bytes([0x41; 20]);
         let mut missing = b"d5:filesd".to_vec();
         push_bstring(&mut missing, hash.as_bytes());
         missing.extend_from_slice(b"d8:completei1e10:incompletei2eeee");
@@ -814,7 +814,7 @@ mod tests {
 
     #[tokio::test]
     async fn scrape_unsupported_and_udp_make_no_binder_calls() {
-        let hash = InfoHash::from_bytes([0x51; 20]);
+        let hash = PeerInfoHash::from_bytes([0x51; 20]);
         let binder = ScrapeBinder::new("127.0.0.1:9".parse().unwrap());
         for tracker_url in [
             "http://tracker.test/not-supported",
@@ -831,7 +831,7 @@ mod tests {
 
     #[tokio::test]
     async fn contained_http_scrape_returns_only_exact_matching_counts() {
-        let hash = InfoHash::from_bytes([0x52; 20]);
+        let hash = PeerInfoHash::from_bytes([0x52; 20]);
         let body = scrape_body(&[(hash, 7, 8, 9)]);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -866,7 +866,7 @@ mod tests {
     #[tokio::test]
     async fn injected_trust_https_scrape_uses_the_same_contained_client() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let hash = InfoHash::from_bytes([0x53; 20]);
+        let hash = PeerInfoHash::from_bytes([0x53; 20]);
         let body = scrape_body(&[(hash, 10, 11, 12)]);
         let certified = rcgen::generate_simple_self_signed(vec!["secure.test".into()]).unwrap();
         let certificate = certified.cert.der().clone();

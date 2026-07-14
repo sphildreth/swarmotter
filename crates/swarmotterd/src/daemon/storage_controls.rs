@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, Notify};
 use swarmotter_core::bandwidth::{RateDirection, RateLimiter};
 use swarmotter_core::config::{lexical_absolute_path, Config};
 use swarmotter_core::error::{CoreError, Result};
-use swarmotter_core::hash::InfoHash;
+use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::storage::{StorageIo, StorageIoMetrics, StorageThroughput};
 
 use super::DaemonRuntime;
@@ -156,7 +156,7 @@ pub(super) fn storage_root_admission_for_path(
 
 #[derive(Debug, Clone)]
 pub(super) struct StorageAdmissionRecord {
-    pub hash: InfoHash,
+    pub key: TorrentKey,
     pub root: PathBuf,
     pub declared_bytes: u64,
 }
@@ -170,7 +170,7 @@ struct StorageAdmissionReservation {
 /// A pure admission snapshot used by queue planning before engine creation.
 #[derive(Debug, Clone, Default)]
 pub(super) struct StorageAdmissionPlan {
-    reservations: HashMap<InfoHash, StorageAdmissionReservation>,
+    reservations: HashMap<TorrentKey, StorageAdmissionReservation>,
 }
 
 impl StorageAdmissionPlan {
@@ -180,7 +180,7 @@ impl StorageAdmissionPlan {
                 .into_iter()
                 .map(|record| {
                     (
-                        record.hash,
+                        record.key,
                         StorageAdmissionReservation {
                             root: record.root,
                             declared_bytes: record.declared_bytes,
@@ -196,14 +196,14 @@ impl StorageAdmissionPlan {
     /// finish safely while new work uses the replacement policy.
     pub(super) fn admit(
         &mut self,
-        hash: InfoHash,
+        key: TorrentKey,
         admission: &StorageRootAdmission,
         declared_bytes: u64,
     ) -> Result<()> {
-        if self.reservations.contains_key(&hash) {
+        if self.reservations.contains_key(&key) {
             return Ok(());
         }
-        admit_reservation(&mut self.reservations, hash, admission, declared_bytes)
+        admit_reservation(&mut self.reservations, key, admission, declared_bytes)
     }
 }
 
@@ -214,7 +214,7 @@ impl StorageAdmissionPlan {
 /// even when magnet metadata becomes available concurrently.
 #[derive(Clone, Default)]
 pub(super) struct StorageAdmissionController {
-    reservations: Arc<Mutex<HashMap<InfoHash, StorageAdmissionReservation>>>,
+    reservations: Arc<Mutex<HashMap<TorrentKey, StorageAdmissionReservation>>>,
     write_limiters: Arc<Mutex<HashMap<PathBuf, RateLimiter>>>,
     notify: Arc<Notify>,
 }
@@ -255,16 +255,16 @@ fn metrics_root_for_path(config: &Config, path: &Path) -> PathBuf {
 impl StorageAdmissionController {
     pub(super) async fn reserve(
         &self,
-        hash: InfoHash,
+        key: TorrentKey,
         admission: &StorageRootAdmission,
         declared_bytes: u64,
     ) -> Result<()> {
         let mut reservations = self.reservations.lock().await;
-        admit_reservation(&mut reservations, hash, admission, declared_bytes)
+        admit_reservation(&mut reservations, key, admission, declared_bytes)
     }
 
-    pub(super) async fn release(&self, hash: &InfoHash) {
-        if self.reservations.lock().await.remove(hash).is_some() {
+    pub(super) async fn release(&self, key: &TorrentKey) {
+        if self.reservations.lock().await.remove(key).is_some() {
             self.notify.notify_waiters();
         }
     }
@@ -280,8 +280,8 @@ impl StorageAdmissionController {
             .lock()
             .await
             .iter()
-            .map(|(hash, reservation)| StorageAdmissionRecord {
-                hash: *hash,
+            .map(|(key, reservation)| StorageAdmissionRecord {
+                key: *key,
                 root: reservation.root.clone(),
                 declared_bytes: reservation.declared_bytes,
             })
@@ -331,15 +331,15 @@ impl StorageAdmissionController {
 }
 
 fn admit_reservation(
-    reservations: &mut HashMap<InfoHash, StorageAdmissionReservation>,
-    hash: InfoHash,
+    reservations: &mut HashMap<TorrentKey, StorageAdmissionReservation>,
+    key: TorrentKey,
     admission: &StorageRootAdmission,
     declared_bytes: u64,
 ) -> Result<()> {
     let mut active_downloads = 0usize;
     let mut active_bytes = 0u64;
-    for (existing_hash, reservation) in reservations.iter() {
-        if *existing_hash != hash && reservation.root == admission.root {
+    for (existing_key, reservation) in reservations.iter() {
+        if *existing_key != key && reservation.root == admission.root {
             active_downloads = active_downloads.saturating_add(1);
             active_bytes = active_bytes.saturating_add(reservation.declared_bytes);
         }
@@ -362,7 +362,7 @@ fn admit_reservation(
         )));
     }
     reservations.insert(
-        hash,
+        key,
         StorageAdmissionReservation {
             root: admission.root.clone(),
             declared_bytes,
@@ -511,6 +511,11 @@ fn lock_unpoisoned<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use swarmotter_core::hash::InfoHash;
+
+    fn key(byte: u8) -> TorrentKey {
+        TorrentKey::v1(InfoHash::from_bytes([byte; 20]))
+    }
 
     fn admission(
         path: &str,
@@ -530,15 +535,11 @@ mod tests {
     fn admission_plan_enforces_count_and_declared_bytes_atomically() {
         let root = admission("/srv/torrents", 2, 10);
         let mut plan = StorageAdmissionPlan::default();
-        plan.admit(InfoHash::from_bytes([1; 20]), &root, 6).unwrap();
-        let error = plan
-            .admit(InfoHash::from_bytes([2; 20]), &root, 5)
-            .unwrap_err();
+        plan.admit(key(1), &root, 6).unwrap();
+        let error = plan.admit(key(2), &root, 5).unwrap_err();
         assert_eq!(error.code().as_str(), "storage_error");
-        plan.admit(InfoHash::from_bytes([2; 20]), &root, 4).unwrap();
-        let error = plan
-            .admit(InfoHash::from_bytes([3; 20]), &root, 0)
-            .unwrap_err();
+        plan.admit(key(2), &root, 4).unwrap();
+        let error = plan.admit(key(3), &root, 0).unwrap_err();
         assert!(error.to_string().contains("active downloads"));
     }
 
@@ -546,8 +547,8 @@ mod tests {
     fn admission_plan_grandfathers_existing_root_records_on_replacement() {
         let old_root = admission("/srv/old", 1, 0);
         let replacement_root = admission("/srv/new", 1, 0);
-        let existing = InfoHash::from_bytes([1; 20]);
-        let subsequent = InfoHash::from_bytes([2; 20]);
+        let existing = key(1);
+        let subsequent = key(2);
         let mut plan = StorageAdmissionPlan::default();
         plan.admit(existing, &old_root, 1).unwrap();
 

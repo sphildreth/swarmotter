@@ -171,7 +171,7 @@ impl DaemonRuntime {
         let live_seeders = {
             let _lifecycle = self.seeder_lifecycle_lock.lock().await;
             self.seeder_registry
-                .info_hashes()
+                .keys()
                 .await
                 .into_iter()
                 .collect::<HashSet<_>>()
@@ -188,7 +188,7 @@ impl DaemonRuntime {
         let live_seeders = {
             let _lifecycle = self.seeder_lifecycle_lock.lock().await;
             self.seeder_registry
-                .info_hashes()
+                .keys()
                 .await
                 .into_iter()
                 .collect::<HashSet<_>>()
@@ -199,11 +199,11 @@ impl DaemonRuntime {
 
     pub(super) async fn reconcile_engine_progress_with_seeders(
         &self,
-        live_seeders: HashSet<InfoHash>,
+        live_seeders: HashSet<TorrentKey>,
         finish_lifecycle_reconciliation: bool,
     ) {
         let states = self.engine_states.read().await.clone();
-        let running_engines: HashSet<InfoHash> =
+        let running_engines: HashSet<TorrentKey> =
             self.engine_handles.read().await.keys().copied().collect();
         let now = Instant::now();
         let retry_after = self.engine_retry_after.read().await.clone();
@@ -321,7 +321,13 @@ impl DaemonRuntime {
                 t.uploaded = s.uploaded;
                 t.active_peer_workers = s.active_peers;
                 t.known_peers = s.peers.len();
-                if !t.state.is_error() && t.state != TorrentState::Paused {
+                if t.policy.preview_until_started && !t.needs_metadata {
+                    // A metadata-only preview remains manually paused even
+                    // while the short-lived metadata engine is still visible
+                    // to this periodic reconciler.
+                    t.state = TorrentState::Paused;
+                    t.seeding_status = SeedingStatus::NotEligible;
+                } else if !t.state.is_error() && t.state != TorrentState::Paused {
                     if s.finished {
                         if !t.progress.is_complete() {
                             t.state = TorrentState::Completed;
@@ -436,7 +442,7 @@ impl DaemonRuntime {
         let now = Instant::now();
 
         for torrent in torrents {
-            let hash = torrent.info_hash();
+            let hash = torrent.key();
             let state = match states.get(&hash) {
                 Some(state) => Some(state.lock().await.clone()),
                 None => None,
@@ -461,7 +467,7 @@ impl DaemonRuntime {
 
     pub(super) async fn apply_autopilot_decision(
         &self,
-        hash: InfoHash,
+        hash: TorrentKey,
         decision: &AutopilotDecision,
         cfg: &Config,
     ) {
@@ -505,7 +511,7 @@ impl DaemonRuntime {
         if applied {
             self.autopilot_last_action.write().await.insert(hash, now);
             tracing::info!(
-                info_hash = %hash,
+                torrent_key = %hash,
                 action_kind = ?action.kind,
                 rationale = %action.rationale,
                 causes = ?decision.snapshot.causes,
@@ -514,7 +520,11 @@ impl DaemonRuntime {
         }
     }
 
-    pub(super) async fn send_engine_command(&self, hash: InfoHash, command: EngineCommand) -> bool {
+    pub(super) async fn send_engine_command(
+        &self,
+        hash: TorrentKey,
+        command: EngineCommand,
+    ) -> bool {
         let tx = self.engine_cmds.lock().await.get(&hash).cloned();
         let Some(tx) = tx else {
             return false;
@@ -524,7 +534,7 @@ impl DaemonRuntime {
 
     pub(super) async fn apply_autopilot_peer_worker_limit(
         &self,
-        hash: InfoHash,
+        hash: TorrentKey,
         decision: &AutopilotDecision,
         cfg: &Config,
     ) -> bool {
@@ -534,7 +544,7 @@ impl DaemonRuntime {
         let next = current.saturating_add(1).min(hard_limit).max(1);
         if next <= current {
             tracing::debug!(
-                info_hash = %hash,
+                torrent_key = %hash,
                 current_peer_worker_limit = current,
                 hard_peer_worker_limit = hard_limit,
                 "autopilot peer worker increase skipped by configured hard cap"
@@ -545,7 +555,7 @@ impl DaemonRuntime {
             .await
     }
 
-    pub(super) async fn apply_autopilot_queue_release(&self, hash: InfoHash) -> bool {
+    pub(super) async fn apply_autopilot_queue_release(&self, hash: TorrentKey) -> bool {
         if !self.engine_handles.read().await.contains_key(&hash) {
             return false;
         }
@@ -555,7 +565,7 @@ impl DaemonRuntime {
             .is_empty()
         {
             tracing::debug!(
-                info_hash = %hash,
+                torrent_key = %hash,
                 "autopilot queue-slot release skipped because no queued replacement is currently eligible"
             );
             return false;
@@ -591,12 +601,12 @@ impl DaemonRuntime {
 
     pub(super) async fn apply_autopilot_download_ceiling(
         &self,
-        hash: InfoHash,
+        hash: TorrentKey,
         suggested_download_limit: Option<u64>,
     ) -> bool {
         let Some(download_limit) = suggested_download_limit else {
             tracing::debug!(
-                info_hash = %hash,
+                torrent_key = %hash,
                 "autopilot download ceiling change skipped without a bounded suggestion"
             );
             return false;

@@ -16,7 +16,7 @@ use sha1::{Digest, Sha1};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::error::{CoreError, Result};
-use crate::hash::InfoHash;
+use crate::hash::PeerInfoHash;
 
 const DH_BYTES: usize = 96;
 const MAX_PAD_BYTES: usize = 512;
@@ -149,7 +149,7 @@ impl<S: AsyncWrite + Unpin> MseStream<S> {
 }
 
 /// Initiate MSE/PE on an outbound peer byte stream.
-pub async fn connect<S>(mut stream: S, info_hash: InfoHash) -> Result<MseStream<S>>
+pub async fn connect<S>(mut stream: S, info_hash: PeerInfoHash) -> Result<MseStream<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -193,7 +193,7 @@ where
 }
 
 /// Accept MSE/PE on an inbound peer byte stream for a known torrent info hash.
-pub async fn accept<S>(stream: S, info_hash: InfoHash) -> Result<MseStream<S>>
+pub async fn accept<S>(stream: S, info_hash: PeerInfoHash) -> Result<MseStream<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -205,7 +205,10 @@ where
 /// the initiator selected. This is used by a process-wide peer listener: the
 /// MSE stream key is the first point at which an encrypted inbound connection
 /// identifies its torrent.
-pub async fn accept_any<S>(stream: S, info_hashes: &[InfoHash]) -> Result<(InfoHash, MseStream<S>)>
+pub async fn accept_any<S>(
+    stream: S,
+    info_hashes: &[PeerInfoHash],
+) -> Result<(PeerInfoHash, MseStream<S>)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -219,8 +222,8 @@ where
 
 async fn accept_matching<S>(
     mut stream: S,
-    info_hashes: &[InfoHash],
-) -> Result<(InfoHash, MseStream<S>)>
+    info_hashes: &[PeerInfoHash],
+) -> Result<(PeerInfoHash, MseStream<S>)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -642,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn mse_stream_round_trips_over_duplex() {
         let (client_io, server_io) = tokio::io::duplex(8192);
-        let info_hash = InfoHash::from_bytes([0x42; 20]);
+        let info_hash = PeerInfoHash::from_bytes([0x42; 20]);
         let server = tokio::spawn(async move { accept(server_io, info_hash).await });
         let mut client = connect(client_io, info_hash).await.unwrap();
         let mut server = server.await.unwrap().unwrap();
@@ -662,8 +665,8 @@ mod tests {
     #[tokio::test]
     async fn mse_accept_any_routes_by_stream_key() {
         let (client_io, server_io) = tokio::io::duplex(8192);
-        let first = InfoHash::from_bytes([0x11; 20]);
-        let selected = InfoHash::from_bytes([0x22; 20]);
+        let first = PeerInfoHash::from_bytes([0x11; 20]);
+        let selected = PeerInfoHash::from_bytes([0x22; 20]);
         let server = tokio::spawn(async move { accept_any(server_io, &[first, selected]).await });
         let mut client = connect(client_io, selected).await.unwrap();
         let (identified, mut server) = server.await.unwrap().unwrap();

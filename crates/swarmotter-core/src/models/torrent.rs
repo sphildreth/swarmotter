@@ -3,7 +3,7 @@
 //! Torrent state, summary, and file models.
 
 use crate::autopilot::AutopilotMode;
-use crate::hash::InfoHash;
+use crate::hash::{TorrentIdentity, TorrentKey};
 use crate::ratio::TorrentSeeding;
 use serde::{Deserialize, Serialize};
 
@@ -206,7 +206,15 @@ pub enum HealthLabel {
 /// Summary of a torrent exposed in the torrent list and details.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TorrentSummary {
-    pub info_hash: InfoHash,
+    /// Canonical full torrent locator. The longstanding `info_hash` JSON
+    /// field name is retained for v1 API compatibility: v1/hybrid torrents
+    /// serialize as their 40-character SHA-1 key and pure v2 torrents as
+    /// their 64-character SHA-256 key.
+    pub info_hash: TorrentKey,
+    /// Explicit v1, v2, or hybrid torrent identity retained alongside the
+    /// locator for callers that need to inspect every available identity.
+    #[serde(default)]
+    pub identity: TorrentIdentity,
     pub name: String,
     pub state: TorrentState,
     /// Last terminal/runtime error associated with this torrent, if any.

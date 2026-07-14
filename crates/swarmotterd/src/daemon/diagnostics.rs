@@ -592,12 +592,24 @@ pub(super) fn apply_resolved_metadata(
     real: &swarmotter_core::meta::TorrentMeta,
     state: &EngineState,
 ) {
+    // A BEP 53 `so` selection refers to the magnet's eventual file tree, not
+    // the synthetic placeholder. Consume it only as real metadata arrives so
+    // later operator file selections are never re-applied or overridden.
+    let magnet_select_only = if t.needs_metadata {
+        std::mem::take(&mut t.magnet_select_only_file_indices)
+    } else {
+        Vec::new()
+    };
     let initialize_files = t.needs_metadata || t.meta.files.len() != real.files.len();
     t.meta = real.clone();
     t.needs_metadata = false;
     t.magnet_info_hash = None;
+    t.magnet_identity = None;
+    let piece_count = real
+        .data_piece_count()
+        .unwrap_or_else(|_| real.piece_count());
     t.progress
-        .replace_from_bitfield(&state.pieces_have, real.piece_count());
+        .replace_from_bitfield(&state.pieces_have, piece_count);
     if initialize_files {
         t.files = real
             .files
@@ -614,6 +626,28 @@ pub(super) fn apply_resolved_metadata(
             .collect();
         t.priorities = vec![FilePriority::Normal; real.files.len()];
         t.wanted = vec![true; real.files.len()];
+        // A magnet's placeholder has no authoritative file tree. Apply the
+        // add-time profile/request snapshot only after real metadata arrives,
+        // before a payload engine can build its piece selection.
+        swarmotter_core::policy::apply_intake_file_rules(t);
+        if !magnet_select_only.is_empty() {
+            // Local add-time exclusions and profile rules have already only
+            // removed files from selection. `so` is an additional allow-list,
+            // never a mechanism for a URI to re-enable an excluded file.
+            swarmotter_core::magnet::apply_select_only_file_indices(
+                &mut t.priorities,
+                &mut t.wanted,
+                &magnet_select_only,
+            );
+            for (index, file) in t.files.iter_mut().enumerate() {
+                if let (Some(priority), Some(wanted)) =
+                    (t.priorities.get(index), t.wanted.get(index))
+                {
+                    file.priority = *priority;
+                    file.wanted = *wanted;
+                }
+            }
+        }
     }
     t.recompute_file_bytes_completed();
     if !t.progress.is_complete() {
@@ -718,10 +752,17 @@ pub(super) fn validate_restored_storage_ownership<'a>(
     for torrent in torrents {
         let (complete_dir, active_dir) =
             DaemonRuntime::policy_storage_paths_with_config(config, torrent);
-        for root in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
-            ownerships
-                .push(storage_io_with_config(torrent.meta.clone(), root, config).path_ownership()?);
-        }
+        ownerships.push(
+            storage_io_with_config(torrent.meta.clone(), PathBuf::from(complete_dir), config)
+                .path_ownership()?,
+        );
+        ownerships.push(
+            storage_io_with_config(torrent.meta.clone(), PathBuf::from(active_dir), config)
+                .with_partial_file_suffix(DaemonRuntime::partial_file_suffix_for_active_storage(
+                    torrent,
+                ))
+                .path_ownership()?,
+        );
     }
     for index in 0..ownerships.len() {
         for other in ownerships.iter().skip(index + 1) {
@@ -1157,7 +1198,7 @@ pub(super) fn latest_progress_instant(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn log_torrent_throughput_peak(
-    hash: &InfoHash,
+    key: &TorrentKey,
     torrent: &Torrent,
     state: &EngineState,
     sample_rate_down: u64,
@@ -1169,7 +1210,7 @@ pub(super) fn log_torrent_throughput_peak(
     now: Instant,
 ) {
     tracing::info!(
-        info_hash = %hash,
+        torrent_key = %key,
         name = %torrent.name(),
         state = %torrent.state,
         sample_rate_down_bps = sample_rate_down,

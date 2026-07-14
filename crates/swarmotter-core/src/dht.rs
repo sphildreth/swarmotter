@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::bencode;
 use crate::error::{CoreError, Result};
-use crate::hash::InfoHash;
+use crate::hash::PeerInfoHash;
 use crate::peer::PeerAddr;
 
 /// A DHT node ID (20 bytes).
@@ -217,7 +217,7 @@ pub struct KrpcArgs {
     /// Sender node id (always present).
     pub id: NodeId,
     /// Target node id for find_node / info hash for get_peers.
-    pub target: Option<InfoHash>,
+    pub target: Option<PeerInfoHash>,
     /// For announce_peer: the port being announced.
     pub port: Option<u16>,
     /// For announce_peer: the token from a prior get_peers response.
@@ -456,7 +456,7 @@ fn write_str(out: &mut Vec<u8>, b: &[u8]) {
 }
 
 /// Build a `get_peers` query for an info hash.
-pub fn build_get_peers(txn: TransactionId, self_id: NodeId, info_hash: InfoHash) -> Vec<u8> {
+pub fn build_get_peers(txn: TransactionId, self_id: NodeId, info_hash: PeerInfoHash) -> Vec<u8> {
     encode_query(
         txn,
         KrpcMethod::GetPeers,
@@ -476,7 +476,7 @@ pub fn build_find_node(txn: TransactionId, self_id: NodeId, target: NodeId) -> V
         KrpcMethod::FindNode,
         &KrpcArgs {
             id: self_id,
-            target: Some(InfoHash::from_bytes(target.0)),
+            target: Some(PeerInfoHash::from_bytes(target.0)),
             port: None,
             token: None,
         },
@@ -501,7 +501,7 @@ pub fn build_ping(txn: TransactionId, self_id: NodeId) -> Vec<u8> {
 pub fn build_announce_peer(
     txn: TransactionId,
     self_id: NodeId,
-    info_hash: InfoHash,
+    info_hash: PeerInfoHash,
     port: u16,
     token: Vec<u8>,
 ) -> Vec<u8> {
@@ -581,7 +581,7 @@ mod tests {
         }
 
         let id = NodeId::from_bytes([7; 20]);
-        let info_hash = InfoHash::from_bytes([8; 20]);
+        let info_hash = PeerInfoHash::from_bytes([8; 20]);
         let q = build_get_peers(TransactionId::new([1, 2]), id, info_hash);
 
         assert!(q.starts_with(b"d1:a"));
@@ -605,7 +605,7 @@ mod tests {
     #[test]
     fn get_peers_query_uses_info_hash_not_target() {
         let id = NodeId::from_bytes([7; 20]);
-        let info_hash = InfoHash::from_bytes([8; 20]);
+        let info_hash = PeerInfoHash::from_bytes([8; 20]);
         let q = build_get_peers(TransactionId::new([1, 2]), id, info_hash);
         let root = bencode::decode(&q).unwrap();
         let dict = root.as_dict().unwrap();

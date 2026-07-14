@@ -19,7 +19,8 @@ use swarmotter_core::models::{
     ConfigUpdateResult, DiagnosticLevel, DoctorReport, LogSnapshot, NetworkDiagnostics, WatchStatus,
 };
 use swarmotter_core::policy::{
-    PolicyBandwidth, PolicyProfile, PolicyQueue, PolicySeeding, PolicyStorage, QueuePriority,
+    PolicyBandwidth, PolicyFileExclusionRule, PolicyIntake, PolicyProfile, PolicyQueue,
+    PolicySeeding, PolicyStorage, PolicyTracker, QueuePriority, TrackerHostRule,
 };
 use tower::ServiceExt;
 
@@ -293,6 +294,16 @@ fn test_base64(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+fn pure_v2_single_file_fixture() -> Vec<u8> {
+    let mut torrent = Vec::new();
+    torrent.extend_from_slice(b"d4:infod9:file treed10:lawful.bind0:d6:lengthi1e11:pieces root32:");
+    torrent.extend_from_slice(&[0x42; 32]);
+    torrent.extend_from_slice(
+        b"eee12:meta versioni2e4:name10:lawful.bin12:piece lengthi16384ee12:piece layersdee",
+    );
+    torrent
 }
 
 fn parse_api_data<T: DeserializeOwned>(body: &[u8]) -> T {
@@ -641,6 +652,74 @@ async fn add_torrent_file_raw_body() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(v["data"].as_str().unwrap().len() == 40);
+}
+
+#[tokio::test]
+async fn pure_v2_adds_preserve_full_identity_and_register() {
+    let (state, daemon) = fake_daemon::fake_state_with_config_and_daemon(Config::default());
+    let app = swarmotter_api::app_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/file")
+                .header("content-type", "application/octet-stream")
+                .body(Body::from(pure_v2_single_file_fixture()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let file_key = value["data"]
+        .as_str()
+        .expect("pure-v2 file add returns a canonical locator")
+        .to_string();
+    assert_eq!(file_key.len(), 64);
+
+    let (status, value) = post_json(
+        &app,
+        "/api/v1/torrents/magnet",
+        serde_json::json!({
+            "magnet": format!("magnet:?xt=urn:btmh:1220{}", "a".repeat(64)),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let magnet_key = value["data"]
+        .as_str()
+        .expect("pure-v2 magnet add returns a canonical locator")
+        .to_string();
+    assert_eq!(magnet_key, "a".repeat(64));
+    let snapshot = daemon.state_snapshot().await;
+    let torrents = snapshot["torrents"]
+        .as_array()
+        .expect("registered torrent summaries");
+    assert_eq!(torrents.len(), 2);
+    assert!(torrents
+        .iter()
+        .any(|torrent| torrent["info_hash"] == file_key));
+    assert!(torrents
+        .iter()
+        .any(|torrent| torrent["info_hash"] == magnet_key));
+
+    // Native route parsing must retain the complete 64-character key for
+    // every per-torrent surface; it must never route through a v1-only
+    // InfoHash parser or truncate the BEP 52 identity.
+    for key in [&file_key, &magnet_key] {
+        let (status, detail) = get_json(&app, &format!("/api/v1/torrents/{key}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["data"]["info_hash"], *key);
+
+        let (status, diagnostics) = get_json(&app, &format!("/api/v1/torrents/{key}/stats")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(diagnostics["data"]["info_hash"], *key);
+    }
 }
 
 #[tokio::test]
@@ -1383,6 +1462,128 @@ async fn policy_profiles_apply_at_add_and_expose_explainable_native_routes() {
 }
 
 #[tokio::test]
+async fn metadata_preview_intake_is_exposed_by_native_api() {
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.profiles.profiles.insert(
+        "review".into(),
+        PolicyProfile {
+            intake: PolicyIntake {
+                excluded_file_patterns: vec!["samples/*".into(), "*.nfo".into()],
+                excluded_file_rules: vec![PolicyFileExclusionRule {
+                    suffix: Some(".sfv".into()),
+                    ..Default::default()
+                }],
+                organization_subdirectory: Some("lawful/releases".into()),
+                incomplete_subdirectory: Some("staging/review".into()),
+                force_top_level_folder: true,
+                partial_file_suffix: Some(".part".into()),
+            },
+            tracker: PolicyTracker {
+                host_rules: vec![TrackerHostRule {
+                    host_pattern: "*.lawful.example".into(),
+                    enabled: Some(false),
+                    priority: Some(QueuePriority::Low),
+                }],
+            },
+            ..Default::default()
+        },
+    );
+    let app = swarmotter_api::app_router(fake_daemon::fake_state_with_config(cfg));
+
+    let (status, added) = post_json(
+        &app,
+        "/api/v1/torrents/magnet",
+        serde_json::json!({
+            "magnet": named_magnet(9_050, "review-before-start"),
+            "profile": "review",
+            "preview": true,
+            "unwanted_file_indices": [4, 1, 4],
+            "file_exclusion_rules": [{ "path_segment": "proof" }],
+            "incomplete_dir": "/review/incomplete",
+            "partial_file_suffix": ".request"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let hash = added["data"].as_str().unwrap();
+
+    let (status, policy) = get_json(&app, &format!("/api/v1/torrents/{hash}/policy")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        policy["data"]["intake"]["excluded_file_patterns"]["value"],
+        serde_json::json!(["samples/*", "*.nfo"])
+    );
+    assert_eq!(
+        policy["data"]["intake"]["excluded_file_patterns"]["source"]["kind"],
+        "intake_snapshot"
+    );
+    assert_eq!(
+        policy["data"]["intake"]["excluded_file_rules"]["value"],
+        serde_json::json!([
+            { "suffix": ".sfv", "path_pattern": null, "path_segment": null, "min_size_bytes": null, "max_size_bytes": null },
+            { "suffix": null, "path_pattern": null, "path_segment": "proof", "min_size_bytes": null, "max_size_bytes": null }
+        ])
+    );
+    assert_eq!(
+        policy["data"]["intake"]["organization_subdirectory"]["value"],
+        "lawful/releases"
+    );
+    assert_eq!(
+        policy["data"]["intake"]["incomplete_subdirectory"]["value"],
+        "staging/review"
+    );
+    assert_eq!(
+        policy["data"]["intake"]["force_top_level_folder"]["value"],
+        true
+    );
+    assert_eq!(
+        policy["data"]["intake"]["partial_file_suffix"]["value"],
+        ".request"
+    );
+    assert_eq!(
+        policy["data"]["incomplete_dir"]["value"],
+        "/review/incomplete"
+    );
+    assert_eq!(
+        policy["data"]["tracker"]["host_rules"]["value"],
+        serde_json::json!([{ "host_pattern": "*.lawful.example", "enabled": false, "priority": "low" }])
+    );
+    assert_eq!(
+        policy["data"]["tracker"]["host_rules"]["source"]["kind"],
+        "profile"
+    );
+    assert_eq!(
+        policy["data"]["intake"]["unwanted_file_indices"],
+        serde_json::json!([1, 4])
+    );
+    assert_eq!(policy["data"]["intake"]["preview_until_started"], true);
+
+    let (status, preview) = post_json(
+        &app,
+        &format!("/api/v1/torrents/{hash}/storage-preview"),
+        serde_json::json!({
+            "download_dir": "/preview/complete",
+            "incomplete_dir": "/preview/incomplete"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        preview["data"]["complete_dir"],
+        "/preview/complete/lawful/releases/review-before-start"
+    );
+    assert_eq!(
+        preview["data"]["incomplete_dir"],
+        "/preview/incomplete/staging/review/review-before-start"
+    );
+    assert_eq!(preview["data"]["partial_file_suffix"], ".request");
+    assert!(preview["data"]["incomplete_files"][0]
+        .as_str()
+        .is_some_and(|path| path.ends_with(".request")));
+}
+
+#[tokio::test]
 async fn per_torrent_encryption_override_is_explainable_and_clearable() {
     let mut cfg = Config::default();
     cfg.network.mode = NetworkContainmentMode::Disabled;
@@ -1990,6 +2191,72 @@ async fn qbittorrent_api_adds_lists_controls_and_deletes_magnets() {
     assert_eq!(status, StatusCode::OK);
     let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(rows.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn compatibility_adapters_preserve_and_accept_full_pure_v2_locators() {
+    let mut cfg = Config::default();
+    cfg.compatibility.qbittorrent.enabled = true;
+    cfg.compatibility.transmission.enabled = true;
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let qb_key = "a".repeat(64);
+    let qb_add = format!("urls=magnet%3A%3Fxt%3Durn%3Abtmh%3A1220{qb_key}&paused=true");
+    let (status, _, body) =
+        qb_post_form(app.clone(), "/api/v2/torrents/add", &qb_add, None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "Ok.");
+
+    let (status, body) = qb_get(
+        app.clone(),
+        &format!("/api/v2/torrents/info?hashes={qb_key}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rows.as_array().unwrap()[0]["hash"], qb_key);
+
+    let session = transmission_session(app.clone(), None).await;
+    let transmission_key = "b".repeat(64);
+    let (status, body) = transmission_rpc(
+        app.clone(),
+        &session,
+        serde_json::json!({
+            "method": "torrent-add",
+            "arguments": { "filename": transmission_key },
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["arguments"]["torrent-added"]["hashString"],
+        transmission_key
+    );
+
+    let (status, body) = transmission_rpc(
+        app,
+        &session,
+        serde_json::json!({
+            "method": "torrent-get",
+            "arguments": {
+                "ids": [transmission_key],
+                "fields": ["hashString", "magnetLink"],
+            },
+        }),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let torrent = &body["arguments"]["torrents"][0];
+    assert_eq!(torrent["hashString"], transmission_key);
+    assert!(torrent["magnetLink"]
+        .as_str()
+        .unwrap()
+        .contains("xt=urn:btmh:1220"));
 }
 
 #[tokio::test]

@@ -12,7 +12,7 @@ struct PeerReconfigurationRollback<'a> {
     previous_permits: &'a PeerPermitConfiguration,
     previous_health: &'a NetworkHealth,
     previous_bind_failure: &'a Option<HealthReport>,
-    previous_lifecycle: &'a HashMap<InfoHash, LiveTorrentTaskSnapshot>,
+    previous_lifecycle: &'a HashMap<TorrentKey, LiveTorrentTaskSnapshot>,
     live_work: &'a LivePeerWorkSnapshot,
 }
 
@@ -93,7 +93,7 @@ impl DaemonRuntime {
         };
         let seeder_hashes = {
             let _lifecycle = self.seeder_lifecycle_lock.lock().await;
-            self.seeder_registry.info_hashes().await
+            self.seeder_registry.keys().await
         };
         let seeders = {
             let registry = self.registry.lock().await;
@@ -111,7 +111,7 @@ impl DaemonRuntime {
 
     pub(super) async fn torrent_lifecycle_snapshot(
         &self,
-    ) -> HashMap<InfoHash, LiveTorrentTaskSnapshot> {
+    ) -> HashMap<TorrentKey, LiveTorrentTaskSnapshot> {
         self.registry
             .lock()
             .await
@@ -123,7 +123,7 @@ impl DaemonRuntime {
 
     pub(super) async fn restore_torrent_lifecycle_snapshot(
         &self,
-        snapshot: &HashMap<InfoHash, LiveTorrentTaskSnapshot>,
+        snapshot: &HashMap<TorrentKey, LiveTorrentTaskSnapshot>,
     ) {
         let mut registry = self.registry.lock().await;
         for (hash, prior) in snapshot {
@@ -154,10 +154,10 @@ impl DaemonRuntime {
         for prior in &snapshot.downloads {
             {
                 let mut registry = self.registry.lock().await;
-                let torrent = registry.get_mut(&prior.hash).ok_or_else(|| {
+                let torrent = registry.get_mut(&prior.key).ok_or_else(|| {
                     CoreError::Internal(format!(
                         "cannot reconstruct missing download torrent {}",
-                        prior.hash
+                        prior.key
                     ))
                 })?;
                 torrent.state = if prior.state == TorrentState::DownloadingMetadata {
@@ -171,16 +171,16 @@ impl DaemonRuntime {
             // The captured task was already scheduler-authorized. Restart it
             // directly without mutating queue order or granting a durable
             // `start_now` bypass as a side effect of reconfiguration.
-            self.start_engine_while_transition_locked(prior.hash).await;
+            self.start_engine_while_transition_locked(prior.key).await;
         }
 
         for prior in &snapshot.seeders {
             {
                 let mut registry = self.registry.lock().await;
-                let torrent = registry.get_mut(&prior.hash).ok_or_else(|| {
+                let torrent = registry.get_mut(&prior.key).ok_or_else(|| {
                     CoreError::Internal(format!(
                         "cannot reconstruct missing seeding torrent {}",
-                        prior.hash
+                        prior.key
                     ))
                 })?;
                 torrent.state = TorrentState::Completed;
@@ -188,7 +188,7 @@ impl DaemonRuntime {
                 torrent.error = None;
                 torrent.containment_recovery_intent = None;
             }
-            self.start_recovered_seeder_while_transition_locked(prior.hash)
+            self.start_recovered_seeder_while_transition_locked(prior.key)
                 .await?;
         }
 
@@ -198,10 +198,10 @@ impl DaemonRuntime {
         {
             let mut registry = self.registry.lock().await;
             for prior in snapshot.downloads.iter().chain(&snapshot.seeders) {
-                let torrent = registry.get_mut(&prior.hash).ok_or_else(|| {
+                let torrent = registry.get_mut(&prior.key).ok_or_else(|| {
                     CoreError::Internal(format!(
                         "cannot restore lifecycle for missing torrent {}",
-                        prior.hash
+                        prior.key
                     ))
                 })?;
                 torrent.state = prior.state;
@@ -226,9 +226,9 @@ impl DaemonRuntime {
                 .iter()
                 .filter_map(|prior| {
                     (!handles
-                        .get(&prior.hash)
+                        .get(&prior.key)
                         .is_some_and(|handle| !handle.is_finished()))
-                    .then_some(prior.hash)
+                    .then_some(prior.key)
                 })
                 .collect::<Vec<_>>()
         };
@@ -236,14 +236,14 @@ impl DaemonRuntime {
             let _lifecycle = self.seeder_lifecycle_lock.lock().await;
             let live = self
                 .seeder_registry
-                .info_hashes()
+                .keys()
                 .await
                 .into_iter()
                 .collect::<HashSet<_>>();
             snapshot
                 .seeders
                 .iter()
-                .filter_map(|prior| (!live.contains(&prior.hash)).then_some(prior.hash))
+                .filter_map(|prior| (!live.contains(&prior.key)).then_some(prior.key))
                 .collect::<Vec<_>>()
         };
         if missing_downloads.is_empty() && missing_seeders.is_empty() {
@@ -281,7 +281,7 @@ impl DaemonRuntime {
             let _lifecycle = self.seeder_lifecycle_lock.lock().await;
             let live = self
                 .seeder_registry
-                .info_hashes()
+                .keys()
                 .await
                 .into_iter()
                 .collect::<HashSet<_>>();
@@ -320,7 +320,7 @@ impl DaemonRuntime {
         }
     }
 
-    pub(super) async fn eligible_seeder_hashes(&self) -> HashSet<InfoHash> {
+    pub(super) async fn eligible_seeder_hashes(&self) -> HashSet<TorrentKey> {
         let cfg = self.config.read().await.clone();
         let samples = self.rate_samples.read().await.clone();
         let completed = self
@@ -340,7 +340,7 @@ impl DaemonRuntime {
             .collect::<Vec<_>>();
         let mut expected = HashSet::new();
         for torrent in completed {
-            let hash = torrent.info_hash();
+            let hash = torrent.key();
             let idle_seconds = samples
                 .get(&hash)
                 .and_then(|sample| sample.last_upload_at)
@@ -504,7 +504,7 @@ impl DaemonRuntime {
         if next_is_blocked {
             let mut registry = self.registry.lock().await;
             for prior in &live_work.downloads {
-                if let Some(torrent) = registry.get_mut(&prior.hash) {
+                if let Some(torrent) = registry.get_mut(&prior.key) {
                     torrent.containment_recovery_intent =
                         Some(if prior.state == TorrentState::DownloadingMetadata {
                             ContainmentRecoveryIntent::DownloadingMetadata
@@ -516,7 +516,7 @@ impl DaemonRuntime {
                 }
             }
             for prior in &live_work.seeders {
-                if let Some(torrent) = registry.get_mut(&prior.hash) {
+                if let Some(torrent) = registry.get_mut(&prior.key) {
                     torrent.containment_recovery_intent = Some(ContainmentRecoveryIntent::Seeding);
                     torrent.state = TorrentState::NetworkBlocked;
                     torrent.error = Some(next_health.detail.clone());

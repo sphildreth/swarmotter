@@ -6,8 +6,8 @@ This document describes SwarmOtter's architecture.
 
 SwarmOtter is a Rust async daemon with these layers:
 
-- **Core engine** (`swarmotter-core`): bencode, torrent/magnet parsing, info
-  hash, domain models, network containment logic, queue/bandwidth/ratio
+- **Core engine** (`swarmotter-core`): bencode, v1/v2/hybrid torrent and
+  magnet identity parsing, domain models, network containment logic, queue/bandwidth/ratio
   logic, storage layout and fast-resume, watch-folder import logic, named
   policy resolution, peer-admission filter compilation, and the torrent
   registry. Pure, testable logic with no direct socket creation. The
@@ -17,10 +17,16 @@ SwarmOtter is a Rust async daemon with these layers:
   fetched via BEP 9, and watch-folder files are bounded by
   `MAX_TORRENT_METADATA_BYTES`, `MAX_BENCODE_DEPTH`, `MAX_BENCODE_NODES`,
   `MAX_TORRENT_FILES`, `MAX_TORRENT_PIECES`, and `MAX_PIECE_LENGTH` before any
-  piece-sized allocation. Restored daemon state is a separate JSON boundary:
-  piece hashes must decode to exactly 20 bytes and restored `TorrentMeta`
-  values must pass `TorrentMeta::validate()` before runtime use. No malformed
-  input may panic the daemon.
+  piece-sized allocation. BEP 52 identities are computed from exact bencoded
+  `info` bytes; pure-v2 transfer uses a separate SHA-256 file-tree/piece-layer
+  engine, while hybrid records retain a v1 primary locator and a full-v2 alias
+  for compatibility (ADR-0065). A full `TorrentKey` is used for library,
+  queue, API, resume, and persistence ownership; the distinct 20-byte
+  `PeerInfoHash` exists only at peer/tracker/DHT wire boundaries. Restored
+  daemon state is a separate SQLite boundary: durable records must deserialize
+  safely, raw metainfo must retain its exact identity bytes, and restored
+  `TorrentMeta` values must pass `TorrentMeta::validate()` before runtime use.
+  No malformed input may panic the daemon.
 - **Network layer** (`swarmotter-core::net`): centralized interface/source
   binding, route validation, VPN/NIC health, and fail-closed enforcement via
   the `InterfaceProbe` trait and the live `NetworkBinder` abstraction. No
@@ -41,9 +47,11 @@ SwarmOtter is a Rust async daemon with these layers:
   UPnP SOAP control, and operator-configured listener reachability tests use
   the same binder boundary; none can create a default-route diagnostic or
   router-control socket (ADR-0059, ADR-0060).
-- **Storage layer** (`swarmotter-core::storage`): file layout, partial/sparse
-  files, piece read/write and verification, fast resume, forced recheck,
-  move/rename, missing/changed file detection logic. Runtime storage I/O reuses
+- **Storage layer** (`swarmotter-core::storage`): v1 contiguous and BEP 52
+  file-tree-aware file layout, partial/sparse files, SHA-1/SHA-256 piece
+  read/write and verification, full-key fast resume, forced recheck,
+  move/rename, active-only suffix finalization, and missing/changed file
+  detection logic. Runtime storage I/O reuses
   per-torrent file handles and flushes cached writes at read/verification and
   move/remove boundaries rather than after every block write. The daemon owns
   root-scoped atomic active-work admission, shared verified-write limiters,
@@ -70,11 +78,13 @@ SwarmOtter is a Rust async daemon with these layers:
   process-wide `SeederHub` (`swarmotterd::seeder`) owns the contained inbound
   peer listener, routes plaintext and encrypted handshakes to registered
   torrents, and owns every accepted peer session. Engine state is reconciled
-  into torrent summaries and a versioned state file preserves torrent and
-  queue state across restarts. Each retained torrent owns one
+  into torrent summaries and a versioned local SQLite state store preserves
+  torrent and queue state across restarts. Each retained torrent owns one
   `Arc<RateLimiter>` shared by its downloader and seeder, and seeder registry
-  transitions are serialized with `TorrentState`/`SeedingStatus` updates (see
-  ADR-0016, ADR-0045, ADR-0046, and ADR-0052).
+  transitions are serialized with `TorrentState`/`SeedingStatus` updates. The
+  durable state store uses versioned SQLite migrations, full WAL checkpoints,
+  and the existing serialized write/rollback boundary (see ADR-0016,
+  ADR-0046, ADR-0052, ADR-0065, ADR-0066, and ADR-0067).
 - **Per-torrent health** (`swarmotter-core::models::health`): a deterministic
   calculator that turns live engine state (piece availability, peer
   usefulness, throughput, recent stability, discovery) into a `TorrentHealth`

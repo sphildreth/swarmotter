@@ -14,7 +14,7 @@ pub(super) struct ExplicitRecheckRestoreState {
 /// root permit itself is released by the recheck executor's RAII scope.
 struct ExplicitRecheckDropGuard {
     runtime: DaemonRuntime,
-    hash: InfoHash,
+    hash: TorrentKey,
     operation: ExplicitRecheckOperation,
     restore: Option<ExplicitRecheckRestoreState>,
 }
@@ -22,7 +22,7 @@ struct ExplicitRecheckDropGuard {
 impl ExplicitRecheckDropGuard {
     fn new(
         runtime: DaemonRuntime,
-        hash: InfoHash,
+        hash: TorrentKey,
         operation: ExplicitRecheckOperation,
         restore: ExplicitRecheckRestoreState,
     ) -> Self {
@@ -127,7 +127,7 @@ impl DaemonRuntime {
 
     pub(super) async fn cancel_explicit_recheck(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
     ) -> Option<ExplicitRecheckOperation> {
         let operation = self.explicit_rechecks.lock().await.get(hash).cloned();
         if let Some(operation) = &operation {
@@ -138,7 +138,7 @@ impl DaemonRuntime {
 
     async fn finish_explicit_recheck_operation(
         &self,
-        hash: InfoHash,
+        hash: TorrentKey,
         operation: ExplicitRecheckOperation,
     ) {
         let mut operations = self.explicit_rechecks.lock().await;
@@ -154,7 +154,7 @@ impl DaemonRuntime {
 
     pub(super) async fn finish_cancelled_explicit_recheck(
         &self,
-        hash: InfoHash,
+        hash: TorrentKey,
         operation: ExplicitRecheckOperation,
         restore: ExplicitRecheckRestoreState,
     ) {
@@ -211,13 +211,82 @@ impl DaemonRuntime {
         self.finish_explicit_recheck_operation(hash, operation)
             .await;
     }
+
+    /// Release a metadata-preview payload gate as one durable transition.
+    ///
+    /// The preview engine is stopped before its gate changes. The registry and
+    /// queue mutations are then persisted before queue reconciliation is
+    /// permitted to construct a normal payload engine. A failed write restores
+    /// the precise affected torrent and queue membership, leaving the durable
+    /// preview gate in force.
+    async fn release_preview_payload_gate(&self, hash: &TorrentKey) -> Result<bool> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
+        let preview_active = self
+            .registry
+            .lock()
+            .await
+            .get(hash)
+            .is_some_and(|torrent| torrent.policy.preview_until_started);
+        if !preview_active {
+            return Ok(false);
+        }
+
+        // A metadata-only task may be between BEP 9 receipt and its durable
+        // commit. Waiting for it prevents an old preview task from later
+        // re-pausing or overwriting this explicit Start/Resume transition.
+        self.stop_engine(hash).await;
+
+        let previous_torrent = self
+            .registry
+            .lock()
+            .await
+            .get(hash)
+            .cloned()
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+        let previous_queue = self.queue.lock().await.membership_snapshot(hash);
+        {
+            let mut registry = self.registry.lock().await;
+            let torrent = registry
+                .get_mut(hash)
+                .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+            torrent.containment_recovery_intent = None;
+            torrent.policy.preview_until_started = false;
+            if torrent.progress.is_complete() {
+                torrent.state = TorrentState::Completed;
+                torrent.seeding_status = SeedingStatus::Queued;
+            } else {
+                torrent.state = TorrentState::Queued;
+                torrent.seeding_status = SeedingStatus::NotEligible;
+            }
+            torrent.error = None;
+        }
+        {
+            let mut queue = self.queue.lock().await;
+            queue.add(*hash);
+            queue.start_now(hash);
+        }
+
+        if let Err(error) = self.persist_state_with_file_rollback().await {
+            if let Some(torrent) = self.registry.lock().await.get_mut(hash) {
+                *torrent = previous_torrent;
+            }
+            self.queue
+                .lock()
+                .await
+                .restore_membership(*hash, previous_queue);
+            return Err(error);
+        }
+        self.engine_retry_after.write().await.remove(hash);
+        Ok(true)
+    }
 }
 
 #[async_trait]
 impl DaemonOps for DaemonRuntime {
     async fn list_torrents(&self) -> Vec<TorrentSummary> {
         let config = self.config.read().await.clone();
-        let positions: HashMap<InfoHash, usize> = self
+        let positions: HashMap<TorrentKey, usize> = self
             .queue
             .lock()
             .await
@@ -234,7 +303,7 @@ impl DaemonOps for DaemonRuntime {
             .iter()
             .map(|t| {
                 let mut summary = t.to_summary();
-                summary.queue_position = positions.get(&t.info_hash()).copied();
+                summary.queue_position = positions.get(&t.key()).copied();
                 let policy = Self::effective_policy_with_config(&config, t);
                 summary.effective_ratio_limit = (!policy.seed_forever.value)
                     .then_some(policy.ratio_limit.value)
@@ -247,7 +316,9 @@ impl DaemonOps for DaemonRuntime {
             .collect()
     }
 
-    async fn get_torrent(&self, hash: &InfoHash) -> Option<TorrentSummary> {
+    async fn get_torrent(&self, hash: &TorrentKey) -> Option<TorrentSummary> {
+        let canonical_hash = self.canonical_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         let config = self.config.read().await.clone();
         let position = self.queue.lock().await.position(hash);
         let _lifecycle = self.seeder_lifecycle_lock.lock().await;
@@ -265,21 +336,27 @@ impl DaemonOps for DaemonRuntime {
         })
     }
 
+    async fn original_metainfo(&self, hash: &TorrentKey) -> Result<Vec<u8>> {
+        let hash = self.require_torrent_key(*hash).await?;
+        self.retained_original_metainfo(hash).await
+    }
+
     async fn add_torrent_file(
         &self,
         bytes: Vec<u8>,
         options: AddTorrentOptions,
-    ) -> Result<InfoHash> {
+    ) -> Result<TorrentKey> {
         self.add_torrent_file_with_options(bytes, options).await
     }
 
-    async fn add_magnet(&self, magnet: &str, options: AddTorrentOptions) -> Result<InfoHash> {
+    async fn add_magnet(&self, magnet: &str, options: AddTorrentOptions) -> Result<TorrentKey> {
         self.add_magnet_with_options(magnet, options).await
     }
 
-    async fn remove_torrent(&self, hash: &InfoHash, delete_data: bool) -> Result<()> {
+    async fn remove_torrent(&self, hash: &TorrentKey, delete_data: bool) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
         let removed = self
-            .remove_torrents_with_single_reconcile(vec![*hash], delete_data)
+            .remove_torrents_with_single_reconcile(vec![canonical_hash], delete_data)
             .await?;
         if removed.is_empty() {
             return Err(CoreError::NotFound("torrent".into()));
@@ -289,14 +366,22 @@ impl DaemonOps for DaemonRuntime {
 
     async fn remove_torrents(
         &self,
-        hashes: Vec<InfoHash>,
+        hashes: Vec<TorrentKey>,
         delete_data: bool,
-    ) -> Result<Vec<InfoHash>> {
-        self.remove_torrents_with_single_reconcile(hashes, delete_data)
+    ) -> Result<Vec<TorrentKey>> {
+        let mut canonical_hashes = Vec::with_capacity(hashes.len());
+        for hash in hashes {
+            if let Some(hash) = self.canonical_torrent_key(hash).await {
+                canonical_hashes.push(hash);
+            }
+        }
+        self.remove_torrents_with_single_reconcile(canonical_hashes, delete_data)
             .await
     }
 
-    async fn pause(&self, hash: &InfoHash) -> Result<()> {
+    async fn pause(&self, hash: &TorrentKey) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         // Stop the live engine; the torrent stays in the registry as paused.
         self.stop_engine(hash).await;
         {
@@ -322,13 +407,32 @@ impl DaemonOps for DaemonRuntime {
         Ok(())
     }
 
-    async fn resume(&self, hash: &InfoHash) -> Result<()> {
+    async fn resume(&self, hash: &TorrentKey) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
+        if self.release_preview_payload_gate(hash).await? {
+            // The gate and queue admission are already durable. Only now may
+            // reconciliation create a payload engine.
+            self.reconcile_queue().await;
+            self.reconcile_seeders().await;
+            let state = self
+                .registry
+                .lock()
+                .await
+                .get(hash)
+                .map(|torrent| torrent.state)
+                .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+            self.publish_torrent_event("torrent_changed", *hash, state);
+            self.publish_event(stats_updated_event());
+            return Ok(());
+        }
         self.engine_retry_after.write().await.remove(hash);
         {
             let mut reg = self.registry.lock().await;
             match reg.get_mut(hash) {
                 Some(t) => {
                     t.containment_recovery_intent = None;
+                    t.policy.preview_until_started = false;
                     if t.progress.is_complete() {
                         t.state = TorrentState::Completed;
                         t.seeding_status = SeedingStatus::Queued;
@@ -361,7 +465,9 @@ impl DaemonOps for DaemonRuntime {
         Ok(())
     }
 
-    async fn start_now(&self, hash: &InfoHash) -> Result<()> {
+    async fn start_now(&self, hash: &TorrentKey) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         let manually_stopped_complete =
             self.registry.lock().await.get(hash).is_some_and(|torrent| {
                 torrent.progress.is_complete()
@@ -371,11 +477,28 @@ impl DaemonOps for DaemonRuntime {
         if manually_stopped_complete {
             return self.resume(hash).await;
         }
+        if self.release_preview_payload_gate(hash).await? {
+            // This path deliberately shares Resume's transactional gate
+            // release so a Start button can never launch payload work before
+            // the explicit choice is durable.
+            self.reconcile_queue().await;
+            let state = self
+                .registry
+                .lock()
+                .await
+                .get(hash)
+                .map(|torrent| torrent.state)
+                .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+            self.publish_torrent_event("torrent_changed", *hash, state);
+            self.publish_event(stats_updated_event());
+            return Ok(());
+        }
         self.engine_retry_after.write().await.remove(hash);
         {
             let mut reg = self.registry.lock().await;
             if let Some(torrent) = reg.get_mut(hash) {
                 torrent.containment_recovery_intent = None;
+                torrent.policy.preview_until_started = false;
             } else {
                 return Err(CoreError::NotFound("torrent".into()));
             }
@@ -391,11 +514,14 @@ impl DaemonOps for DaemonRuntime {
         Ok(())
     }
 
-    async fn stop(&self, hash: &InfoHash) -> Result<()> {
-        self.pause(hash).await
+    async fn stop(&self, hash: &TorrentKey) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        self.pause(&canonical_hash).await
     }
 
-    async fn recheck(&self, hash: &InfoHash) -> Result<()> {
+    async fn recheck(&self, hash: &TorrentKey) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         self.stop_engine(hash).await;
         let torrent = {
             let reg = self.registry.lock().await;
@@ -459,6 +585,11 @@ impl DaemonOps for DaemonRuntime {
             torrent.meta.clone(),
             std::path::PathBuf::from(&storage_dir),
             &cfg,
+        )
+        .with_partial_file_suffix(
+            (!payload_in_complete_dir)
+                .then(|| Self::partial_file_suffix_for_active_storage(&torrent))
+                .flatten(),
         )
         .with_metrics(Some(metrics));
         let cancellation = operation.cancellation();
@@ -535,7 +666,9 @@ impl DaemonOps for DaemonRuntime {
         Ok(())
     }
 
-    async fn reannounce(&self, hash: &InfoHash) -> Result<()> {
+    async fn reannounce(&self, hash: &TorrentKey) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         // If the engine is running, send a reannounce command; otherwise
         // restart the engine which announces on start.
         let tx = self.engine_cmds.lock().await.get(hash).cloned();
@@ -547,7 +680,9 @@ impl DaemonOps for DaemonRuntime {
         }
     }
 
-    async fn move_data(&self, hash: &InfoHash, path: String) -> Result<()> {
+    async fn move_data(&self, hash: &TorrentKey, path: String) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         if path.trim().is_empty() {
             return Err(CoreError::Storage(
                 "torrent data destination must not be empty".into(),
@@ -567,10 +702,12 @@ impl DaemonOps for DaemonRuntime {
         destination_policy.download_dir = Some(path.clone());
         let (destination_complete, destination_active) =
             Self::policy_storage_paths_with_config(&cfg, &destination_policy);
+        let active_partial_file_suffix = Self::partial_file_suffix_for_active_storage(&torrent);
         self.ensure_storage_paths_available_at_paths_except(
             &torrent.meta,
             &destination_complete,
             &destination_active,
+            active_partial_file_suffix.as_deref(),
             Some(*hash),
         )
         .await?;
@@ -595,8 +732,18 @@ impl DaemonOps for DaemonRuntime {
             destination_active
         };
         let source_path = PathBuf::from(source);
-        let storage = storage_io_with_config(torrent.meta.clone(), source_path.clone(), &cfg);
-        let moved_storage = match storage.move_to(PathBuf::from(destination)).await {
+        let payload_partial_file_suffix = (!payload_in_complete)
+            .then_some(active_partial_file_suffix.clone())
+            .flatten();
+        let storage = storage_io_with_config(torrent.meta.clone(), source_path.clone(), &cfg)
+            .with_partial_file_suffix(payload_partial_file_suffix.clone());
+        let moved_storage = match storage
+            .move_to_with_partial_file_suffix(
+                PathBuf::from(destination),
+                payload_partial_file_suffix.clone(),
+            )
+            .await
+        {
             Ok(storage) => storage,
             Err(error) => {
                 drop(storage_ownership);
@@ -613,7 +760,10 @@ impl DaemonOps for DaemonRuntime {
         }
         let persist_result = self.persist_state().await;
         let result = if let Err(persist_error) = persist_result {
-            match moved_storage.move_to(source_path).await {
+            match moved_storage
+                .move_to_with_partial_file_suffix(source_path, payload_partial_file_suffix)
+                .await
+            {
                 Ok(_) => {
                     if let Some(current) = self.registry.lock().await.get_mut(hash) {
                         current.download_dir = torrent.download_dir.clone();
@@ -638,10 +788,12 @@ impl DaemonOps for DaemonRuntime {
 
     async fn rename_path(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         file_index: usize,
         new_path: String,
     ) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         let components = validated_relative_path(&new_path)?;
         let storage_ownership = self.storage_ownership_lock.lock().await;
         let torrent = self
@@ -658,10 +810,12 @@ impl DaemonOps for DaemonRuntime {
         renamed_meta.files[file_index].path = components;
         let cfg = self.config.read().await.clone();
         let (complete_dir, active_dir) = Self::policy_storage_paths_with_config(&cfg, &torrent);
+        let active_partial_file_suffix = Self::partial_file_suffix_for_active_storage(&torrent);
         self.ensure_storage_paths_available_at_paths_except(
             &renamed_meta,
             &complete_dir,
             &active_dir,
+            active_partial_file_suffix.as_deref(),
             Some(*hash),
         )
         .await?;
@@ -681,11 +835,16 @@ impl DaemonOps for DaemonRuntime {
         } else {
             self.resolve_incomplete_dir_for(&torrent).await
         };
+        let payload_partial_file_suffix = (!payload_in_complete)
+            .then_some(active_partial_file_suffix)
+            .flatten();
         let old_storage =
-            storage_io_with_config(torrent.meta.clone(), PathBuf::from(&storage_dir), &cfg);
+            storage_io_with_config(torrent.meta.clone(), PathBuf::from(&storage_dir), &cfg)
+                .with_partial_file_suffix(payload_partial_file_suffix.clone());
         let old_path = old_storage.file_path(file_index)?;
         let new_storage =
-            storage_io_with_config(renamed_meta.clone(), PathBuf::from(storage_dir), &cfg);
+            storage_io_with_config(renamed_meta.clone(), PathBuf::from(storage_dir), &cfg)
+                .with_partial_file_suffix(payload_partial_file_suffix);
         let new_file_path = new_storage.file_path(file_index)?;
         if old_path == new_file_path {
             drop(storage_ownership);
@@ -736,7 +895,9 @@ impl DaemonOps for DaemonRuntime {
         result
     }
 
-    async fn set_labels(&self, hash: &InfoHash, labels: Vec<String>) -> Result<()> {
+    async fn set_labels(&self, hash: &TorrentKey, labels: Vec<String>) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         // Labels can select a profile, so hold the same transaction boundary
         // as profile replacement through the durable torrent-state write.
         let _config_transaction = self.config_write_lock.lock().await;
@@ -785,9 +946,11 @@ impl DaemonOps for DaemonRuntime {
 
     async fn set_torrent_limits(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         limits: swarmotter_core::bandwidth::TorrentBandwidth,
     ) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         {
             let mut reg = self.registry.lock().await;
             match reg.get_mut(hash) {
@@ -817,9 +980,11 @@ impl DaemonOps for DaemonRuntime {
 
     async fn set_torrent_seeding(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         seeding: swarmotter_core::ratio::TorrentSeeding,
     ) -> Result<TorrentSummary> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         if seeding
             .ratio_limit
             .is_some_and(|value| !value.is_finite() || value < 0.0)
@@ -870,8 +1035,10 @@ impl DaemonOps for DaemonRuntime {
 
     async fn torrent_policy(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
     ) -> Option<swarmotter_core::policy::EffectiveTorrentPolicy> {
+        let canonical_hash = self.canonical_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         let config = self.config.read().await.clone();
         self.registry
             .lock()
@@ -880,20 +1047,44 @@ impl DaemonOps for DaemonRuntime {
             .map(|torrent| Self::effective_policy_with_config(&config, torrent))
     }
 
-    async fn set_torrent_profile(&self, hash: &InfoHash, profile: Option<String>) -> Result<()> {
+    async fn preview_torrent_storage_paths(
+        &self,
+        hash: &TorrentKey,
+        request: swarmotter_api::state::StoragePathPreviewRequest,
+    ) -> Result<swarmotter_api::state::StoragePathPreview> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
+        let config = self.config.read().await.clone();
+        let torrent = self
+            .registry
+            .lock()
+            .await
+            .get(hash)
+            .cloned()
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+        Self::preview_storage_paths_with_config(&config, &torrent, request)
+    }
+
+    async fn set_torrent_profile(&self, hash: &TorrentKey, profile: Option<String>) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         self.assign_torrent_profile(hash, profile).await
     }
 
     async fn set_torrent_encryption_mode(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         encryption_mode: Option<swarmotter_core::config::PeerEncryptionMode>,
     ) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         self.assign_torrent_encryption_mode(hash, encryption_mode)
             .await
     }
 
-    async fn list_files(&self, hash: &InfoHash) -> Option<Vec<TorrentFile>> {
+    async fn list_files(&self, hash: &TorrentKey) -> Option<Vec<TorrentFile>> {
+        let canonical_hash = self.canonical_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         self.registry
             .lock()
             .await
@@ -903,10 +1094,12 @@ impl DaemonOps for DaemonRuntime {
 
     async fn set_wanted(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         file_indices: Vec<usize>,
         wanted: bool,
     ) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         let should_restart = {
             let mut reg = self.registry.lock().await;
             let Some(t) = reg.get_mut(hash) else {
@@ -935,10 +1128,12 @@ impl DaemonOps for DaemonRuntime {
 
     async fn set_priority(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         file_indices: Vec<usize>,
         priority: FilePriority,
     ) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         let should_restart = {
             let mut reg = self.registry.lock().await;
             let Some(t) = reg.get_mut(hash) else {
@@ -968,7 +1163,9 @@ impl DaemonOps for DaemonRuntime {
         Ok(())
     }
 
-    async fn list_trackers(&self, hash: &InfoHash) -> Option<Vec<TrackerInfo>> {
+    async fn list_trackers(&self, hash: &TorrentKey) -> Option<Vec<TrackerInfo>> {
+        let canonical_hash = self.canonical_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         // Reflect real per-tracker announce results from the live engine, if
         // present. Success text is kept separate from last_error so the UI and
         // Transmission emulation do not report successful announces as errors.
@@ -1027,7 +1224,9 @@ impl DaemonOps for DaemonRuntime {
         })
     }
 
-    async fn add_tracker(&self, hash: &InfoHash, url: String) -> Result<()> {
+    async fn add_tracker(&self, hash: &TorrentKey, url: String) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         let result = match self.registry.lock().await.get_mut(hash) {
             Some(t) => {
                 if t.meta.announce.is_none() {
@@ -1043,7 +1242,9 @@ impl DaemonOps for DaemonRuntime {
         self.persist_state().await
     }
 
-    async fn remove_tracker(&self, hash: &InfoHash, url: String) -> Result<()> {
+    async fn remove_tracker(&self, hash: &TorrentKey, url: String) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         let result = match self.registry.lock().await.get_mut(hash) {
             Some(t) => {
                 if t.meta.announce.as_deref() == Some(&url) {
@@ -1061,7 +1262,14 @@ impl DaemonOps for DaemonRuntime {
         self.persist_state().await
     }
 
-    async fn edit_tracker(&self, hash: &InfoHash, old_url: String, new_url: String) -> Result<()> {
+    async fn edit_tracker(
+        &self,
+        hash: &TorrentKey,
+        old_url: String,
+        new_url: String,
+    ) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         let result = match self.registry.lock().await.get_mut(hash) {
             Some(t) => {
                 if t.meta.announce.as_deref() == Some(&old_url) {
@@ -1083,7 +1291,9 @@ impl DaemonOps for DaemonRuntime {
         self.persist_state().await
     }
 
-    async fn list_peers(&self, hash: &InfoHash) -> Option<Vec<Peer>> {
+    async fn list_peers(&self, hash: &TorrentKey) -> Option<Vec<Peer>> {
+        let canonical_hash = self.canonical_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         // Manual bans are a global operator action, and this read-only lookup
         // intentionally does not call `PeerFilter::admit_ip`: rendering peer
         // rows must not increment admission/audit counters.
@@ -1134,9 +1344,11 @@ impl DaemonOps for DaemonRuntime {
 
     async fn ban_peer(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         ban: swarmotter_core::peer_filter::ManualPeerBan,
     ) -> Result<swarmotter_core::peer_filter::PeerFilterStatus> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         let _config_transaction = self.config_write_lock.lock().await;
         if self.registry.lock().await.get(hash).is_none() {
             return Err(CoreError::NotFound("torrent".into()));
@@ -1169,9 +1381,11 @@ impl DaemonOps for DaemonRuntime {
 
     async fn unban_peer(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         ip: String,
     ) -> Result<swarmotter_core::peer_filter::PeerFilterStatus> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         let _config_transaction = self.config_write_lock.lock().await;
         if self.registry.lock().await.get(hash).is_none() {
             return Err(CoreError::NotFound("torrent".into()));
@@ -1187,7 +1401,9 @@ impl DaemonOps for DaemonRuntime {
         self.remove_global_manual_ban_locked(ip).await
     }
 
-    async fn queue_move_up(&self, hash: &InfoHash) -> Result<()> {
+    async fn queue_move_up(&self, hash: &TorrentKey) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         {
             let reg = self.registry.lock().await;
             if reg.get(hash).is_none() {
@@ -1198,7 +1414,9 @@ impl DaemonOps for DaemonRuntime {
         self.reconcile_queue().await;
         self.persist_state().await
     }
-    async fn queue_move_down(&self, hash: &InfoHash) -> Result<()> {
+    async fn queue_move_down(&self, hash: &TorrentKey) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         {
             let reg = self.registry.lock().await;
             if reg.get(hash).is_none() {
@@ -1209,7 +1427,9 @@ impl DaemonOps for DaemonRuntime {
         self.reconcile_queue().await;
         self.persist_state().await
     }
-    async fn queue_move_to_top(&self, hash: &InfoHash) -> Result<()> {
+    async fn queue_move_to_top(&self, hash: &TorrentKey) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         {
             let reg = self.registry.lock().await;
             if reg.get(hash).is_none() {
@@ -1220,7 +1440,9 @@ impl DaemonOps for DaemonRuntime {
         self.reconcile_queue().await;
         self.persist_state().await
     }
-    async fn queue_move_to_bottom(&self, hash: &InfoHash) -> Result<()> {
+    async fn queue_move_to_bottom(&self, hash: &TorrentKey) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         {
             let reg = self.registry.lock().await;
             if reg.get(hash).is_none() {
@@ -1557,7 +1779,7 @@ impl DaemonOps for DaemonRuntime {
             torrents_requested = torrents.len(),
             "download state reset requested by API request"
         );
-        let registry_hashes: Vec<InfoHash> = torrents.iter().map(Torrent::info_hash).collect();
+        let registry_hashes: Vec<TorrentKey> = torrents.iter().map(Torrent::key).collect();
         self.stop_all_torrent_tasks(&registry_hashes).await;
         self.clear_download_runtime_state().await;
 
@@ -1565,8 +1787,23 @@ impl DaemonOps for DaemonRuntime {
         for torrent in &torrents {
             let complete_dir = self.resolve_download_dir(torrent).await;
             let active_dir = self.resolve_incomplete_dir_for(torrent).await;
-            for dir in unique_pathbufs([PathBuf::from(active_dir), PathBuf::from(complete_dir)]) {
-                let storage = storage_io_with_config(torrent.meta.clone(), dir.clone(), &cfg);
+            let active_partial_file_suffix = Self::partial_file_suffix_for_active_storage(torrent);
+            let mut storages = vec![(
+                PathBuf::from(&active_dir),
+                storage_io_with_config(torrent.meta.clone(), PathBuf::from(&active_dir), &cfg)
+                    .with_partial_file_suffix(active_partial_file_suffix.clone()),
+            )];
+            if active_dir != complete_dir || active_partial_file_suffix.is_some() {
+                storages.push((
+                    PathBuf::from(&complete_dir),
+                    storage_io_with_config(
+                        torrent.meta.clone(),
+                        PathBuf::from(&complete_dir),
+                        &cfg,
+                    ),
+                ));
+            }
+            for (dir, storage) in storages {
                 storage.remove_all().await?;
                 push_display_path(&mut storage_paths, &dir);
             }
@@ -1849,7 +2086,7 @@ impl DaemonOps for DaemonRuntime {
                 entry.0 = entry.0.saturating_add(1);
                 entry.1 = entry.1.saturating_add(record.declared_bytes);
                 entry.2 = entry.2.saturating_add(
-                    reg.get(&record.hash)
+                    reg.get(&record.key)
                         .map(|torrent| torrent.rate_down)
                         .unwrap_or(0),
                 );
@@ -2019,7 +2256,9 @@ impl DaemonOps for DaemonRuntime {
         }
     }
 
-    async fn torrent_stats(&self, hash: &InfoHash) -> Option<TorrentDiagnostics> {
+    async fn torrent_stats(&self, hash: &TorrentKey) -> Option<TorrentDiagnostics> {
+        let canonical_hash = self.canonical_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         let _lifecycle = self.seeder_lifecycle_lock.lock().await;
         let engine_state = self.engine_states.read().await.get(hash).cloned();
         let live = if let Some(state) = engine_state {
@@ -2040,7 +2279,7 @@ impl DaemonOps for DaemonRuntime {
         };
         let live = live.unwrap_or_default();
         Some(TorrentDiagnostics {
-            info_hash: t.info_hash(),
+            info_hash: t.key(),
             name: t.name().to_string(),
             state: t.state,
             total_length: t.meta.total_length,
@@ -2079,7 +2318,9 @@ impl DaemonOps for DaemonRuntime {
         self.config.read().await.autopilot.clone()
     }
 
-    async fn torrent_autopilot_decision(&self, hash: &InfoHash) -> Option<AutopilotDecision> {
+    async fn torrent_autopilot_decision(&self, hash: &TorrentKey) -> Option<AutopilotDecision> {
+        let canonical_hash = self.canonical_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         let torrent = self.registry.lock().await.get(hash).cloned()?;
         let cfg = self.config.read().await.clone();
         let network = self.network_health.read().await.clone();
@@ -2109,9 +2350,11 @@ impl DaemonOps for DaemonRuntime {
 
     async fn set_torrent_autopilot_mode_override(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         mode: Option<AutopilotMode>,
     ) -> Result<()> {
+        let canonical_hash = self.require_torrent_key(*hash).await?;
+        let hash = &canonical_hash;
         {
             let mut reg = self.registry.lock().await;
             let Some(t) = reg.get_mut(hash) else {

@@ -29,6 +29,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+use swarmotter_core::hash::{TorrentIdentity, TorrentKey};
 use swarmotter_core::meta::{
     build_single_file_torrent, build_single_file_torrent_with_webseeds, parse_torrent,
 };
@@ -244,7 +245,7 @@ async fn accept_plain_or_mse(
     }
     let encrypted = tokio::time::timeout(
         Duration::from_secs(10),
-        swarmotter_core::mse::accept(stream, info_hash),
+        swarmotter_core::mse::accept(stream, info_hash.into()),
     )
     .await??;
     Ok(Box::new(encrypted))
@@ -883,7 +884,8 @@ async fn local_swarm_seeds_completed_download_to_leecher() {
             peer_session_budget,
             torrent_shutdown_rx,
         ))
-        .await;
+        .await
+        .unwrap();
     let (seeder_shutdown_tx, seeder_shutdown_rx) = tokio::sync::watch::channel(false);
     let seeder = SeederHub::new(
         registry,
@@ -1036,7 +1038,7 @@ async fn local_swarm_endgame_completes_from_near_complete_state() {
         })
         .collect();
     let resume = swarmotter_core::storage::io::build_resume(
-        meta.info_hash,
+        TorrentKey::v1(meta.info_hash),
         meta.name.clone(),
         bf,
         piece_count,
@@ -1394,13 +1396,13 @@ fn pick_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-/// BEP 9 magnet end-to-end: a magnet link (info hash + trackers) is added to
-/// the engine with no real metadata. The engine announces to the trackers,
-/// retries after an incompatible metadata peer, discovers a seed peer from the
-/// next announce, fetches the `info` dict via ut_metadata, verifies the info
-/// hash, then downloads the real content from the same seed.
+/// BEP 9 magnet end-to-end: a metadata-only preview first resolves a magnet
+/// through a direct contained peer without payload work; a normal run then
+/// announces to trackers, retries after an incompatible metadata peer,
+/// discovers a seed peer, verifies the `info` dict, and downloads the lawful
+/// generated content.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn local_swarm_magnet_fetches_metadata_then_downloads() {
+async fn local_swarm_magnet_preview_fetches_metadata_without_payload_then_downloads() {
     use swarmotter_core::extensions;
     use swarmotter_core::magnet::Magnet;
 
@@ -1467,14 +1469,58 @@ async fn local_swarm_magnet_fetches_metadata_then_downloads() {
 
     // Build the magnet link from the real info hash + tracker.
     let magnet = Magnet {
-        info_hash,
+        identity: TorrentIdentity::v1(info_hash),
         display_name: Some("magnet.bin".into()),
         trackers: vec![tracker_url],
         exact_length: None,
         webseeds: vec![],
+        select_only_file_indices: Vec::new(),
+        direct_peers: Vec::new(),
         raw: format!("magnet:?xt=urn:btih:{}", info_hash.to_hex()),
     };
     let magnet_uri = magnet.to_uri();
+
+    // A preview resolves metadata through the same contained direct-peer
+    // path, but it must return before creating a payload layout, announcing
+    // to a tracker, or scheduling a single piece. Use no tracker here so a
+    // recorded announce would be an unambiguous regression.
+    let preview_dir = unique_dir("magnet-preview-metadata-only");
+    std::fs::remove_dir_all(&preview_dir).unwrap();
+    let preview_state = Arc::new(Mutex::new(EngineState::default()));
+    let (_preview_cmd_tx, preview_cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
+    let preview_engine = TorrentEngine::with_limiter(
+        meta.clone(),
+        preview_dir.clone(),
+        peer_id(b"-SW009P-"),
+        Arc::new(LoopbackBinder),
+        preview_state,
+        preview_cmd_rx,
+        vec![seed_peer],
+        6881,
+        swarmotter_core::bandwidth::RateLimiter::unlimited(),
+        Some(swarmotterd::engine::MagnetParams {
+            identity: magnet.identity.clone(),
+            info_hash,
+            wire_info_hash: info_hash.into(),
+            name: "magnet.bin".into(),
+            trackers: Vec::new(),
+            select_only_file_indices: Vec::new(),
+        }),
+    )
+    .with_metadata_only();
+    let preview_final = tokio::time::timeout(Duration::from_secs(20), preview_engine.run())
+        .await
+        .expect("metadata-only magnet preview did not finish")
+        .expect("metadata-only magnet preview failed");
+    assert!(preview_final.resolved_meta.is_some());
+    assert!(!preview_final.finished);
+    assert_eq!(preview_final.pieces_have.count(meta.piece_count()), 0);
+    assert!(preview_final.tracker_announces.is_empty());
+    assert!(preview_final.last_announce.is_none());
+    assert!(
+        !preview_dir.exists(),
+        "metadata-only preview must not create payload storage"
+    );
 
     let dir = unique_dir("magnet");
     let binder = Arc::new(LoopbackBinder);
@@ -1492,9 +1538,12 @@ async fn local_swarm_magnet_fetches_metadata_then_downloads() {
         6881,
         swarmotter_core::bandwidth::RateLimiter::unlimited(),
         Some(swarmotterd::engine::MagnetParams {
+            identity: magnet.identity.clone(),
             info_hash,
+            wire_info_hash: info_hash.into(),
             name: "magnet.bin".into(),
             trackers: magnet.trackers.clone(),
+            select_only_file_indices: Vec::new(),
         }),
     );
     let _ = magnet_uri;
@@ -1982,7 +2031,7 @@ async fn serve_encrypted_bittorrent_over_utp_stream(
     stream: Box<dyn swarmotter_core::utp::PeerDuplex>,
     seed: &UtpSeedPeer,
 ) -> swarmotter_core::Result<()> {
-    let encrypted = swarmotter_core::mse::accept(stream, seed.info_hash).await?;
+    let encrypted = swarmotter_core::mse::accept(stream, seed.info_hash.into()).await?;
     serve_bittorrent_over_stream(Box::new(encrypted), seed).await
 }
 

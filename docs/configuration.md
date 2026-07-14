@@ -76,11 +76,14 @@ containment or security setting from silently falling back to a default.
 
 ## Durable daemon state
 
-Torrent records, queue order, labels, file choices, and per-torrent controls
-are stored separately from configuration in a versioned state file. Select its
-path with `--state-file PATH` or `SWARMOTTER_STATE_FILE=PATH`. Those explicit
-choices take precedence over `storage.state_dir`; when that setting is present,
-the daemon uses `storage.state_dir/state.json` on its next start.
+Torrent records, queue order, labels, file choices, per-torrent controls,
+canonical metainfo, and library-operation indexes are stored separately from
+configuration in a versioned local SQLite state store. Select its path with
+`--state-file PATH` or `SWARMOTTER_STATE_FILE=PATH`. Those explicit choices
+take precedence over `storage.state_dir`; when that setting is present, the
+daemon uses `storage.state_dir/state.json` on its next start. The legacy file
+name is retained for path compatibility even after its contents migrate to
+SQLite.
 
 Without an explicit path, the daemon uses the first available location:
 
@@ -90,9 +93,37 @@ Without an explicit path, the daemon uses the first available location:
 4. `$HOME/.local/state/swarmotter/state.json`.
 5. `./swarmotter-state.json`.
 
-The state file is atomically replaced and mode `0600` on Unix. Corrupt or
-unsupported state stops startup with an explicit error instead of presenting
-an empty library. Restored completed torrents are rechecked before seeding.
+Existing version-one JSON state is read for upgrade compatibility and migrates
+in place on its first successful save. The migration first writes and
+checkpoints a complete temporary SQLite database, then atomically replaces the
+legacy file. SQLite writes use a durable local transaction and checkpoint
+before a rollback snapshot; the database file is mode `0600` on Unix. Corrupt
+or unsupported state stops startup with an explicit error instead of presenting
+an empty library. SwarmOtter does not rebuild a damaged library database from
+payload or fast-resume files because those sources are not authoritative for
+queue and control-plane state; restore a valid state backup or re-add the
+torrents intentionally. Restored completed torrents are rechecked before
+seeding.
+
+The SQLite store retains indexed library/queue state, canonical metainfo,
+byte-exact original locally supplied `.torrent` files, bounded audit history,
+and rolling metric history. It uses full 40-character v1/hybrid-primary or
+64-character pure-v2 locators; a v2 peer-wire truncation is never persisted as
+a library key. To rebuild only verified indexes and projections after an
+interrupted projection update, stop the daemon and run:
+
+```bash
+swarmotterd --state-file /path/to/state.json --rebuild-state-projections
+```
+
+This offline command validates the existing supported SQLite database first.
+It refuses missing, legacy, corrupt, or unsupported files; it never creates a
+new state file, migrates JSON, reconstructs payload state, or repairs a corrupt
+database. The command deliberately does not load `--config` or consult
+`storage.state_dir`: it resolves only `--state-file` (including
+`SWARMOTTER_STATE_FILE`) or the platform compatibility default, so it remains
+usable when the normal configuration is invalid or its strict network path is
+unavailable.
 
 ## Common configuration: bind torrents to `br0`
 
@@ -325,8 +356,8 @@ Remote HTTP/HTTPS URLs for torrent metadata are rejected by this adapter.
 | --- | --- | --- |
 | `download_dir` | unset | Final directory for verified completed downloads. |
 | `incomplete_dir` | unset | Active write directory for incomplete downloads. |
-| `resume_dir` | unset | Dedicated durable fast-resume directory. Resume filenames use the info hash; unset preserves adjacent active-data placement. |
-| `state_dir` | unset | Default directory for `state.json` when no `--state-file` or `SWARMOTTER_STATE_FILE` is supplied; changing it through Settings requires restart. |
+| `resume_dir` | unset | Dedicated durable fast-resume directory. Resume filenames use the full canonical torrent locator; unset preserves adjacent active-data placement. |
+| `state_dir` | unset | Default directory for the durable state store (the compatible default filename is `state.json`) when no `--state-file` or `SWARMOTTER_STATE_FILE` is supplied; changing it through Settings requires restart. |
 | `temp_dir` | unset | Root for the fallback `swarmotter-downloads` payload layout when `download_dir` is unset. It does not relocate atomic state/resume temporary files. |
 | `preallocate` | `false` | Pre-size files before downloading. |
 | `sparse` | `true` | When `false`, active payload files are sized up front even if `preallocate = false`. |
@@ -340,7 +371,7 @@ the preflight uses the stricter reserve.
 
 When `incomplete_dir` is set, SwarmOtter writes partial pieces there while the
 torrent is downloading. `resume_dir`, when configured, stores fast-resume
-metadata separately under an info-hash filename; configuring it never moves
+metadata separately under a full canonical torrent-locator filename; configuring it never moves
 payload data. After every piece is verified, the daemon moves torrent data into
 `download_dir` and removes its fast-resume metadata so the completed directory
 contains only user payload files. If `incomplete_dir` is unset, the active and
@@ -416,10 +447,10 @@ replacement; subsequent admissions use the replacement controls.
 Named policy profiles keep category-style defaults consistent without copying
 queue, seeding, or bandwidth values into every torrent. A profile can supply
 storage paths, queue priority, initial start behavior, ratio/idle defaults,
-seed-forever, per-torrent transfer caps, and an optional peer-wire
-`encryption_mode`. Labels map case-insensitively to profiles; when more than
-one mapped label is present, the normalized label name makes the selection
-deterministic.
+seed-forever, per-torrent transfer caps, an optional peer-wire
+`encryption_mode`, and intake-time file-selection/content-organization rules.
+Labels map case-insensitively to profiles; when more than one mapped label is
+present, the normalized label name makes the selection deterministic.
 
 ```toml
 [profiles.labels]
@@ -444,6 +475,34 @@ seed_forever = false
 [profiles.profiles.linux-release.bandwidth]
 download_limit = 0       # bytes/sec; 0 is unlimited
 upload_limit = 5242880
+
+[profiles.profiles.linux-release.tracker]
+# First matching case-insensitive host glob wins. Omit enabled to leave a
+# matching tracker eligible; high/normal/low determines attempt ordering.
+host_rules = [
+  { host_pattern = "*.example.invalid", enabled = false },
+  { host_pattern = "tracker.example.org", priority = "high" },
+]
+
+[profiles.profiles.linux-release.intake]
+# Case-insensitive * and ? patterns against slash-separated torrent paths.
+excluded_file_patterns = ["*.nfo", "samples/*"]
+# Safe relative path below both selected storage roots.
+organization_subdirectory = "lawful/linux"
+# Optional independent staging directory below the incomplete root.
+incomplete_subdirectory = "review"
+# Put single-file torrents below a directory named after the torrent.
+force_top_level_folder = true
+# Active files are named `original-name.part` until completion.
+partial_file_suffix = ".part"
+
+[[profiles.profiles.linux-release.intake.excluded_file_rules]]
+# Every populated field in one rule must match; any matching rule excludes.
+path_segment = "samples"
+max_size_bytes = 104857600
+
+[[profiles.profiles.linux-release.intake.excluded_file_rules]]
+suffix = ".txt"
 ```
 
 An explicit profile supplied at add time, by a watch folder, or through the
@@ -460,8 +519,10 @@ Encryption precedence is explicit torrent override, selected profile, then
 global `torrent.encryption_mode`. A profile or label-map replacement restarts
 only active download/metadata engines whose effective mode changes; future
 inbound TCP seeding sessions use the refreshed mode, while an already
-negotiated peer session retains its wire stream. Profiles do not create a
-separate network path or proxy.
+negotiated peer session retains its wire stream. Pure-v2 MSE/PE uses its
+20-byte peer-wire identity only at the protocol boundary; the full SHA-256
+identity remains the durable/API key. Profiles do not create a separate network
+path or proxy.
 
 Storage is deliberately different: the resolved completed and incomplete
 paths are captured when a torrent is registered, including the global/no-
@@ -473,6 +534,19 @@ operation for an intentional relocation. State restored from before these
 fields is migrated transactionally from its preceding effective values when a
 profile configuration replacement is applied; until then it retains legacy
 global queue behavior.
+
+Intake rules are also create-time snapshots. Exclusion patterns mark matching
+files unwanted before payload transfer; an add request may supply additional
+`unwanted_file_indices` or structured suffix/path-glob/path-segment/size rules.
+For a magnet, those choices are retained until its contained metadata fetch
+exposes the real file tree. `organization_subdirectory` and
+`incomplete_subdirectory` must be non-empty relative paths with normal
+components only; absolute, current-directory, and parent-directory paths are
+rejected. `partial_file_suffix` is applied only to active payload names and is
+removed on complete verification. Later profile edits never silently rewrite
+an existing torrent's reviewed selection or location. Tracker host rules remain
+live profile policy, so they can control discovery without rewriting the intake
+snapshot.
 
 ### `[network]`
 
@@ -627,7 +701,7 @@ this diagnostic through the same contained runtime path.
 | `allow_ipv6` | `true` | Enables IPv6 peers when network containment also allows IPv6; when false, IPv6 peers are filtered before connecting. |
 | `utp_enabled` | `true` | Enables uTP peer transport through contained UDP sockets. |
 | `utp_prefer_tcp` | `true` | Tries TCP first, with uTP fallback. |
-| `encryption_mode` | `preferred` | Contained TCP/uTP MSE/PE peer-wire mode. `disabled` uses plaintext only. `preferred` attempts MSE/PE first, then retries plaintext only on the same selected contained transport. `required` refuses plaintext and never falls back. Changing this global setting rebuilds active data-plane tasks before it is reported as applied. |
+| `encryption_mode` | `preferred` | Contained TCP/uTP MSE/PE peer-wire mode. `disabled` uses plaintext only. `preferred` attempts MSE/PE first, then retries plaintext only on the same selected contained transport. `required` refuses plaintext and never falls back. Pure-v2 uses its required 20-byte peer-wire identity only for MSE/PE while retaining its full SHA-256 library key. Changing this global setting rebuilds active data-plane tasks before it is reported as applied. |
 | `selfish` | `false` | Removes a torrent after verified completion and does not seed it; already-completed managed records are also removed on runtime reconciliation while preserving downloaded data. |
 
 ### `[port_mapping]`

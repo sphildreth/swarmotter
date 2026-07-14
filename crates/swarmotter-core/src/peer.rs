@@ -14,7 +14,7 @@
 use std::net::SocketAddr;
 
 use crate::error::{CoreError, Result};
-use crate::hash::InfoHash;
+use crate::hash::{InfoHash, PeerInfoHash, V2InfoHash};
 
 /// The standard BitTorrent protocol handshake pstr: "BitTorrent protocol".
 pub const PSTR: &[u8] = b"BitTorrent protocol";
@@ -22,6 +22,23 @@ pub const PSTR: &[u8] = b"BitTorrent protocol";
 /// Reserved bytes (8). All zero by default; the extension-protocol bit
 /// (`EXTENSION_RESERVED`) is set by callers that want BEP 10/PEX/metadata.
 pub const RESERVED: [u8; 8] = [0u8; 8];
+
+/// Index of the BEP 52 capability bit in the peer-handshake reserved bytes.
+/// BEP 52 specifies the fourth-most-significant bit of the final byte.
+pub const V2_RESERVED_BYTE_INDEX: usize = 7;
+
+/// BEP 52 capability bit in the final reserved handshake byte.
+pub const V2_RESERVED_BIT: u8 = 0x08;
+
+/// Return a reserved-byte field with the BEP 52 capability bit set.
+///
+/// Hybrid initiators set this alongside their v1 SHA-1 handshake to permit a
+/// peer to reply with the v2 truncated hash. Pure v2 sessions also set it so
+/// both ends make their v2 capability explicit.
+pub const fn with_v2_support(mut reserved: [u8; 8]) -> [u8; 8] {
+    reserved[V2_RESERVED_BYTE_INDEX] |= V2_RESERVED_BIT;
+    reserved
+}
 
 /// Block size used for piece requests (16 KiB), per BEP 3 convention.
 pub const BLOCK_SIZE: u32 = 16 * 1024;
@@ -90,6 +107,82 @@ impl Handshake {
     pub fn supports_extensions(&self) -> bool {
         self.reserved[5] & 0x10 != 0
     }
+
+    /// Whether the peer advertised BEP 52 v2 peer-protocol capability.
+    pub fn supports_v2(&self) -> bool {
+        self.reserved[V2_RESERVED_BYTE_INDEX] & V2_RESERVED_BIT != 0
+    }
+}
+
+/// A BEP 52-capable peer handshake.
+///
+/// The BitTorrent wire handshake always carries 20 bytes. For a pure v2
+/// swarm those bytes are the truncated SHA-256 identity, represented by
+/// [`PeerInfoHash`] rather than the v1-only [`InfoHash`]. Keeping this type
+/// separate prevents a v2 truncation from leaking into v1 registry or MSE
+/// boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V2Handshake {
+    pub info_hash: PeerInfoHash,
+    pub peer_id: [u8; 20],
+    pub reserved: [u8; 8],
+}
+
+impl V2Handshake {
+    pub fn new(info_hash: PeerInfoHash, peer_id: [u8; 20]) -> Self {
+        Self {
+            info_hash,
+            peer_id,
+            reserved: with_v2_support(RESERVED),
+        }
+    }
+
+    /// Encode the ordinary 68-byte BitTorrent handshake with a neutral
+    /// 20-byte BEP 52 peer/tracker wire identity.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + PSTR.len() + 8 + 20 + 20);
+        out.push(PSTR.len() as u8);
+        out.extend_from_slice(PSTR);
+        out.extend_from_slice(&self.reserved);
+        out.extend_from_slice(self.info_hash.as_bytes());
+        out.extend_from_slice(&self.peer_id);
+        out
+    }
+
+    /// Decode a 68-byte BEP 52-capable handshake.
+    pub fn decode(buf: &[u8]) -> Result<Self> {
+        if buf.len() < 68 {
+            return Err(CoreError::Parse(format!(
+                "handshake too short: {} bytes",
+                buf.len()
+            )));
+        }
+        let pstrlen = buf[0] as usize;
+        if pstrlen != 19 || &buf[1..20] != PSTR {
+            return Err(CoreError::Parse("handshake has wrong pstr".into()));
+        }
+        let mut reserved = [0u8; 8];
+        reserved.copy_from_slice(&buf[20..28]);
+        let mut info_hash = [0u8; 20];
+        info_hash.copy_from_slice(&buf[28..48]);
+        let mut peer_id = [0u8; 20];
+        peer_id.copy_from_slice(&buf[48..68]);
+        Ok(Self {
+            info_hash: PeerInfoHash::from_bytes(info_hash),
+            peer_id,
+            reserved,
+        })
+    }
+
+    /// Whether the peer advertises BEP 10 extension protocol support.
+    pub fn supports_extensions(&self) -> bool {
+        self.reserved[5] & 0x10 != 0
+    }
+
+    /// Whether the peer advertised BEP 52 v2 capability.
+    pub fn supports_v2(&self) -> bool {
+        self.reserved[V2_RESERVED_BYTE_INDEX] & V2_RESERVED_BIT != 0
+    }
 }
 
 /// Peer wire message ids.
@@ -105,6 +198,10 @@ pub enum MessageId {
     Request = 6,
     Piece = 7,
     Cancel = 8,
+    Reject = 16,
+    HashRequest = 21,
+    Hashes = 22,
+    HashReject = 23,
 }
 
 impl MessageId {
@@ -119,6 +216,10 @@ impl MessageId {
             6 => Some(Self::Request),
             7 => Some(Self::Piece),
             8 => Some(Self::Cancel),
+            16 => Some(Self::Reject),
+            21 => Some(Self::HashRequest),
+            22 => Some(Self::Hashes),
+            23 => Some(Self::HashReject),
             _ => None,
         }
     }
@@ -152,6 +253,39 @@ pub enum Message {
         piece: u32,
         offset: u32,
         length: u32,
+    },
+    /// Fast-extension request rejection (wire id 16).
+    Reject {
+        piece: u32,
+        offset: u32,
+        length: u32,
+    },
+    /// BEP 52 hash request (wire id 21). `pieces_root` identifies the file;
+    /// the other fields select a hash-tree range and proof.
+    HashRequest {
+        pieces_root: V2InfoHash,
+        base_layer: u32,
+        index: u32,
+        length: u32,
+        proof_layers: u32,
+    },
+    /// BEP 52 hash response (wire id 22). The returned sequence includes the
+    /// requested hashes followed by the required uncle/proof hashes.
+    Hashes {
+        pieces_root: V2InfoHash,
+        base_layer: u32,
+        index: u32,
+        length: u32,
+        proof_layers: u32,
+        hashes: Vec<V2InfoHash>,
+    },
+    /// BEP 52 hash request rejection (wire id 23).
+    HashReject {
+        pieces_root: V2InfoHash,
+        base_layer: u32,
+        index: u32,
+        length: u32,
+        proof_layers: u32,
     },
     /// A BEP 10 extension message (wire id 20). `id` is the extension id from
     /// the extension handshake (`0` = handshake itself); `payload` is the
@@ -217,6 +351,73 @@ impl Message {
                 payload.extend_from_slice(&length.to_be_bytes());
                 len_prefix(13, &payload)
             }
+            Self::Reject {
+                piece,
+                offset,
+                length,
+            } => {
+                let mut payload = Vec::with_capacity(13);
+                payload.push(16);
+                payload.extend_from_slice(&piece.to_be_bytes());
+                payload.extend_from_slice(&offset.to_be_bytes());
+                payload.extend_from_slice(&length.to_be_bytes());
+                len_prefix(13, &payload)
+            }
+            Self::HashRequest {
+                pieces_root,
+                base_layer,
+                index,
+                length,
+                proof_layers,
+            } => len_prefix(
+                49,
+                &v2_hash_message_payload(
+                    21,
+                    *pieces_root,
+                    *base_layer,
+                    *index,
+                    *length,
+                    *proof_layers,
+                    &[],
+                ),
+            ),
+            Self::Hashes {
+                pieces_root,
+                base_layer,
+                index,
+                length,
+                proof_layers,
+                hashes,
+            } => {
+                let payload = v2_hash_message_payload(
+                    22,
+                    *pieces_root,
+                    *base_layer,
+                    *index,
+                    *length,
+                    *proof_layers,
+                    hashes,
+                );
+                len_prefix(payload.len() as u32, &payload)
+            }
+            Self::HashReject {
+                pieces_root,
+                base_layer,
+                index,
+                length,
+                proof_layers,
+            } => len_prefix(
+                49,
+                &v2_hash_message_payload(
+                    23,
+                    *pieces_root,
+                    *base_layer,
+                    *index,
+                    *length,
+                    *proof_layers,
+                    &[],
+                ),
+            ),
             Self::Extended { id, payload } => {
                 let mut p = Vec::with_capacity(1 + payload.len());
                 p.push(20); // BEP 10 extension message id
@@ -298,6 +499,63 @@ impl Message {
                     length,
                 })
             }
+            Some(MessageId::Reject) if payload.len() == 12 => {
+                let piece = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+                let offset = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                let length = u32::from_be_bytes(payload[8..12].try_into().unwrap());
+                Ok(Self::Reject {
+                    piece,
+                    offset,
+                    length,
+                })
+            }
+            Some(MessageId::HashRequest) if payload.len() == 48 => {
+                let (pieces_root, base_layer, index, length, proof_layers) =
+                    decode_v2_hash_message_header(payload)?;
+                validate_v2_hash_request(index, length)?;
+                Ok(Self::HashRequest {
+                    pieces_root,
+                    base_layer,
+                    index,
+                    length,
+                    proof_layers,
+                })
+            }
+            Some(MessageId::Hashes)
+                if payload.len() >= 48 && (payload.len() - 48).is_multiple_of(32) =>
+            {
+                let (pieces_root, base_layer, index, length, proof_layers) =
+                    decode_v2_hash_message_header(&payload[..48])?;
+                validate_v2_hash_request(index, length)?;
+                let hashes = payload[48..]
+                    .chunks_exact(32)
+                    .map(|hash| {
+                        let mut bytes = [0u8; 32];
+                        bytes.copy_from_slice(hash);
+                        V2InfoHash::from_bytes(bytes)
+                    })
+                    .collect();
+                Ok(Self::Hashes {
+                    pieces_root,
+                    base_layer,
+                    index,
+                    length,
+                    proof_layers,
+                    hashes,
+                })
+            }
+            Some(MessageId::HashReject) if payload.len() == 48 => {
+                let (pieces_root, base_layer, index, length, proof_layers) =
+                    decode_v2_hash_message_header(payload)?;
+                validate_v2_hash_request(index, length)?;
+                Ok(Self::HashReject {
+                    pieces_root,
+                    base_layer,
+                    index,
+                    length,
+                    proof_layers,
+                })
+            }
             // BEP 10 extension message: first payload byte is the extension id.
             _ if id == 20 && !payload.is_empty() => {
                 let ext_id = payload[0];
@@ -312,6 +570,53 @@ impl Message {
             }),
         }
     }
+}
+
+fn v2_hash_message_payload(
+    id: u8,
+    pieces_root: V2InfoHash,
+    base_layer: u32,
+    index: u32,
+    length: u32,
+    proof_layers: u32,
+    hashes: &[V2InfoHash],
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(49 + hashes.len() * 32);
+    payload.push(id);
+    payload.extend_from_slice(pieces_root.as_bytes());
+    payload.extend_from_slice(&base_layer.to_be_bytes());
+    payload.extend_from_slice(&index.to_be_bytes());
+    payload.extend_from_slice(&length.to_be_bytes());
+    payload.extend_from_slice(&proof_layers.to_be_bytes());
+    for hash in hashes {
+        payload.extend_from_slice(hash.as_bytes());
+    }
+    payload
+}
+
+fn decode_v2_hash_message_header(payload: &[u8]) -> Result<(V2InfoHash, u32, u32, u32, u32)> {
+    if payload.len() != 48 {
+        return Err(CoreError::Parse(format!(
+            "BEP 52 hash message header has {} bytes; expected 48",
+            payload.len()
+        )));
+    }
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&payload[..32]);
+    Ok((
+        V2InfoHash::from_bytes(root),
+        u32::from_be_bytes(payload[32..36].try_into().unwrap()),
+        u32::from_be_bytes(payload[36..40].try_into().unwrap()),
+        u32::from_be_bytes(payload[40..44].try_into().unwrap()),
+        u32::from_be_bytes(payload[44..48].try_into().unwrap()),
+    ))
+}
+
+fn validate_v2_hash_request(index: u32, length: u32) -> Result<()> {
+    if length < 2 || !length.is_power_of_two() || !index.is_multiple_of(length) {
+        return Err(CoreError::Parse("invalid BEP 52 hash request range".into()));
+    }
+    Ok(())
 }
 
 fn len_prefix(len: u32, body: &[u8]) -> Vec<u8> {
@@ -529,6 +834,13 @@ impl<S: tokio::io::AsyncRead + Unpin> PeerReader<S> {
         Handshake::decode(&buf)
     }
 
+    /// Read and decode a BEP 52-capable handshake carrying a neutral
+    /// [`PeerInfoHash`] wire value.
+    pub async fn read_v2_handshake(&mut self) -> Result<V2Handshake> {
+        let buf = self.read_exact(68).await?;
+        V2Handshake::decode(&buf)
+    }
+
     /// Read one length-prefixed message (or keepalive). Returns `None` on a
     /// clean EOF between messages.
     pub async fn read_message(&mut self) -> Result<Option<Message>> {
@@ -599,6 +911,15 @@ pub async fn write_handshake<W: tokio::io::AsyncWrite + Unpin>(
     w.write_all(&hs.encode()).await.map_err(CoreError::from)
 }
 
+/// Write a BEP 52-capable peer handshake to a duplex stream.
+pub async fn write_v2_handshake<W: tokio::io::AsyncWrite + Unpin>(
+    w: &mut W,
+    hs: &V2Handshake,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    w.write_all(&hs.encode()).await.map_err(CoreError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,7 +948,20 @@ mod tests {
     }
 
     #[test]
+    fn v2_handshake_roundtrip_keeps_truncated_wire_identity_distinct() {
+        let full = V2InfoHash::from_bytes([0xC7; 32]);
+        let hs = V2Handshake::new(full.peer_info_hash(), *b"-SWV200-abcdefghij12");
+        let encoded = hs.encode();
+        assert_eq!(encoded.len(), 68);
+        assert_eq!(&encoded[28..48], &full.as_bytes()[..20]);
+        let decoded = V2Handshake::decode(&encoded).unwrap();
+        assert_eq!(decoded, hs);
+        assert!(decoded.supports_v2());
+    }
+
+    #[test]
     fn message_roundtrip_all_kinds() {
+        let v2_root = V2InfoHash::from_bytes([0xB2; 32]);
         let cases = vec![
             Message::Keepalive,
             Message::Choke,
@@ -653,12 +987,55 @@ mod tests {
                 offset: 16,
                 length: 32,
             },
+            Message::Reject {
+                piece: 2,
+                offset: 16,
+                length: 32,
+            },
+            Message::HashRequest {
+                pieces_root: v2_root,
+                base_layer: 0,
+                index: 0,
+                length: 2,
+                proof_layers: 3,
+            },
+            Message::Hashes {
+                pieces_root: v2_root,
+                base_layer: 0,
+                index: 0,
+                length: 2,
+                proof_layers: 3,
+                hashes: vec![
+                    V2InfoHash::from_bytes([0x11; 32]),
+                    V2InfoHash::from_bytes([0x22; 32]),
+                ],
+            },
+            Message::HashReject {
+                pieces_root: v2_root,
+                base_layer: 0,
+                index: 0,
+                length: 2,
+                proof_layers: 3,
+            },
         ];
         for m in cases {
             let enc = m.encode();
             let back = Message::decode_frame(&enc).unwrap();
             assert_eq!(back, m, "mismatch for {:?}", m);
         }
+    }
+
+    #[test]
+    fn hash_request_rejects_non_power_of_two_or_unaligned_range() {
+        let message = Message::HashRequest {
+            pieces_root: V2InfoHash::from_bytes([0x39; 32]),
+            base_layer: 0,
+            index: 1,
+            length: 3,
+            proof_layers: 0,
+        };
+        let error = Message::decode_frame(&message.encode()).unwrap_err();
+        assert!(matches!(error, CoreError::Parse(_)));
     }
 
     #[test]

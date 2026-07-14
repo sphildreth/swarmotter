@@ -113,10 +113,11 @@ limit returns HTTP 413 with `payload_too_large` before the metadata-specific
 error. Bulk and Transmission base64 metainfo decoding stops before decoded
 output can exceed 16 MiB.
 
-Restored daemon state is JSON, not bencode. Its piece-hash sequence is capped at
-`MAX_TORRENT_PIECES`; each hash must encode exactly 20 bytes before hex
-decoding/copying, and restored metainfo must pass `TorrentMeta::validate()`
-before runtime use. See ADR-0050.
+Restored daemon state uses a versioned local SQLite store, not bencode. A
+validated legacy JSON state document migrates in place on its first successful
+save. Restored metainfo, including retained canonical raw `info` bytes when
+available, must pass `TorrentMeta::validate()` before runtime use. See
+ADR-0050 and ADR-0067.
 
 ## Health, version, and stats
 
@@ -158,10 +159,11 @@ the process-wide connection-limit authority.
 | GET | `/torrents` | List torrents. |
 | GET | `/torrents/query` | Query torrents with server-side filters, sorting, pagination, counts, and optional grouping. |
 | POST | `/torrents` | Add magnet JSON or raw `.torrent` body. |
-| POST | `/torrents/magnet` | Add magnet JSON: `{ magnet, download_dir?, paused?, start_behavior?, profile?, labels? }`. |
-| POST | `/torrents/file` | Upload raw `.torrent` body; query supports `paused`, `start_behavior`, `profile`, and comma-separated `labels`. |
+| POST | `/torrents/magnet` | Add magnet JSON with storage, profile, preview, file-selection, structured exclusion, and active-file-suffix options. |
+| POST | `/torrents/file` | Upload raw `.torrent` body; query supports start, profile, label, preview, selection, active-root, and partial-suffix options. |
 | POST | `/torrents/bulk` | Add multiple magnets and/or base64 `.torrent` payloads. |
 | GET | `/torrents/:hash` | Torrent details. |
+| GET | `/torrents/:hash/metainfo` | Return the retained, byte-exact original `.torrent` document when one exists. |
 | GET | `/torrents/:hash/stats` | Per-torrent counters and live engine diagnostics. |
 | DELETE | `/torrents/:hash?delete_data=bool` | Remove torrent, optionally deleting data. |
 | POST | `/torrents/remove` | Remove multiple torrents: `{ info_hashes, delete_data? }`. |
@@ -177,6 +179,7 @@ the process-wide connection-limit authority.
 | PUT | `/torrents/:hash/seeding` | Replace the persisted per-torrent ratio/idle/forever policy. |
 | GET | `/torrents/:hash/policy` | Effective profile values plus the source of every value. |
 | PUT | `/torrents/:hash/policy` | Set/clear explicit profile: `{ profile: "name" }` or `{ profile: null }`. |
+| POST | `/torrents/:hash/storage-preview` | Read-only path proposal: `{ download_dir?, incomplete_dir?, profile? }`. |
 
 Torrent list/detail rows include nullable `error`, `uploaded`, `ratio`,
 `seeding`, `seeding_status`, `effective_ratio_limit`, and
@@ -186,6 +189,14 @@ that clears it. The persisted `seeding` object has nullable `ratio_limit` and
 `idle_limit` fields plus `seed_forever`. Nullable targets inherit `[seeding]`
 globals; explicit zero is an immediate target. `seed_forever: true` makes both
 effective fields `null` without erasing stored overrides.
+
+Rows also include an explicit `identity` object with `kind` (`v1`, `v2`, or
+`hybrid`) and the applicable full hash values. `unknown` is retained only for a
+legacy record that predates the additive identity field. The longstanding
+`info_hash` field is now the canonical torrent locator: 40 lowercase hexadecimal
+characters for v1 and hybrid-primary records, or 64 for pure-v2 records. A
+hybrid's full v2 locator is also accepted as an alias for its canonical v1
+record. The 20-byte peer/tracker/DHT wire value is never an API locator.
 
 When every attempted configured tracker fails and no usable DHT, PEX,
 direct-peer, or webseed source exists, the daemon stops the bounded engine
@@ -227,6 +238,38 @@ provided. If add-time free-space preflight is configured, add requests can fail
 before write with a storage-capacity error when the target root does not meet the
 reserve configured under `[storage]`.
 
+Set `preview: true` to register a metadata-first preview. A `.torrent` preview
+is paused with its parsed file tree available immediately. A magnet preview may
+use the normal contained BEP 9 metadata path, then becomes paused before any
+payload storage, payload announce, or piece request. Resume or Start Now clears
+the durable preview gate and follows the normal queue and containment paths.
+`preview` cannot be combined with an explicit payload-start request.
+`unwanted_file_indices` is a deduplicated selection captured at add time; for
+magnets it is applied only after the real file tree has been validated. The
+effective policy endpoint exposes the stored intake decision. Add JSON and bulk
+requests may additionally supply `file_exclusion_rules`, `incomplete_dir`, and
+`partial_file_suffix`. A structured rule can combine a path glob, filename
+suffix, path segment, and inclusive minimum/maximum byte length; matching files
+remain unwanted. A partial suffix applies only to active files and is removed
+when all files complete. The storage-preview endpoint is read-only: it shows
+the resolved complete and incomplete paths without creating, moving, or opening
+payload files.
+
+SwarmOtter accepts v1, pure-v2, and hybrid BEP 52 magnets and `.torrent` files.
+Pure-v2 records retain their full SHA-256 locator through registration, queue,
+API, durable state, fast resume, and contained peer/tracker/DHT discovery. The
+pure-v2 engine validates the file tree and SHA-256 piece layers before payload
+transfer. Hybrid records preserve both validated identities and use their v1
+compatibility swarm as the canonical registry record. Invalid or incomplete
+v2/hybrid metadata fails with a typed error; it never falls back to a v1 key,
+piece hash, or network path.
+
+`GET /torrents/:hash/metainfo` returns `application/x-bittorrent` bytes only
+when SwarmOtter retained an original full `.torrent` document at local-file or
+watch-folder intake. It never reconstructs an original document from canonical
+`info` bytes, never starts metadata retrieval, and returns an unavailable/not-
+found error for magnet-only or pre-retention records.
+
 Strict fail-closed network blocking can still put the new torrent in
 `network_blocked` instead of `paused`.
 
@@ -245,11 +288,13 @@ profile is rejected. Compatibility adapters likewise attach their category or
 labels before registration.
 
 `GET /torrents/:hash/policy` returns the selected profile plus each effective
-storage, queue, seeding, bandwidth, and peer-encryption value with a
+storage, queue, seeding, bandwidth, peer-encryption, and create-time intake
+value with a
 machine-readable source:
 `global`, `profile`, `label`, `torrent`, `legacy_torrent`,
 `profile_storage_snapshot`, `registration_storage_snapshot`,
-`existing_storage_snapshot`, or `initial_admission_snapshot`. This lets
+`existing_storage_snapshot`, `initial_admission_snapshot`, or
+`intake_snapshot`. This lets
 clients explain why a value applies without duplicating daemon precedence
 rules. `registration_storage_snapshot` means the resolved storage choice was
 fixed when the torrent was registered; `initial_admission_snapshot` means the
@@ -267,6 +312,19 @@ new or migrated queued torrent's admission. Queue priority, seeding, and rate
 caps update live while a torrent inherits them. Legacy state is migrated
 transactionally during a profile configuration replacement.
 
+Profile tracker settings use ordered, case-insensitive host glob rules. The
+first matching rule controls tracker enablement and priority; this remains a
+live profile policy. Intake settings are under
+`[profiles.profiles.<name>.intake]`. `excluded_file_patterns` and structured
+`excluded_file_rules` select unwanted files, while
+`organization_subdirectory`, `incomplete_subdirectory`,
+`force_top_level_folder`, and `partial_file_suffix` determine safe active and
+completed paths. These intake values are snapshotted when a torrent is
+registered, so later profile edits do not rewrite a reviewed selection or
+location. Magnet `so=` selection is a bounded local allowlist that can only
+reduce the selected files; literal `x.pe` endpoints use the ordinary peer
+filter and contained binder without hostname resolution.
+
 Successful add responses mean the torrent record was registered and inserted
 into queue order. The daemon does not wait for queue reconciliation, metadata
 fetching, tracker announces, peer connections, or engine startup before
@@ -279,21 +337,28 @@ Bulk add requests use:
   "magnets": ["magnet:?xt=urn:btih:..."],
   "torrent_files": [{ "metainfo": "base64 .torrent bytes" }],
   "download_dir": "/data/downloads",
+  "incomplete_dir": "/data/.incoming",
   "paused": true,
+  "preview": true,
+  "unwanted_file_indices": [2, 5],
+  "file_exclusion_rules": [{ "suffix": ".nfo" }],
+  "partial_file_suffix": ".part",
   "profile": "linux-release",
   "labels": ["linux"]
 }
 ```
 
-`download_dir`, `paused`, `start_behavior`, `profile`, and `labels` apply to every item in the
-batch. The response includes `added` items with `{ kind, index, info_hash }`
-and `failed` items with `{ kind, index, code, message }`, so one invalid or
-duplicate item does not prevent other valid items from being registered.
+`download_dir`, `incomplete_dir`, `paused`, `start_behavior`, `preview`,
+`unwanted_file_indices`, `file_exclusion_rules`, `partial_file_suffix`,
+`profile`, and `labels` apply to every item in the batch. The response includes
+`added` items with `{ kind, index, info_hash }` and `failed` items with
+`{ kind, index, code, message }`, so one invalid or duplicate item does not
+prevent other valid items from being registered.
 
 Bulk remove requests use:
 
 ```json
-{ "info_hashes": ["40hex..."], "delete_data": false }
+{ "info_hashes": ["40-or-64-hex locator..."], "delete_data": false }
 ```
 
 The response includes `removed` and `not_found` info-hash arrays. The daemon
@@ -439,13 +504,16 @@ successful replacement. It also reports any fail-closed loading detail.
 
 The global mode applies MSE/PE to contained TCP and uTP peer streams. In
 `preferred` mode, failed negotiation may retry plaintext only on the same
-selected contained transport; `required` never retries plaintext. Changing the
-global field live-rebuilds existing data-plane tasks and does not require a
-process restart. A named profile may set `encryption_mode`, and the per-torrent
-endpoint overrides it durably. Profile or label-map changes restart only active
-download/metadata engines whose resolved mode changes after persistence. Future
-inbound TCP seeding sessions use the refreshed mode; existing negotiated
-sessions retain their established wire stream.
+selected contained transport; `required` never retries plaintext. Pure-v2
+sessions use the required 20-byte peer-wire/MSE identity while retaining their
+full SHA-256 API and durable locator, so the same negotiation rules apply
+without a lossy registry fallback. Changing the global field live-rebuilds
+existing data-plane tasks and does not require a process restart. A named
+profile may set `encryption_mode`, and the per-torrent endpoint overrides it
+durably. Profile or label-map changes restart only active download/metadata
+engines whose resolved mode changes after persistence. Future inbound TCP
+seeding sessions use the refreshed mode; existing negotiated sessions retain
+their established wire stream.
 
 Named profiles are part of the full settings configuration under `profiles`;
 the dedicated `/profiles` endpoints are preferred when only that section needs

@@ -12,7 +12,7 @@ use axum::{
     Extension, Router,
 };
 use serde::Deserialize;
-use swarmotter_core::hash::InfoHash;
+use swarmotter_core::hash::TorrentKey;
 
 use crate::state::SharedState;
 use crate::{envelope, handlers};
@@ -169,6 +169,10 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             post(handlers::torrents::remove_torrents),
         )
         .route(
+            "/torrents/:hash/metainfo",
+            get(handlers::torrents::export_metainfo),
+        )
+        .route(
             "/torrents/:hash",
             get(handlers::torrents::get_torrent).delete(handlers::torrents::remove_torrent),
         )
@@ -176,6 +180,10 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
         .route(
             "/torrents/:hash/policy",
             get(handlers::policies::torrent_policy).put(handlers::policies::set_torrent_profile),
+        )
+        .route(
+            "/torrents/:hash/storage-preview",
+            post(handlers::policies::storage_path_preview),
         )
         .route(
             "/torrents/:hash/encryption-mode",
@@ -583,9 +591,12 @@ pub struct DeleteQuery {
     pub delete_data: Option<bool>,
 }
 
-/// Parse an info hash from a path segment.
-pub fn parse_hash(s: &str) -> swarmotter_core::error::Result<InfoHash> {
-    InfoHash::from_hex(s)
+/// Parse a canonical v1 or pure-v2 torrent locator from a path segment.
+/// The historical function name remains internal to avoid churn in handlers;
+/// it accepts the full 40- or 64-character key form rather than truncating a
+/// pure-v2 identity into an invalid v1 hash.
+pub fn parse_hash(s: &str) -> swarmotter_core::error::Result<TorrentKey> {
+    TorrentKey::from_locator(s)
 }
 
 // Suppress unused import warnings for handlers used via macro.

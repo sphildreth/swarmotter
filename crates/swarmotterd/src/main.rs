@@ -13,7 +13,7 @@ use clap::Parser;
 use swarmotter_core::config::Config;
 use swarmotter_core::error::Result;
 use swarmotter_core::net::{self, OsInterfaceProbe};
-use swarmotterd::{daemon, logging};
+use swarmotterd::{daemon, logging, state_store};
 
 use swarmotter_api::state::{AppState, BuildInfo};
 
@@ -32,11 +32,30 @@ struct Args {
     /// Validate the effective configuration and exit without starting services.
     #[arg(long)]
     check_config: bool,
+
+    /// Rebuild verified SQLite state projections and indexes, then exit.
+    ///
+    /// This is an offline maintenance operation. It refuses missing, legacy,
+    /// or integrity-failing state files and does not attempt to repair
+    /// database corruption.
+    #[arg(long, conflicts_with = "check_config")]
+    rebuild_state_projections: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Offline projection rebuild is intentionally independent of daemon
+    // configuration. It must remain usable when a strict containment path is
+    // currently unavailable or a stale configuration needs separate repair.
+    // `--state-file` (including its environment source) still selects the
+    // target; without it this uses only the platform compatibility default,
+    // never `storage.state_dir` from a configuration that we deliberately do
+    // not load for this maintenance command.
+    if run_offline_state_maintenance(&args)? {
+        return Ok(());
+    }
 
     // Install the rustls crypto provider (ring) so HTTPS trackers over
     // contained sockets work.
@@ -54,6 +73,8 @@ async fn main() -> Result<()> {
     // unless env overrides provide a valid strict path or explicit disabled
     // mode. See ADR-0051.
     config.validate()?;
+
+    let state_file = resolve_state_file(args.state_file.clone(), &config);
 
     if args.check_config {
         println!("SwarmOtter configuration is valid");
@@ -98,7 +119,6 @@ async fn main() -> Result<()> {
 
     let max_request_body_bytes = config.api.max_request_body_bytes;
     let broker = swarmotter_api::handlers::events::EventBroker::default();
-    let state_file = resolve_state_file(args.state_file.clone(), &config);
     let runtime = Arc::new(daemon::DaemonRuntime::with_paths_broker_and_state(
         config.clone(),
         health,
@@ -185,6 +205,26 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Run an offline state operation before loading daemon configuration.
+///
+/// Returns whether an operation was selected. This narrow helper keeps the
+/// execution ordering testable: an invalid or unavailable network
+/// configuration cannot prevent a local, explicit state-file rebuild.
+fn run_offline_state_maintenance(args: &Args) -> Result<bool> {
+    if !args.rebuild_state_projections {
+        return Ok(false);
+    }
+    let state_file = args.state_file.clone().unwrap_or_else(default_state_file);
+    let report = state_store::rebuild_projections(&state_file)?;
+    println!(
+        "SwarmOtter SQLite state projections rebuilt at {} (torrents: {}, queue entries: {})",
+        state_file.display(),
+        report.torrents,
+        report.queue_entries
+    );
+    Ok(true)
+}
+
 fn default_state_file() -> PathBuf {
     if let Some(directory) = std::env::var_os("STATE_DIRECTORY") {
         if let Some(first) = std::env::split_paths(&directory).next() {
@@ -258,5 +298,67 @@ mod tests {
 
         let configured = resolve_state_file(None, &config);
         assert!(configured.ends_with("configured-state/state.json"));
+    }
+
+    #[test]
+    fn rebuild_state_projections_accepts_an_explicit_state_file() {
+        let args = Args::try_parse_from([
+            "swarmotterd",
+            "--state-file",
+            "operator-state.sqlite",
+            "--rebuild-state-projections",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.state_file,
+            Some(PathBuf::from("operator-state.sqlite"))
+        );
+        assert!(args.rebuild_state_projections);
+        assert!(!args.check_config);
+    }
+
+    #[test]
+    fn rebuild_state_projections_and_check_config_are_mutually_exclusive() {
+        assert!(Args::try_parse_from([
+            "swarmotterd",
+            "--check-config",
+            "--rebuild-state-projections",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn offline_projection_rebuild_skips_invalid_config_and_uses_explicit_state_file() {
+        let root = std::env::temp_dir().join(format!(
+            "swarmotterd-offline-rebuild-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let state_file = root.join("operator-state.sqlite");
+        state_store::save(
+            &state_file,
+            &state_store::DaemonState::new(
+                Vec::new(),
+                swarmotter_core::queue::QueueState::default(),
+            ),
+        )
+        .unwrap();
+        let args = Args {
+            // The file need not exist or be valid: this offline command must
+            // return before normal configuration loading/validation.
+            config: Some(root.join("invalid-strict-network-config.toml")),
+            state_file: Some(state_file.clone()),
+            check_config: false,
+            rebuild_state_projections: true,
+        };
+
+        assert!(run_offline_state_maintenance(&args).unwrap());
+        assert!(state_file.is_file());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

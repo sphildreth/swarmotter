@@ -17,7 +17,7 @@ use swarmotter_core::policy::PolicyProfilesConfig;
 
 use crate::error::{err_response, into_response};
 use crate::routes::parse_hash;
-use crate::state::SharedState;
+use crate::state::{SharedState, StoragePathPreviewRequest};
 
 #[derive(Debug, Deserialize)]
 pub struct SetTorrentProfileBody {
@@ -118,6 +118,25 @@ pub async fn torrent_policy(
             Some(policy) => into_response(Ok(policy)),
             None => err_response(CoreError::NotFound("torrent".into())),
         },
+        Err(error) => err_response(error),
+    }
+}
+
+/// Resolve a bounded, read-only preview of the paths a move or profile
+/// assignment would use. The daemon performs no filesystem or network I/O
+/// here, so operators can inspect placement before applying a change.
+pub async fn storage_path_preview(
+    State(state): State<SharedState>,
+    Path(hash): Path<String>,
+    Json(request): Json<StoragePathPreviewRequest>,
+) -> Response {
+    match parse_hash(&hash) {
+        Ok(hash) => into_response(
+            state
+                .daemon
+                .preview_torrent_storage_paths(&hash, request)
+                .await,
+        ),
         Err(error) => err_response(error),
     }
 }

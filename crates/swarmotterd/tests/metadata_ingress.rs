@@ -11,6 +11,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use swarmotter_api::state::{AppState, BuildInfo, DaemonOps};
 use swarmotter_core::config::{Config, StartBehavior, WatchFolderConfig};
+use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::meta::{build_single_file_torrent, parse_torrent, MAX_TORRENT_METADATA_BYTES};
 use swarmotter_core::models::network::{
     NetworkContainmentMode, NetworkContainmentStatus, NetworkHealth,
@@ -75,6 +76,19 @@ fn torrent_padded_to_size(name: &str, target: usize) -> Vec<u8> {
             .expect("target must accommodate generated metainfo");
     }
     panic!("could not generate metainfo at exact size {target}");
+}
+
+/// A self-contained valid pure-BEP-52 document. Its one-byte file is smaller
+/// than the piece length, so no piece-layer entries are needed for the exact
+/// original-metainfo export path exercised below.
+fn pure_v2_single_file_torrent() -> Vec<u8> {
+    let mut torrent = Vec::new();
+    torrent.extend_from_slice(b"d4:infod9:file treed10:lawful.bind0:d6:lengthi1e11:pieces root32:");
+    torrent.extend_from_slice(&[0x42; 32]);
+    torrent.extend_from_slice(
+        b"eee12:meta versioni2e4:name10:lawful.bin12:piece lengthi16384ee12:piece layersdee",
+    );
+    torrent
 }
 
 fn isolated_disabled_config(root: &Path) -> Config {
@@ -148,7 +162,7 @@ async fn real_daemon_api_accepts_exact_metadata_limit_and_rejects_one_over() {
     assert_eq!(envelope["data"], expected_hash.to_hex());
     let registered = runtime.list_torrents().await;
     assert_eq!(registered.len(), 1);
-    assert_eq!(registered[0].info_hash, expected_hash);
+    assert_eq!(registered[0].info_hash, TorrentKey::v1(expected_hash));
     assert_eq!(registered[0].state, TorrentState::Paused);
 
     let mut one_over = exact;
@@ -178,6 +192,198 @@ async fn real_daemon_api_accepts_exact_metadata_limit_and_rejects_one_over() {
         .as_str()
         .is_some_and(|message| message.contains("exceeds maximum")));
     assert_eq!(runtime.list_torrents().await.len(), 1);
+}
+
+#[tokio::test]
+async fn retained_original_metainfo_export_is_authenticated_exact_and_never_reconstructs_magnets() {
+    let root = TestDir::new("retained-export-api");
+    let mut config = isolated_disabled_config(root.path());
+    config.api.require_auth = true;
+    config.api.auth_token = Some("retained-export-token".into());
+    let runtime = Arc::new(DaemonRuntime::with_paths_broker_and_state(
+        config.clone(),
+        disabled_health(),
+        None,
+        None,
+        Some(root.path().join("state.sqlite")),
+        swarmotter_api::handlers::events::EventBroker::default(),
+    ));
+    let app = swarmotter_api::routes::app_router_with_body_limit(
+        app_state(runtime.clone(), config.clone()),
+        config.api.max_request_body_bytes,
+    );
+    let original = build_single_file_torrent(
+        "retained-export.bin",
+        b"generated retained original metainfo fixture",
+        8,
+        None,
+        false,
+    );
+    let file_hash = parse_torrent(&original).unwrap().info_hash;
+    let export_uri = format!("/api/v1/torrents/{}/metainfo", file_hash.to_hex());
+
+    let unauthenticated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&export_uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/file?paused=true")
+                .header("authorization", "Bearer retained-export-token")
+                .header("content-type", "application/x-bittorrent")
+                .body(Body::from(original.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
+
+    let exported = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(&export_uri)
+                .header("authorization", "Bearer retained-export-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exported.status(), StatusCode::OK);
+    assert_eq!(
+        exported.headers().get("content-type").unwrap(),
+        "application/x-bittorrent"
+    );
+    assert_eq!(
+        axum::body::to_bytes(exported.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        original.as_slice()
+    );
+
+    let magnet = format!(
+        "magnet:?xt=urn:btih:{}&dn=magnet-without-original.bin",
+        "4".repeat(40)
+    );
+    let magnet_add = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/magnet?paused=true")
+                .header("authorization", "Bearer retained-export-token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "magnet": magnet }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(magnet_add.status(), StatusCode::OK);
+    let missing = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/torrents/{}/metainfo", "4".repeat(40)))
+                .header("authorization", "Bearer retained-export-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let missing_body = axum::body::to_bytes(missing.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let missing_envelope: serde_json::Value = serde_json::from_slice(&missing_body).unwrap();
+    assert!(missing_envelope["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("unavailable")));
+}
+
+#[tokio::test]
+async fn retained_original_metainfo_export_supports_a_pure_v2_locator() {
+    let root = TestDir::new("retained-export-pure-v2-api");
+    let mut config = isolated_disabled_config(root.path());
+    config.api.require_auth = true;
+    config.api.auth_token = Some("retained-export-v2-token".into());
+    let runtime = Arc::new(DaemonRuntime::with_paths_broker_and_state(
+        config.clone(),
+        disabled_health(),
+        None,
+        None,
+        Some(root.path().join("state.sqlite")),
+        swarmotter_api::handlers::events::EventBroker::default(),
+    ));
+    let app = swarmotter_api::routes::app_router_with_body_limit(
+        app_state(runtime, config.clone()),
+        config.api.max_request_body_bytes,
+    );
+    let original = pure_v2_single_file_torrent();
+    let key = parse_torrent(&original)
+        .unwrap()
+        .identity
+        .primary_key()
+        .expect("parsed pure-v2 metainfo must have a durable key");
+    assert!(key.as_v2().is_some());
+    let locator = key.to_locator();
+    assert_eq!(locator.len(), 64);
+    let export_uri = format!("/api/v1/torrents/{locator}/metainfo");
+
+    let upload = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/file?paused=true")
+                .header("authorization", "Bearer retained-export-v2-token")
+                .header("content-type", "application/x-bittorrent")
+                .body(Body::from(original.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
+    let upload_body = axum::body::to_bytes(upload.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let upload_envelope: serde_json::Value = serde_json::from_slice(&upload_body).unwrap();
+    assert_eq!(upload_envelope["data"], locator);
+
+    let exported = app
+        .oneshot(
+            Request::builder()
+                .uri(export_uri)
+                .header("authorization", "Bearer retained-export-v2-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exported.status(), StatusCode::OK);
+    assert_eq!(
+        exported.headers().get("content-type").unwrap(),
+        "application/x-bittorrent"
+    );
+    assert_eq!(
+        axum::body::to_bytes(exported.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .as_ref(),
+        original.as_slice()
+    );
 }
 
 #[tokio::test]
@@ -224,7 +430,7 @@ async fn real_daemon_watch_accepts_exact_metadata_limit_and_rejects_one_over() {
         .expect("second watch observation must process stable files");
     let registered = runtime.list_torrents().await;
     assert_eq!(registered.len(), 1);
-    assert_eq!(registered[0].info_hash, expected_hash);
+    assert_eq!(registered[0].info_hash, TorrentKey::v1(expected_hash));
     assert_eq!(registered[0].state, TorrentState::Paused);
     assert_eq!(registered[0].labels, vec!["phase-1-limit"]);
 

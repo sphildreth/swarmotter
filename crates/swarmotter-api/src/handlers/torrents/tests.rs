@@ -3,6 +3,7 @@
 use super::*;
 use super::{add::*, bulk::*, query::*};
 use std::collections::BTreeMap;
+use swarmotter_core::hash::InfoHash;
 use swarmotter_core::models::torrent::TorrentHealth;
 
 fn hash(seed: u8) -> InfoHash {
@@ -29,7 +30,8 @@ fn summary_with(
     download_dir: Option<&str>,
 ) -> TorrentSummary {
     TorrentSummary {
-        info_hash: hash(seed),
+        info_hash: hash(seed).into(),
+        identity: swarmotter_core::hash::TorrentIdentity::v1(hash(seed)),
         name: name.to_string(),
         state,
         error: None,
@@ -300,7 +302,7 @@ fn torrent_matches_search_matches_name_hash_state_health_label_storage_and_label
     assert!(torrent_matches_search(&s, "good"));
     assert!(torrent_matches_search(&s, "data"));
     // Hash lookup
-    let hex = s.info_hash.to_hex();
+    let hex = s.info_hash.to_locator();
     assert!(torrent_matches_search(&s, &hex[..8]));
     // Mismatch
     assert!(!torrent_matches_search(&s, "nonexistent"));
@@ -626,6 +628,7 @@ fn add_options_picks_query_value_when_body_absent() {
         start_behavior: None,
         profile: None,
         labels: None,
+        ..Default::default()
     };
     let opts = add_options(None, None, None, Some(&q)).unwrap();
     assert!(!opts.paused);
@@ -638,6 +641,7 @@ fn add_options_rejects_conflicting_paused() {
         start_behavior: None,
         profile: None,
         labels: None,
+        ..Default::default()
     };
     let err = add_options(None, Some(false), None, Some(&q)).unwrap_err();
     assert!(err.to_string().contains("conflict"));
@@ -650,6 +654,7 @@ fn add_options_rejects_conflicting_start_behavior() {
         start_behavior: Some(StartBehavior::Start),
         profile: None,
         labels: None,
+        ..Default::default()
     };
     let err = add_options(None, None, Some(StartBehavior::Paused), Some(&q)).unwrap_err();
     assert!(err.to_string().contains("conflict"));
@@ -659,6 +664,73 @@ fn add_options_rejects_conflicting_start_behavior() {
 fn add_options_rejects_paused_vs_start_behavior_mismatch() {
     let err = add_options(None, Some(true), Some(StartBehavior::Start), None).unwrap_err();
     assert!(err.to_string().contains("conflict"));
+}
+
+#[test]
+fn intake_add_options_normalize_selection_and_reject_payload_start() {
+    let query = AddTorrentQuery {
+        preview: Some(true),
+        unwanted_file_indices: Some("4, 1,4".into()),
+        ..Default::default()
+    };
+    let options = apply_intake_add_options(
+        AddTorrentOptions::request(None, false, false, None, Vec::new()),
+        None,
+        None,
+        Some(vec![swarmotter_core::policy::PolicyFileExclusionRule {
+            suffix: Some(".nfo".into()),
+            ..Default::default()
+        }]),
+        Some("/data/incomplete".into()),
+        Some(".part".into()),
+        &query,
+    )
+    .unwrap();
+    assert!(options.preview);
+    assert_eq!(options.unwanted_file_indices, vec![1, 4]);
+    assert_eq!(options.file_exclusion_rules.len(), 1);
+    assert_eq!(options.incomplete_dir.as_deref(), Some("/data/incomplete"));
+    assert_eq!(options.partial_file_suffix.as_deref(), Some(".part"));
+
+    let error = apply_intake_add_options(
+        AddTorrentOptions::request(None, false, true, None, Vec::new()),
+        Some(true),
+        Some(vec![2]),
+        None,
+        None,
+        None,
+        &AddTorrentQuery::default(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("explicit payload start"));
+
+    let invalid_rule = apply_intake_add_options(
+        AddTorrentOptions::request(None, false, false, None, Vec::new()),
+        None,
+        None,
+        Some(vec![swarmotter_core::policy::PolicyFileExclusionRule {
+            min_size_bytes: Some(2),
+            max_size_bytes: Some(1),
+            ..Default::default()
+        }]),
+        None,
+        None,
+        &AddTorrentQuery::default(),
+    )
+    .unwrap_err();
+    assert!(invalid_rule.to_string().contains("min_size_bytes"));
+
+    let invalid_suffix = apply_intake_add_options(
+        AddTorrentOptions::request(None, false, false, None, Vec::new()),
+        None,
+        None,
+        None,
+        None,
+        Some("/escape".into()),
+        &AddTorrentQuery::default(),
+    )
+    .unwrap_err();
+    assert!(invalid_suffix.to_string().contains("partial_file_suffix"));
 }
 
 #[test]

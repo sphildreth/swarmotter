@@ -98,7 +98,7 @@ updates use two API paths:
   (ADR-0056).
 - `[storage]` also separates durable placement from payload placement:
   `resume_dir` stores info-hash-named fast-resume metadata, `state_dir` is the
-  default state-file directory after restart when no CLI/environment state path
+  default SQLite state-store directory after restart when no CLI/environment state path
   is explicit, and `temp_dir` is only the fallback payload root when no
   download directory is configured. State/resume atomic temporary files stay
   beside their targets to preserve same-filesystem rename and directory-sync
@@ -121,8 +121,10 @@ updates use two API paths:
   label-to-profile mappings. An explicitly attached add/watch/torrent profile
   wins over a matching label; per-field torrent overrides win last. Resolved
   storage and the initial admission decision are captured in durable torrent
-  state at registration, while queue priority, seeding, bandwidth, and optional
-  `encryption_mode` resolve live for inheriting records. Reassignment and later
+  state at registration. Intake file-selection and content-organization rules
+  are likewise snapshotted before payload transfer, while queue priority,
+  seeding, bandwidth, and optional `encryption_mode` resolve live for
+  inheriting records. Reassignment and later
   label changes preserve existing storage paths; snapshot-bearing torrents
   retain their captured admission when profile/global start settings change.
   Legacy records are migrated transactionally on a profile replacement
@@ -153,9 +155,10 @@ magnet `info` dicts fetched via BEP 9, and watch-folder files — shares one
 bounded parser in `swarmotter-core` (see ADR-0050). The shared
 `MAX_TORRENT_METADATA_BYTES` (16 MiB) limit is enforced by the core parser
 before any piece-sized allocation, independent of `api.max_request_body_bytes`
-(which may be higher for other request payloads). Restored daemon state is
-JSON; its piece hashes require an exact 20-byte decode and each restored
-`TorrentMeta` must pass `TorrentMeta::validate()` before runtime use.
+(which may be higher for other request payloads). Restored daemon state uses a
+versioned local SQLite store; validated legacy JSON migrates in place on its
+first successful save, and each restored `TorrentMeta` must pass
+`TorrentMeta::validate()` before runtime use.
 Watch files are read through a bounded reader that checks stable size before
 allocation and verifies path/opened-file length and modified time before and
 after the read. A stable oversize file is rejected with a typed permanent input
@@ -191,6 +194,12 @@ over contained TCP and uTP byte streams:
   ordering still follows `torrent.utp_prefer_tcp`.
 - `required`: negotiate MSE/PE over the selected contained TCP or uTP stream
   and refuse plaintext without a fallback retry.
+
+Pure-v2 transfers retain their full SHA-256 identity locally while using the
+explicit 20-byte `PeerInfoHash` required by the peer/MSE wire format.
+`preferred` and `required` therefore preserve the same contained negotiation
+and no-plaintext-fallback rules as v1/hybrid work; a peer-wire truncation is
+never accepted as a durable torrent identity.
 
 Profiles may set an optional `profiles.profiles.<name>.encryption_mode`, and a
 durable torrent `policy.overrides.encryption_mode` can be set or explicitly

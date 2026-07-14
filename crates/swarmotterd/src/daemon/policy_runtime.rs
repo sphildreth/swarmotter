@@ -8,8 +8,13 @@
 //! into per-torrent overrides.
 
 use super::*;
+use swarmotter_api::state::{StoragePathPreview, StoragePathPreviewRequest};
 use swarmotter_core::config::{PeerEncryptionMode, StartBehavior};
-use swarmotter_core::policy::{EffectiveTorrentPolicy, PolicyProfileOrigin, PolicyStorageSnapshot};
+use swarmotter_core::policy::{
+    apply_intake_file_rules, force_top_level_storage_path, organize_storage_path,
+    validate_intake_selection_indices, EffectiveTorrentPolicy, IntakePolicySnapshot,
+    PolicyProfileOrigin, PolicyStorageSnapshot,
+};
 
 /// Policy fields migrated for a legacy torrent during a profile-configuration
 /// replacement. The migration deliberately contains only the
@@ -22,7 +27,7 @@ pub(super) struct LegacyPolicySnapshotMigration {
 
 #[derive(Debug, Clone)]
 struct LegacyPolicySnapshotMigrationRecord {
-    hash: InfoHash,
+    key: TorrentKey,
     previous_storage_snapshot: Option<PolicyStorageSnapshot>,
     applied_storage_snapshot: Option<PolicyStorageSnapshot>,
     previous_initial_start_behavior: Option<StartBehavior>,
@@ -55,7 +60,7 @@ impl DaemonRuntime {
         previous: &Config,
         next: &Config,
         torrents: &[Torrent],
-    ) -> Vec<InfoHash> {
+    ) -> Vec<TorrentKey> {
         torrents
             .iter()
             .filter_map(|torrent| {
@@ -65,7 +70,7 @@ impl DaemonRuntime {
                     != Self::effective_policy_with_config(next, torrent)
                         .encryption_mode
                         .value)
-                    .then_some(torrent.info_hash())
+                    .then_some(torrent.key())
             })
             .collect()
     }
@@ -75,7 +80,7 @@ impl DaemonRuntime {
     /// seeding sessions use the updated registration immediately. Running
     /// download/metadata engines are rebuilt so every new outbound session
     /// uses the new mode.
-    pub(super) async fn restart_changed_encryption_policy_work(&self, hashes: &[InfoHash]) {
+    pub(super) async fn restart_changed_encryption_policy_work(&self, hashes: &[TorrentKey]) {
         if hashes.is_empty() {
             return;
         }
@@ -172,7 +177,7 @@ impl DaemonRuntime {
                 || previous_initial_start_behavior != applied_initial_start_behavior
             {
                 records.push(LegacyPolicySnapshotMigrationRecord {
-                    hash: torrent.info_hash(),
+                    key: torrent.key(),
                     previous_storage_snapshot,
                     applied_storage_snapshot,
                     previous_initial_start_behavior,
@@ -194,7 +199,7 @@ impl DaemonRuntime {
         }
         let mut registry = self.registry.lock().await;
         for record in &migration.records {
-            let Some(torrent) = registry.get(&record.hash) else {
+            let Some(torrent) = registry.get(&record.key) else {
                 continue;
             };
             if torrent.policy.storage_snapshot != record.previous_storage_snapshot
@@ -202,12 +207,12 @@ impl DaemonRuntime {
             {
                 return Err(CoreError::Internal(format!(
                     "torrent {} policy changed during configuration replacement",
-                    record.hash
+                    record.key
                 )));
             }
         }
         for record in &migration.records {
-            let Some(torrent) = registry.get_mut(&record.hash) else {
+            let Some(torrent) = registry.get_mut(&record.key) else {
                 continue;
             };
             torrent.policy.storage_snapshot = record.applied_storage_snapshot.clone();
@@ -228,7 +233,7 @@ impl DaemonRuntime {
         }
         let mut registry = self.registry.lock().await;
         for record in &migration.records {
-            let Some(torrent) = registry.get(&record.hash) else {
+            let Some(torrent) = registry.get(&record.key) else {
                 continue;
             };
             if torrent.policy.storage_snapshot != record.applied_storage_snapshot
@@ -236,12 +241,12 @@ impl DaemonRuntime {
             {
                 return Err(CoreError::Internal(format!(
                     "torrent {} policy changed during configuration rollback",
-                    record.hash
+                    record.key
                 )));
             }
         }
         for record in &migration.records {
-            let Some(torrent) = registry.get_mut(&record.hash) else {
+            let Some(torrent) = registry.get_mut(&record.key) else {
                 continue;
             };
             torrent.policy.storage_snapshot = record.previous_storage_snapshot.clone();
@@ -325,7 +330,169 @@ impl DaemonRuntime {
             .incomplete_dir
             .value
             .unwrap_or_else(|| complete_dir.clone());
+        let organization_subdirectory = torrent
+            .policy
+            .intake_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.organization_subdirectory.as_deref());
+        let incomplete_subdirectory =
+            torrent
+                .policy
+                .intake_snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot
+                        .incomplete_subdirectory
+                        .as_deref()
+                        .or(snapshot.organization_subdirectory.as_deref())
+                });
+        let force_top_level_folder = torrent
+            .policy
+            .intake_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.force_top_level_folder);
+        let complete_dir = force_top_level_storage_path(
+            organize_storage_path(complete_dir, organization_subdirectory),
+            &torrent.meta.name,
+            torrent.meta.is_multi_file,
+            force_top_level_folder,
+        );
+        let active_dir = force_top_level_storage_path(
+            organize_storage_path(active_dir, incomplete_subdirectory),
+            &torrent.meta.name,
+            torrent.meta.is_multi_file,
+            force_top_level_folder,
+        );
         (complete_dir, active_dir)
+    }
+
+    /// Return the immutable add-time suffix used for an incomplete payload
+    /// root. Completed storage always uses canonical metainfo names; callers
+    /// that construct an active-root handle must apply this value so rechecks,
+    /// moves, deletes, and ownership checks address the same files as the
+    /// transfer engine.
+    pub(super) fn partial_file_suffix_for_active_storage(torrent: &Torrent) -> Option<String> {
+        torrent
+            .policy
+            .intake_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.partial_file_suffix.clone())
+    }
+
+    /// Resolve a bounded, side-effect-free placement preview. The candidate is
+    /// deliberately cloned, and profile reassignment freezes legacy storage
+    /// first just as the real lifecycle operation does; a preview cannot make
+    /// an existing payload appear movable by a profile edit alone.
+    pub(super) fn preview_storage_paths_with_config(
+        config: &Config,
+        torrent: &Torrent,
+        request: StoragePathPreviewRequest,
+    ) -> Result<StoragePathPreview> {
+        let mut candidate = torrent.clone();
+        if let Some(profile) = request.profile {
+            if profile.trim().is_empty() || !config.profiles.profiles.contains_key(&profile) {
+                return Err(CoreError::InvalidArgument(format!(
+                    "unknown or empty policy profile {profile:?}"
+                )));
+            }
+            Self::snapshot_existing_storage(config, &mut candidate);
+            candidate.policy.profile = Some(profile);
+            candidate.policy.profile_origin = Some(PolicyProfileOrigin::Torrent);
+        }
+        if let Some(download_dir) = request.download_dir {
+            if download_dir.trim().is_empty() {
+                return Err(CoreError::InvalidArgument(
+                    "download_dir must not be empty when previewing placement".into(),
+                ));
+            }
+            candidate.download_dir = Some(download_dir);
+        }
+        if let Some(incomplete_dir) = request.incomplete_dir {
+            if incomplete_dir.trim().is_empty() {
+                return Err(CoreError::InvalidArgument(
+                    "incomplete_dir must not be empty when previewing placement".into(),
+                ));
+            }
+            candidate.policy.overrides.incomplete_dir = Some(incomplete_dir);
+        }
+
+        let (complete_dir, incomplete_dir) =
+            Self::policy_storage_paths_with_config(config, &candidate);
+        let partial_file_suffix = Self::partial_file_suffix_for_active_storage(&candidate);
+        swarmotter_core::policy::validate_partial_file_suffix(partial_file_suffix.as_deref())
+            .map_err(CoreError::InvalidArgument)?;
+
+        const FILE_LIMIT: usize = 256;
+        let file_count = candidate.meta.files.len();
+        let complete_storage =
+            storage_io_with_config(candidate.meta.clone(), PathBuf::from(&complete_dir), config);
+        let incomplete_storage = storage_io_with_config(
+            candidate.meta.clone(),
+            PathBuf::from(&incomplete_dir),
+            config,
+        )
+        .with_partial_file_suffix(partial_file_suffix.clone());
+        let mut complete_files = Vec::with_capacity(file_count.min(FILE_LIMIT));
+        let mut incomplete_files = Vec::with_capacity(file_count.min(FILE_LIMIT));
+        for index in 0..file_count.min(FILE_LIMIT) {
+            complete_files.push(complete_storage.file_path(index)?.display().to_string());
+            incomplete_files.push(incomplete_storage.file_path(index)?.display().to_string());
+        }
+        Ok(StoragePathPreview {
+            complete_dir,
+            incomplete_dir,
+            partial_file_suffix,
+            complete_files,
+            incomplete_files,
+            file_count,
+            truncated: file_count > FILE_LIMIT,
+        })
+    }
+
+    /// Capture the exact profile-derived intake behavior before a torrent can
+    /// enter the scheduler. This makes profile/label selection explainable
+    /// and keeps later profile edits from changing a reviewed file selection
+    /// or content location.
+    pub(super) fn snapshot_registration_intake(
+        config: &Config,
+        torrent: &mut Torrent,
+        mut unwanted_file_indices: Vec<usize>,
+        file_exclusion_rules: Vec<swarmotter_core::policy::PolicyFileExclusionRule>,
+        partial_file_suffix: Option<String>,
+    ) {
+        if torrent.policy.intake_snapshot.is_some() {
+            return;
+        }
+        unwanted_file_indices.sort_unstable();
+        unwanted_file_indices.dedup();
+        let effective = Self::effective_policy_with_config(config, torrent);
+        let profile_name = effective
+            .profile
+            .as_ref()
+            .map(|profile| profile.name.clone())
+            .unwrap_or_default();
+        let intake = effective
+            .profile
+            .as_ref()
+            .and_then(|profile| config.profiles.profiles.get(&profile.name))
+            .map(|profile| profile.intake.clone())
+            .unwrap_or_default();
+        let mut excluded_file_rules = intake.excluded_file_rules;
+        for rule in file_exclusion_rules {
+            if !excluded_file_rules.contains(&rule) {
+                excluded_file_rules.push(rule);
+            }
+        }
+        torrent.policy.intake_snapshot = Some(IntakePolicySnapshot {
+            profile: profile_name,
+            excluded_file_patterns: intake.excluded_file_patterns,
+            excluded_file_rules,
+            organization_subdirectory: intake.organization_subdirectory,
+            incomplete_subdirectory: intake.incomplete_subdirectory,
+            force_top_level_folder: intake.force_top_level_folder,
+            partial_file_suffix: partial_file_suffix.or(intake.partial_file_suffix),
+            unwanted_file_indices,
+        });
     }
 
     /// Apply a profile assignment received through the add API. Profile names
@@ -334,29 +501,52 @@ impl DaemonRuntime {
     pub(super) async fn apply_add_profile(
         &self,
         torrent: &mut Torrent,
-        profile: Option<String>,
-        labels: Vec<String>,
-        start_behavior_explicit: bool,
-        requested_paused: bool,
+        options: &AddTorrentOptions,
     ) -> Result<bool> {
-        torrent.labels = labels;
+        torrent.labels = options.labels.clone();
         let config = self.config.read().await;
-        if let Some(profile) = profile {
-            if !config.profiles.profiles.contains_key(&profile) {
+        if let Some(profile) = options.profile.as_ref() {
+            if !config.profiles.profiles.contains_key(profile) {
                 return Err(CoreError::InvalidArgument(format!(
                     "unknown policy profile {profile}"
                 )));
             }
-            torrent.policy.profile = Some(profile);
+            torrent.policy.profile = Some(profile.clone());
             torrent.policy.profile_origin = Some(PolicyProfileOrigin::AddRequest);
         }
         // A label may select a profile even when no explicit add profile was
         // provided. The storage selection is always a create-time snapshot,
         // including an intentionally global result.
+        Self::snapshot_registration_intake(
+            &config,
+            torrent,
+            options.unwanted_file_indices.clone(),
+            options.file_exclusion_rules.clone(),
+            options.partial_file_suffix.clone(),
+        );
+        if !torrent.needs_metadata {
+            let intake = torrent.policy.intake_snapshot.as_ref().ok_or_else(|| {
+                CoreError::Internal("missing intake snapshot after registration policy".into())
+            })?;
+            validate_intake_selection_indices(intake, torrent.meta.files.len())
+                .map_err(CoreError::InvalidArgument)?;
+        }
         Self::snapshot_registration_storage(&config, torrent);
+        if !torrent.needs_metadata {
+            apply_intake_file_rules(torrent);
+        }
+        if options.preview {
+            // A preview has a deliberately stronger admission rule than a
+            // profile's default: `.torrent` payload work is paused now, while
+            // a magnet is permitted to fetch only metadata through the same
+            // contained binder before pausing.
+            torrent.policy.preview_until_started = true;
+            torrent.policy.initial_start_behavior = Some(StartBehavior::Paused);
+            return Ok(!torrent.needs_metadata);
+        }
         let effective = Self::effective_policy_with_config(&config, torrent);
-        let start_behavior = if start_behavior_explicit {
-            if requested_paused {
+        let start_behavior = if options.start_behavior_explicit {
+            if options.paused {
                 StartBehavior::Paused
             } else {
                 StartBehavior::Start
@@ -377,8 +567,8 @@ impl DaemonRuntime {
             .and_then(|assignment| config.profiles.profiles.get(&assignment.name))
             .and_then(|profile| profile.queue.start_behavior)
             .is_some_and(|behavior| matches!(behavior, StartBehavior::Paused));
-        Ok(if start_behavior_explicit {
-            requested_paused
+        Ok(if options.start_behavior_explicit {
+            options.paused
         } else {
             profile_requests_pause
         })
@@ -390,7 +580,7 @@ impl DaemonRuntime {
     /// completed and active payloads.
     pub(super) async fn assign_torrent_profile(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         profile: Option<String>,
     ) -> Result<()> {
         // Serialize validation, durable assignment, and profile replacement.
@@ -446,7 +636,7 @@ impl DaemonRuntime {
         self.publish_event(Event::new(
             "torrent_policy_changed",
             json!({
-                "info_hash": hash.to_hex(),
+                "info_hash": hash.to_locator(),
             }),
         ));
         Ok(())
@@ -459,7 +649,7 @@ impl DaemonRuntime {
     /// transport policy.
     pub(super) async fn assign_torrent_encryption_mode(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         encryption_mode: Option<PeerEncryptionMode>,
     ) -> Result<()> {
         let _config_transaction = self.config_write_lock.lock().await;
@@ -493,7 +683,7 @@ impl DaemonRuntime {
         self.publish_event(Event::new(
             "torrent_policy_changed",
             json!({
-                "info_hash": hash.to_hex(),
+                "info_hash": hash.to_locator(),
             }),
         ));
         Ok(())
@@ -576,7 +766,7 @@ pub(super) fn validate_explicit_profile_assignments(
         if !config.profiles.profiles.contains_key(profile) {
             return Err(CoreError::InvalidConfig(format!(
                 "policy profile {profile} is still assigned to torrent {}; reassign or clear it before removing the profile",
-                torrent.info_hash()
+                torrent.key()
             )));
         }
     }

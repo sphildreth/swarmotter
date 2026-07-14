@@ -26,11 +26,14 @@ use tokio::sync::Mutex;
 use crate::bandwidth::{RateDirection, RateLimiter};
 use crate::config::CowStrategy;
 use crate::error::{CoreError, Result};
+#[cfg(test)]
 use crate::hash::InfoHash;
+use crate::hash::TorrentKey;
 use crate::meta::TorrentMeta;
 use crate::storage::metrics::StorageIoMetrics;
 use crate::storage::resume::{FastResume, PieceBitfield, ResumeFileStamp};
 use crate::storage::{piece_file_ranges, verify_piece};
+use crate::v2::V2PieceLayout;
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -38,7 +41,16 @@ static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone)]
 pub struct StorageIo {
     meta: TorrentMeta,
+    /// The canonical daemon/durable identity used for fast-resume and path
+    /// ownership. This deliberately remains distinct from `meta.info_hash`,
+    /// which is zero for pure-v2 metainfo.
+    torrent_key: TorrentKey,
     download_dir: PathBuf,
+    /// Optional active-only filename suffix. It is applied exclusively to the
+    /// final component of payload file paths; fast-resume names remain stable
+    /// so a restart can find the same progress record before completion
+    /// restores canonical payload paths.
+    partial_file_suffix: Option<String>,
     /// Optional dedicated root for fast-resume state. When absent, preserve
     /// the historical adjacent-to-active-data placement.
     resume_dir: Option<PathBuf>,
@@ -81,7 +93,7 @@ struct MovePlanEntry {
 /// distinct info hashes never write or delete the same payload/resume paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoragePathOwnership {
-    pub info_hash: InfoHash,
+    pub key: TorrentKey,
     pub base_dir: PathBuf,
     pub payload_paths: Vec<PathBuf>,
     pub resume_path: PathBuf,
@@ -93,7 +105,7 @@ impl StoragePathOwnership {
     /// Ancestor/descendant claims also conflict: one torrent cannot own a
     /// regular file at a path that another torrent needs as a directory.
     pub fn conflicts_with(&self, other: &Self) -> bool {
-        if self.info_hash == other.info_hash {
+        if self.key == other.key {
             return false;
         }
         let mut owned = self
@@ -118,8 +130,8 @@ impl StoragePathOwnership {
         if self.conflicts_with(other) {
             return Err(CoreError::Storage(format!(
                 "storage path ownership conflict between {} and {} under {}",
-                self.info_hash,
-                other.info_hash,
+                self.key,
+                other.key,
                 self.base_dir.display()
             )));
         }
@@ -129,9 +141,15 @@ impl StoragePathOwnership {
 
 impl StorageIo {
     pub fn new(meta: TorrentMeta, download_dir: impl Into<PathBuf>) -> Self {
+        let torrent_key = meta
+            .identity
+            .primary_key()
+            .unwrap_or_else(|| TorrentKey::v1(meta.info_hash));
         Self {
             meta,
+            torrent_key,
             download_dir: download_dir.into(),
+            partial_file_suffix: None,
             resume_dir: None,
             file_handles: Arc::new(Mutex::new(HashMap::new())),
             resume_write_lock: Arc::new(Mutex::new(())),
@@ -147,6 +165,33 @@ impl StorageIo {
     pub fn with_resume_dir(mut self, resume_dir: Option<PathBuf>) -> Self {
         self.resume_dir = resume_dir;
         self
+    }
+
+    /// Attach the authoritative runtime key for this storage handle. Daemon
+    /// callers supply the registry's canonical key so hybrid aliases and
+    /// pure-v2 resume records share one collision-safe identity.
+    pub fn with_torrent_key(mut self, torrent_key: TorrentKey) -> Self {
+        self.torrent_key = torrent_key;
+        self
+    }
+
+    /// The full canonical durable key used by this handle.
+    pub fn torrent_key(&self) -> TorrentKey {
+        self.torrent_key
+    }
+
+    /// Select an active-only payload filename suffix, such as `.part`.
+    /// The suffix is validated again when paths are resolved so direct core
+    /// callers cannot turn it into traversal or a platform drive delimiter.
+    pub fn with_partial_file_suffix(mut self, partial_file_suffix: Option<String>) -> Self {
+        self.partial_file_suffix = partial_file_suffix;
+        self
+    }
+
+    /// Return the active-only suffix, if this handle is intentionally backed
+    /// by incomplete payload names.
+    pub fn partial_file_suffix(&self) -> Option<&str> {
+        self.partial_file_suffix.as_deref()
     }
 
     /// Select an explicit CoW behavior for newly created payload files.
@@ -193,7 +238,7 @@ impl StorageIo {
             {
                 return Err(CoreError::Storage(format!(
                     "overlapping payload paths owned by torrent {}: {} and {}",
-                    self.meta.info_hash,
+                    self.torrent_key,
                     existing.display(),
                     path.display()
                 )));
@@ -208,13 +253,13 @@ impl StorageIo {
         {
             return Err(CoreError::Storage(format!(
                 "payload path collides with fast-resume path for torrent {}: {} and {}",
-                self.meta.info_hash,
+                self.torrent_key,
                 payload_path.display(),
                 resume_path.display()
             )));
         }
         Ok(StoragePathOwnership {
-            info_hash: self.meta.info_hash,
+            key: self.torrent_key,
             base_dir: normalize_lexical_path(&self.download_dir),
             payload_paths,
             resume_path,
@@ -306,7 +351,19 @@ impl StorageIo {
             .files
             .get(index)
             .ok_or_else(|| CoreError::Storage(format!("file index {index} out of range")))?;
-        join(&self.download_dir, &file.path)
+        let mut path = join(&self.download_dir, &file.path)?;
+        if let Some(suffix) = self.partial_file_suffix.as_deref() {
+            crate::policy::validate_partial_file_suffix(Some(suffix))
+                .map_err(CoreError::Storage)?;
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    CoreError::Storage("payload path does not have a UTF-8 file name".into())
+                })?;
+            path.set_file_name(format!("{name}{suffix}"));
+        }
+        Ok(path)
     }
 
     /// Ensure all parent directories for a file path exist.
@@ -492,6 +549,31 @@ impl StorageIo {
         self.write_piece_range(piece_index, 0, piece).await
     }
 
+    /// Write one complete file-aligned BEP 52 piece after SHA-256
+    /// verification. Unlike v1 `write_piece`, a v2 logical piece never spans
+    /// two files; the layout explicitly skips the alignment gaps between
+    /// files.
+    pub async fn write_v2_piece(
+        &self,
+        layout: &V2PieceLayout,
+        piece_index: usize,
+        data: &[u8],
+    ) -> Result<()> {
+        let piece = layout.piece(piece_index).ok_or_else(|| {
+            CoreError::Storage(format!("BEP 52 piece {piece_index} out of range"))
+        })?;
+        let actual_length = u64::try_from(data.len())
+            .map_err(|_| CoreError::Storage("BEP 52 piece write length exceeds u64".into()))?;
+        if actual_length != piece.length {
+            return Err(CoreError::Storage(format!(
+                "BEP 52 piece {piece_index} write length {actual_length} does not match expected {}",
+                piece.length
+            )));
+        }
+        self.write_v2_file_range(piece.file_index, piece.offset, data)
+            .await
+    }
+
     /// Write contiguous data within a piece with one open/seek/write per
     /// touched file slice.
     ///
@@ -629,6 +711,48 @@ impl StorageIo {
         Ok(out)
     }
 
+    /// Read one complete file-aligned BEP 52 logical piece from disk.
+    pub async fn read_v2_piece(
+        &self,
+        layout: &V2PieceLayout,
+        piece_index: usize,
+    ) -> Result<Vec<u8>> {
+        let piece = layout.piece(piece_index).ok_or_else(|| {
+            CoreError::Storage(format!("BEP 52 piece {piece_index} out of range"))
+        })?;
+        self.read_v2_file_range(piece.file_index, piece.offset, piece.length as usize)
+            .await
+    }
+
+    /// Read a requested block from a BEP 52 file-aligned logical piece.
+    pub async fn read_v2_block(
+        &self,
+        layout: &V2PieceLayout,
+        piece_index: usize,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        let piece = layout.piece(piece_index).ok_or_else(|| {
+            CoreError::Storage(format!("BEP 52 piece {piece_index} out of range"))
+        })?;
+        let length_u64 = u64::try_from(length)
+            .map_err(|_| CoreError::Storage("BEP 52 block length exceeds u64".into()))?;
+        let end = offset.checked_add(length_u64).ok_or_else(|| {
+            CoreError::Storage(format!("BEP 52 piece {piece_index} block range overflows"))
+        })?;
+        if end > piece.length {
+            return Err(CoreError::Storage(format!(
+                "BEP 52 piece {piece_index} block range {offset}..{end} exceeds piece length {}",
+                piece.length
+            )));
+        }
+        let file_offset = piece.offset.checked_add(offset).ok_or_else(|| {
+            CoreError::Storage(format!("BEP 52 piece {piece_index} file offset overflows"))
+        })?;
+        self.read_v2_file_range(piece.file_index, file_offset, length)
+            .await
+    }
+
     /// Read the bytes for a block request (piece + offset + length) for
     /// serving peers while seeding.
     pub async fn read_block(
@@ -699,6 +823,78 @@ impl StorageIo {
             .clone())
     }
 
+    async fn write_v2_file_range(&self, file_index: usize, offset: u64, data: &[u8]) -> Result<()> {
+        let file_length = self
+            .meta
+            .files
+            .get(file_index)
+            .ok_or_else(|| CoreError::Storage(format!("file index {file_index} out of range")))?
+            .length;
+        let data_length = u64::try_from(data.len())
+            .map_err(|_| CoreError::Storage("BEP 52 storage write length exceeds u64".into()))?;
+        let end = offset
+            .checked_add(data_length)
+            .ok_or_else(|| CoreError::Storage("BEP 52 storage write offset overflows".into()))?;
+        if end > file_length {
+            return Err(CoreError::Storage(format!(
+                "BEP 52 storage write {offset}..{end} exceeds file {file_index} length {file_length}"
+            )));
+        }
+        if let Some(limiter) = &self.write_limiter {
+            limiter.acquire(RateDirection::Download, data_length).await;
+        }
+        self.ensure_file_dirs(file_index).await?;
+        let file = self.open_file_handle(file_index, true).await?;
+        let mut file = file.lock().await;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(CoreError::from)?;
+        file.write_all(data).await.map_err(CoreError::from)?;
+        drop(file);
+        if let Some(metrics) = &self.metrics {
+            metrics.record_payload_write(data_length);
+        }
+        Ok(())
+    }
+
+    async fn read_v2_file_range(
+        &self,
+        file_index: usize,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>> {
+        let file_length = self
+            .meta
+            .files
+            .get(file_index)
+            .ok_or_else(|| CoreError::Storage(format!("file index {file_index} out of range")))?
+            .length;
+        let length_u64 = u64::try_from(length)
+            .map_err(|_| CoreError::Storage("BEP 52 storage read length exceeds u64".into()))?;
+        let end = offset
+            .checked_add(length_u64)
+            .ok_or_else(|| CoreError::Storage("BEP 52 storage read offset overflows".into()))?;
+        if end > file_length {
+            return Err(CoreError::Storage(format!(
+                "BEP 52 storage read {offset}..{end} exceeds file {file_index} length {file_length}"
+            )));
+        }
+        self.flush_writable_file_slices(&[FileSliceRange {
+            file_index,
+            offset_in_file: offset,
+            length: length_u64,
+        }])
+        .await?;
+        let file = self.open_file_handle(file_index, false).await?;
+        let mut file = file.lock().await;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(CoreError::from)?;
+        let mut out = vec![0u8; length];
+        file.read_exact(&mut out).await.map_err(CoreError::from)?;
+        Ok(out)
+    }
+
     async fn flush_writable_file_slices(&self, slices: &[FileSliceRange]) -> Result<()> {
         let handles = {
             let handles = self.file_handles.lock().await;
@@ -755,6 +951,28 @@ impl StorageIo {
         Ok(verify_piece(&self.meta, piece_index, &data))
     }
 
+    /// Verify a file-aligned BEP 52 piece on disk using its SHA-256 Merkle
+    /// subtree root. Missing payload is treated as not-yet-present, matching
+    /// the v1 recheck contract.
+    pub async fn verify_v2_piece_on_disk(
+        &self,
+        layout: &V2PieceLayout,
+        piece_index: usize,
+    ) -> Result<bool> {
+        if layout.piece(piece_index).is_none() {
+            return Ok(false);
+        }
+        let data = match self.read_v2_piece(layout, piece_index).await {
+            Ok(data) => data,
+            Err(CoreError::Io(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if let Some(metrics) = &self.metrics {
+            metrics.record_verification_read(data.len() as u64);
+        }
+        Ok(layout.verify_piece(piece_index, &data))
+    }
+
     /// Full recheck: verify every piece on disk and return a bitfield of
     /// verified pieces.
     pub async fn recheck(&self) -> Result<PieceBitfield> {
@@ -767,8 +985,25 @@ impl StorageIo {
         Ok(bf)
     }
 
+    /// Full BEP 52 recheck over its file-aligned piece address space.
+    pub async fn recheck_v2(&self, layout: &V2PieceLayout) -> Result<PieceBitfield> {
+        let mut bitfield = PieceBitfield::new(layout.piece_count());
+        for index in 0..layout.piece_count() {
+            if self.verify_v2_piece_on_disk(layout, index).await? {
+                bitfield.set(index);
+            }
+        }
+        Ok(bitfield)
+    }
+
     /// Persist fast-resume metadata next to active torrent data.
     pub async fn save_resume(&self, resume: &FastResume) -> Result<PathBuf> {
+        if resume.key != self.torrent_key {
+            return Err(CoreError::Storage(format!(
+                "refusing to save resume for {} through storage handle for {}",
+                resume.key, self.torrent_key
+            )));
+        }
         let _write_guard = self.resume_write_lock.lock().await;
         let path = self.checked_resume_path()?;
         if let Some(parent) = path.parent() {
@@ -804,9 +1039,39 @@ impl StorageIo {
         Ok(path)
     }
 
-    /// Load fast-resume metadata for this torrent, validating the info hash
-    /// matches. Returns `None` if no resume file exists.
-    pub async fn load_resume(&self, expected_hash: &InfoHash) -> Result<Option<FastResume>> {
+    /// Load v1/hybrid fast-resume metadata, validating the full key matches.
+    /// Returns `None` if no resume file exists or its local payload stamps
+    /// require a safe recheck.
+    pub async fn load_resume(&self, expected_key: &TorrentKey) -> Result<Option<FastResume>> {
+        let piece_lengths = (0..self.meta.piece_count())
+            .filter_map(|index| self.meta.piece_byte_range(index as u64))
+            .map(|(start, end)| end - start)
+            .collect::<Vec<_>>();
+        self.load_resume_with_piece_lengths(expected_key, &piece_lengths)
+            .await
+    }
+
+    /// Load pure-v2 fast-resume metadata using the file-aligned BEP 52 piece
+    /// layout. This avoids interpreting a v2 bitfield in v1 contiguous-piece
+    /// arithmetic.
+    pub async fn load_resume_v2(
+        &self,
+        expected_key: &TorrentKey,
+        layout: &V2PieceLayout,
+    ) -> Result<Option<FastResume>> {
+        let piece_lengths = (0..layout.piece_count())
+            .filter_map(|index| layout.piece(index))
+            .map(|piece| piece.length)
+            .collect::<Vec<_>>();
+        self.load_resume_with_piece_lengths(expected_key, &piece_lengths)
+            .await
+    }
+
+    async fn load_resume_with_piece_lengths(
+        &self,
+        expected_key: &TorrentKey,
+        piece_lengths: &[u64],
+    ) -> Result<Option<FastResume>> {
         let _write_guard = self.resume_write_lock.lock().await;
         let path = self.checked_resume_path()?;
         let bytes = match fs::read(&path).await {
@@ -830,19 +1095,18 @@ impl StorageIo {
                 return Ok(None);
             }
         };
-        if &resume.info_hash != expected_hash {
+        if &resume.key != expected_key {
             return Err(CoreError::Storage(format!(
-                "resume info hash mismatch: expected {}, found {}",
-                expected_hash, resume.info_hash
+                "resume torrent key mismatch: expected {}, found {}",
+                expected_key, resume.key
             )));
         }
         let expected_bitfield_bytes = resume.piece_count.div_ceil(8);
-        let piece_count_matches = resume.piece_count == self.meta.piece_count();
+        let piece_count_matches = resume.piece_count == piece_lengths.len();
         let verified_bytes = piece_count_matches.then(|| {
-            (0..self.meta.piece_count())
+            (0..piece_lengths.len())
                 .filter(|&index| resume.piece_bitfield.has(index))
-                .filter_map(|index| self.meta.piece_byte_range(index as u64))
-                .map(|(start, end)| end - start)
+                .map(|index| piece_lengths[index])
                 .sum::<u64>()
         });
         let structurally_inconsistent = resume.name != self.meta.name
@@ -884,10 +1148,10 @@ impl StorageIo {
     /// Path of the fast-resume file for this torrent.
     pub fn resume_path(&self) -> PathBuf {
         if let Some(resume_dir) = &self.resume_dir {
-            return resume_dir.join(format!("{}.swarmotter.resume", self.meta.info_hash));
+            return resume_dir.join(format!("{}.swarmotter.resume", self.torrent_key));
         }
         self.download_dir
-            .join(format!("{}.swarmotter.resume", self.meta.name))
+            .join(format!("{}.swarmotter.resume", self.torrent_key))
     }
 
     fn checked_resume_path(&self) -> Result<PathBuf> {
@@ -914,17 +1178,64 @@ impl StorageIo {
     /// contain the torrent's files; refusing to overwrite avoids clobbering
     /// user data when a path is misconfigured.
     pub async fn move_to(&self, destination_dir: impl Into<PathBuf>) -> Result<Self> {
+        self.move_to_with_partial_file_suffix(destination_dir, None)
+            .await
+    }
+
+    /// Move payload data while selecting the destination's active-only
+    /// suffix. Completion uses [`Self::move_to`] with no suffix, whereas an
+    /// operator moving incomplete work preserves the suffix until the torrent
+    /// actually completes.
+    pub async fn move_to_with_partial_file_suffix(
+        &self,
+        destination_dir: impl Into<PathBuf>,
+        partial_file_suffix: Option<String>,
+    ) -> Result<Self> {
         let destination = Self::new(self.meta.clone(), destination_dir)
+            .with_torrent_key(self.torrent_key)
             .with_resume_dir(self.resume_dir.clone())
+            .with_partial_file_suffix(partial_file_suffix)
             .with_cow_strategy(self.cow_strategy)
             .with_metrics(self.metrics.clone());
         if self.shares_storage_root_with(&destination) {
+            if self.partial_file_suffix != destination.partial_file_suffix {
+                return self.rewrite_partial_file_suffix(destination).await;
+            }
             return Ok(destination);
         }
         self.flush_all_writable_handles().await?;
         self.clear_file_handles().await;
         let plan = self.build_move_plan(&destination).await?;
         self.remove_resume().await?;
+        execute_move_plan(&plan, &destination.download_dir).await?;
+        for entry in &plan {
+            if entry.kind == MoveEntryKind::Existing {
+                cleanup_empty_parents(entry.source.parent(), &self.download_dir).await;
+            }
+        }
+        Ok(destination)
+    }
+
+    /// Atomically rewrite active-only filename suffixes in place. This is the
+    /// same collision-checked move plan used across roots, but retains the
+    /// fast-resume file because only payload names change. Completion calls
+    /// this path when complete and incomplete roots are identical.
+    pub async fn finalize_partial_file_suffix(&self) -> Result<Self> {
+        let destination = Self::new(self.meta.clone(), self.download_dir.clone())
+            .with_torrent_key(self.torrent_key)
+            .with_resume_dir(self.resume_dir.clone())
+            .with_cow_strategy(self.cow_strategy)
+            .with_metrics(self.metrics.clone());
+        if self.partial_file_suffix.is_none() {
+            return Ok(destination);
+        }
+        self.rewrite_partial_file_suffix(destination).await
+    }
+
+    async fn rewrite_partial_file_suffix(&self, destination: Self) -> Result<Self> {
+        self.flush_all_writable_handles().await?;
+        self.clear_file_handles().await;
+        let plan = self.build_move_plan(&destination).await?;
         execute_move_plan(&plan, &destination.download_dir).await?;
         for entry in &plan {
             if entry.kind == MoveEntryKind::Existing {
@@ -1523,7 +1834,7 @@ async fn cleanup_empty_parents(parent: Option<&Path>, stop_at: &Path) {
 /// may be shorter than `piece_length`).
 #[allow(clippy::too_many_arguments)]
 pub fn build_resume(
-    info_hash: InfoHash,
+    key: TorrentKey,
     name: String,
     bitfield: PieceBitfield,
     piece_count: usize,
@@ -1541,7 +1852,7 @@ pub fn build_resume(
         .map(|priority| *priority != crate::models::torrent::FilePriority::Unwanted)
         .collect::<Vec<_>>();
     build_resume_with_wanted(
-        info_hash,
+        key,
         name,
         bitfield,
         piece_count,
@@ -1561,7 +1872,7 @@ pub fn build_resume(
 /// from scheduling priority.
 #[allow(clippy::too_many_arguments)]
 pub fn build_resume_with_wanted(
-    info_hash: InfoHash,
+    key: TorrentKey,
     name: String,
     bitfield: PieceBitfield,
     piece_count: usize,
@@ -1580,7 +1891,7 @@ pub fn build_resume_with_wanted(
         .map(|i| *piece_byte_lengths.get(i).unwrap_or(&0))
         .sum();
     FastResume {
-        info_hash,
+        key,
         name,
         piece_bitfield: bitfield,
         piece_count,
@@ -1631,7 +1942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dedicated_resume_directory_uses_info_hash_without_relocating_payload() {
+    async fn dedicated_resume_directory_uses_torrent_key_without_relocating_payload() {
         let bytes = build_single_file_torrent("same-name.bin", b"payload", 7, None, false);
         let meta = parse_torrent(&bytes).unwrap();
         let active = unique_dir("resume-active");
@@ -1650,7 +1961,7 @@ mod tests {
         assert!(!resume_path.starts_with(&active));
 
         let persisted = build_resume(
-            meta.info_hash,
+            TorrentKey::v1(meta.info_hash),
             meta.name.clone(),
             PieceBitfield::new(meta.piece_count()),
             meta.piece_count(),
@@ -1680,6 +1991,138 @@ mod tests {
         std::fs::remove_dir_all(active).ok();
         std::fs::remove_dir_all(resume).ok();
         std::fs::remove_dir_all(complete).ok();
+    }
+
+    #[tokio::test]
+    async fn partial_file_suffix_finalizes_single_file_in_place() {
+        let content = b"0123456789abcdef";
+        let bytes = build_single_file_torrent("active.bin", content, 8, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let root = unique_dir("partial-suffix-finalize-single");
+        let active = StorageIo::new(meta.clone(), root.clone())
+            .with_partial_file_suffix(Some(".part".into()));
+        let canonical = StorageIo::new(meta.clone(), root.clone());
+
+        active.preallocate().await.unwrap();
+        active.write_block(0, 0, &content[..8]).await.unwrap();
+        active.write_block(1, 0, &content[8..]).await.unwrap();
+        let active_path = active.file_path(0).unwrap();
+        assert!(active_path.ends_with("active.bin.part"));
+        assert!(active_path.exists());
+
+        let finalized = active.finalize_partial_file_suffix().await.unwrap();
+
+        assert_eq!(finalized.partial_file_suffix(), None);
+        assert!(!active_path.exists());
+        assert_eq!(
+            finalized.file_path(0).unwrap(),
+            canonical.file_path(0).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(finalized.file_path(0).unwrap()).unwrap(),
+            content
+        );
+        assert!(finalized.recheck().await.unwrap().has(0));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn partial_file_suffix_moves_multi_file_payload_to_canonical_paths() {
+        let files = vec![
+            (vec!["a.txt".into()], 5u64),
+            (vec!["sub".into(), "b.bin".into()], 7u64),
+        ];
+        let contents: Vec<&[u8]> = vec![b"hello", b"world!!"];
+        let bytes = build_multi_file_torrent("bundle", &files, &contents, 4, None);
+        let meta = parse_torrent(&bytes).unwrap();
+        let active_root = unique_dir("partial-suffix-move-multi-active");
+        let complete_root = unique_dir("partial-suffix-move-multi-complete");
+        let active = StorageIo::new(meta.clone(), active_root.clone())
+            .with_partial_file_suffix(Some(".part".into()));
+
+        active.preallocate().await.unwrap();
+        active.write_block(0, 0, b"hell").await.unwrap();
+        active.write_block(1, 0, b"owor").await.unwrap();
+        active.write_block(2, 0, b"ld!!").await.unwrap();
+        let active_first = active.file_path(0).unwrap();
+        let active_second = active.file_path(1).unwrap();
+
+        let complete = active.move_to(complete_root.clone()).await.unwrap();
+
+        assert_eq!(complete.partial_file_suffix(), None);
+        assert!(!active_first.exists());
+        assert!(!active_second.exists());
+        assert_eq!(
+            std::fs::read(complete.file_path(0).unwrap()).unwrap(),
+            b"hello"
+        );
+        assert_eq!(
+            std::fs::read(complete.file_path(1).unwrap()).unwrap(),
+            b"world!!"
+        );
+        std::fs::remove_dir_all(active_root).ok();
+        std::fs::remove_dir_all(complete_root).ok();
+    }
+
+    #[tokio::test]
+    async fn partial_file_suffix_active_move_preserves_incomplete_names() {
+        let bytes = build_single_file_torrent("moving.bin", b"01234567", 8, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let old_root = unique_dir("partial-suffix-active-move-old");
+        let new_root = unique_dir("partial-suffix-active-move-new");
+        let active = StorageIo::new(meta.clone(), old_root.clone())
+            .with_partial_file_suffix(Some(".part".into()));
+
+        active.preallocate().await.unwrap();
+        active.write_block(0, 0, b"01234567").await.unwrap();
+        let old_path = active.file_path(0).unwrap();
+        let moved = active
+            .move_to_with_partial_file_suffix(new_root.clone(), Some(".part".into()))
+            .await
+            .unwrap();
+
+        let new_suffix_path = moved.file_path(0).unwrap();
+        let canonical = StorageIo::new(meta, new_root.clone()).file_path(0).unwrap();
+        assert_eq!(moved.partial_file_suffix(), Some(".part"));
+        assert!(!old_path.exists());
+        assert!(new_suffix_path.ends_with("moving.bin.part"));
+        assert_eq!(std::fs::read(new_suffix_path).unwrap(), b"01234567");
+        assert!(!canonical.exists());
+        std::fs::remove_dir_all(old_root).ok();
+        std::fs::remove_dir_all(new_root).ok();
+    }
+
+    #[tokio::test]
+    async fn partial_file_suffix_finalization_rejects_canonical_collision_without_data_loss() {
+        let bytes = build_single_file_torrent("collision.bin", b"01234567", 8, None, false);
+        let meta = parse_torrent(&bytes).unwrap();
+        let root = unique_dir("partial-suffix-finalize-collision");
+        let active = StorageIo::new(meta.clone(), root.clone())
+            .with_partial_file_suffix(Some(".part".into()));
+        let canonical = StorageIo::new(meta, root.clone());
+
+        active.preallocate().await.unwrap();
+        active.write_block(0, 0, b"01234567").await.unwrap();
+        let active_path = active.file_path(0).unwrap();
+        let canonical_path = canonical.file_path(0).unwrap();
+        fs::write(&canonical_path, b"existing canonical payload")
+            .await
+            .unwrap();
+
+        let error = match active.finalize_partial_file_suffix().await {
+            Ok(_) => panic!("canonical collision must reject suffix finalization"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("destination file already exists"));
+        assert_eq!(std::fs::read(active_path).unwrap(), b"01234567");
+        assert_eq!(
+            std::fs::read(canonical_path).unwrap(),
+            b"existing canonical payload"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
@@ -2026,7 +2469,7 @@ mod tests {
         bf.set(0);
         bf.set(1);
         let resume = build_resume_with_wanted(
-            meta.info_hash,
+            TorrentKey::v1(meta.info_hash),
             meta.name.clone(),
             bf,
             meta.piece_count(),
@@ -2041,8 +2484,12 @@ mod tests {
             &[8u64; 4],
         );
         store.save_resume(&resume).await.unwrap();
-        let loaded = store.load_resume(&meta.info_hash).await.unwrap().unwrap();
-        assert_eq!(loaded.info_hash, meta.info_hash);
+        let loaded = store
+            .load_resume(&store.torrent_key())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.key, store.torrent_key());
         assert_eq!(loaded.piece_count, meta.piece_count());
         assert!(loaded.piece_bitfield.has(0));
         assert!(loaded.piece_bitfield.has(1));
@@ -2067,28 +2514,32 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(store.load_resume(&meta.info_hash).await.unwrap().is_none());
+        assert!(store
+            .load_resume(&store.torrent_key())
+            .await
+            .unwrap()
+            .is_none());
         assert!(!store.resume_path().exists());
-        let prefix = "corrupt.bin.swarmotter.resume.corrupt-";
+        let prefix = format!("{}.swarmotter.resume.corrupt-", store.torrent_key());
         assert!(std::fs::read_dir(&dir).unwrap().any(|entry| {
             entry
                 .unwrap()
                 .file_name()
                 .to_string_lossy()
-                .starts_with(prefix)
+                .starts_with(&prefix)
         }));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[tokio::test]
-    async fn resume_rejects_mismatched_info_hash() {
+    async fn resume_rejects_mismatched_torrent_key_on_save() {
         let bytes = build_single_file_torrent("m.bin", b"01234567", 8, None, false);
         let meta = parse_torrent(&bytes).unwrap();
         let dir = unique_dir("resume-mismatch");
         let store = StorageIo::new(meta.clone(), dir.clone());
         let other = InfoHash::from_bytes([0u8; 20]);
         let resume = build_resume(
-            other,
+            TorrentKey::v1(other),
             "m.bin".into(),
             PieceBitfield::new(1),
             1,
@@ -2101,8 +2552,7 @@ mod tests {
             &[],
             &[8u64],
         );
-        store.save_resume(&resume).await.unwrap();
-        let err = store.load_resume(&meta.info_hash).await;
+        let err = store.save_resume(&resume).await;
         assert!(err.is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2182,7 +2632,7 @@ mod tests {
         store.write_block(0, 0, &content[..8]).await.unwrap();
         store.write_block(1, 0, &content[8..]).await.unwrap();
         let resume = build_resume(
-            meta.info_hash,
+            TorrentKey::v1(meta.info_hash),
             meta.name.clone(),
             PieceBitfield::new(meta.piece_count()),
             meta.piece_count(),
@@ -2331,7 +2781,7 @@ mod tests {
         store.write_block(1, 0, b"owor").await.unwrap();
         store.write_block(2, 0, b"ld!!").await.unwrap();
         let resume = build_resume(
-            meta.info_hash,
+            TorrentKey::v1(meta.info_hash),
             meta.name.clone(),
             PieceBitfield::new(meta.piece_count()),
             meta.piece_count(),
@@ -2461,7 +2911,9 @@ mod tests {
         let root = unique_dir("path-ownership");
         let first = StorageIo::new(meta.clone(), root.clone());
         let mut other_meta = meta.clone();
-        other_meta.info_hash = InfoHash::from_bytes([9u8; 20]);
+        let other_hash = InfoHash::from_bytes([9u8; 20]);
+        other_meta.info_hash = other_hash;
+        other_meta.identity = crate::hash::TorrentIdentity::v1(other_hash);
         let second = StorageIo::new(other_meta, root.join("child").join(".."));
 
         assert!(first.shares_storage_root_with(&second));
@@ -2485,6 +2937,7 @@ mod tests {
         ));
         let meta = TorrentMeta {
             info_hash: InfoHash::from_bytes([8u8; 20]),
+            identity: crate::hash::TorrentIdentity::v1(InfoHash::from_bytes([8u8; 20])),
             name: "root".into(),
             piece_length: 16,
             pieces: vec![[0u8; 20]],
@@ -2492,10 +2945,12 @@ mod tests {
                 MetaFile {
                     path: vec!["root".into(), "file".into()],
                     length: 1,
+                    pieces_root: None,
                 },
                 MetaFile {
                     path: vec!["root".into(), "file".into(), "child".into()],
                     length: 1,
+                    pieces_root: None,
                 },
             ],
             total_length: 2,
@@ -2507,6 +2962,8 @@ mod tests {
             created_by: None,
             creation_date: None,
             is_multi_file: true,
+            v2: None,
+            raw_info: None,
         };
         let store = StorageIo::new(meta, std::env::temp_dir());
         assert!(store.path_ownership().is_err());
@@ -2516,7 +2973,10 @@ mod tests {
     fn path_ownership_rejects_payload_collision_with_its_resume_file() {
         let bytes = build_single_file_torrent("payload.bin", b"01234567", 8, None, false);
         let mut meta = parse_torrent(&bytes).unwrap();
-        meta.files[0].path = vec!["payload.bin.swarmotter.resume".into()];
+        meta.files[0].path = vec![format!(
+            "{}.swarmotter.resume",
+            meta.identity.primary_key().unwrap()
+        )];
         let store = StorageIo::new(meta, std::env::temp_dir());
 
         let error = store.path_ownership().unwrap_err();
@@ -2530,12 +2990,14 @@ mod tests {
     fn storage_rejects_unsafe_path_components() {
         let meta = TorrentMeta {
             info_hash: InfoHash::from_bytes([1u8; 20]),
+            identity: crate::hash::TorrentIdentity::v1(InfoHash::from_bytes([1u8; 20])),
             name: "safe-name".into(),
             piece_length: 16,
             pieces: vec![[0u8; 20]],
             files: vec![MetaFile {
                 path: vec!["safe-name".into(), "../traversal".into()],
                 length: 1,
+                pieces_root: None,
             }],
             total_length: 1,
             private: false,
@@ -2546,6 +3008,8 @@ mod tests {
             created_by: None,
             creation_date: None,
             is_multi_file: true,
+            v2: None,
+            raw_info: None,
         };
         let store = StorageIo::new(meta, std::env::temp_dir());
         assert!(store.file_path(0).is_err());
@@ -2555,12 +3019,14 @@ mod tests {
     fn storage_rejects_empty_path_components() {
         let meta = TorrentMeta {
             info_hash: InfoHash::from_bytes([2u8; 20]),
+            identity: crate::hash::TorrentIdentity::v1(InfoHash::from_bytes([2u8; 20])),
             name: "safe".into(),
             piece_length: 16,
             pieces: vec![[0u8; 20]],
             files: vec![MetaFile {
                 path: vec!["safe".into(), "".into()],
                 length: 1,
+                pieces_root: None,
             }],
             total_length: 1,
             private: false,
@@ -2571,6 +3037,8 @@ mod tests {
             created_by: None,
             creation_date: None,
             is_multi_file: true,
+            v2: None,
+            raw_info: None,
         };
         let store = StorageIo::new(meta, std::env::temp_dir());
         assert!(store.file_path(0).is_err());

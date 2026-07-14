@@ -13,7 +13,7 @@ ADR-0009 and ADR-0010.
 - JSON request/response by default.
 - Consistent `{ success, data, error }` response envelope.
 - Stable snake_case machine-readable error codes.
-- Stable object identifiers based on torrent info hashes.
+- Stable object identifiers based on canonical full torrent locators.
 - Native API versioning through the `/api/v1` prefix.
 - Complete coverage of user-facing daemon features.
 - Suitable for scripts, browser integrations, and the built-in Web UI.
@@ -40,6 +40,11 @@ ADR-0009 and ADR-0010.
   fall behind the broker buffer receive an `events_dropped` notice.
 - Native torrent add requests support add-time options such as paused start
   behavior without requiring add-then-pause sequencing; see ADR-0029.
+- Native add requests may also register metadata-first previews and a
+  deterministic unwanted-file selection. Preview magnets use only the
+  contained metadata path and remain paused before payload transfer; an
+  explicit Resume or Start Now is required to clear the persisted preview
+  gate (ADR-0066).
 - Add requests return after registration, queue insertion, and durable state
   persistence; persistence failure restores exact hash-specific snapshots and
   emits/schedules nothing. Expensive queue reconciliation and engine startup
@@ -79,6 +84,10 @@ ADR-0009 and ADR-0010.
   property endpoints plus Transmission's optional `profile` add/set field are
   translations over the same `DaemonOps` behavior; neither surface maintains
   a second torrent store or routing path (ADR-0061).
+- Native and compatibility selectors accept only canonical 40-character v1 or
+  hybrid-primary locators and 64-character pure-v2 locators. A hybrid's full
+  v2 locator resolves to its canonical v1 record. The 20-byte peer/tracker/DHT
+  wire identity is deliberately not an API key or compatibility hash.
 - `/api/v1/network/health` preserves the flattened containment health shape
   and additively returns non-sensitive `port_mapping` and `port_test` status.
   Dedicated mapping-status/refresh and port-test routes delegate only to the
@@ -125,11 +134,21 @@ ADR-0009 and ADR-0010.
   is lower, crossing it returns HTTP 413 `payload_too_large`; otherwise crossing
   16 MiB returns `malformed_torrent`. Bulk and Transmission base64 metainfo use
   a decoder that stops before its decoded output can exceed 16 MiB.
-- Restored daemon state is JSON rather than bencode. Its piece hashes are
-  decoded through a sequence capped at `MAX_TORRENT_PIECES`, each hash is
-  required to encode exactly 20 bytes before hex decoding/copying, and each
-  restored `TorrentMeta` is checked with `TorrentMeta::validate()` before
-  runtime use.
+- Restored daemon state uses a versioned local SQLite store rather than
+  bencode. A validated legacy JSON document migrates in place on its first
+  successful save. Each durable torrent record, including its canonical raw
+  `info` bytes when available, is checked with `TorrentMeta::validate()`
+  before runtime use. Native `:hash` locators are unambiguous by length:
+  40 hexadecimal characters address v1/hybrid-primary records and 64 address
+  pure-v2 records. Hybrid full-v2 aliases resolve to their canonical v1
+  record; a peer-wire/tracker/DHT 20-byte value is never accepted as a durable
+  or API key.
+- `GET /api/v1/torrents/:hash/metainfo` is an authenticated read-only export
+  of the retained, byte-exact original full `.torrent` document. It returns
+  `application/x-bittorrent` only when that local-file or watch-folder input
+  was retained. It never reconstructs bytes from canonical `info` data,
+  performs metadata retrieval, or substitutes another representation; missing
+  original bytes return the normal not-found/unavailable error.
 - Oversized or malformed bencoded metadata is rejected with
   `malformed_torrent` (or `bencode_error` for raw decoder overruns). No
   malformed input may panic the daemon or cause an unbounded or piece-sized
@@ -182,8 +201,11 @@ ADR-0009 and ADR-0010.
   Root-budget saturation keeps work queued rather than converting it into a
   permanent payload error. See ADR-0056.
 - `storage.resume_dir` stores fast-resume files under info-hash names without
-  moving payloads. `storage.state_dir` supplies the state-file default only
-  after restart and never overrides an explicit CLI/environment state path.
+  moving payloads. New resume files use full canonical torrent locators, while
+  legacy v1 filenames remain readable for migration. `storage.state_dir` supplies the local SQLite state-store
+  default only after restart and never overrides an explicit CLI/environment
+  state path. The compatible default name can still be `state.json` even when
+  the file has migrated to SQLite.
   `storage.temp_dir` supplies only the fallback payload root. Durable atomic
   replacement files remain siblings of their targets. `cow_strategy` defaults
   to conservative; explicit NOCOW is limited to newly created Linux Btrfs
@@ -195,13 +217,19 @@ ADR-0009 and ADR-0010.
   `{ profiles, labels }` configuration section. Full replacement validates
   profile names, references, paths, and finite/non-negative ratio values before
   it affects runtime state.
+- A profile's ordered tracker-host rules remain live discovery policy: the
+  first case-insensitive `*`/`?` host match determines enablement and priority.
+  Intake exclusions, organization/incomplete subdirectories, forced top-level
+  folder, partial suffix, and explicit unwanted file indices are instead
+  captured on each registered torrent before payload work.
 - Native add requests and bulk add may supply a profile and labels. Labels are
   assigned before resolution so their mapping can select a profile before
   storage is chosen. Watch and compatibility intake paths follow the same
   ordering.
 - `GET /api/v1/torrents/:hash/policy` returns the effective profile plus every
-  resolved storage, queue, seeding, bandwidth, and encryption value with its
-  source layer.
+  resolved storage, queue, seeding, bandwidth, tracker, encryption, and intake
+  value with its source layer. It includes the persisted metadata-preview gate
+  and selection snapshot so clients can explain why no payload may start.
   Serialized source kinds are `global`, `profile`, `label`, `torrent`,
   `legacy_torrent`, `profile_storage_snapshot`,
   `registration_storage_snapshot`, `existing_storage_snapshot`, and
@@ -223,6 +251,16 @@ ADR-0009 and ADR-0010.
   value changes; global encryption replacement keeps the complete data-plane
   transaction. Legacy records are migrated transactionally during profile
   replacement (ADR-0063).
+- `POST /api/v1/torrents/:hash/storage-preview` accepts an optional completed
+  root, incomplete root, and profile assignment and returns bounded resolved
+  complete/incomplete file paths without opening, creating, moving, or
+  otherwise changing a payload. It is the confirmation surface for an
+  organization or move decision.
+- Native add and bulk-add requests can select `preview`, explicit unwanted
+  indices, structured suffix/path-glob/path-segment/size exclusion rules,
+  incomplete root, and active-only partial suffix. Magnet `so=` selection can
+  only reduce this resulting file selection; literal `x.pe` hints enter the
+  normal peer filter and contained binder without hostname resolution.
 
 ## Peer-admission API contract
 

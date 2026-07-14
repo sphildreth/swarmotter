@@ -2,8 +2,8 @@
 
 //! `.torrent` metadata parsing.
 //!
-//! Parses single-file and multi-file torrent metadata dictionaries, computes
-//! the info hash from the raw `info` dictionary, validates the structure, and
+//! Parses v1, BEP 52 v2, and hybrid torrent metadata dictionaries, computes
+//! identities from the raw `info` dictionary, validates the structure, and
 //! preserves source metadata where useful (announce, announce-list, private
 //! flag, comment, created by, creation date).
 //!
@@ -13,7 +13,7 @@
 
 use crate::bencode::{self, Value};
 use crate::error::{CoreError, Result};
-use crate::hash::InfoHash;
+use crate::hash::{InfoHash, TorrentIdentity, V2InfoHash};
 use serde::{Deserialize, Serialize};
 
 /// Maximum total size of a bencoded `.torrent` metadata document (or magnet
@@ -40,10 +40,22 @@ pub const MAX_TORRENT_PIECES: usize = 750_000;
 /// Maximum declared piece length in bytes. See ADR-0050.
 pub const MAX_PIECE_LENGTH: u64 = 64 * 1024 * 1024;
 
+/// BEP 52 merkle-tree leaf block size.
+pub const V2_BLOCK_LENGTH: u64 = 16 * 1024;
+
 /// Parsed torrent metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TorrentMeta {
+    /// The legacy v1 SHA-1 info hash. It remains the v1/hybrid data-plane
+    /// registry key. Pure v2 torrents have no v1 identity and use
+    /// [`TorrentMeta::identity`] as their authoritative identifier; their
+    /// legacy field is `InfoHash::ZERO` and is rejected before the v1-only
+    /// data plane can use it.
     pub info_hash: InfoHash,
+    /// Explicit v1, v2, or hybrid identity. `Unknown` is accepted only when
+    /// reading durable records written before this field existed.
+    #[serde(default)]
+    pub identity: TorrentIdentity,
     pub name: String,
     pub piece_length: u64,
     /// Concatenated SHA-1 piece hashes (20 bytes each).
@@ -63,6 +75,14 @@ pub struct TorrentMeta {
     pub created_by: Option<String>,
     pub creation_date: Option<u64>,
     pub is_multi_file: bool,
+    /// BEP 52-specific file-tree and piece-layer metadata, when present.
+    #[serde(default)]
+    pub v2: Option<V2TorrentMeta>,
+    /// Exact bencoded `info` dictionary bytes. This is populated from a full
+    /// `.torrent` document or a BEP 9 metadata exchange and must never be
+    /// regenerated for identity validation or later export.
+    #[serde(default)]
+    pub raw_info: Option<Vec<u8>>,
 }
 
 /// A file entry within a torrent.
@@ -71,6 +91,79 @@ pub struct MetaFile {
     /// Path components; for single-file this is `[name]`.
     pub path: Vec<String>,
     pub length: u64,
+    /// BEP 52 SHA-256 merkle root for a non-empty file. v1 file entries leave
+    /// this unset.
+    #[serde(default)]
+    pub pieces_root: Option<V2InfoHash>,
+}
+
+/// BEP 52 data retained alongside the common torrent metadata fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct V2TorrentMeta {
+    /// The only supported BEP 52 metadata revision.
+    pub meta_version: u8,
+    /// Files represented by the BEP 52 `file tree`. Hybrid torrents retain
+    /// their v1 files in [`TorrentMeta::files`] and place the independent v2
+    /// tree here.
+    pub files: Vec<MetaFile>,
+    /// Piece layers keyed by their corresponding file merkle roots.
+    #[serde(default)]
+    pub piece_layers: Vec<V2PieceLayer>,
+    /// True only when a complete metainfo document supplied and verified the
+    /// top-level `piece layers` dictionary. BEP 9 transmits just `info`, so a
+    /// hybrid metadata exchange may legitimately have this false while it
+    /// continues on the separately validated v1 transfer path.
+    #[serde(default)]
+    pub piece_layers_verified: bool,
+}
+
+/// One BEP 52 piece layer from the top-level `piece layers` dictionary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct V2PieceLayer {
+    pub pieces_root: V2InfoHash,
+    pub hashes: Vec<V2InfoHash>,
+}
+
+/// Safe preliminary description of BEP 52 metadata received through BEP 9.
+/// It intentionally contains no piece layers: callers use it only to request
+/// those layers through BEP 52 hash messages, then call
+/// [`parse_info_dict_with_piece_layers`] to obtain executable metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bep9V2Info {
+    pub identity: V2InfoHash,
+    pub piece_length: u64,
+    pub files: Vec<MetaFile>,
+}
+
+impl Bep9V2Info {
+    /// File roots that require a top-level piece layer, paired with the exact
+    /// number of logical pieces expected for that file. Repeated roots are
+    /// deduplicated because a BEP 52 layer is keyed by its file root.
+    pub fn required_piece_layers(&self) -> Result<Vec<(V2InfoHash, usize)>> {
+        let mut layers = std::collections::BTreeMap::new();
+        for file in &self.files {
+            if file.length <= self.piece_length {
+                continue;
+            }
+            let root = file.pieces_root.ok_or_else(|| {
+                CoreError::MalformedTorrent("non-empty BEP 52 file is missing pieces root".into())
+            })?;
+            let count = usize::try_from(file.length.div_ceil(self.piece_length)).map_err(|_| {
+                CoreError::MalformedTorrent(
+                    "BEP 52 piece-layer count exceeds platform limits".into(),
+                )
+            })?;
+            match layers.insert(root, count) {
+                Some(previous) if previous != count => {
+                    return Err(CoreError::MalformedTorrent(
+                        "BEP 52 files sharing a pieces root have inconsistent lengths".into(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        Ok(layers.into_iter().collect())
+    }
 }
 
 impl TorrentMeta {
@@ -93,75 +186,129 @@ impl TorrentMeta {
                 self.piece_length
             )));
         }
-        if self.files.is_empty() {
-            return Err(CoreError::MalformedTorrent(
-                "torrent must contain at least one file".into(),
-            ));
-        }
-        if self.files.len() > MAX_TORRENT_FILES {
-            return Err(CoreError::MalformedTorrent(format!(
-                "file count {} exceeds maximum {MAX_TORRENT_FILES}",
-                self.files.len()
-            )));
-        }
-        if self.pieces.len() > MAX_TORRENT_PIECES {
-            return Err(CoreError::MalformedTorrent(format!(
-                "piece count {} exceeds maximum {MAX_TORRENT_PIECES}",
-                self.pieces.len()
-            )));
-        }
         if self.total_length == 0 {
             return Err(CoreError::MalformedTorrent(
                 "torrent total length must be greater than zero".into(),
             ));
         }
+        validate_file_list(&self.files, self.total_length, "torrent")?;
         if !self.is_multi_file && self.files.len() != 1 {
             return Err(CoreError::MalformedTorrent(
                 "single-file torrent must contain exactly one file".into(),
             ));
         }
 
-        let mut total = 0u64;
-        let mut paths = std::collections::HashSet::with_capacity(self.files.len());
-        for file in &self.files {
-            if file.path.is_empty() {
-                return Err(CoreError::MalformedTorrent("file with empty path".into()));
-            }
-            for component in &file.path {
-                validate_path_component(component, "file path component")?;
-            }
-            if !paths.insert(file.path.clone()) {
+        if let Some(raw_info) = &self.raw_info {
+            if raw_info.len() > MAX_TORRENT_METADATA_BYTES {
                 return Err(CoreError::MalformedTorrent(format!(
-                    "duplicate file path: {}",
-                    file.path.join("/")
+                    "raw info dictionary size {} exceeds maximum {MAX_TORRENT_METADATA_BYTES}",
+                    raw_info.len()
                 )));
             }
-            total = total.checked_add(file.length).ok_or_else(|| {
-                CoreError::MalformedTorrent("total file length exceeds u64".into())
-            })?;
+            match &self.identity {
+                TorrentIdentity::Unknown => {
+                    if InfoHash::from_info_bencoded(raw_info) != self.info_hash {
+                        return Err(CoreError::MalformedTorrent(
+                            "raw info dictionary does not match legacy v1 info hash".into(),
+                        ));
+                    }
+                }
+                identity if !identity.matches_info_bencoded(raw_info) => {
+                    return Err(CoreError::MalformedTorrent(
+                        "raw info dictionary does not match torrent identity".into(),
+                    ));
+                }
+                _ => {}
+            }
         }
-        if total != self.total_length {
-            return Err(CoreError::MalformedTorrent(format!(
-                "file lengths total {total} does not match recorded length {}",
-                self.total_length
-            )));
-        }
-        let expected_pieces_u64 = total.div_ceil(self.piece_length);
-        if expected_pieces_u64 > MAX_TORRENT_PIECES as u64 {
-            return Err(CoreError::MalformedTorrent(format!(
-                "expected piece count {expected_pieces_u64} exceeds maximum {MAX_TORRENT_PIECES}"
-            )));
-        }
-        let expected_pieces = usize::try_from(expected_pieces_u64).map_err(|_| {
-            CoreError::MalformedTorrent("piece count exceeds platform limits".into())
-        })?;
-        if self.pieces.len() != expected_pieces {
-            return Err(CoreError::MalformedTorrent(format!(
-                "piece count {} does not match expected {expected_pieces}",
-                self.pieces.len()
-            )));
+
+        match &self.identity {
+            TorrentIdentity::Unknown => validate_v1_piece_layout(self)?,
+            TorrentIdentity::V1 { v1 } => {
+                if *v1 != self.info_hash {
+                    return Err(CoreError::MalformedTorrent(
+                        "explicit v1 identity does not match legacy info hash".into(),
+                    ));
+                }
+                if self.v2.is_some() {
+                    return Err(CoreError::MalformedTorrent(
+                        "v1 identity cannot carry BEP 52 metadata".into(),
+                    ));
+                }
+                validate_v1_piece_layout(self)?;
+            }
+            TorrentIdentity::V2 { .. } => {
+                if self.info_hash != InfoHash::ZERO {
+                    return Err(CoreError::MalformedTorrent(
+                        "pure v2 metadata must not carry a v1 info hash".into(),
+                    ));
+                }
+                if !self.pieces.is_empty() {
+                    return Err(CoreError::MalformedTorrent(
+                        "pure v2 metadata must not carry v1 piece hashes".into(),
+                    ));
+                }
+                let v2 = self.v2.as_ref().ok_or_else(|| {
+                    CoreError::MalformedTorrent("v2 identity is missing BEP 52 metadata".into())
+                })?;
+                validate_v2_metadata(v2, self.piece_length, self.total_length)?;
+                if !v2.piece_layers_verified {
+                    return Err(CoreError::MalformedTorrent(
+                        "pure v2 metadata requires verified piece layers".into(),
+                    ));
+                }
+            }
+            TorrentIdentity::Hybrid { v1, .. } => {
+                if *v1 != self.info_hash {
+                    return Err(CoreError::MalformedTorrent(
+                        "hybrid v1 identity does not match legacy info hash".into(),
+                    ));
+                }
+                validate_v1_piece_layout(self)?;
+                let v2 = self.v2.as_ref().ok_or_else(|| {
+                    CoreError::MalformedTorrent("hybrid identity is missing BEP 52 metadata".into())
+                })?;
+                validate_v2_metadata(v2, self.piece_length, self.total_length)?;
+                validate_hybrid_layout(&self.files, &v2.files, self.is_multi_file)?;
+            }
         }
         Ok(())
+    }
+
+    /// The v1 SHA-1 identity when this torrent has a v1 compatibility swarm.
+    pub const fn v1_info_hash(&self) -> Option<InfoHash> {
+        match self.identity.v1_info_hash() {
+            Some(hash) => Some(hash),
+            None if matches!(self.identity, TorrentIdentity::Unknown) => Some(self.info_hash),
+            None => None,
+        }
+    }
+
+    /// True when this torrent needs the BEP 52 SHA-256 piece-layer data plane
+    /// rather than the existing v1 piece exchange.
+    pub const fn requires_v2_data_plane(&self) -> bool {
+        !self.identity.supports_v1_data_plane()
+            && !matches!(self.identity, TorrentIdentity::Unknown)
+    }
+
+    /// Construct the file-aligned BEP 52 piece mapping for payload transfer.
+    ///
+    /// The mapping is intentionally fallible: a pure v2 BEP 9 `info`
+    /// dictionary does not contain the top-level piece layers needed to
+    /// verify files larger than one logical piece.
+    pub fn v2_piece_layout(&self) -> Result<crate::v2::V2PieceLayout> {
+        crate::v2::V2PieceLayout::from_meta(self)
+    }
+
+    /// Return the actual data-plane piece count for this metainfo.
+    ///
+    /// v1 and hybrid v1 transfers retain their legacy contiguous SHA-1 piece
+    /// count. Pure v2 callers receive the file-aligned BEP 52 count instead.
+    pub fn data_piece_count(&self) -> Result<usize> {
+        if self.requires_v2_data_plane() {
+            return self.v2_piece_layout().map(|layout| layout.piece_count());
+        }
+        Ok(self.piece_count())
     }
 
     /// Number of pieces.
@@ -265,7 +412,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentMeta> {
     let info_bytes = bencode::extract_value_bytes(bytes, b"info")
         .ok_or_else(|| CoreError::MalformedTorrent("missing 'info' dictionary".into()))?;
 
-    parse_torrent_root(root, info_bytes)
+    parse_torrent_root(root, info_bytes, true)
 }
 
 /// Parse a raw BEP 9 `info` dictionary and attach magnet tracker context.
@@ -302,10 +449,150 @@ pub fn parse_info_dict(info_bytes: &[u8], trackers: &[String]) -> Result<Torrent
     }
     root.push((b"info".to_vec(), info));
 
-    parse_torrent_root(&root, info_bytes)
+    // BEP 9 transports only the `info` dictionary, not the top-level BEP 52
+    // `piece layers` dictionary. Hybrid metadata can use its validated v1
+    // compatibility layout immediately. This public parser returns only
+    // executable metadata, so a bare pure-v2 result remains rejected; callers
+    // that need to acquire its layers must use `inspect_bep9_v2_info` followed
+    // by `parse_info_dict_with_piece_layers`.
+    let meta = parse_torrent_root(&root, info_bytes, false)?;
+    if meta.requires_v2_data_plane() {
+        return Err(CoreError::MalformedTorrent(
+            "pure v2 metadata requires verified piece layers".into(),
+        ));
+    }
+    Ok(meta)
 }
 
-fn parse_torrent_root(root: &[(Vec<u8>, Value)], info_bytes: &[u8]) -> Result<TorrentMeta> {
+/// Validate a BEP 9 `info` dictionary enough to safely discover the BEP 52
+/// piece layers it still needs. This does not make the metadata executable:
+/// callers must fetch and verify every item returned by
+/// [`Bep9V2Info::required_piece_layers`] before constructing a final
+/// [`TorrentMeta`] with [`parse_info_dict_with_piece_layers`].
+pub fn inspect_bep9_v2_info(info_bytes: &[u8]) -> Result<Option<Bep9V2Info>> {
+    let info = bencode::decode(info_bytes)?;
+    if info.as_dict().is_none() {
+        return Err(CoreError::MalformedTorrent(
+            "BEP 9 info metadata must be a dictionary".into(),
+        ));
+    }
+    let root = vec![(b"info".to_vec(), info)];
+    let meta = parse_torrent_root(&root, info_bytes, false)?;
+    let Some(identity) = meta.identity.v2_info_hash() else {
+        return Ok(None);
+    };
+    let files =
+        meta.v2.as_ref().map(|v2| v2.files.clone()).ok_or_else(|| {
+            CoreError::MalformedTorrent("BEP 52 identity has no v2 file tree".into())
+        })?;
+    Ok(Some(Bep9V2Info {
+        identity,
+        piece_length: meta.piece_length,
+        files,
+    }))
+}
+
+/// Parse BEP 9 `info` metadata together with verified BEP 52 piece layers
+/// fetched through the peer protocol. A pure-v2 magnet cannot become an
+/// executable payload layout from its `info` dictionary alone: the top-level
+/// `piece layers` dictionary is deliberately outside the BEP 9 payload.
+///
+/// Callers must obtain each layer through a verified BEP 52 hash exchange for
+/// the corresponding file root; this function reconstructs only the parser's
+/// in-memory top-level view and performs the normal complete-v2 validation.
+pub fn parse_info_dict_with_piece_layers(
+    info_bytes: &[u8],
+    trackers: &[String],
+    piece_layers: &[V2PieceLayer],
+) -> Result<TorrentMeta> {
+    let info = bencode::decode(info_bytes)?;
+    if info.as_dict().is_none() {
+        return Err(CoreError::MalformedTorrent(
+            "BEP 9 info metadata must be a dictionary".into(),
+        ));
+    }
+
+    let mut root = magnet_root_with_trackers(info, trackers);
+    let layers = piece_layers
+        .iter()
+        .map(|layer| {
+            let mut bytes = Vec::with_capacity(layer.hashes.len() * 32);
+            for hash in &layer.hashes {
+                bytes.extend_from_slice(hash.as_bytes());
+            }
+            (layer.pieces_root.as_bytes().to_vec(), Value::Str(bytes))
+        })
+        .collect::<Vec<_>>();
+    root.push((b"piece layers".to_vec(), Value::Dict(layers)));
+    parse_torrent_root(&root, info_bytes, true)
+}
+
+fn magnet_root_with_trackers(info: Value, trackers: &[String]) -> Vec<(Vec<u8>, Value)> {
+    let mut root = Vec::new();
+    if let Some(primary) = trackers.first() {
+        root.push((
+            b"announce".to_vec(),
+            Value::Str(primary.as_bytes().to_vec()),
+        ));
+    }
+    if trackers.len() > 1 {
+        root.push((
+            b"announce-list".to_vec(),
+            Value::List(vec![Value::List(
+                trackers[1..]
+                    .iter()
+                    .map(|tracker| Value::Str(tracker.as_bytes().to_vec()))
+                    .collect(),
+            )]),
+        ));
+    }
+    root.push((b"info".to_vec(), info));
+    root
+}
+
+fn parse_torrent_root(
+    root: &[(Vec<u8>, Value)],
+    info_bytes: &[u8],
+    require_v2_piece_layers: bool,
+) -> Result<TorrentMeta> {
+    let info = find_info_dict(root)?;
+    let meta_version = info.iter().find(|(key, _)| key == b"meta version");
+    let Some((_, meta_version)) = meta_version else {
+        return parse_v1_torrent_root(root, info_bytes);
+    };
+    let meta_version = meta_version
+        .as_int()
+        .ok_or_else(|| CoreError::MalformedTorrent("'meta version' must be an integer".into()))?;
+    if meta_version != 2 {
+        return Err(CoreError::MalformedTorrent(format!(
+            "unsupported BEP 52 meta version {meta_version}"
+        )));
+    }
+
+    let has_v1_pieces = info.iter().any(|(key, _)| key == b"pieces");
+    let has_v1_layout = info
+        .iter()
+        .any(|(key, _)| key == b"length" || key == b"files");
+    if has_v1_pieces || has_v1_layout {
+        if !(has_v1_pieces && has_v1_layout) {
+            return Err(CoreError::MalformedTorrent(
+                "hybrid torrent must contain both v1 pieces and a v1 file layout".into(),
+            ));
+        }
+        let mut v1 = parse_v1_torrent_root(root, info_bytes)?;
+        let v2 = parse_v2_metadata(root, info, v1.piece_length, require_v2_piece_layers)?;
+        let v2_hash = V2InfoHash::from_info_bencoded(info_bytes);
+        validate_hybrid_layout(&v1.files, &v2.files, v1.is_multi_file)?;
+        v1.identity = TorrentIdentity::hybrid(v1.info_hash, v2_hash);
+        v1.v2 = Some(v2);
+        v1.validate()?;
+        return Ok(v1);
+    }
+
+    parse_v2_torrent_root(root, info, info_bytes, require_v2_piece_layers)
+}
+
+fn parse_v1_torrent_root(root: &[(Vec<u8>, Value)], info_bytes: &[u8]) -> Result<TorrentMeta> {
     let info_hash = InfoHash::from_info_bencoded(info_bytes);
 
     let info = root
@@ -376,6 +663,7 @@ fn parse_torrent_root(root: &[(Vec<u8>, Value)], info_bytes: &[u8]) -> Result<To
                 vec![MetaFile {
                     path: vec![name.clone()],
                     length,
+                    pieces_root: None,
                 }],
                 length,
                 false,
@@ -427,6 +715,7 @@ fn parse_torrent_root(root: &[(Vec<u8>, Value)], info_bytes: &[u8]) -> Result<To
                 out.push(MetaFile {
                     path: full_path,
                     length,
+                    pieces_root: None,
                 });
             }
             (out, total, true)
@@ -489,6 +778,7 @@ fn parse_torrent_root(root: &[(Vec<u8>, Value)], info_bytes: &[u8]) -> Result<To
 
     let meta = TorrentMeta {
         info_hash,
+        identity: TorrentIdentity::v1(info_hash),
         name,
         piece_length,
         pieces,
@@ -502,9 +792,554 @@ fn parse_torrent_root(root: &[(Vec<u8>, Value)], info_bytes: &[u8]) -> Result<To
         created_by,
         creation_date,
         is_multi_file,
+        v2: None,
+        raw_info: Some(info_bytes.to_vec()),
     };
     meta.validate()?;
     Ok(meta)
+}
+
+fn find_info_dict(root: &[(Vec<u8>, Value)]) -> Result<&[(Vec<u8>, Value)]> {
+    root.iter()
+        .find(|(key, _)| key == b"info")
+        .map(|(_, value)| value)
+        .and_then(Value::as_dict)
+        .ok_or_else(|| CoreError::MalformedTorrent("missing 'info' dictionary".into()))
+}
+
+fn parse_v2_torrent_root(
+    root: &[(Vec<u8>, Value)],
+    info: &[(Vec<u8>, Value)],
+    info_bytes: &[u8],
+    require_v2_piece_layers: bool,
+) -> Result<TorrentMeta> {
+    let name = get_str(info, b"name")
+        .ok_or_else(|| CoreError::MalformedTorrent("missing 'name'".into()))?
+        .to_string();
+    validate_path_component(&name, "torrent name")?;
+    if name.is_empty() {
+        return Err(CoreError::MalformedTorrent("empty 'name'".into()));
+    }
+    let piece_length = parse_piece_length(info)?;
+    validate_v2_piece_length(piece_length)?;
+    let v2 = parse_v2_metadata(root, info, piece_length, require_v2_piece_layers)?;
+    let total_length = total_file_length(&v2.files, "BEP 52 file tree")?;
+    if total_length == 0 {
+        return Err(CoreError::MalformedTorrent(
+            "torrent total length must be greater than zero".into(),
+        ));
+    }
+    let private = get_int(info, b"private").unwrap_or(0) == 1;
+    let announce = get_str(root, b"announce").map(str::to_string);
+    let announce_list = parse_announce_list(root);
+    let webseeds = parse_url_list(root);
+    let comment = get_str(root, b"comment").map(str::to_string);
+    let created_by = get_str(root, b"created by").map(str::to_string);
+    let creation_date = get_int(root, b"creation date").map(|value| value as u64);
+    let meta = TorrentMeta {
+        // Do not derive a non-standard SHA-1 and label it as a v1 identity.
+        // Pure-v2 metadata uses the separate SHA-256 data plane.
+        info_hash: InfoHash::ZERO,
+        identity: TorrentIdentity::v2(V2InfoHash::from_info_bencoded(info_bytes)),
+        name,
+        piece_length,
+        pieces: Vec::new(),
+        files: v2.files.clone(),
+        total_length,
+        private,
+        announce,
+        announce_list,
+        webseeds,
+        comment,
+        created_by,
+        creation_date,
+        is_multi_file: v2.files.len() != 1,
+        v2: Some(v2),
+        raw_info: Some(info_bytes.to_vec()),
+    };
+    // A BEP 9 exchange only carries the `info` dictionary. For a pure-v2
+    // torrent, the top-level piece layers are deliberately unavailable until
+    // the caller retrieves them with BEP 52 hash requests. Parsing this
+    // preliminary description already validates its file tree and file roots
+    // in `parse_v2_metadata`; only final executable metadata must satisfy the
+    // complete `TorrentMeta` invariant.
+    if require_v2_piece_layers {
+        meta.validate()?;
+    }
+    Ok(meta)
+}
+
+fn parse_piece_length(info: &[(Vec<u8>, Value)]) -> Result<u64> {
+    let piece_length = get_int(info, b"piece length")
+        .ok_or_else(|| CoreError::MalformedTorrent("missing 'piece length'".into()))?;
+    if piece_length <= 0 {
+        return Err(CoreError::MalformedTorrent(
+            "piece_length must be greater than zero".into(),
+        ));
+    }
+    let piece_length = u64::try_from(piece_length)
+        .map_err(|_| CoreError::MalformedTorrent("piece_length exceeds supported range".into()))?;
+    if piece_length > MAX_PIECE_LENGTH {
+        return Err(CoreError::MalformedTorrent(format!(
+            "piece_length {piece_length} exceeds maximum {MAX_PIECE_LENGTH}"
+        )));
+    }
+    Ok(piece_length)
+}
+
+fn validate_v2_piece_length(piece_length: u64) -> Result<()> {
+    if piece_length < V2_BLOCK_LENGTH || !piece_length.is_power_of_two() {
+        return Err(CoreError::MalformedTorrent(format!(
+            "BEP 52 piece length must be a power of two at least {V2_BLOCK_LENGTH}"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_v2_metadata(
+    root: &[(Vec<u8>, Value)],
+    info: &[(Vec<u8>, Value)],
+    piece_length: u64,
+    require_piece_layers: bool,
+) -> Result<V2TorrentMeta> {
+    validate_v2_piece_length(piece_length)?;
+    let file_tree = info
+        .iter()
+        .find(|(key, _)| key == b"file tree")
+        .map(|(_, value)| value)
+        .and_then(Value::as_dict)
+        .ok_or_else(|| CoreError::MalformedTorrent("missing BEP 52 'file tree'".into()))?;
+    let files = parse_v2_file_tree(file_tree)?;
+    let total = total_file_length(&files, "BEP 52 file tree")?;
+    if total == 0 {
+        return Err(CoreError::MalformedTorrent(
+            "torrent total length must be greater than zero".into(),
+        ));
+    }
+    let (piece_layers, piece_layers_verified) = parse_v2_piece_layers(root, require_piece_layers)?;
+    let v2 = V2TorrentMeta {
+        meta_version: 2,
+        files,
+        piece_layers,
+        piece_layers_verified,
+    };
+    validate_v2_metadata(&v2, piece_length, total)?;
+    Ok(v2)
+}
+
+fn parse_v2_file_tree(file_tree: &[(Vec<u8>, Value)]) -> Result<Vec<MetaFile>> {
+    let mut files = Vec::new();
+    let mut path = Vec::new();
+    parse_v2_file_tree_node(file_tree, &mut path, &mut files)?;
+    if files.is_empty() {
+        return Err(CoreError::MalformedTorrent(
+            "BEP 52 file tree must contain at least one file".into(),
+        ));
+    }
+    if files.len() > MAX_TORRENT_FILES {
+        return Err(CoreError::MalformedTorrent(format!(
+            "BEP 52 file tree has {} files; maximum is {MAX_TORRENT_FILES}",
+            files.len()
+        )));
+    }
+    Ok(files)
+}
+
+fn parse_v2_file_tree_node(
+    node: &[(Vec<u8>, Value)],
+    path: &mut Vec<String>,
+    files: &mut Vec<MetaFile>,
+) -> Result<()> {
+    let mut properties = None;
+    let mut children = Vec::new();
+    for (key, value) in node {
+        if key.is_empty() {
+            properties = Some(value.as_dict().ok_or_else(|| {
+                CoreError::MalformedTorrent("BEP 52 file properties must be a dictionary".into())
+            })?);
+        } else {
+            children.push((key, value));
+        }
+    }
+
+    if let Some(properties) = properties {
+        if path.is_empty() {
+            return Err(CoreError::MalformedTorrent(
+                "BEP 52 file tree root must not describe a file".into(),
+            ));
+        }
+        if !children.is_empty() {
+            return Err(CoreError::MalformedTorrent(
+                "BEP 52 file node must not contain sibling entries".into(),
+            ));
+        }
+        let length = properties
+            .iter()
+            .find(|(key, _)| key == b"length")
+            .map(|(_, value)| value)
+            .and_then(Value::as_int)
+            .ok_or_else(|| {
+                CoreError::MalformedTorrent("BEP 52 file is missing integer 'length'".into())
+            })?;
+        let length = non_negative_length(length, "BEP 52 file length")?;
+        let pieces_root = properties
+            .iter()
+            .find(|(key, _)| key == b"pieces root")
+            .map(|(_, value)| value)
+            .map(parse_v2_hash_value)
+            .transpose()?;
+        if length > 0 && pieces_root.is_none() {
+            return Err(CoreError::MalformedTorrent(
+                "non-empty BEP 52 file is missing 'pieces root'".into(),
+            ));
+        }
+        files.push(MetaFile {
+            path: path.clone(),
+            length,
+            pieces_root,
+        });
+        return Ok(());
+    }
+
+    for (key, value) in children {
+        let component = std::str::from_utf8(key).map_err(|_| {
+            CoreError::MalformedTorrent("BEP 52 file-tree path component is not UTF-8".into())
+        })?;
+        validate_path_component(component, "BEP 52 file-tree path component")?;
+        let child = value.as_dict().ok_or_else(|| {
+            CoreError::MalformedTorrent("BEP 52 file-tree entry must be a dictionary".into())
+        })?;
+        path.push(component.to_string());
+        parse_v2_file_tree_node(child, path, files)?;
+        path.pop();
+    }
+    Ok(())
+}
+
+fn parse_v2_piece_layers(
+    root: &[(Vec<u8>, Value)],
+    require_piece_layers: bool,
+) -> Result<(Vec<V2PieceLayer>, bool)> {
+    let value = root
+        .iter()
+        .find(|(key, _)| key == b"piece layers")
+        .map(|(_, value)| value);
+    let Some(value) = value else {
+        if require_piece_layers {
+            return Err(CoreError::MalformedTorrent(
+                "BEP 52 metainfo is missing top-level 'piece layers'".into(),
+            ));
+        }
+        return Ok((Vec::new(), false));
+    };
+    let layers = value.as_dict().ok_or_else(|| {
+        CoreError::MalformedTorrent("BEP 52 'piece layers' must be a dictionary".into())
+    })?;
+    let mut parsed = Vec::with_capacity(layers.len());
+    for (root_bytes, hashes) in layers {
+        let pieces_root = parse_v2_hash_bytes(root_bytes, "BEP 52 piece-layer key")?;
+        let hashes = hashes.as_str().ok_or_else(|| {
+            CoreError::MalformedTorrent("BEP 52 piece layer must be a byte string".into())
+        })?;
+        if hashes.len() % 32 != 0 {
+            return Err(CoreError::MalformedTorrent(
+                "BEP 52 piece layer length must be a multiple of 32".into(),
+            ));
+        }
+        if hashes.len() / 32 > MAX_TORRENT_PIECES {
+            return Err(CoreError::MalformedTorrent(format!(
+                "BEP 52 piece layer contains more than {MAX_TORRENT_PIECES} hashes"
+            )));
+        }
+        let hashes = hashes
+            .chunks_exact(32)
+            .map(|hash| parse_v2_hash_bytes(hash, "BEP 52 piece-layer hash"))
+            .collect::<Result<Vec<_>>>()?;
+        parsed.push(V2PieceLayer {
+            pieces_root,
+            hashes,
+        });
+    }
+    Ok((parsed, true))
+}
+
+fn parse_v2_hash_value(value: &Value) -> Result<V2InfoHash> {
+    let bytes = value
+        .as_str()
+        .ok_or_else(|| CoreError::MalformedTorrent("BEP 52 hash must be a byte string".into()))?;
+    parse_v2_hash_bytes(bytes, "BEP 52 hash")
+}
+
+fn parse_v2_hash_bytes(bytes: &[u8], field: &str) -> Result<V2InfoHash> {
+    if bytes.len() != 32 {
+        return Err(CoreError::MalformedTorrent(format!(
+            "{field} must be exactly 32 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(bytes);
+    Ok(V2InfoHash::from_bytes(hash))
+}
+
+fn parse_announce_list(root: &[(Vec<u8>, Value)]) -> Vec<Vec<String>> {
+    root.iter()
+        .find(|(key, _)| key == b"announce-list")
+        .map(|(_, value)| value)
+        .and_then(Value::as_list)
+        .map(|tiers| {
+            tiers
+                .iter()
+                .map(|tier| {
+                    tier.as_list()
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str_utf8().map(str::to_string))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn validate_file_list(files: &[MetaFile], expected_total: u64, context: &str) -> Result<()> {
+    if files.is_empty() {
+        return Err(CoreError::MalformedTorrent(format!(
+            "{context} must contain at least one file"
+        )));
+    }
+    if files.len() > MAX_TORRENT_FILES {
+        return Err(CoreError::MalformedTorrent(format!(
+            "{context} file count {} exceeds maximum {MAX_TORRENT_FILES}",
+            files.len()
+        )));
+    }
+    let mut paths = std::collections::HashSet::with_capacity(files.len());
+    for file in files {
+        if file.path.is_empty() {
+            return Err(CoreError::MalformedTorrent("file with empty path".into()));
+        }
+        for component in &file.path {
+            validate_path_component(component, "file path component")?;
+        }
+        if !paths.insert(file.path.clone()) {
+            return Err(CoreError::MalformedTorrent(format!(
+                "duplicate file path: {}",
+                file.path.join("/")
+            )));
+        }
+    }
+    let total = total_file_length(files, context)?;
+    if total != expected_total {
+        return Err(CoreError::MalformedTorrent(format!(
+            "{context} file lengths total {total} does not match recorded length {expected_total}"
+        )));
+    }
+    Ok(())
+}
+
+fn total_file_length(files: &[MetaFile], context: &str) -> Result<u64> {
+    files.iter().try_fold(0u64, |total, file| {
+        total.checked_add(file.length).ok_or_else(|| {
+            CoreError::MalformedTorrent(format!("{context} total file length exceeds u64"))
+        })
+    })
+}
+
+fn validate_v1_piece_layout(meta: &TorrentMeta) -> Result<()> {
+    if meta.pieces.len() > MAX_TORRENT_PIECES {
+        return Err(CoreError::MalformedTorrent(format!(
+            "piece count {} exceeds maximum {MAX_TORRENT_PIECES}",
+            meta.pieces.len()
+        )));
+    }
+    let expected_pieces_u64 = meta.total_length.div_ceil(meta.piece_length);
+    if expected_pieces_u64 > MAX_TORRENT_PIECES as u64 {
+        return Err(CoreError::MalformedTorrent(format!(
+            "expected piece count {expected_pieces_u64} exceeds maximum {MAX_TORRENT_PIECES}"
+        )));
+    }
+    let expected_pieces = usize::try_from(expected_pieces_u64)
+        .map_err(|_| CoreError::MalformedTorrent("piece count exceeds platform limits".into()))?;
+    if meta.pieces.len() != expected_pieces {
+        return Err(CoreError::MalformedTorrent(format!(
+            "piece count {} does not match expected {expected_pieces}",
+            meta.pieces.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_v2_metadata(v2: &V2TorrentMeta, piece_length: u64, total_length: u64) -> Result<()> {
+    if v2.meta_version != 2 {
+        return Err(CoreError::MalformedTorrent(format!(
+            "unsupported BEP 52 meta version {}",
+            v2.meta_version
+        )));
+    }
+    validate_v2_piece_length(piece_length)?;
+    validate_file_list(&v2.files, total_length, "BEP 52 file tree")?;
+
+    let mut files_by_root = std::collections::HashMap::new();
+    for file in &v2.files {
+        if file.length == 0 {
+            continue;
+        }
+        let root = file.pieces_root.ok_or_else(|| {
+            CoreError::MalformedTorrent("non-empty BEP 52 file is missing pieces root".into())
+        })?;
+        files_by_root
+            .entry(root)
+            .or_insert_with(Vec::new)
+            .push(file);
+    }
+
+    if !v2.piece_layers_verified {
+        if !v2.piece_layers.is_empty() {
+            return Err(CoreError::MalformedTorrent(
+                "unverified BEP 52 metadata must not carry piece layers".into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let mut layers_by_root = std::collections::HashMap::new();
+    for layer in &v2.piece_layers {
+        if layers_by_root.insert(layer.pieces_root, layer).is_some() {
+            return Err(CoreError::MalformedTorrent(
+                "duplicate BEP 52 piece-layer root".into(),
+            ));
+        }
+    }
+    for (root, files) in &files_by_root {
+        let requires_layer = files.iter().any(|file| file.length > piece_length);
+        let layer = layers_by_root.get(root).copied();
+        if requires_layer {
+            let layer = layer.ok_or_else(|| {
+                CoreError::MalformedTorrent(
+                    "BEP 52 file larger than piece length is missing a piece layer".into(),
+                )
+            })?;
+            for file in files {
+                if file.length <= piece_length {
+                    continue;
+                }
+                let expected =
+                    usize::try_from(file.length.div_ceil(piece_length)).map_err(|_| {
+                        CoreError::MalformedTorrent(
+                            "BEP 52 piece-layer count exceeds platform limits".into(),
+                        )
+                    })?;
+                if layer.hashes.len() != expected {
+                    return Err(CoreError::MalformedTorrent(format!(
+                        "BEP 52 piece layer has {} hashes; expected {expected}",
+                        layer.hashes.len()
+                    )));
+                }
+            }
+            if v2_piece_layer_root(&layer.hashes, piece_length)? != *root {
+                return Err(CoreError::MalformedTorrent(
+                    "BEP 52 piece layer does not match its pieces root".into(),
+                ));
+            }
+        } else if layer.is_some() {
+            return Err(CoreError::MalformedTorrent(
+                "BEP 52 file at or below piece length must not have a piece layer".into(),
+            ));
+        }
+    }
+    for root in layers_by_root.keys() {
+        if !files_by_root.contains_key(root) {
+            return Err(CoreError::MalformedTorrent(
+                "BEP 52 piece layer does not correspond to a file root".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Return the BEP 52 file-tree root implied by one piece layer.
+///
+/// A piece layer contains hashes at the logical piece layer rather than leaf
+/// hashes. Consequently, absent right-hand entries must be padded with the
+/// all-zero subtree at the piece layer, not with a raw all-zero SHA-256 value.
+/// Metadata ingress uses this same primitive to verify hash-exchange results
+/// before it turns a pure-v2 BEP 9 `info` dictionary into executable
+/// metainfo.
+pub fn v2_piece_layer_root(hashes: &[V2InfoHash], piece_length: u64) -> Result<V2InfoHash> {
+    if hashes.is_empty() {
+        return Err(CoreError::MalformedTorrent(
+            "BEP 52 piece layer must contain at least one hash".into(),
+        ));
+    }
+    validate_v2_piece_length(piece_length)?;
+    let layer_depth = piece_length
+        .checked_div(V2_BLOCK_LENGTH)
+        .ok_or_else(|| CoreError::MalformedTorrent("invalid BEP 52 piece length".into()))?
+        .trailing_zeros();
+    let mut zero = V2InfoHash::ZERO;
+    for _ in 0..layer_depth {
+        zero = hash_v2_pair(zero, zero);
+    }
+    let target_len = hashes.len().checked_next_power_of_two().ok_or_else(|| {
+        CoreError::MalformedTorrent("BEP 52 piece-layer width exceeds platform limits".into())
+    })?;
+    let mut level = hashes.to_vec();
+    level.resize(target_len, zero);
+    while level.len() > 1 {
+        level = level
+            .chunks_exact(2)
+            .map(|pair| hash_v2_pair(pair[0], pair[1]))
+            .collect();
+    }
+    Ok(level[0])
+}
+
+fn hash_v2_pair(left: V2InfoHash, right: V2InfoHash) -> V2InfoHash {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(left.as_bytes());
+    hasher.update(right.as_bytes());
+    let digest = hasher.finalize();
+    let mut output = [0u8; 32];
+    output.copy_from_slice(&digest);
+    V2InfoHash::from_bytes(output)
+}
+
+fn validate_hybrid_layout(
+    v1_files: &[MetaFile],
+    v2_files: &[MetaFile],
+    v1_is_multi_file: bool,
+) -> Result<()> {
+    let same_layout = |left: Vec<(Vec<String>, u64)>, right: &[MetaFile]| {
+        left.len() == right.len()
+            && left
+                .iter()
+                .zip(right)
+                .all(|((path, length), file)| path == &file.path && *length == file.length)
+    };
+    let full = v1_files
+        .iter()
+        .map(|file| (file.path.clone(), file.length))
+        .collect::<Vec<_>>();
+    if same_layout(full, v2_files) {
+        return Ok(());
+    }
+    if v1_is_multi_file {
+        let relative = v1_files
+            .iter()
+            .map(|file| (file.path.get(1..).unwrap_or_default().to_vec(), file.length))
+            .collect::<Vec<_>>();
+        if same_layout(relative, v2_files) {
+            return Ok(());
+        }
+    }
+    Err(CoreError::MalformedTorrent(
+        "hybrid v1 and v2 file layouts are not identical".into(),
+    ))
 }
 
 fn get_str<'a>(dict: &'a [(Vec<u8>, Value)], key: &[u8]) -> Option<&'a str> {
@@ -912,6 +1747,98 @@ fn write_int(out: &mut Vec<u8>, n: u64) {
 mod tests {
     use super::*;
 
+    fn sha1_piece_hashes(content: &[u8], piece_length: usize) -> Vec<u8> {
+        use sha1::{Digest, Sha1};
+
+        content
+            .chunks(piece_length)
+            .flat_map(|chunk| Sha1::digest(chunk).to_vec())
+            .collect()
+    }
+
+    fn v2_leaf_hashes(content: &[u8]) -> Vec<V2InfoHash> {
+        use sha2::{Digest, Sha256};
+
+        content
+            .chunks(V2_BLOCK_LENGTH as usize)
+            .map(|chunk| {
+                let digest = Sha256::digest(chunk);
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&digest);
+                V2InfoHash::from_bytes(hash)
+            })
+            .collect()
+    }
+
+    /// Build a canonical local BEP 52 fixture. The payload is lawful generated
+    /// test data; no external metainfo or network source is used.
+    fn build_v2_single_file_torrent(
+        name: &str,
+        tree_name: &str,
+        content: &[u8],
+        hybrid: bool,
+        include_piece_layers: bool,
+    ) -> Vec<u8> {
+        assert!(content.len() as u64 > V2_BLOCK_LENGTH);
+        let piece_length = V2_BLOCK_LENGTH;
+        let leaves = v2_leaf_hashes(content);
+        let root = v2_piece_layer_root(&leaves, piece_length).unwrap();
+        let mut layer_bytes = Vec::with_capacity(leaves.len() * 32);
+        for leaf in &leaves {
+            layer_bytes.extend_from_slice(leaf.as_bytes());
+        }
+
+        let mut info = Vec::new();
+        info.push(b'd');
+        // Canonical raw-key ordering: file tree, length (hybrid), meta version,
+        // name, piece length, pieces (hybrid).
+        write_str(&mut info, b"file tree");
+        info.push(b'd');
+        write_str(&mut info, tree_name.as_bytes());
+        info.push(b'd');
+        write_str(&mut info, b"");
+        info.push(b'd');
+        write_str(&mut info, b"length");
+        write_int(&mut info, content.len() as u64);
+        write_str(&mut info, b"pieces root");
+        write_str(&mut info, root.as_bytes());
+        info.push(b'e');
+        info.push(b'e');
+        info.push(b'e');
+        if hybrid {
+            write_str(&mut info, b"length");
+            write_int(&mut info, content.len() as u64);
+        }
+        write_str(&mut info, b"meta version");
+        write_int(&mut info, 2);
+        write_str(&mut info, b"name");
+        write_str(&mut info, name.as_bytes());
+        write_str(&mut info, b"piece length");
+        write_int(&mut info, piece_length);
+        if hybrid {
+            write_str(&mut info, b"pieces");
+            write_str(
+                &mut info,
+                &sha1_piece_hashes(content, piece_length as usize),
+            );
+        }
+        info.push(b'e');
+
+        let mut torrent = Vec::new();
+        torrent.push(b'd');
+        write_str(&mut torrent, b"info");
+        torrent.extend_from_slice(&info);
+        if include_piece_layers {
+            write_str(&mut torrent, b"piece layers");
+            torrent.push(b'd');
+            write_str(&mut torrent, root.as_bytes());
+            write_str(&mut torrent, &layer_bytes);
+            torrent.push(b'e');
+        }
+        torrent.push(b'e');
+        torrent
+    }
+
     fn torrent_padded_to_size(target: usize) -> Vec<u8> {
         let mut bytes =
             build_single_file_torrent("limit.bin", b"bounded metadata payload", 8, None, false);
@@ -1005,6 +1932,102 @@ mod tests {
         assert_eq!(meta.files[1].path, vec!["dir", "sub", "b.bin"]);
         assert_eq!(meta.total_length, 12);
         assert_eq!(meta.announce.as_deref(), Some("http://t/a"));
+    }
+
+    #[test]
+    fn parses_and_validates_pure_v2_fixture_without_v1_coercion() {
+        let content = vec![b'v'; V2_BLOCK_LENGTH as usize + 137];
+        let bytes = build_v2_single_file_torrent("lawful.bin", "lawful.bin", &content, false, true);
+        let meta = parse_torrent(&bytes).unwrap();
+
+        assert!(matches!(meta.identity, TorrentIdentity::V2 { .. }));
+        assert_eq!(meta.info_hash, InfoHash::ZERO);
+        assert!(meta.v1_info_hash().is_none());
+        assert!(meta.requires_v2_data_plane());
+        assert!(meta.pieces.is_empty());
+        assert_eq!(meta.files[0].path, vec!["lawful.bin"]);
+        assert_eq!(meta.files[0].length, content.len() as u64);
+        assert!(meta.files[0].pieces_root.is_some());
+        assert!(meta.v2.as_ref().unwrap().piece_layers_verified);
+        assert_eq!(
+            meta.raw_info.as_deref(),
+            bencode::extract_value_bytes(&bytes, b"info")
+        );
+        assert!(meta.validate().is_ok());
+    }
+
+    #[test]
+    fn parses_hybrid_fixture_and_retains_both_identities() {
+        let content = vec![b'h'; V2_BLOCK_LENGTH as usize + 259];
+        let bytes = build_v2_single_file_torrent("hybrid.bin", "hybrid.bin", &content, true, true);
+        let meta = parse_torrent(&bytes).unwrap();
+
+        let TorrentIdentity::Hybrid { v1, v2 } = meta.identity else {
+            panic!("expected a hybrid identity");
+        };
+        assert_eq!(
+            v1,
+            InfoHash::from_info_bencoded(meta.raw_info.as_deref().unwrap())
+        );
+        assert_eq!(
+            v2,
+            V2InfoHash::from_info_bencoded(meta.raw_info.as_deref().unwrap())
+        );
+        assert_eq!(meta.v1_info_hash(), Some(v1));
+        assert!(!meta.requires_v2_data_plane());
+        assert_eq!(meta.pieces.len(), 2);
+        assert!(meta.v2.as_ref().unwrap().piece_layers_verified);
+    }
+
+    #[test]
+    fn rejects_v2_missing_or_tampered_piece_layers() {
+        let content = vec![b'p'; V2_BLOCK_LENGTH as usize + 511];
+        let missing =
+            build_v2_single_file_torrent("payload.bin", "payload.bin", &content, false, false);
+        let error = parse_torrent(&missing).unwrap_err();
+        assert!(error.to_string().contains("piece layers"));
+
+        let mut tampered =
+            build_v2_single_file_torrent("payload.bin", "payload.bin", &content, false, true);
+        let leaf = v2_leaf_hashes(&content)[0];
+        let offset = tampered
+            .windows(32)
+            .position(|window| window == leaf.as_bytes())
+            .expect("fixture contains first piece-layer hash");
+        tampered[offset] ^= 0x80;
+        let error = parse_torrent(&tampered).unwrap_err();
+        assert!(error.to_string().contains("piece layer does not match"));
+    }
+
+    #[test]
+    fn rejects_incompatible_hybrid_layout_and_pure_v2_bep9_metadata() {
+        let content = vec![b'x'; V2_BLOCK_LENGTH as usize + 333];
+        let incompatible =
+            build_v2_single_file_torrent("hybrid.bin", "different.bin", &content, true, true);
+        let error = parse_torrent(&incompatible).unwrap_err();
+        assert!(error.to_string().contains("file layouts are not identical"));
+
+        let pure = build_v2_single_file_torrent("v2.bin", "v2.bin", &content, false, true);
+        let info = bencode::extract_value_bytes(&pure, b"info").unwrap();
+        let error = parse_info_dict(info, &[]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("pure v2 metadata requires verified piece layers"));
+    }
+
+    #[test]
+    fn bep9_hybrid_info_retains_identity_but_marks_piece_layers_unverified() {
+        let content = vec![b'm'; V2_BLOCK_LENGTH as usize + 99];
+        let torrent =
+            build_v2_single_file_torrent("hybrid.bin", "hybrid.bin", &content, true, true);
+        let info = bencode::extract_value_bytes(&torrent, b"info").unwrap();
+        let meta =
+            parse_info_dict(info, &["https://tracker.example/announce".to_string()]).unwrap();
+
+        assert!(matches!(meta.identity, TorrentIdentity::Hybrid { .. }));
+        assert!(!meta.v2.as_ref().unwrap().piece_layers_verified);
+        assert!(meta.v2.as_ref().unwrap().piece_layers.is_empty());
+        assert!(meta.validate().is_ok());
     }
 
     #[test]
@@ -1279,7 +2302,7 @@ mod tests {
             ),
         ]);
         let root = vec![(b"info".to_vec(), info)];
-        let error = parse_torrent_root(&root, b"direct-file-count-test").unwrap_err();
+        let error = parse_torrent_root(&root, b"direct-file-count-test", true).unwrap_err();
         assert!(matches!(&error, CoreError::MalformedTorrent(_)));
         assert!(error.to_string().contains("file count"));
         assert!(error.to_string().contains("exceeds maximum"));

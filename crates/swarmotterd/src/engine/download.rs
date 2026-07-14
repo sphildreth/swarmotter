@@ -4,14 +4,60 @@ use super::*;
 
 impl TorrentEngine {
     pub async fn run(mut self) -> Result<EngineState> {
-        // If this is a magnet (no real metadata yet), fetch the `info` dict
-        // from a peer via BEP 9 before downloading. The real info hash,
-        // name, and trackers come from the magnet parameters.
+        let magnet_select_only_file_indices = self
+            .magnet
+            .as_ref()
+            .map(|magnet| magnet.select_only_file_indices.clone())
+            .unwrap_or_default();
+        // If this is a magnet (no real metadata yet), fetch executable
+        // metadata before downloading. Pure-v2 magnets obtain their BEP 9
+        // `info` bytes plus verified BEP 52 piece layers on the contained
+        // metadata path, so this never constructs a data plane from an
+        // incomplete raw `info` dictionary.
         if let Some(magnet) = self.magnet.clone() {
             self.state.lock().await.tracker_message = Some("fetching metadata via BEP 9".into());
-            let info = self.fetch_magnet_metadata(&magnet).await?;
-            let rebuilt =
-                crate::metadata::build_meta_from_info(&info, &magnet.name, &magnet.trackers)?;
+            let resolved = self.fetch_magnet_metadata(&magnet).await?;
+            let rebuilt = resolved.meta;
+            if rebuilt.identity != magnet.identity {
+                return Err(CoreError::MalformedTorrent(
+                    "resolved metadata identity does not match the magnet exact topics".into(),
+                ));
+            }
+            self.torrent_key = rebuilt.identity.primary_key().ok_or_else(|| {
+                CoreError::MalformedTorrent(
+                    "resolved metadata does not provide a canonical torrent key".into(),
+                )
+            })?;
+            swarmotter_core::magnet::validate_select_only_file_indices(
+                &magnet.select_only_file_indices,
+                rebuilt.files.len(),
+            )
+            .map_err(CoreError::InvalidArgument)?;
+            if self.metadata_only {
+                // A preview is allowed to use the same contained peer,
+                // tracker, and metadata paths as ordinary magnet discovery,
+                // but must return before payload ownership, storage layout,
+                // announces, or piece requests begin.
+                self.meta = rebuilt.clone();
+                {
+                    let mut state = self.state.lock().await;
+                    state.piece_count = rebuilt
+                        .data_piece_count()
+                        .unwrap_or_else(|_| rebuilt.piece_count());
+                    state.total_length = rebuilt.total_length;
+                    state.resolved_meta = Some(rebuilt.clone());
+                    state.tracker_message =
+                        Some("metadata received; payload transfer awaits explicit start".into());
+                }
+                // The daemon installs a preview-only callback that commits the
+                // resolved file tree and captured intake selection durably.
+                // Do this before reporting success so UI/events can never
+                // expose preview metadata that did not reach durable state.
+                if let Some(preflight) = &self.metadata_preflight {
+                    preflight(rebuilt).await?;
+                }
+                return Ok(self.state.lock().await.clone());
+            }
             if let Some(preflight) = &self.metadata_preflight {
                 preflight(rebuilt.clone()).await?;
             }
@@ -20,11 +66,32 @@ impl TorrentEngine {
             // Replace the placeholder meta with the real one.
             self.meta = rebuilt;
         }
+        if self.meta.requires_v2_data_plane() {
+            return self.run_v2().await;
+        }
         if self.file_priorities.len() != self.meta.files.len()
             || self.wanted.len() != self.meta.files.len()
         {
             self.file_priorities = vec![FilePriority::Normal; self.meta.files.len()];
             self.wanted = vec![true; self.meta.files.len()];
+        }
+        if let Some(selection) = self.intake_selection.as_ref() {
+            swarmotter_core::policy::apply_intake_selection(
+                &self.meta.files,
+                &mut self.file_priorities,
+                &mut self.wanted,
+                selection,
+            );
+        }
+        if !magnet_select_only_file_indices.is_empty() {
+            // Profile/API intake exclusions run first and only remove files;
+            // BEP 53 then narrows that result without allowing a URI to
+            // re-enable a local exclusion.
+            swarmotter_core::magnet::apply_select_only_file_indices(
+                &mut self.file_priorities,
+                &mut self.wanted,
+                &magnet_select_only_file_indices,
+            );
         }
         self.piece_selection =
             PieceSelection::from_files(&self.meta, &self.file_priorities, &self.wanted)?;
@@ -49,6 +116,7 @@ impl TorrentEngine {
         self.storage_preflight()?;
 
         let complete_storage = StorageIo::new(self.meta.clone(), self.complete_dir.clone())
+            .with_torrent_key(self.torrent_key)
             .with_resume_dir(self.resume_dir.clone())
             .with_cow_strategy(self.cow_strategy)
             .with_metrics(self.storage_metrics.clone());
@@ -63,7 +131,9 @@ impl TorrentEngine {
         }
 
         let storage = StorageIo::new(self.meta.clone(), self.download_dir.clone())
+            .with_torrent_key(self.torrent_key)
             .with_resume_dir(self.resume_dir.clone())
+            .with_partial_file_suffix(self.partial_file_suffix.clone())
             .with_cow_strategy(self.cow_strategy)
             .with_metrics(self.storage_metrics.clone())
             .with_write_limiter(self.storage_write_limiter.clone());
@@ -403,7 +473,7 @@ impl TorrentEngine {
     }
 
     pub(super) async fn load_or_recheck(&self, storage: &StorageIo) -> Result<PieceBitfield> {
-        if let Some(resume) = storage.load_resume(&self.meta.info_hash).await? {
+        if let Some(resume) = storage.load_resume(&self.torrent_key).await? {
             let payload_bytes = storage.payload_bytes_on_disk().await?;
             let current_stamps = storage.resume_file_stamps().await?;
             let stamps_match = !resume.file_stamps.is_empty()
@@ -438,7 +508,7 @@ impl TorrentEngine {
 
     pub(super) async fn complete_storage(&self, storage: &StorageIo) -> Result<StorageIo> {
         if self.download_dir == self.complete_dir {
-            return Ok(storage.clone());
+            return storage.finalize_partial_file_suffix().await;
         }
         tracing::info!(
             info_hash = %self.meta.info_hash,
@@ -454,7 +524,9 @@ impl TorrentEngine {
         storage.remove_resume().await?;
         if self.download_dir != self.complete_dir {
             let active_storage = StorageIo::new(self.meta.clone(), self.download_dir.clone())
+                .with_torrent_key(self.torrent_key)
                 .with_resume_dir(self.resume_dir.clone())
+                .with_partial_file_suffix(self.partial_file_suffix.clone())
                 .with_cow_strategy(self.cow_strategy)
                 .with_metrics(self.storage_metrics.clone());
             active_storage.remove_resume().await?;
@@ -468,11 +540,7 @@ impl TorrentEngine {
         have: &PieceBitfield,
     ) -> Result<()> {
         if have.count(self.meta.piece_count()) == self.meta.piece_count() {
-            let final_storage = if storage.base_dir() == self.complete_dir.as_path() {
-                storage.clone()
-            } else {
-                self.complete_storage(storage).await?
-            };
+            let final_storage = self.complete_storage(storage).await?;
             self.finish_without_resume(&final_storage).await
         } else {
             // A selected-file download is complete without claiming pieces
@@ -493,7 +561,7 @@ impl TorrentEngine {
             .collect();
         let s = self.state.lock().await;
         let mut resume = swarmotter_core::storage::io::build_resume_with_wanted(
-            self.meta.info_hash,
+            self.torrent_key,
             self.meta.name.clone(),
             have.clone(),
             self.meta.piece_count(),

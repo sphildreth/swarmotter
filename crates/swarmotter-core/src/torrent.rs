@@ -4,7 +4,8 @@
 //! per-torrent settings into an in-memory `Torrent` record owned by the daemon.
 
 use crate::autopilot::AutopilotMode;
-use crate::hash::InfoHash;
+use crate::hash::{InfoHash, TorrentIdentity, TorrentKey};
+use crate::magnet::MagnetDirectPeer;
 use crate::meta::TorrentMeta;
 use crate::models::torrent::{
     FilePriority, SeedingStatus, TorrentFile, TorrentHealth, TorrentState, TorrentSummary,
@@ -78,9 +79,29 @@ pub struct Torrent {
     /// The real info hash for a magnet (before metadata is fetched); used as
     /// the registry key and for tracker announce. `None` for `.torrent` files.
     pub magnet_info_hash: Option<InfoHash>,
+    /// The complete v1/v2/hybrid magnet identity before metadata is fetched.
+    /// This remains separate from placeholder `meta`, whose raw `info` bytes
+    /// belong to a synthetic v1 record and must never be relabeled as the
+    /// magnet's real hybrid identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub magnet_identity: Option<TorrentIdentity>,
     /// Magnet display name and trackers (for metadata fetch + announce).
     pub magnet_name: Option<String>,
     pub magnet_trackers: Vec<String>,
+    /// Deferred BEP 53 select-only indices for an unresolved magnet.
+    ///
+    /// They are applied once the real metadata makes file indices
+    /// authoritative, then cleared so subsequent operator selections remain
+    /// durable and authoritative.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub magnet_select_only_file_indices: Vec<usize>,
+    /// Literal `x.pe` direct-peer hints originally supplied by a magnet.
+    ///
+    /// These survive metadata resolution so a restart can still use the same
+    /// contained candidates for payload discovery. They never carry a
+    /// hostname or trigger DNS resolution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub magnet_direct_peers: Vec<MagnetDirectPeer>,
     /// Optional per-torrent autopilot mode override.
     pub autopilot_mode_override: Option<AutopilotMode>,
     /// Work that was actually live when containment transitioned to blocked.
@@ -93,7 +114,12 @@ pub struct Torrent {
 
 impl Torrent {
     pub fn new(meta: TorrentMeta, date_added: u64) -> Self {
-        let piece_count = meta.piece_count();
+        // Pure v2 has a file-aligned logical piece space.  Valid complete
+        // metainfo provides that layout; unresolved magnets deliberately fall
+        // back to their placeholder count until metadata arrives.
+        let piece_count = meta
+            .data_piece_count()
+            .unwrap_or_else(|_| meta.piece_count());
         let file_count = meta.files.len();
         let files = meta
             .files
@@ -134,8 +160,11 @@ impl Torrent {
             upload_limit: 0,
             needs_metadata: false,
             magnet_info_hash: None,
+            magnet_identity: None,
             magnet_name: None,
             magnet_trackers: Vec::new(),
+            magnet_select_only_file_indices: Vec::new(),
+            magnet_direct_peers: Vec::new(),
             autopilot_mode_override: None,
             containment_recovery_intent: None,
         }
@@ -145,6 +174,37 @@ impl Torrent {
         // For magnets that still need metadata, the real info hash is the
         // magnet's; otherwise use the parsed metadata's info hash.
         self.magnet_info_hash.unwrap_or(self.meta.info_hash)
+    }
+
+    /// The authoritative identity visible to callers. While magnet metadata
+    /// is pending this is the parsed magnet identity; after resolution it is
+    /// the identity from the canonical torrent metadata.
+    pub fn identity(&self) -> &TorrentIdentity {
+        self.magnet_identity.as_ref().unwrap_or(&self.meta.identity)
+    }
+
+    /// Canonical daemon, durable-state, queue, and API key.
+    ///
+    /// This must be used for record ownership. [`Self::info_hash`] is kept
+    /// only for v1 compatibility surfaces and is intentionally not a pure-v2
+    /// fallback (a pure-v2 record must never be indexed by `InfoHash::ZERO`).
+    pub fn key(&self) -> TorrentKey {
+        self.identity()
+            .primary_key()
+            .unwrap_or_else(|| TorrentKey::v1(self.info_hash()))
+    }
+
+    /// All full identifiers that resolve to this record, primary first.
+    ///
+    /// A hybrid record has its v1 key as primary and its full v2 identity as
+    /// an alias. Pure v2 has one full SHA-256 key, never a truncated alias.
+    pub fn keys(&self) -> Vec<TorrentKey> {
+        let keys = self.identity().keys();
+        if keys.is_empty() {
+            vec![TorrentKey::v1(self.info_hash())]
+        } else {
+            keys
+        }
     }
 
     pub fn name(&self) -> &str {
@@ -173,7 +233,8 @@ impl Torrent {
 
     pub fn to_summary(&self) -> TorrentSummary {
         TorrentSummary {
-            info_hash: self.info_hash(),
+            info_hash: self.key(),
+            identity: self.identity().clone(),
             name: self.name().to_string(),
             state: self.state,
             error: self.error.clone(),
@@ -185,7 +246,10 @@ impl Torrent {
             seeding_status: self.seeding_status,
             effective_ratio_limit: None,
             effective_idle_limit: None,
-            piece_count: self.meta.piece_count(),
+            piece_count: self
+                .meta
+                .data_piece_count()
+                .unwrap_or_else(|_| self.meta.piece_count()),
             pieces_have: self.pieces_have(),
             piece_length: self.meta.piece_length,
             private: self.meta.is_private(),
@@ -209,6 +273,28 @@ impl Torrent {
     /// Recompute every file's progress from verified piece byte ranges.
     /// Boundary pieces credit only the bytes intersecting each file.
     pub fn recompute_file_bytes_completed(&mut self) {
+        if self.meta.requires_v2_data_plane() {
+            for row in &mut self.files {
+                row.bytes_completed = 0;
+            }
+            if let Ok(layout) = self.meta.v2_piece_layout() {
+                for piece in 0..layout.piece_count() {
+                    if !self.progress.bitfield().has(piece) {
+                        continue;
+                    }
+                    if let Some(mapping) = layout.piece(piece) {
+                        if let Some(row) = self.files.get_mut(mapping.file_index) {
+                            row.bytes_completed = row
+                                .bytes_completed
+                                .saturating_add(mapping.length)
+                                .min(row.length);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         let bitfield = self.progress.bitfield();
         let piece_length = self.meta.piece_length;
         let mut file_start = 0u64;
@@ -243,6 +329,16 @@ impl Torrent {
 /// Exact verified bytes represented by a piece bitfield. The final piece is
 /// credited only for its actual byte length.
 pub fn verified_bytes(meta: &TorrentMeta, bitfield: &crate::storage::PieceBitfield) -> u64 {
+    if meta.requires_v2_data_plane() {
+        return meta.v2_piece_layout().map_or(0, |layout| {
+            (0..layout.piece_count())
+                .filter(|index| bitfield.has(*index))
+                .filter_map(|index| layout.piece(index))
+                .map(|piece| piece.length)
+                .sum()
+        });
+    }
+
     (0..meta.piece_count())
         .filter(|index| bitfield.has(*index))
         .filter_map(|index| meta.piece_byte_range(index as u64))
@@ -250,46 +346,74 @@ pub fn verified_bytes(meta: &TorrentMeta, bitfield: &crate::storage::PieceBitfie
         .sum()
 }
 
-/// A registry holding all torrents keyed by info hash, with duplicate
-/// detection. Pure logic; the daemon wraps this with channels/locking.
+/// A registry holding all torrents by full [`TorrentKey`].
+///
+/// A hybrid torrent is stored only once under its v1 primary key. Its full
+/// v2 key is kept in `aliases`, so callers resolving either full locator see
+/// the same record without allowing two records to claim one alias.
 #[derive(Debug, Default)]
 pub struct TorrentRegistry {
-    pub torrents: BTreeMap<InfoHash, Torrent>,
+    pub torrents: BTreeMap<TorrentKey, Torrent>,
+    aliases: BTreeMap<TorrentKey, TorrentKey>,
 }
 
 impl TorrentRegistry {
-    pub fn add(&mut self, torrent: Torrent) -> Result<(), InfoHash> {
-        if self.torrents.contains_key(&torrent.info_hash()) {
-            return Err(torrent.info_hash());
+    /// Insert a record, rejecting primary and hybrid-alias collisions.
+    pub fn add(&mut self, torrent: Torrent) -> Result<(), TorrentKey> {
+        let primary = torrent.key();
+        let keys = torrent.keys();
+        for key in &keys {
+            if self.torrents.contains_key(key) || self.aliases.contains_key(key) {
+                return Err(*key);
+            }
         }
-        self.torrents.insert(torrent.info_hash(), torrent);
+        self.torrents.insert(primary, torrent);
+        for key in keys {
+            if key != primary {
+                self.aliases.insert(key, primary);
+            }
+        }
         Ok(())
     }
 
-    pub fn remove(&mut self, hash: &InfoHash) -> Option<Torrent> {
-        self.torrents.remove(hash)
+    /// Resolve a primary key or a hybrid alias to the stored primary key.
+    pub fn canonical_key(&self, key: &TorrentKey) -> Option<TorrentKey> {
+        if self.torrents.contains_key(key) {
+            Some(*key)
+        } else {
+            self.aliases.get(key).copied()
+        }
     }
 
-    pub fn get(&self, hash: &InfoHash) -> Option<&Torrent> {
-        self.torrents.get(hash)
+    pub fn remove(&mut self, key: &TorrentKey) -> Option<Torrent> {
+        let primary = self.canonical_key(key)?;
+        self.aliases.retain(|_, target| *target != primary);
+        self.torrents.remove(&primary)
     }
 
-    pub fn get_mut(&mut self, hash: &InfoHash) -> Option<&mut Torrent> {
-        self.torrents.get_mut(hash)
+    pub fn get(&self, key: &TorrentKey) -> Option<&Torrent> {
+        self.canonical_key(key)
+            .and_then(|primary| self.torrents.get(&primary))
+    }
+
+    pub fn get_mut(&mut self, key: &TorrentKey) -> Option<&mut Torrent> {
+        self.canonical_key(key)
+            .and_then(|primary| self.torrents.get_mut(&primary))
     }
 
     pub fn list(&self) -> Vec<&Torrent> {
         self.torrents.values().collect()
     }
 
-    pub fn contains(&self, hash: &InfoHash) -> bool {
-        self.torrents.contains_key(hash)
+    pub fn contains(&self, key: &TorrentKey) -> bool {
+        self.canonical_key(key).is_some()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::V2InfoHash;
     use crate::meta::{build_multi_file_torrent, build_single_file_torrent};
 
     #[test]
@@ -302,6 +426,51 @@ mod tests {
         let t2 = Torrent::new(meta, 2);
         assert!(reg.add(t2).is_err()); // duplicate
         assert_eq!(reg.torrents.len(), 1);
+    }
+
+    #[test]
+    fn registry_resolves_hybrid_v2_alias_to_one_primary_record() {
+        let bytes = build_single_file_torrent("f", b"some data here", 8, None, false);
+        let mut meta = crate::meta::parse_torrent(&bytes).unwrap();
+        let v1 = meta.info_hash;
+        let v2 = V2InfoHash::from_bytes([0x52; 32]);
+        meta.identity = TorrentIdentity::hybrid(v1, v2);
+
+        let mut registry = TorrentRegistry::default();
+        registry.add(Torrent::new(meta, 1)).unwrap();
+
+        let primary = TorrentKey::v1(v1);
+        let alias = TorrentKey::v2(v2);
+        assert_eq!(registry.canonical_key(&primary), Some(primary));
+        assert_eq!(registry.canonical_key(&alias), Some(primary));
+        assert_eq!(registry.get(&alias).unwrap().key(), primary);
+        assert!(registry.contains(&alias));
+        assert_eq!(registry.torrents.len(), 1);
+
+        assert!(registry.remove(&alias).is_some());
+        assert!(registry.get(&primary).is_none());
+        assert!(registry.get(&alias).is_none());
+    }
+
+    #[test]
+    fn registry_rejects_primary_or_alias_collisions() {
+        let bytes = build_single_file_torrent("f", b"some data here", 8, None, false);
+        let mut hybrid_meta = crate::meta::parse_torrent(&bytes).unwrap();
+        let v1 = hybrid_meta.info_hash;
+        let v2 = V2InfoHash::from_bytes([0x53; 32]);
+        hybrid_meta.identity = TorrentIdentity::hybrid(v1, v2);
+
+        let mut registry = TorrentRegistry::default();
+        registry.add(Torrent::new(hybrid_meta, 1)).unwrap();
+
+        let mut v2_meta = crate::meta::parse_torrent(&bytes).unwrap();
+        v2_meta.info_hash = InfoHash::ZERO;
+        v2_meta.identity = TorrentIdentity::v2(v2);
+        assert_eq!(
+            registry.add(Torrent::new(v2_meta, 2)),
+            Err(TorrentKey::v2(v2))
+        );
+        assert_eq!(registry.torrents.len(), 1);
     }
 
     #[test]

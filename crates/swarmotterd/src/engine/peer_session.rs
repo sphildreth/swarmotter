@@ -254,6 +254,10 @@ impl TorrentEngine {
                             | Message::NotInterested
                             | Message::Request { .. }
                             | Message::Cancel { .. }
+                            | Message::Reject { .. }
+                            | Message::HashRequest { .. }
+                            | Message::Hashes { .. }
+                            | Message::HashReject { .. }
                             | Message::Extended { .. }
                             | Message::Unknown { .. } => {}
                         }
@@ -342,6 +346,10 @@ impl TorrentEngine {
                 | Message::Request { .. }
                 | Message::Piece { .. }
                 | Message::Cancel { .. }
+                | Message::Reject { .. }
+                | Message::HashRequest { .. }
+                | Message::Hashes { .. }
+                | Message::HashReject { .. }
                 | Message::Unknown { .. } => {}
                 Message::Extended { id, payload } => {
                     // BEP 10 extension: handshake (id 0) or a PEX message.
@@ -637,7 +645,7 @@ pub(super) async fn attempt_peer_wire_transport(
         PeerEncryptionMode::Required => {
             let encrypted = timeout(
                 Duration::from_secs(10),
-                swarmotter_core::mse::connect(stream, info_hash),
+                swarmotter_core::mse::connect(stream, PeerInfoHash::from_v1(info_hash)),
             )
             .await??;
             Box::new(encrypted) as Box<dyn utp::PeerDuplex>
@@ -645,7 +653,7 @@ pub(super) async fn attempt_peer_wire_transport(
         PeerEncryptionMode::Preferred => {
             match timeout(
                 Duration::from_secs(10),
-                swarmotter_core::mse::connect(stream, info_hash),
+                swarmotter_core::mse::connect(stream, PeerInfoHash::from_v1(info_hash)),
             )
             .await
             {

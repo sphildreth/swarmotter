@@ -25,6 +25,7 @@ use tower::ServiceExt;
 
 use swarmotter_api::state::{AddTorrentOptions, AppState, BuildInfo, DaemonOps};
 use swarmotter_core::config::Config;
+use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::meta::{build_multi_file_torrent, build_single_file_torrent, parse_torrent};
 use swarmotter_core::models::network::{
     NetworkContainmentMode, NetworkContainmentStatus, NetworkHealth,
@@ -86,7 +87,7 @@ async fn api_torrent_file_add_retains_envelope_and_shared_rollback_contract() {
         None,
         false,
     );
-    let expected_hash = parse_torrent(&bytes).unwrap().info_hash;
+    let expected_hash = TorrentKey::v1(parse_torrent(&bytes).unwrap().info_hash);
     let failed_runtime = Arc::new(DaemonRuntime::with_paths_broker_and_state(
         config.clone(),
         health.clone(),
@@ -137,7 +138,7 @@ async fn api_torrent_file_add_retains_envelope_and_shared_rollback_contract() {
         .unwrap();
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["success"], true);
-    assert_eq!(value["data"], expected_hash.to_hex());
+    assert_eq!(value["data"], expected_hash.to_locator());
     assert_eq!(value["error"], serde_json::Value::Null);
     assert!(successful_runtime
         .get_torrent(&expected_hash)
@@ -419,7 +420,7 @@ async fn terminal_tracker_failure_sets_tracker_error_and_reannounce_retries() {
     let content = b"generated tracker-error reachability payload";
     let torrent_bytes =
         build_single_file_torrent("tracker-error.bin", content, 8, Some(&tracker_url), false);
-    let hash = parse_torrent(&torrent_bytes).unwrap().info_hash;
+    let hash = TorrentKey::v1(parse_torrent(&torrent_bytes).unwrap().info_hash);
     let download_dir = unique_dir("tracker-error");
 
     let mut config = Config::default();
@@ -474,7 +475,7 @@ async fn terminal_tracker_failure_sets_tracker_error_and_reannounce_retries() {
     let response = swarmotter_api::app_router(app_state(runtime.clone(), config))
         .oneshot(
             Request::builder()
-                .uri(format!("/api/v1/torrents/{}", hash.to_hex()))
+                .uri(format!("/api/v1/torrents/{}", hash.to_locator()))
                 .body(Body::empty())
                 .unwrap(),
         )
