@@ -7,6 +7,285 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [2.0.0] - [2026-07-14]
+
+### Upgrade notes
+
+- Existing `1.x` installations that omitted `[network]` must configure a
+  strict interface/source/namespace path before upgrading. Explicit
+  `mode = "disabled"` is accepted only for development or when a separately
+  enforced boundary supplies containment. Validate the migrated file with
+  `swarmotterd --check-config --config PATH` before restarting.
+
+### Added
+
+- **BEP 52 v2/hybrid interoperability:** SwarmOtter now accepts and operates
+  v1, pure-v2, and hybrid magnets and `.torrent` files with explicit SHA-1/
+  SHA-256 identities from exact bencoded `info` bytes. The separate pure-v2
+  engine validates file trees and piece layers, verifies SHA-256 Merkle roots,
+  uses contained v2 peer transfer plus tracker/DHT/metadata discovery, and
+  persists full-key fast resume. Registry, queue, SQLite, native API, Web UI,
+  qBittorrent, and Transmission paths preserve canonical 40/64-character
+  locators; hybrid v2 locators resolve as aliases of their v1-primary record.
+  No durable or API path truncates a v2 identity to a peer-wire hash. See
+  [ADR-0065](design/adr/0065-bep-52-v2-hybrid-torrent-identity.md).
+
+- **Policy-driven metadata-first intake:** add requests and the Web UI can
+  create `.torrent` or magnet previews; a magnet may fetch only contained BEP
+  9 metadata and remains durably paused before payload transfer. Named profiles
+  now support deterministic tracker-host enablement/priority, structured
+  suffix/path-glob/path-segment/size exclusions, content/incomplete
+  organization, forced top-level folders, and active-only partial suffixes.
+  The resolved intake selection is durable and explainable, with a read-only
+  storage-path preview; BEP 53 `so=` can only reduce it, and literal `x.pe`
+  hints still pass through peer admission and the contained binder. Completion
+  continues to use bounded seed-forever, ratio, or idle policy without deletion
+  hooks. The native metainfo endpoint exports only retained byte-exact original
+  `.torrent` inputs. See
+  [ADR-0066](design/adr/0066-policy-driven-metadata-first-intake.md).
+
+- **SQLite durable library state:** the daemon now uses a
+  versioned, local SQLite state store with WAL/full-sync durability, indexed
+  registry/queue/health/current-metric/history/audit records, raw metainfo BLOB
+  retention, deterministic history caps, and crash-safe rollback snapshots.
+  Valid legacy JSON state migrates in place on its first successful save;
+  full v1/v2 keys and exact original `.torrent` documents remain distinct from
+  canonical magnet `info` bytes. The offline projection rebuild validates a
+  supported database and rebuilds only derived indexes, refusing missing,
+  legacy, corrupt, or unsupported state rather than attempting a broad repair.
+  See
+  [ADR-0067](design/adr/0067-sqlite-durable-library-state.md).
+
+- **Contained SOCKS5 TCP proxy:** optional SOCKS5 `CONNECT` support now routes
+  outbound peer TCP, HTTP(S) tracker/scrape, and webseed requests through the
+  existing fail-closed network path. It supports no-authentication and RFC 1929
+  credentials, resolves target hostnames remotely through the proxy, redacts
+  credentials from settings views, and never falls back to a direct target
+  connection. This initial TCP-only scope requires DHT and uTP to be disabled
+  and rejects UDP tracker traffic rather than bypassing the proxy. See
+  [ADR-0062](design/adr/0062-contained-socks5-tcp-proxy.md).
+
+- **Complete contained MSE/PE policy:** peer-wire encryption now works over
+  contained TCP and uTP streams, with global, named-profile, and durable
+  per-torrent modes. `required` mode never retries plaintext, while
+  `preferred` retries only the already-selected contained transport. The native
+  API and Web UI show the effective value and its inheritance source. See
+  [ADR-0063](design/adr/0063-contained-mse-utp-and-effective-encryption-policy.md).
+
+- **Filesystem-aware storage strategy and placement:** storage diagnostics now
+  report best-effort mount details and observed payload-write/verification
+  throughput. Operators can place resume metadata, daemon state, and fallback
+  payload storage deliberately, and may explicitly request Btrfs NOCOW only
+  for new files; unsupported requests fail instead of silently changing
+  strategy. See
+  [ADR-0064](design/adr/0064-filesystem-aware-storage-strategy-and-state-placement.md).
+
+- **Contained router port mapping:** opt-in NAT-PMP and UPnP mapping now
+  creates, refreshes, reports, and best-effort removes the TCP peer-listener
+  lease only through the configured strict, fail-closed interface path. Router
+  discovery, UDP exchange, and SOAP control requests never create a default
+  route socket; mapping failure is a visible reachability condition rather
+  than a containment bypass. See
+  [ADR-0059](design/adr/0059-contained-opt-in-router-port-mapping.md).
+
+- **Operator-configured listen-port reachability tests:** an optional bounded
+  HTTP(S) test endpoint can report whether the TCP peer listener is externally
+  open. Runs are contained, serialized, cached, surfaced in the native API,
+  Transmission compatibility response, and Web UI, and remain informational
+  when the endpoint or network path fails. No third-party endpoint is bundled.
+  See
+  [ADR-0060](design/adr/0060-contained-listener-reachability-testing.md).
+
+- **Broader automation compatibility:** qBittorrent-compatible categories,
+  properties, tracker/file inspection, recheck/reannounce, location, and
+  rename workflows now delegate to native durable operations. Transmission
+  add/set accepts explicit named profiles and reports truthful status,
+  completion, labels, and errors. Both adapters retain native authorization,
+  origin protection, and network containment, without adding search, indexers,
+  or discovery APIs. See
+  [ADR-0061](design/adr/0061-compatible-automation-profile-and-lifecycle-parity.md).
+
+- **Storage-root resource controls:** repeatable
+  `[[storage.root_controls]]` entries now provide independently observable,
+  longest-path-matched active-download, declared-byte, verified-write, and
+  full-recheck budgets. Queue admission is atomic, bounded rechecks release
+  capacity on cancellation, and the API, Doctor view, and Settings expose
+  limits, use, and saturation without changing torrent network containment.
+  See [ADR-0056](design/adr/0056-storage-root-resource-controls.md).
+
+- **Named policy profiles and explainable inheritance:** profiles can be
+  selected explicitly, by watch folder, or by deterministic label mapping for
+  storage, queue, seeding, and per-torrent bandwidth behavior. Creation-time
+  resolved-storage and initial-admission snapshots prevent profile edits or
+  reassignment from moving payloads or changing an existing torrent's start
+  intent. Older durable records are migrated transactionally when profile
+  policy is replaced, while inheriting operational settings
+  resolve live and are visible through native policy endpoints and the Web UI.
+  See
+  [ADR-0057](design/adr/0057-policy-profiles-and-inherited-settings.md).
+
+- **Global peer-admission filtering:** bounded local IP/CIDR/range blocklists,
+  manual IP bans, and peer-ID-prefix rules now apply consistently to peer
+  discovery, metadata, engine, and inbound-session admission. Policy updates
+  validate and replace transactionally while retaining the required contained
+  socket path, and expose audit counters through the API and Web UI. See
+  [ADR-0058](design/adr/0058-global-peer-admission-filtering.md).
+
+- **Contained framed tracker/webseed HTTP and real HTTP(S) scrape:** tracker
+  announce, supported BEP 48 scrape, and webseed range reads now share one
+  bounded HTTP/1 codec over binder-provided TCP/TLS streams. Redirects repeat
+  contained resolution/connect, enforce a five-hop/loop limit, allow HTTPS
+  upgrade, reject downgrade, preserve exact authorities and Range, and never
+  construct a connector, resolver, pool, or general client. Scrape is scheduled
+  by download, magnet real-hash, reannounce/completion, and seeder activity.
+  Native tracker rows expose separate attempt status/time/error and retained
+  last-success counts; failed/task-aborted scrapes preserve those counts, and
+  compatibility counts fall back when announce has not succeeded. UDP and
+  non-derivable scrape are explicitly unsupported. See
+  [ADR-0055](design/adr/0055-contained-http1-client-framing-and-redirect-policy.md).
+
+- **Durable per-torrent seeding lifecycle:** each torrent now persists nullable
+  ratio and idle overrides plus seed-forever policy, exposes stored/effective
+  targets and exact seeding status through the native API, and provides a strict
+  replacement control in Torrent Details. Seeder registration is authoritative
+  for active counts and lifecycle state across queue slots, automatic/manual
+  stops, restart, and fail-closed containment recovery. Verified piece ranges
+  now produce exact single- and multi-file completed-byte accounting at file and
+  final-piece boundaries. Downloader and seeder retain one live per-torrent
+  limiter, so an upload-limit update shapes an accepted peer transfer without
+  replacing the registration. See
+  [ADR-0052](design/adr/0052-persisted-per-torrent-seeding-policy-and-runtime-lifecycle.md).
+
+### Fixed
+
+- **Web UI startup validation:** corrected an invalid shared-state
+  redeclaration, three stale bare query-state references, and two omitted UI
+  helper bindings that prevented the module graph, its first nonempty torrent
+  refresh, or Doctor badge from completing. CI, local prechecks, and the Web UI
+  Rust suite now parse every embedded JavaScript asset in ES-module mode and
+  execute the complete production module graph through its first API-driven
+  render.
+
+- **Reachable terminal tracker diagnostics:** a bounded engine attempt now
+  enters `tracker_error` when every attempted configured tracker fails and no
+  usable DHT, PEX, direct-peer, or webseed source exists. Native summaries and
+  Torrent Details retain the last error; reannounce/resume clears and retries.
+  Reannounce no longer holds the engine-command lock while delegating to
+  resume, preventing a stopped-engine deadlock.
+
+- **Stable, idempotent, transactional watch ingestion:** complete sorted
+  directory walks now run off the async workers, reject symlink roots, skip
+  child symlinks, and require two unchanged length/modified-time observations.
+  Bounded reads recheck path/open-file metadata and reset without a terminal
+  result when copying continues. One in-memory processed fingerprint prevents
+  repeated `leave` imports; restart duplicates are successful and preserve the
+  existing torrent/queue/settings while applying the success action once. API,
+  magnet, and watch adds share one locked durable transaction with exact
+  registry/queue rollback and no pre-persistence events or scheduling.
+  Permanent parser errors move to failure while transient operational errors
+  stay for retry. Archive/failure actions use create-new semantics, never
+  overwrite, and expose `post_action_error`. Recursive folders exclude their
+  own strict-descendant archive/failure paths without affecting separately
+  configured overlapping roots; whitespace-only and equal-root action paths
+  are rejected. Stable outcomes/events and a 10,000-entry in-memory history are
+  rendered in the Watch UI. See
+  [ADR-0054](design/adr/0054-watch-folder-stability-idempotence-and-import-atomicity.md).
+
+- **One process-wide peer-session budget:** `bandwidth.max_peers` now enforces
+  one runtime-owned limit across metadata, serial, parallel, endgame, inbound
+  seeding, TCP, and uTP sessions for every torrent, while
+  `max_peers_per_torrent` is an additional per-torrent cap shared across
+  inbound and outbound sessions.
+  Trackers, webseeds, DHT, DNS, discovery, and retry waits remain outside the
+  peer-specific budget. Live diagnostics expose exact limit, observed in-use,
+  coherent availability, and inbound-denial counters, including unlimited
+  observation. PATCH and full PUT replace pool objects through locked
+  data-plane reconstruction; failed provisional work or persistence restores
+  exact prior pool identities, task/lifecycle/queue ownership, config bytes,
+  and durable state without enabling pre-commit selfish removal. See
+  [ADR-0053](design/adr/0053-process-wide-peer-session-permit-pool.md).
+
+- **Browser-origin protection for every control API:** the shared
+  `browser_origin_guard` middleware is now applied as the outermost layer to
+  every browser-reachable control route — `/api/v1`, `/transmission/rpc`, and
+  `/api/v2` — so cross-site/same-site Fetch Metadata, foreign/malformed/`null`
+  /multi-value/opaque origins are rejected with 403 before authentication,
+  session negotiation, and compatibility-enabled checks in both authentication
+  modes. Duplicate or invalid-byte Origin/Host/`Sec-Fetch-Site` fields, unknown
+  Fetch Metadata values, and origins containing userinfo, a path, query, or
+  fragment now fail closed. Rejections retain the native, Transmission, or
+  qBittorrent error format, and the duplicate guard call was removed from native
+  auth. See
+  [ADR-0044](design/adr/0044-browser-origin-and-loopback-api-security.md),
+  [ADR-0049](design/adr/0049-configured-unauthenticated-lan-control-plane.md).
+- **Authenticated Chrome extension API access:** Manifest V3 extension service
+  workers with a valid `chrome-extension://<extension-id>` Origin and realistic
+  `Sec-Fetch-Site: none` can now call native bulk-add and every guarded control
+  surface when API authentication is enabled and the request supplies the
+  configured Bearer or `X-SwarmOtter-Auth` token. Auth-disabled mode and
+  missing, invalid, or duplicated credentials fail with 403 before mutation;
+  ordinary foreign HTTP(S), malformed/opaque/`null`, and invalid extension
+  Origins remain rejected. Native failures use the actionable
+  `extension_origin_forbidden` envelope. See
+  [ADR-0044](design/adr/0044-browser-origin-and-loopback-api-security.md) and
+  [ADR-0049](design/adr/0049-configured-unauthenticated-lan-control-plane.md).
+
+- **Strict containment is the default (breaking):** `NetworkConfig::default()`
+  now selects strict mode, matching the Serde default. An omitted `[network]`
+  table produces strict mode without a path and fails `Config::validate()` with
+  `invalid_config` before the control listener or any background task starts.
+  `--check-config` fails the same way, and full config validation now runs
+  before logging initialization and the success message. Existing users who
+  relied on the disabled default must configure a strict path or set
+  `mode = "disabled"` explicitly. See
+  [ADR-0051](design/adr/0051-explicit-network-path-and-live-containment-gate.md).
+  This breaking contract is part of the unreleased `v2.0.0` work.
+
+- **Live containment gate:** one process-wide `ContainmentGate` (atomics plus
+  `tokio::sync::Notify`) is now shared by every torrent data-plane component.
+  Every bind, connect, resolve, accept-loop iteration, UDP send, tracker
+  request, webseed request, and DHT send observes the gate. On healthy-to-
+  unhealthy transition the gate blocks immediately, the inbound listener and
+  DHT runner stop, data-plane tasks are aborted, active torrents enter
+  `network_blocked`, state persists, and events publish — all while the control
+  plane remains available. Every block advances a wakeup-safe cancellation
+  generation, so an immediate block/recovery cycle still terminates streams
+  from the old generation. Recovery consumes durable typed intent only for
+  downloads, metadata work, and seeders demonstrably live at the block edge;
+  paused, queued, stopped, and stale blocked records stay stopped. The health
+  loop now uses an injected `InterfaceProbe` (tests inject a mutable fake) and
+  exposes one `network_health_tick()` that tests drive without sleeping.
+  Bind/listen/source-bind failures block synchronously, expose
+  `socket_bind_failed`, and remain latched across healthy probe results until an
+  explicit full configuration replacement validates contained UDP and listener
+  binds; strict policy denials with no more specific status expose
+  `blocked_fail_closed`. A CI harness now proves a real generated local
+  tracker/peer transfer stops when its route-less namespace veth is deleted,
+  while running fixtures without capabilities and granting the daemon only
+  `CAP_NET_RAW` for `SO_BINDTODEVICE`. See
+  [ADR-0051](design/adr/0051-explicit-network-path-and-live-containment-gate.md).
+
+- **Bounded untrusted metainfo parsing:** the shared bencode decoder and
+  metainfo builder now enforce fixed depth, node-count, file-count,
+  piece-count, piece-length, and 16 MiB metadata byte budgets before any
+  piece-sized allocation. These bencode budgets cover `.torrent` uploads, bulk
+  base64 metainfo, magnet `info` dicts fetched via BEP 9, watch-folder files,
+  and direct core parser callers. The decoder rejects empty/leading-zero/
+  negative-zero integers, missing terminators, duplicate and non-string
+  dictionary keys, overflowing string lengths, and trailing bytes, and
+  requires EOF after exactly one top-level value. No malformed input may panic
+  the daemon. Raw uploads stream only to the lower configured/metadata limit;
+  bulk and Transmission base64 decoders stop before decoded output exceeds the
+  metadata limit. BEP 9 uses the hardened prefix parser for a bounded dictionary
+  followed by binary piece data and validates advertised/per-message/final
+  assembly values. Restored daemon state is JSON: its piece-hash sequence is
+  capped at `MAX_TORRENT_PIECES`, each SHA-1 hash is validated to encode exactly
+  20 bytes with record/piece-index context before decoding/copying, and restored
+  `TorrentMeta` values must pass shape validation before runtime use.
+  Engine/storage boundaries narrow piece length with `u32::try_from` rather
+  than `as`. See
+  [ADR-0050](design/adr/0050-bounded-untrusted-metainfo-parsing.md).
+
 ## [1.3.1] - [2026-07-12]
 
 ### Fixed
@@ -235,7 +514,7 @@ date or duration estimates.
   concurrent torrents sharing a global limiter no longer serialize on the same
   two locks.
 - **Daemon state lock contention:** read-heavy daemon state maps (`config`,
-  `network_health`, `engine_states`, `engine_handles`, `engine_limiters`,
+  `network_health`, `engine_states`, `engine_handles`, `torrent_limiters`,
   `rate_samples`, `engine_retry_after`, `autopilot_decisions`,
   `autopilot_last_action`) now use `tokio::sync::RwLock` instead of
   `tokio::sync::Mutex`, allowing concurrent readers during progress

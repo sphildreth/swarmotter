@@ -70,6 +70,12 @@ pub struct NetworkDiagnostics {
     pub utp_enabled: bool,
     pub utp_prefer_tcp: bool,
     pub peer_encryption_mode: PeerEncryptionMode,
+    /// Whether the opt-in SOCKS5 TCP CONNECT transport wraps the data-plane
+    /// binder. The proxy host and credentials are deliberately omitted.
+    pub socks5_enabled: bool,
+    /// SOCKS5 support is TCP CONNECT only, so enabled proxy mode blocks UDP
+    /// tracker, DHT, and uTP traffic instead of allowing a direct fallback.
+    pub socks5_udp_blocked: bool,
     pub interfaces: Vec<NetworkInterfaceDiagnostic>,
     pub checks: Vec<NetworkPathCheck>,
     pub containment_matrix: Vec<NetworkPathCheck>,

@@ -46,15 +46,18 @@ and do not create independent network paths.
   so no HTTPS traffic can bypass containment.
 - Certificate validation uses the platform root trust store; invalid tracker
   certificates are rejected (the TLS handshake fails with a typed error).
-- The TLS layer is confined to the daemon crate; `swarmotter-core` remains
-  free of TLS dependencies, and the `NetworkBinder` trait's `http_get`
-  contract is unchanged (it now transparently supports `https://`).
+- ADR-0055 subsequently moved TLS and HTTP/1 framing into
+  `swarmotter-core::net::ContainedHttpClient` so tracker announce, supported
+  scrape, and webseed ranges share one implementation. Rustls still receives
+  only a binder-provided stream; Hyper has no connector or socket path.
 - DHT and uTP UDP traffic remain unaffected by this TLS addition.
 
 ## Related Documents
 
+- `crates/swarmotter-core/src/net/http.rs`
 - `crates/swarmotterd/src/netbinder.rs`
 - `design/vpn-network-containment.md`
 - ADR-0012 (network binder)
 - ADR-0014 (tracker implementation strategy)
+- [ADR-0055: Contained HTTP/1 Client Framing and Redirect Policy](0055-contained-http1-client-framing-and-redirect-policy.md)
 - `THIRD_PARTY_LICENSES.md`

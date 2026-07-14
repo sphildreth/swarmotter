@@ -44,6 +44,27 @@ for the format and lifecycle.
 4. Update `CHANGELOG.md` for notable changes, recorded by capability.
 5. Do not commit secrets, `target/`, or build artifacts.
 
+### Source ownership boundaries
+
+Keep daemon work in the owning file under `crates/swarmotterd/src/daemon/` and
+engine work under `crates/swarmotterd/src/engine/`; their `mod.rs` files are the
+stable public facades. Native torrent API changes belong under
+`crates/swarmotter-api/src/handlers/torrents/`. Do not restore parallel module
+declarations in the daemon binary or bypass these facades.
+
+The Web UI is vanilla JavaScript with `/app.js` as its sole ES-module composer.
+Put API transport, shared state, torrent-list, detail, settings, event/log, and
+DOM/formatting work in the corresponding `crates/swarmotter-web/assets/js/`
+module. Keep the feature import graph acyclic and preserve the `script-src
+'self'` CSP. Run syntax checks for every asset and the executable DOM harnesses:
+
+```bash
+scripts/check-web-js-modules.sh
+scripts/check-web-ui-startup.sh
+node crates/swarmotter-web/tests/watch-history.test.js
+node crates/swarmotter-web/tests/seeding-policy.test.js
+```
+
 ## License
 
 By contributing, you agree your contributions are licensed under the

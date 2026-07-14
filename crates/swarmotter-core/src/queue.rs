@@ -56,50 +56,80 @@ impl Default for QueueLimits {
 }
 
 /// A queued torrent entry.
+///
+/// The default key remains [`InfoHash`] for source compatibility with legacy
+/// callers. The daemon uses `QueueState<TorrentKey>` so a pure-v2 record is
+/// never reduced to a zero or truncated v1 hash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueueEntry {
-    pub info_hash: InfoHash,
+pub struct QueueEntry<K = InfoHash> {
+    pub info_hash: K,
     pub position: usize,
     pub bypass_queue: bool,
     pub paused: bool,
 }
 
-/// Queue state.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct QueueState {
-    pub limits: QueueLimits,
-    /// Ordered list of info hashes (position = index).
-    pub order: Vec<InfoHash>,
-    pub bypass: Vec<InfoHash>,
-
-    #[serde(skip, default)]
-    order_set: HashSet<InfoHash>,
-    #[serde(skip, default)]
-    bypass_set: HashSet<InfoHash>,
-    #[serde(skip, default)]
-    order_index: HashMap<InfoHash, usize>,
+/// Exact membership of one key in queue order and bypass order. This is used
+/// by daemon mutation transactions to restore only the affected key without
+/// overwriting unrelated concurrent queue state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueMembershipSnapshot {
+    order_index: Option<usize>,
+    bypass_index: Option<usize>,
 }
 
-impl<'de> Deserialize<'de> for QueueState {
+/// Queue state over a full torrent identity key.
+///
+/// The default is retained for source compatibility. New daemon ownership
+/// must select `QueueState<TorrentKey>`.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueState<K = InfoHash> {
+    pub limits: QueueLimits,
+    /// Ordered list of torrent keys (position = index).
+    pub order: Vec<K>,
+    pub bypass: Vec<K>,
+
+    #[serde(skip, default)]
+    order_set: HashSet<K>,
+    #[serde(skip, default)]
+    bypass_set: HashSet<K>,
+    #[serde(skip, default)]
+    order_index: HashMap<K, usize>,
+}
+
+impl<K> Default for QueueState<K> {
+    fn default() -> Self {
+        Self {
+            limits: QueueLimits::default(),
+            order: Vec::new(),
+            bypass: Vec::new(),
+            order_set: HashSet::new(),
+            bypass_set: HashSet::new(),
+            order_index: HashMap::new(),
+        }
+    }
+}
+
+impl<'de, K> Deserialize<'de> for QueueState<K>
+where
+    K: Deserialize<'de> + Copy + Eq + std::hash::Hash,
+{
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        struct QueueStateSerde {
+        struct QueueStateSerde<K> {
             #[serde(default)]
             limits: QueueLimits,
-            #[serde(default)]
-            order: Vec<InfoHash>,
-            #[serde(default)]
-            bypass: Vec<InfoHash>,
+            order: Option<Vec<K>>,
+            bypass: Option<Vec<K>>,
         }
 
         let restored = QueueStateSerde::deserialize(deserializer)?;
         let mut state = Self {
             limits: restored.limits,
-            order: restored.order,
-            bypass: restored.bypass,
+            order: restored.order.unwrap_or_default(),
+            bypass: restored.bypass.unwrap_or_default(),
             order_set: HashSet::new(),
             bypass_set: HashSet::new(),
             order_index: HashMap::new(),
@@ -109,7 +139,10 @@ impl<'de> Deserialize<'de> for QueueState {
     }
 }
 
-impl QueueState {
+impl<K> QueueState<K>
+where
+    K: Copy + Eq + std::hash::Hash,
+{
     pub fn new(limits: QueueLimits) -> Self {
         let mut state = Self {
             limits,
@@ -154,15 +187,15 @@ impl QueueState {
         }
     }
 
-    fn order_index_for(&mut self, hash: &InfoHash) -> Option<usize> {
+    fn order_index_for(&mut self, key: &K) -> Option<usize> {
         self.sync_membership_sets();
-        if let Some(&i) = self.order_index.get(hash) {
-            if self.order.get(i) == Some(hash) {
+        if let Some(&i) = self.order_index.get(key) {
+            if self.order.get(i) == Some(key) {
                 return Some(i);
             }
         }
         self.rebuild_membership_sets();
-        self.order_index.get(hash).copied()
+        self.order_index.get(key).copied()
     }
 
     pub fn clear(&mut self) {
@@ -172,42 +205,64 @@ impl QueueState {
     }
 
     /// Add many torrents to the end of the queue.
-    pub fn add_many<I: IntoIterator<Item = InfoHash>>(&mut self, hashes: I) {
+    pub fn add_many<I: IntoIterator<Item = K>>(&mut self, keys: I) {
         self.sync_membership_sets();
-        for hash in hashes {
-            if self.order_set.insert(hash) {
+        for key in keys {
+            if self.order_set.insert(key) {
                 let pos = self.order.len();
-                self.order.push(hash);
-                self.order_index.insert(hash, pos);
+                self.order.push(key);
+                self.order_index.insert(key, pos);
             }
         }
     }
 
     /// Add a torrent to the end of the queue.
-    pub fn add(&mut self, hash: InfoHash) {
+    pub fn add(&mut self, key: K) {
         self.sync_membership_sets();
-        if self.order_set.insert(hash) {
+        if self.order_set.insert(key) {
             let pos = self.order.len();
-            self.order.push(hash);
-            self.order_index.insert(hash, pos);
+            self.order.push(key);
+            self.order_index.insert(key, pos);
         }
+    }
+
+    /// Capture the exact positions occupied by one key.
+    pub fn membership_snapshot(&self, key: &K) -> QueueMembershipSnapshot {
+        QueueMembershipSnapshot {
+            order_index: self.order.iter().position(|candidate| candidate == key),
+            bypass_index: self.bypass.iter().position(|candidate| candidate == key),
+        }
+    }
+
+    /// Restore one key to a previously captured membership without changing
+    /// the relative order or flags of any other key.
+    pub fn restore_membership(&mut self, key: K, snapshot: QueueMembershipSnapshot) {
+        self.order.retain(|candidate| *candidate != key);
+        self.bypass.retain(|candidate| *candidate != key);
+        if let Some(index) = snapshot.order_index {
+            self.order.insert(index.min(self.order.len()), key);
+        }
+        if let Some(index) = snapshot.bypass_index {
+            self.bypass.insert(index.min(self.bypass.len()), key);
+        }
+        self.rebuild_membership_sets();
     }
 
     /// Remove a torrent from the queue.
-    pub fn remove(&mut self, hash: &InfoHash) {
+    pub fn remove(&mut self, key: &K) {
         self.sync_membership_sets();
-        if self.order_set.remove(hash) {
-            self.order.retain(|h| h != hash);
+        if self.order_set.remove(key) {
+            self.order.retain(|candidate| candidate != key);
             self.rebuild_membership_sets();
         }
-        self.bypass_set.remove(hash);
-        self.bypass.retain(|h| h != hash);
+        self.bypass_set.remove(key);
+        self.bypass.retain(|candidate| candidate != key);
     }
 
     /// Remove many torrents from the queue.
-    pub fn remove_many<I: IntoIterator<Item = InfoHash>>(&mut self, hashes: I) {
+    pub fn remove_many<I: IntoIterator<Item = K>>(&mut self, keys: I) {
         self.sync_membership_sets();
-        let to_remove: HashSet<InfoHash> = hashes.into_iter().collect();
+        let to_remove: HashSet<K> = keys.into_iter().collect();
         if to_remove.is_empty() {
             return;
         }
@@ -217,8 +272,8 @@ impl QueueState {
     }
 
     /// Move a torrent up one position.
-    pub fn move_up(&mut self, hash: &InfoHash) {
-        if let Some(i) = self.order_index_for(hash) {
+    pub fn move_up(&mut self, key: &K) {
+        if let Some(i) = self.order_index_for(key) {
             if i > 0 {
                 self.order.swap(i, i - 1);
                 self.order_index.insert(self.order[i], i);
@@ -228,8 +283,8 @@ impl QueueState {
     }
 
     /// Move a torrent down one position.
-    pub fn move_down(&mut self, hash: &InfoHash) {
-        if let Some(i) = self.order_index_for(hash) {
+    pub fn move_down(&mut self, key: &K) {
+        if let Some(i) = self.order_index_for(key) {
             if i + 1 < self.order.len() {
                 self.order.swap(i, i + 1);
                 self.order_index.insert(self.order[i], i);
@@ -239,8 +294,8 @@ impl QueueState {
     }
 
     /// Move a torrent to the top of the queue.
-    pub fn move_to_top(&mut self, hash: &InfoHash) {
-        if let Some(i) = self.order_index_for(hash) {
+    pub fn move_to_top(&mut self, key: &K) {
+        if let Some(i) = self.order_index_for(key) {
             let h = self.order.remove(i);
             self.order.insert(0, h);
             self.rebuild_membership_sets();
@@ -248,8 +303,8 @@ impl QueueState {
     }
 
     /// Move a torrent to the bottom of the queue.
-    pub fn move_to_bottom(&mut self, hash: &InfoHash) {
-        if let Some(i) = self.order_index_for(hash) {
+    pub fn move_to_bottom(&mut self, key: &K) {
+        if let Some(i) = self.order_index_for(key) {
             let h = self.order.remove(i);
             self.order.push(h);
             self.rebuild_membership_sets();
@@ -257,19 +312,19 @@ impl QueueState {
     }
 
     /// Move many torrents to the bottom of the queue.
-    pub fn move_many_to_bottom<I: IntoIterator<Item = InfoHash>>(&mut self, hashes: I) {
+    pub fn move_many_to_bottom<I: IntoIterator<Item = K>>(&mut self, keys: I) {
         self.sync_membership_sets();
-        let to_move: HashSet<InfoHash> = hashes.into_iter().collect();
+        let to_move: HashSet<K> = keys.into_iter().collect();
         if to_move.is_empty() {
             return;
         }
         let mut kept = Vec::with_capacity(self.order.len());
         let mut moved = Vec::new();
-        for hash in self.order.drain(..) {
-            if to_move.contains(&hash) {
-                moved.push(hash);
+        for key in self.order.drain(..) {
+            if to_move.contains(&key) {
+                moved.push(key);
             } else {
-                kept.push(hash);
+                kept.push(key);
             }
         }
         kept.extend(moved);
@@ -278,24 +333,24 @@ impl QueueState {
     }
 
     /// Mark a torrent to start now (bypass queue).
-    pub fn start_now(&mut self, hash: &InfoHash) {
+    pub fn start_now(&mut self, key: &K) {
         self.sync_membership_sets();
-        if self.bypass_set.insert(*hash) {
-            self.bypass.push(*hash);
+        if self.bypass_set.insert(*key) {
+            self.bypass.push(*key);
         }
     }
 
     /// Clear bypass flag.
-    pub fn clear_bypass(&mut self, hash: &InfoHash) {
+    pub fn clear_bypass(&mut self, key: &K) {
         self.sync_membership_sets();
-        self.bypass.retain(|h| h != hash);
-        self.bypass_set.remove(hash);
+        self.bypass.retain(|candidate| candidate != key);
+        self.bypass_set.remove(key);
     }
 
     /// Clear bypass flags.
-    pub fn clear_bypass_many<I: IntoIterator<Item = InfoHash>>(&mut self, hashes: I) {
+    pub fn clear_bypass_many<I: IntoIterator<Item = K>>(&mut self, keys: I) {
         self.sync_membership_sets();
-        let clear_set: HashSet<InfoHash> = hashes.into_iter().collect();
+        let clear_set: HashSet<K> = keys.into_iter().collect();
         if clear_set.is_empty() {
             return;
         }
@@ -304,30 +359,33 @@ impl QueueState {
     }
 
     /// Position of a torrent (1-based) or None if not queued.
-    pub fn position(&self, hash: &InfoHash) -> Option<usize> {
-        if let Some(&i) = self.order_index.get(hash) {
-            if self.order.get(i) == Some(hash) {
+    pub fn position(&self, key: &K) -> Option<usize> {
+        if let Some(&i) = self.order_index.get(key) {
+            if self.order.get(i) == Some(key) {
                 return Some(i + 1);
             }
         }
-        self.order.iter().position(|h| h == hash).map(|i| i + 1)
+        self.order
+            .iter()
+            .position(|candidate| candidate == key)
+            .map(|i| i + 1)
     }
 
     /// Determine which torrents are allowed to download given the limits.
-    /// Returns info hashes allowed to be active.
-    pub fn active_download_slots(&self) -> Vec<InfoHash> {
+    /// Returns full torrent keys allowed to be active.
+    pub fn active_download_slots(&self) -> Vec<K> {
         let limit = self.limits.max_active_downloads;
         if limit == 0 {
             return self.order.clone();
         }
-        let mut active: Vec<InfoHash> = self.bypass.to_vec();
-        let mut active_set: HashSet<InfoHash> = self.bypass.iter().copied().collect();
-        for h in &self.order {
+        let mut active: Vec<K> = self.bypass.to_vec();
+        let mut active_set: HashSet<K> = self.bypass.iter().copied().collect();
+        for key in &self.order {
             if active.len() >= limit {
                 break;
             }
-            if active_set.insert(*h) {
-                active.push(*h);
+            if active_set.insert(*key) {
+                active.push(*key);
             }
         }
         active
@@ -337,6 +395,7 @@ impl QueueState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::{TorrentKey, V2InfoHash};
 
     fn h(n: u32) -> InfoHash {
         let mut bytes = [0u8; 20];
@@ -405,6 +464,23 @@ mod tests {
         q.add(h(2));
         assert_eq!(q.position(&h(2)), Some(2));
         assert_eq!(q.position(&h(9)), None);
+    }
+
+    #[test]
+    fn membership_snapshot_restores_exact_order_and_bypass_position() {
+        let mut q = QueueState::default();
+        q.add_many([h(1), h(2), h(3)]);
+        q.start_now(&h(3));
+        q.start_now(&h(2));
+        let snapshot = q.membership_snapshot(&h(2));
+
+        q.remove(&h(2));
+        q.add(h(4));
+        q.restore_membership(h(2), snapshot);
+
+        assert_eq!(q.order, [h(1), h(2), h(3), h(4)]);
+        assert_eq!(q.bypass, [h(3), h(2)]);
+        assert_eq!(q.position(&h(2)), Some(2));
     }
 
     #[test]
@@ -483,5 +559,21 @@ mod tests {
         q.start_now(&duplicate);
         q.clear_bypass_many(vec![duplicate, duplicate]);
         assert!(q.bypass.is_empty());
+    }
+
+    #[test]
+    fn full_v2_keys_survive_queue_order_and_serde() {
+        let first = TorrentKey::v2(V2InfoHash::from_bytes([0x61; 32]));
+        let second = TorrentKey::v2(V2InfoHash::from_bytes([0x62; 32]));
+        let mut queue: QueueState<TorrentKey> = QueueState::new(QueueLimits::default());
+        queue.add(first);
+        queue.add(second);
+        queue.start_now(&second);
+
+        let json = serde_json::to_string(&queue).unwrap();
+        let restored: QueueState<TorrentKey> = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.order, vec![first, second]);
+        assert_eq!(restored.position(&second), Some(2));
+        assert_eq!(restored.active_download_slots()[0], second);
     }
 }

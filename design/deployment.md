@@ -28,6 +28,11 @@ builder described in ADR-0032.
   and torrent data-plane containment.
 - Container deployments must not imply that publishing `9091` exposes torrent
   peer/tracker/DHT traffic.
+- The supplied Gluetun profile may use explicit in-app disabled mode only
+  because `network_mode: service:vpn` places SwarmOtter inside Gluetun's
+  firewall/kill-switch namespace. Standalone native or container profiles must
+  configure strict containment rather than inheriting an implicit disabled
+  default.
 - VPN, NIC, interface, source-address, and namespace deployment patterns must
   be described as routing correctness, privacy-preserving network design,
   operational safety, container networking, and fail-closed behavior.
@@ -50,6 +55,10 @@ The release-facing container contract includes:
   private so atomic settings replacement preserves credential confidentiality.
 - Standalone containers and Compose set `nofile` to `65536` for peer, tracker,
   and storage handles.
+- Omitted network configuration fails validation. Live concrete bind failures
+  remain latched until a full configuration replacement validates contained UDP
+  and peer-listener binds; deployment automation must not rewrite strict mode
+  to disabled to make a health check pass.
 
 Changes to this contract are release-facing and should be handled through
 `VERSIONING_GUIDE.md`.

@@ -30,13 +30,11 @@ futures-util = { workspace = true }
 once_cell = { workspace = true }
 clap = { workspace = true }
 url = { workspace = true }
-tokio-rustls = { workspace = true }
 rustls = { workspace = true }
-webpki-roots = { workspace = true }
 libc = { workspace = true }
 socket2 = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 swarmotter-core = { path = "../swarmotter-core", features = ["test-binder"] }
-rcgen = "0.13"
-rustls-pemfile = "2"
+tokio = { workspace = true, features = ["test-util"] }

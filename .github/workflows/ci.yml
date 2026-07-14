@@ -30,9 +30,9 @@ jobs:
       - name: Test
         run: cargo test --all --all-features
       - name: Validate Web UI JavaScript
-        run: |
-          node --check crates/swarmotter-web/assets/theme-bootstrap.js
-          node --check crates/swarmotter-web/assets/app.js
+        run: scripts/check-web-js-modules.sh
+      - name: Exercise Web UI startup
+        run: scripts/check-web-ui-startup.sh
       - name: Validate deployment manifests
         run: |
           cp deploy/gluetun.env.example deploy/gluetun.env
@@ -46,6 +46,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - name: Check locked workspace at the minimum Rust version
         run: cargo check --locked --workspace --all-targets --all-features
+
+  containment-transition:
+    name: Privileged live containment transition
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install local namespace fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends iproute2 curl python3 util-linux
+
+      - name: Build daemon as the normal runner user
+        run: cargo build --locked -p swarmotterd
+
+      - name: Run isolated namespace and link acceptance harness
+        run: |
+          scripts/test-network-containment-transition.sh \
+            "$PWD/target/debug/swarmotterd"
 
   docs-site:
     runs-on: ubuntu-latest

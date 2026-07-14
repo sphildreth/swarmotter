@@ -177,6 +177,55 @@ If a trusted-LAN deployment should not require a token, set
 listeners log a warning because every reachable client can then control
 SwarmOtter.
 
+## Chrome extension POST returns `extension_origin_forbidden`
+
+Chrome Manifest V3 service workers are cross-origin clients. A privileged
+extension request normally carries both:
+
+```text
+Origin: chrome-extension://<32-character-extension-id>
+Sec-Fetch-Site: none
+```
+
+SwarmOtter accepts that Origin only with authenticated API mode and a valid API
+token. Configure:
+
+```toml
+[api]
+require_auth = true
+auth_token = "replace-with-a-long-random-token"
+```
+
+Then send the same token on the extension service worker's request:
+
+```text
+Authorization: Bearer <token>
+```
+
+or:
+
+```text
+X-SwarmOtter-Auth: <token>
+```
+
+Also grant the exact SwarmOtter API origin in the extension manifest's
+`host_permissions`; HTTP and HTTPS permissions are separate. Do not try to set
+`Origin` or `Sec-Fetch-Site` in extension code—the browser owns those headers.
+
+Check the native JSON error code and message:
+
+- `extension_origin_forbidden`: authenticated mode is off, the token is absent
+  or invalid, an authentication header is duplicated, or both supported token
+  header forms were sent together.
+- `cross_origin_forbidden`: Fetch Metadata, Origin, or Host failed the ordinary
+  browser-origin policy. `same-site`/`cross-site`, foreign HTTP(S), `null`,
+  opaque, malformed (including an invalid extension ID), and multi-value
+  Origins remain intentionally rejected.
+
+Setting only `auth_token` while `require_auth = false` does not enable extension
+access. SwarmOtter does not broadly trust all installed extensions on an
+unauthenticated listener.
+
 ## Update helper health check reports connection resets
 
 If `deploy/update-swarmotter.sh` reports repeated `curl: (56) Recv failure:
@@ -232,7 +281,7 @@ Useful fields:
 - `choked_peers`: reserved for explicit choke-state telemetry; currently
   `null` until the engine records positive per-peer choke state.
 - `recent_peer_failures`, `recent_tracker_failures`: recent failed peer
-  sessions and tracker announce failures reported by the live engine.
+  sessions and tracker announce/scrape failures reported by the live engine.
 - `tracker_ok`, `tracker_message`, `last_announce`: last tracker announce
   status from the live engine.
 - `tracker_last_ok_seconds_ago`, `dht_last_seen_seconds_ago`,
@@ -242,15 +291,21 @@ Useful fields:
   succeeded recently in the live engine.
 
 Tracker rows from `/api/v1/torrents/<info_hash>/trackers` report per-tracker
-announce results. `seeders` and `leechers` come from the last announce response,
-`last_error` is set only for failed announces, and `last_message` carries the
-latest successful announce result.
+announce and scrape results. `last_error`/`last_message` remain announce-only.
+`scrape_status`, `last_scrape`, nullable `scrape_seeders`/`scrape_leechers`/
+`scrape_downloads`, and `last_scrape_error` describe scrape. A failed scrape
+retains the previous successful counts. `unsupported` is expected for UDP and
+HTTP(S) URLs whose final path does not begin with `announce`; it does not mean
+UDP announce failed. If announce is not successful, compatibility seed/leech
+counts fall back to retained scrape data.
 
 Common causes:
 
 - The torrent has no live seeders.
 - The tracker hostnames cannot resolve under strict DNS containment.
 - UDP tracker traffic is blocked by the network path.
+- A supported HTTP(S) scrape is redirected to an HTTPS-to-HTTP downgrade,
+  returns malformed/missing exact-key BEP 48 data, or exceeds the decoded cap.
 - Only WebTorrent `wss://` trackers are present; those are not BitTorrent TCP
   or UDP trackers.
 
@@ -272,8 +327,9 @@ When managing large torrent libraries, monitor these indicators:
 
 ### Check file descriptor usage
 
-Each active torrent requires 50+ file descriptors. Check the daemon's current
-limit and usage:
+Peer-session descriptors are bounded by a nonzero `max_peers`; payload files,
+trackers, DHT, the shared listener, and the control plane add workload-specific
+overhead. Check the daemon's current limit and usage:
 
 ```bash
 PID=$(pgrep swarmotterd)
@@ -296,11 +352,17 @@ Key fields:
 
 - `requested_downloads` vs `granted_downloads`: if requested exceeds granted,
   the download slot cap is the bottleneck.
-- `requested_metadata` vs `granted_metadata`: if requested exceeds granted,
+- `requested_metadata_fetches` vs `granted_metadata_fetches`: if requested exceeds granted,
   the metadata fetch slot cap is the bottleneck.
-- `peer_worker_saturation`: `true` means the global peer worker cap is fully
-  consumed; active torrents may have fewer peers than configured.
-- `retry_backoff_count`: high values indicate many torrents waiting for retry
+- `peer_limit`, `peer_permits_in_use`, and `peer_permits_available`: the
+  authoritative process-wide peer-session cap and current usage. Available is
+  `null` when unlimited.
+- `peer_sessions_denied`: inbound sockets rejected before session start by an
+  applicable global or per-torrent cap.
+- `peer_worker_budget_saturated` (and legacy peer-worker budget fields): engine
+  worker-pressure compatibility telemetry. It does not mean the process-wide
+  peer connection cap is full; use the permit fields above for that decision.
+- `retry_backoff_torrents`: high values indicate many torrents waiting for retry
   after transient failures.
 
 ### Check event subscriber lag

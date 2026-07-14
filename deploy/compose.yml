@@ -24,6 +24,10 @@ services:
     depends_on:
       vpn:
         condition: service_healthy
+    # config/swarmotter.container.toml.example explicitly disables in-process
+    # containment only because this joins Gluetun's firewall/kill-switch
+    # namespace. Do not remove this shared-namespace boundary or attach a
+    # fallback bridge while using that config.
     network_mode: "service:vpn"
     environment:
       SWARMOTTER_API__REQUIRE_AUTH: ${SWARMOTTER_API_REQUIRE_AUTH:-true}

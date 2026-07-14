@@ -4,17 +4,17 @@
 //!
 //! Builds announce requests from torrent metadata, encodes the info hash and
 //! peer id, parses compact peer responses, respects tracker tiers and private
-//! torrent restrictions, and routes all HTTP traffic through the network
-//! containment layer (`NetworkBinder`). UDP trackers are modeled but only the
-//! HTTP path is implemented in this slice; the live UDP engine is tracked as
-//! remaining work.
+//! torrent restrictions, and routes HTTP announce/scrape through the contained
+//! HTTP client over `NetworkBinder`. Live UDP announce is implemented in
+//! `udp_tracker`; UDP scrape is explicitly unsupported.
 
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::bencode::{self, Value};
 use crate::error::{CoreError, Result};
-use crate::hash::InfoHash;
-use crate::net::NetworkBinder;
+use crate::hash::PeerInfoHash;
+use crate::net::{ContainedHttpClient, NetworkBinder};
 use crate::peer::PeerAddr;
 
 /// Announce event.
@@ -41,7 +41,7 @@ impl AnnounceEvent {
 #[derive(Debug, Clone)]
 pub struct AnnounceRequest {
     pub tracker_url: String,
-    pub info_hash: InfoHash,
+    pub info_hash: PeerInfoHash,
     pub peer_id: [u8; 20],
     pub port: u16,
     pub uploaded: u64,
@@ -141,6 +141,22 @@ pub struct AnnounceResponse {
     pub peers: Vec<PeerAddr>,
     pub failure_reason: Option<String>,
     pub tracker_id: Option<String>,
+}
+
+/// Last-success counts returned by a BEP 48 tracker scrape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrapeCounts {
+    pub seeders: u64,
+    pub leechers: u64,
+    pub downloads: u64,
+}
+
+/// A scrape URL is not universally derivable. Unsupported tracker schemes or
+/// path shapes are distinct from a failed supported request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScrapeOutcome {
+    Unsupported,
+    Success(HashMap<PeerInfoHash, ScrapeCounts>),
 }
 
 /// Parse a bencoded tracker announce response body.
@@ -299,6 +315,172 @@ pub async fn http_announce(
     parse_announce_response(&resp.body)
 }
 
+/// Derive a BEP 48 HTTP/HTTPS scrape URL and append exactly one binary
+/// `info_hash` query pair for each distinct requested hash, in input order.
+/// Existing form-decoded `info_hash` pairs are removed while unrelated raw
+/// query components retain their spelling and order.
+pub fn build_scrape_url(tracker_url: &str, info_hashes: &[PeerInfoHash]) -> Result<Option<String>> {
+    if info_hashes.is_empty() {
+        return Err(CoreError::InvalidArgument(
+            "tracker scrape requires at least one info hash".into(),
+        ));
+    }
+    let mut distinct = HashSet::with_capacity(info_hashes.len());
+    for hash in info_hashes {
+        if !distinct.insert(*hash) {
+            return Err(CoreError::InvalidArgument(format!(
+                "tracker scrape contains duplicate info hash {}",
+                hash.to_hex()
+            )));
+        }
+    }
+
+    let mut url = url::Url::parse(tracker_url)
+        .map_err(|error| CoreError::InvalidArgument(format!("bad tracker URL: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Ok(None);
+    }
+    let path = url.path();
+    let (directory, final_segment) = path.rsplit_once('/').unwrap_or(("", path));
+    let Some(suffix) = final_segment.strip_prefix("announce") else {
+        return Ok(None);
+    };
+    let scrape_path = format!("{directory}/scrape{suffix}");
+    url.set_path(&scrape_path);
+    url.set_fragment(None);
+
+    let mut query_components = url
+        .query()
+        .map(|query| {
+            query
+                .split('&')
+                .filter(|component| !raw_query_key_is_info_hash(component))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    query_components.extend(
+        info_hashes
+            .iter()
+            .map(|hash| format!("info_hash={}", bytes_escape(hash.as_bytes()))),
+    );
+    url.set_query(Some(&query_components.join("&")));
+    Ok(Some(url.to_string()))
+}
+
+fn raw_query_key_is_info_hash(component: &str) -> bool {
+    let raw_key = component
+        .split_once('=')
+        .map(|(key, _)| key)
+        .unwrap_or(component);
+    url::form_urlencoded::parse(raw_key.as_bytes())
+        .next()
+        .is_some_and(|(key, _)| key == "info_hash")
+}
+
+/// Parse a bounded BEP 48 response for every requested hash. The entire
+/// attempt fails before returning any counts if one requested entry is absent
+/// or malformed.
+pub fn parse_scrape_response(
+    body: &[u8],
+    info_hashes: &[PeerInfoHash],
+) -> Result<HashMap<PeerInfoHash, ScrapeCounts>> {
+    if info_hashes.is_empty() {
+        return Err(CoreError::InvalidArgument(
+            "tracker scrape requires at least one info hash".into(),
+        ));
+    }
+    let root = bencode::decode(body)?;
+    let root = root
+        .as_dict()
+        .ok_or_else(|| CoreError::Parse("tracker scrape response is not a dictionary".into()))?;
+    if let Some(reason) = root
+        .iter()
+        .find(|(key, _)| key == b"failure reason")
+        .and_then(|(_, value)| value.as_str_utf8())
+    {
+        return Err(CoreError::Parse(format!(
+            "tracker scrape failure: {reason}"
+        )));
+    }
+    let files = root
+        .iter()
+        .find(|(key, _)| key == b"files")
+        .and_then(|(_, value)| value.as_dict())
+        .ok_or_else(|| {
+            CoreError::Parse("tracker scrape response has no files dictionary".into())
+        })?;
+
+    let mut parsed = HashMap::with_capacity(info_hashes.len());
+    for hash in info_hashes {
+        let entry = files
+            .iter()
+            .find(|(key, _)| key.as_slice() == hash.as_bytes())
+            .and_then(|(_, value)| value.as_dict())
+            .ok_or_else(|| {
+                CoreError::Parse(format!(
+                    "tracker scrape response has no dictionary for info hash {}",
+                    hash.to_hex()
+                ))
+            })?;
+        let counts = ScrapeCounts {
+            seeders: scrape_nonnegative_count(entry, b"complete", hash)?,
+            leechers: scrape_nonnegative_count(entry, b"incomplete", hash)?,
+            downloads: scrape_nonnegative_count(entry, b"downloaded", hash)?,
+        };
+        parsed.insert(*hash, counts);
+    }
+    Ok(parsed)
+}
+
+fn scrape_nonnegative_count(
+    entry: &[(Vec<u8>, Value)],
+    field: &[u8],
+    hash: &PeerInfoHash,
+) -> Result<u64> {
+    let value = entry
+        .iter()
+        .find(|(key, _)| key.as_slice() == field)
+        .and_then(|(_, value)| value.as_int())
+        .ok_or_else(|| {
+            CoreError::Parse(format!(
+                "tracker scrape field {} is missing or not an integer for info hash {}",
+                String::from_utf8_lossy(field),
+                hash.to_hex()
+            ))
+        })?;
+    u64::try_from(value).map_err(|_| {
+        CoreError::Parse(format!(
+            "tracker scrape field {} is negative for info hash {}",
+            String::from_utf8_lossy(field),
+            hash.to_hex()
+        ))
+    })
+}
+
+/// Execute a supported HTTP/HTTPS scrape through the contained client.
+pub async fn http_scrape(
+    binder: &dyn NetworkBinder,
+    tracker_url: &str,
+    info_hashes: &[PeerInfoHash],
+) -> Result<ScrapeOutcome> {
+    let client = ContainedHttpClient::new(binder);
+    http_scrape_with_client(&client, tracker_url, info_hashes).await
+}
+
+async fn http_scrape_with_client<B: NetworkBinder + ?Sized>(
+    client: &ContainedHttpClient<'_, B>,
+    tracker_url: &str,
+    info_hashes: &[PeerInfoHash],
+) -> Result<ScrapeOutcome> {
+    let Some(scrape_url) = build_scrape_url(tracker_url, info_hashes)? else {
+        return Ok(ScrapeOutcome::Unsupported);
+    };
+    let response = client.get_tracker(&scrape_url).await?;
+    let counts = parse_scrape_response(&response.body, info_hashes)?;
+    Ok(ScrapeOutcome::Success(counts))
+}
+
 /// A peer contact for announcing "self" to a tracker: address bound through
 /// the containment layer.
 #[derive(Debug, Clone, Copy)]
@@ -316,12 +498,18 @@ impl SelfPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::InfoHash;
+    use crate::hash::PeerInfoHash;
+    use crate::net::{ContainedUdpSocket, PeerListener};
+    use async_trait::async_trait;
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn req() -> AnnounceRequest {
         AnnounceRequest {
             tracker_url: "http://tracker.example/announce".into(),
-            info_hash: InfoHash::from_bytes([0x12u8; 20]),
+            info_hash: PeerInfoHash::from_bytes([0x12u8; 20]),
             peer_id: *b"-SW0010-abcdefghij12",
             port: 6881,
             uploaded: 0,
@@ -437,5 +625,292 @@ mod tests {
         // the only peer source when private.
         let tiers = announce_tiers(Some("http://t/a"), &[]);
         assert!(!tiers.is_empty());
+    }
+
+    fn push_bstring(out: &mut Vec<u8>, value: &[u8]) {
+        out.extend_from_slice(value.len().to_string().as_bytes());
+        out.push(b':');
+        out.extend_from_slice(value);
+    }
+
+    fn scrape_body(entries: &[(PeerInfoHash, i64, i64, i64)]) -> Vec<u8> {
+        let mut body = b"d5:filesd".to_vec();
+        for (hash, complete, incomplete, downloaded) in entries {
+            push_bstring(&mut body, hash.as_bytes());
+            body.push(b'd');
+            body.extend_from_slice(format!("8:completei{complete}e").as_bytes());
+            body.extend_from_slice(format!("10:downloadedi{downloaded}e").as_bytes());
+            body.extend_from_slice(format!("10:incompletei{incomplete}e").as_bytes());
+            body.push(b'e');
+        }
+        body.extend_from_slice(b"ee");
+        body
+    }
+
+    #[test]
+    fn scrape_url_derivation_preserves_raw_query_and_orders_binary_hashes() {
+        let first = PeerInfoHash::from_bytes([
+            0x00, 0x20, 0x2f, 0x3f, 0xff, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
+        ]);
+        let second = PeerInfoHash::from_bytes([0x22; 20]);
+        let url = build_scrape_url(
+            "https://tracker.test/nested/path/announce.php?pass=%2f+Keep&info_hash=old&%69nfo_hash=old2&x=1#ignored",
+            &[first, second],
+        )
+        .unwrap()
+        .unwrap();
+        assert!(url.starts_with("https://tracker.test/nested/path/scrape.php?"));
+        assert!(!url.contains('#'));
+        let query = url::Url::parse(&url).unwrap().query().unwrap().to_string();
+        assert_eq!(
+            query,
+            format!(
+                "pass=%2f+Keep&x=1&info_hash={}&info_hash={}",
+                bytes_escape(first.as_bytes()),
+                bytes_escape(second.as_bytes())
+            )
+        );
+    }
+
+    #[test]
+    fn scrape_url_derivation_handles_exact_suffix_relative_directory_and_unsupported() {
+        let hash = PeerInfoHash::from_bytes([0x11; 20]);
+        assert_eq!(
+            build_scrape_url("http://tracker.test/announce", &[hash])
+                .unwrap()
+                .unwrap(),
+            format!(
+                "http://tracker.test/scrape?info_hash={}",
+                bytes_escape(hash.as_bytes())
+            )
+        );
+        assert!(
+            build_scrape_url("http://tracker.test/a/b/announce-v2", &[hash])
+                .unwrap()
+                .unwrap()
+                .contains("/a/b/scrape-v2?")
+        );
+        for unsupported in [
+            "http://tracker.test/a/not-announce",
+            "http://tracker.test/a/Announce",
+            "udp://tracker.test:6969/announce",
+        ] {
+            assert_eq!(
+                build_scrape_url(unsupported, &[hash]).unwrap(),
+                None,
+                "{unsupported}"
+            );
+        }
+        assert!(build_scrape_url("http://tracker.test/announce", &[]).is_err());
+        assert!(build_scrape_url("http://tracker.test/announce", &[hash, hash]).is_err());
+    }
+
+    #[test]
+    fn scrape_parser_requires_every_exact_hash_and_all_nonnegative_counts() {
+        let first = PeerInfoHash::from_bytes([0x31; 20]);
+        let second = PeerInfoHash::from_bytes([0x32; 20]);
+        let unrelated = PeerInfoHash::from_bytes([0x77; 20]);
+        let parsed = parse_scrape_response(
+            &scrape_body(&[(unrelated, 9, 8, 7), (first, 1, 2, 3), (second, 4, 5, 6)]),
+            &[first, second],
+        )
+        .unwrap();
+        assert_eq!(
+            parsed[&first],
+            ScrapeCounts {
+                seeders: 1,
+                leechers: 2,
+                downloads: 3
+            }
+        );
+        assert_eq!(parsed[&second].downloads, 6);
+
+        assert!(
+            parse_scrape_response(&scrape_body(&[(first, 1, 2, 3)]), &[first, second]).is_err()
+        );
+        assert!(parse_scrape_response(&scrape_body(&[(first, -1, 2, 3)]), &[first]).is_err());
+        assert!(parse_scrape_response(b"d5:filesd20:11111111111111111111i1eee", &[first]).is_err());
+        assert!(parse_scrape_response(b"le", &[first]).is_err());
+        assert!(parse_scrape_response(b"d5:filesdee", &[first]).is_err());
+        assert!(parse_scrape_response(b"d14:failure reason13:not availablee", &[first]).is_err());
+    }
+
+    #[test]
+    fn scrape_parser_rejects_missing_wrong_and_out_of_range_matching_fields() {
+        let hash = PeerInfoHash::from_bytes([0x41; 20]);
+        let mut missing = b"d5:filesd".to_vec();
+        push_bstring(&mut missing, hash.as_bytes());
+        missing.extend_from_slice(b"d8:completei1e10:incompletei2eeee");
+        assert!(parse_scrape_response(&missing, &[hash]).is_err());
+
+        let mut wrong = b"d5:filesd".to_vec();
+        push_bstring(&mut wrong, hash.as_bytes());
+        wrong.extend_from_slice(b"d8:complete3:bad10:downloadedi3e10:incompletei2eeee");
+        assert!(parse_scrape_response(&wrong, &[hash]).is_err());
+
+        let mut overflow = b"d5:filesd".to_vec();
+        push_bstring(&mut overflow, hash.as_bytes());
+        overflow.extend_from_slice(
+            b"d8:completei9223372036854775808e10:downloadedi3e10:incompletei2eeee",
+        );
+        assert!(parse_scrape_response(&overflow, &[hash]).is_err());
+    }
+
+    struct ScrapeBinder {
+        address: SocketAddr,
+        resolves: AtomicUsize,
+        connects: AtomicUsize,
+    }
+
+    impl ScrapeBinder {
+        fn new(address: SocketAddr) -> Self {
+            Self {
+                address,
+                resolves: AtomicUsize::new(0),
+                connects: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NetworkBinder for ScrapeBinder {
+        async fn connect_peer(&self, _addr: SocketAddr) -> Result<tokio::net::TcpStream> {
+            self.connects.fetch_add(1, Ordering::SeqCst);
+            tokio::net::TcpStream::connect(self.address)
+                .await
+                .map_err(CoreError::from)
+        }
+
+        async fn resolve_host(&self, _host: &str, _port: u16) -> Result<SocketAddr> {
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            Ok(self.address)
+        }
+
+        async fn udp_socket(&self) -> Result<Box<dyn ContainedUdpSocket>> {
+            Err(CoreError::Internal("unused in scrape fixture".into()))
+        }
+
+        async fn bind_peer_listener(&self, _port: u16) -> Result<Box<dyn PeerListener>> {
+            Err(CoreError::Internal("unused in scrape fixture".into()))
+        }
+
+        fn traffic_allowed(&self) -> bool {
+            true
+        }
+    }
+
+    async fn read_http_request<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 1024];
+        while request.windows(4).all(|window| window != b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).await.unwrap();
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..count]);
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn scrape_unsupported_and_udp_make_no_binder_calls() {
+        let hash = PeerInfoHash::from_bytes([0x51; 20]);
+        let binder = ScrapeBinder::new("127.0.0.1:9".parse().unwrap());
+        for tracker_url in [
+            "http://tracker.test/not-supported",
+            "udp://tracker.test:6969/announce",
+        ] {
+            assert_eq!(
+                http_scrape(&binder, tracker_url, &[hash]).await.unwrap(),
+                ScrapeOutcome::Unsupported
+            );
+        }
+        assert_eq!(binder.resolves.load(Ordering::SeqCst), 0);
+        assert_eq!(binder.connects.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn contained_http_scrape_returns_only_exact_matching_counts() {
+        let hash = PeerInfoHash::from_bytes([0x52; 20]);
+        let body = scrape_body(&[(hash, 7, 8, 9)]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_body = body.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = String::from_utf8(read_http_request(&mut stream).await).unwrap();
+            assert!(request.starts_with("GET /scrape?info_hash="));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                expected_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(&expected_body).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let binder = ScrapeBinder::new(address);
+        let outcome = http_scrape(&binder, "http://tracker.test/announce", &[hash])
+            .await
+            .unwrap();
+        let ScrapeOutcome::Success(counts) = outcome else {
+            panic!("supported HTTP scrape was reported unsupported");
+        };
+        assert_eq!(counts[&hash].seeders, 7);
+        assert_eq!(counts[&hash].leechers, 8);
+        assert_eq!(counts[&hash].downloads, 9);
+        assert_eq!(binder.resolves.load(Ordering::SeqCst), 1);
+        assert_eq!(binder.connects.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn injected_trust_https_scrape_uses_the_same_contained_client() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let hash = PeerInfoHash::from_bytes([0x53; 20]);
+        let body = scrape_body(&[(hash, 10, 11, 12)]);
+        let certified = rcgen::generate_simple_self_signed(vec!["secure.test".into()]).unwrap();
+        let certificate = certified.cert.der().clone();
+        let key =
+            rustls::pki_types::PrivateKeyDer::try_from(certified.key_pair.serialize_der()).unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_body = body.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(stream).await.unwrap();
+            let request = String::from_utf8(read_http_request(&mut stream).await).unwrap();
+            assert!(request.starts_with("GET /scrape?info_hash="));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                expected_body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(&expected_body).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let tls_config = Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+        let binder = ScrapeBinder::new(address);
+        let client = ContainedHttpClient::with_tls_config(&binder, tls_config);
+        let outcome = http_scrape_with_client(&client, "https://secure.test:443/announce", &[hash])
+            .await
+            .unwrap();
+        let ScrapeOutcome::Success(counts) = outcome else {
+            panic!("supported HTTPS scrape was reported unsupported");
+        };
+        assert_eq!(counts[&hash].downloads, 12);
+        assert_eq!(binder.resolves.load(Ordering::SeqCst), 1);
+        assert_eq!(binder.connects.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
     }
 }

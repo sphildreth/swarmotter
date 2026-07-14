@@ -115,7 +115,7 @@ for reaching hardware-limited throughput with thousands of torrents.
   from O(N × tick) to O(active × tick).
 - **`DashMap` for engine handle maps.** Replace
   `tokio::sync::RwLock<HashMap<InfoHash, V>>` for `engine_handles`,
-  `engine_states`, `engine_cmds`, `engine_limiters`, `engine_retry_after`,
+  `engine_states`, `engine_cmds`, `torrent_limiters`, `engine_retry_after`,
   `autopilot_decisions`, `autopilot_last_action`, `rate_samples` with
   `DashMap<InfoHash, V>`. Avoids the global write lock when adding or
   removing a torrent.
@@ -172,11 +172,11 @@ connection attempts, and peer workers. Engines request slots from it; queue
 reconciliation becomes a function of granted slots, not a function of
 config-string combinations.
 
-The most important property of Phase 4 is that it removes the implicit
-dependency between `max_active_downloads`, `max_peers`, and
-`max_peers_per_torrent`. The current
-`effective_peer_worker_limit(max_peers, max_peers_per_torrent, active)` in
-`crates/swarmotterd/src/daemon.rs:2875-2891` divides a global cap by the
-active-download count, which starves a wide library even when there is no
-real contention. Phase 4 replaces this with a single per-resource
-"requested / granted / waiters" model that all engines and seeders share.
+The process-wide peer resource no longer has an implicit dependency between
+`max_active_downloads`, `max_peers`, and `max_peers_per_torrent`.
+`DaemonRuntime` owns one global permit pool and one retained pool per torrent;
+metadata, serial, parallel, endgame, and inbound seeding sessions satisfy both
+applicable limits for their complete lifetime (ADR-0053). Engine worker counts
+remain per-torrent scheduling pressure, while the permit diagnostics are the
+connection authority. Future scheduler work should compose with these pools
+rather than reintroducing active-download division.

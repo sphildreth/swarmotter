@@ -29,6 +29,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+use swarmotter_core::hash::{TorrentIdentity, TorrentKey};
 use swarmotter_core::meta::{
     build_single_file_torrent, build_single_file_torrent_with_webseeds, parse_torrent,
 };
@@ -244,7 +245,7 @@ async fn accept_plain_or_mse(
     }
     let encrypted = tokio::time::timeout(
         Duration::from_secs(10),
-        swarmotter_core::mse::accept(stream, info_hash),
+        swarmotter_core::mse::accept(stream, info_hash.into()),
     )
     .await??;
     Ok(Box::new(encrypted))
@@ -821,7 +822,8 @@ async fn local_swarm_downloads_from_seed_via_udp_tracker() {
 /// contained network path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_swarm_seeds_completed_download_to_leecher() {
-    use swarmotterd::seeder::Seeder;
+    use swarmotterd::peer_permits::{PeerPermitPool, PeerSessionBudget};
+    use swarmotterd::seeder::{SeedRegistration, SeedRegistry, SeederHub};
 
     let mut content = Vec::with_capacity(32 * 1024 + 5);
     for i in 0..32 * 1024 + 5 {
@@ -865,15 +867,33 @@ async fn local_swarm_seeds_completed_download_to_leecher() {
     drop(probe);
 
     let binder = Arc::new(LoopbackBinder);
+    let global_peer_permits = PeerPermitPool::unlimited();
+    let peer_session_budget =
+        PeerSessionBudget::new(global_peer_permits.clone(), PeerPermitPool::unlimited());
+    let registry = SeedRegistry::default();
+    let (torrent_shutdown_tx, torrent_shutdown_rx) = tokio::sync::watch::channel(false);
+    registry
+        .register(SeedRegistration::new(
+            meta.clone(),
+            seed_storage.clone(),
+            None,
+            seed_state.clone(),
+            peer_id(b"-SD0010-"),
+            swarmotter_core::bandwidth::RateLimiter::unlimited(),
+            None,
+            peer_session_budget,
+            torrent_shutdown_rx,
+        ))
+        .await
+        .unwrap();
     let (seeder_shutdown_tx, seeder_shutdown_rx) = tokio::sync::watch::channel(false);
-    let seeder = Seeder::new(
-        meta.clone(),
-        seed_storage.clone(),
-        seed_state.clone(),
+    let seeder = SeederHub::new(
+        registry,
         binder.clone(),
         port,
-        peer_id(b"-SD0010-"),
+        swarmotter_core::config::PeerEncryptionMode::Preferred,
         seeder_shutdown_rx,
+        global_peer_permits,
     );
     let seeder_task = tokio::spawn(async move { seeder.run().await });
     let seed_peer_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -927,6 +947,7 @@ async fn local_swarm_seeds_completed_download_to_leecher() {
     assert_eq!(written, content, "leecher content mismatches seed content");
 
     // Shutdown the seeder.
+    let _ = torrent_shutdown_tx.send(true);
     let _ = seeder_shutdown_tx.send(true);
     let _ = seeder_task.await;
     std::fs::remove_dir_all(&seed_dir).ok();
@@ -1017,7 +1038,7 @@ async fn local_swarm_endgame_completes_from_near_complete_state() {
         })
         .collect();
     let resume = swarmotter_core::storage::io::build_resume(
-        meta.info_hash,
+        TorrentKey::v1(meta.info_hash),
         meta.name.clone(),
         bf,
         piece_count,
@@ -1375,13 +1396,13 @@ fn pick_port() -> u16 {
     listener.local_addr().unwrap().port()
 }
 
-/// BEP 9 magnet end-to-end: a magnet link (info hash + trackers) is added to
-/// the engine with no real metadata. The engine announces to the trackers,
-/// retries after an incompatible metadata peer, discovers a seed peer from the
-/// next announce, fetches the `info` dict via ut_metadata, verifies the info
-/// hash, then downloads the real content from the same seed.
+/// BEP 9 magnet end-to-end: a metadata-only preview first resolves a magnet
+/// through a direct contained peer without payload work; a normal run then
+/// announces to trackers, retries after an incompatible metadata peer,
+/// discovers a seed peer, verifies the `info` dict, and downloads the lawful
+/// generated content.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn local_swarm_magnet_fetches_metadata_then_downloads() {
+async fn local_swarm_magnet_preview_fetches_metadata_without_payload_then_downloads() {
     use swarmotter_core::extensions;
     use swarmotter_core::magnet::Magnet;
 
@@ -1448,14 +1469,58 @@ async fn local_swarm_magnet_fetches_metadata_then_downloads() {
 
     // Build the magnet link from the real info hash + tracker.
     let magnet = Magnet {
-        info_hash,
+        identity: TorrentIdentity::v1(info_hash),
         display_name: Some("magnet.bin".into()),
         trackers: vec![tracker_url],
         exact_length: None,
         webseeds: vec![],
+        select_only_file_indices: Vec::new(),
+        direct_peers: Vec::new(),
         raw: format!("magnet:?xt=urn:btih:{}", info_hash.to_hex()),
     };
     let magnet_uri = magnet.to_uri();
+
+    // A preview resolves metadata through the same contained direct-peer
+    // path, but it must return before creating a payload layout, announcing
+    // to a tracker, or scheduling a single piece. Use no tracker here so a
+    // recorded announce would be an unambiguous regression.
+    let preview_dir = unique_dir("magnet-preview-metadata-only");
+    std::fs::remove_dir_all(&preview_dir).unwrap();
+    let preview_state = Arc::new(Mutex::new(EngineState::default()));
+    let (_preview_cmd_tx, preview_cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
+    let preview_engine = TorrentEngine::with_limiter(
+        meta.clone(),
+        preview_dir.clone(),
+        peer_id(b"-SW009P-"),
+        Arc::new(LoopbackBinder),
+        preview_state,
+        preview_cmd_rx,
+        vec![seed_peer],
+        6881,
+        swarmotter_core::bandwidth::RateLimiter::unlimited(),
+        Some(swarmotterd::engine::MagnetParams {
+            identity: magnet.identity.clone(),
+            info_hash,
+            wire_info_hash: info_hash.into(),
+            name: "magnet.bin".into(),
+            trackers: Vec::new(),
+            select_only_file_indices: Vec::new(),
+        }),
+    )
+    .with_metadata_only();
+    let preview_final = tokio::time::timeout(Duration::from_secs(20), preview_engine.run())
+        .await
+        .expect("metadata-only magnet preview did not finish")
+        .expect("metadata-only magnet preview failed");
+    assert!(preview_final.resolved_meta.is_some());
+    assert!(!preview_final.finished);
+    assert_eq!(preview_final.pieces_have.count(meta.piece_count()), 0);
+    assert!(preview_final.tracker_announces.is_empty());
+    assert!(preview_final.last_announce.is_none());
+    assert!(
+        !preview_dir.exists(),
+        "metadata-only preview must not create payload storage"
+    );
 
     let dir = unique_dir("magnet");
     let binder = Arc::new(LoopbackBinder);
@@ -1473,9 +1538,12 @@ async fn local_swarm_magnet_fetches_metadata_then_downloads() {
         6881,
         swarmotter_core::bandwidth::RateLimiter::unlimited(),
         Some(swarmotterd::engine::MagnetParams {
+            identity: magnet.identity.clone(),
             info_hash,
+            wire_info_hash: info_hash.into(),
             name: "magnet.bin".into(),
             trackers: magnet.trackers.clone(),
+            select_only_file_indices: Vec::new(),
         }),
     );
     let _ = magnet_uri;
@@ -1956,11 +2024,23 @@ async fn serve_bittorrent_over_stream(
     }
 }
 
-/// Local swarm uTP download: a uTP-capable seed serves a generated payload, and
-/// the SwarmOtter engine downloads it over the contained uTP transport (uTP
-/// preferred, TCP fallback disabled by config), verifying every piece and the
-/// final file contents. All traffic goes through the `LoopbackBinder`'s
-/// contained UDP socket; no uncontrolled UDP sockets are created.
+/// Serve the same generated swarm fixture after negotiating MSE/PE over the
+/// already-established contained uTP byte stream. The MSE layer wraps the
+/// stream; it does not create a TCP or UDP socket of its own.
+async fn serve_encrypted_bittorrent_over_utp_stream(
+    stream: Box<dyn swarmotter_core::utp::PeerDuplex>,
+    seed: &UtpSeedPeer,
+) -> swarmotter_core::Result<()> {
+    let encrypted = swarmotter_core::mse::accept(stream, seed.info_hash.into()).await?;
+    serve_bittorrent_over_stream(Box::new(encrypted), seed).await
+}
+
+/// Local swarm plaintext-uTP download: a uTP-capable seed serves a generated
+/// payload, and the SwarmOtter engine downloads it over the contained uTP
+/// transport (uTP preferred, TCP fallback disabled by config), verifying every
+/// piece and the final file contents. All traffic goes through the
+/// `LoopbackBinder`'s contained UDP socket; no uncontrolled UDP sockets are
+/// created.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_swarm_downloads_from_seed_via_utp() {
     let mut content = Vec::with_capacity(32 * 1024 + 9);
@@ -2019,8 +2099,9 @@ async fn local_swarm_downloads_from_seed_via_utp() {
     let state = Arc::new(Mutex::new(EngineState::default()));
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let seed_peer = PeerAddr::from_socket_addr(seed_addr);
-    // uTP preferred (utp_prefer_tcp = false), uTP enabled. TCP fallback remains
-    // available but should not be needed since the seed speaks uTP.
+    // uTP preferred (utp_prefer_tcp = false), uTP enabled. This fixture serves
+    // plaintext peer-wire, so disable MSE/PE explicitly; encrypted uTP is
+    // covered by the required-encryption fixture below.
     let engine = TorrentEngine::new(
         meta.clone(),
         dir.clone(),
@@ -2031,7 +2112,8 @@ async fn local_swarm_downloads_from_seed_via_utp() {
         vec![seed_peer],
         6881,
     )
-    .with_transport(true, false);
+    .with_transport(true, false)
+    .with_encryption_mode(swarmotter_core::config::PeerEncryptionMode::Disabled);
 
     let final_state = tokio::time::timeout(Duration::from_secs(60), engine.run())
         .await
@@ -2050,6 +2132,95 @@ async fn local_swarm_downloads_from_seed_via_utp() {
     assert_eq!(
         written, content,
         "uTP downloaded content mismatches original"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Required MSE/PE mode succeeds over uTP without opening a TCP fallback.
+/// Both the connection setup and the encrypted peer-wire bytes remain on the
+/// LoopbackBinder-provided contained UDP sockets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn local_swarm_downloads_from_encrypted_seed_via_utp_when_required() {
+    let mut content = Vec::with_capacity(16 * 1024 + 17);
+    for i in 0..16 * 1024 + 17 {
+        content.push((i % 239) as u8);
+    }
+    let piece_length: u64 = 8 * 1024;
+    let torrent_bytes =
+        build_single_file_torrent("encrypted-utp.bin", &content, piece_length, None, false);
+    let meta = parse_torrent(&torrent_bytes).unwrap();
+
+    let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+    use swarmotter_core::net::NetworkBinder;
+    let seed_sock = binder.udp_socket().await.unwrap();
+    let seed_addr = seed_sock.local_addr().unwrap();
+    let seed_sock: std::sync::Arc<dyn swarmotter_core::net::ContainedUdpSocket> = seed_sock.into();
+
+    let content_clone = content.clone();
+    let meta_clone = meta.clone();
+    let seed_sock_clone = seed_sock.clone();
+    tokio::spawn(async move {
+        use swarmotter_core::utp::{UtpConnection, UtpHeader, UtpStream, UtpType};
+        let mut buf = vec![0u8; 2048];
+        let (from, n) = match seed_sock_clone.recv_from(&mut buf).await {
+            Ok(packet) => packet,
+            Err(_) => return,
+        };
+        let (syn, _payload) = match UtpHeader::decode(&buf[..n]) {
+            Ok(packet) => packet,
+            Err(_) => return,
+        };
+        if syn.typ != UtpType::Syn {
+            return;
+        }
+        let conn = match UtpConnection::accept_from_syn(seed_sock_clone, from, &syn).await {
+            Ok(connection) => connection,
+            Err(_) => return,
+        };
+        let seed = UtpSeedPeer {
+            content: content_clone,
+            info_hash: meta_clone.info_hash,
+            meta: meta_clone,
+            peer_id: peer_id(b"-SDEUTP-"),
+        };
+        let _ = serve_encrypted_bittorrent_over_utp_stream(Box::new(UtpStream::spawn(conn)), &seed)
+            .await;
+    });
+
+    let dir = unique_dir("encrypted-utp-download");
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
+    let engine = TorrentEngine::new(
+        meta.clone(),
+        dir.clone(),
+        peer_id(b"-SWEUTP-"),
+        binder,
+        state,
+        cmd_rx,
+        vec![PeerAddr::from_socket_addr(seed_addr)],
+        6881,
+    )
+    .with_transport(true, false)
+    .with_encryption_mode(swarmotter_core::config::PeerEncryptionMode::Required);
+
+    let final_state = tokio::time::timeout(Duration::from_secs(60), engine.run())
+        .await
+        .expect("encrypted uTP engine did not finish in time")
+        .expect("encrypted uTP engine error");
+
+    assert!(
+        final_state.finished,
+        "required encrypted uTP download did not complete"
+    );
+    assert_eq!(
+        final_state.pieces_have.count(meta.piece_count()),
+        meta.piece_count(),
+        "required encrypted uTP download did not verify all pieces"
+    );
+    let storage = StorageIo::new(meta, dir.clone());
+    assert_eq!(
+        std::fs::read(storage.file_path(0).unwrap()).unwrap(),
+        content
     );
     std::fs::remove_dir_all(&dir).ok();
 }

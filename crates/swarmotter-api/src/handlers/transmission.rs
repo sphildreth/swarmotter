@@ -17,7 +17,7 @@ use serde_json::{json, Map, Value};
 use swarmotter_core::bandwidth::TorrentBandwidth;
 use swarmotter_core::config::Config;
 use swarmotter_core::error::CoreError;
-use swarmotter_core::hash::InfoHash;
+use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::models::peer::{Peer, PeerDirection};
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{TrackerInfo, TrackerStatus};
@@ -493,12 +493,29 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
     let args = request.args();
     let download_dir = string_arg(&args, &["download_dir", "download-dir"]);
     let labels = string_array_arg(&args, &["labels"]).unwrap_or_default();
-    let paused = bool_arg(&args, &["paused"]).unwrap_or(false);
-    let add_options = AddTorrentOptions::new(download_dir.clone(), paused);
+    let profile = optional_profile_arg(&args)?.unwrap_or(None);
+    let paused = bool_arg(&args, &["paused"]);
+    // Transmission omits `paused` when it delegates initial admission to the
+    // daemon. Preserve that distinction so a label-mapped profile can decide
+    // whether this new torrent starts; an explicit boolean remains
+    // authoritative.
+    let add_options = AddTorrentOptions::request(
+        download_dir.clone(),
+        paused.unwrap_or(false),
+        paused.is_some(),
+        profile,
+        // Labels must be present during registration so a label-mapped profile
+        // can capture its storage paths before any payload is created.
+        labels.clone(),
+    );
 
     let add_result = if let Some(metainfo) = string_arg(&args, &["metainfo"]) {
-        let bytes = decode_base64(&metainfo)
-            .ok_or_else(|| RpcFailure::invalid("metainfo must be valid base64"))?;
+        let bytes = super::torrents::decode_torrent_metainfo_base64(&metainfo).map_err(
+            |error| match error {
+                CoreError::InvalidArgument(message) => RpcFailure::invalid(message),
+                error => RpcFailure::from_core(error),
+            },
+        )?;
         state
             .daemon
             .add_torrent_file(bytes, add_options.clone())
@@ -513,12 +530,12 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
             return Err(RpcFailure::invalid(
                 "remote torrent URL fetching is not supported by the compatibility adapter",
             ));
-        } else if filename.len() == 40 && filename.chars().all(|c| c.is_ascii_hexdigit()) {
-            let magnet = format!("magnet:?xt=urn:btih:{filename}");
+        } else if let Ok(key) = TorrentKey::from_locator(&filename) {
+            let magnet = magnet_for_key(key, None);
             state.daemon.add_magnet(&magnet, add_options.clone()).await
         } else {
             return Err(RpcFailure::invalid(
-                "filename must be a magnet link; use metainfo for torrent file bytes",
+                "filename must be a magnet link or a 40/64-character torrent locator; use metainfo for torrent file bytes",
             ));
         }
     } else {
@@ -530,13 +547,16 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
     let (hash, duplicate) = match add_result {
         Ok(hash) => (hash, false),
         Err(CoreError::DuplicateTorrent(hash)) => (
-            InfoHash::from_hex(&hash).map_err(RpcFailure::from_core)?,
+            TorrentKey::from_locator(&hash).map_err(RpcFailure::from_core)?,
             true,
         ),
         Err(error) => return Err(RpcFailure::from_core(error)),
     };
 
-    if !labels.is_empty() {
+    // A duplicate keeps its existing labels; preserve the historical adapter
+    // behavior by applying the supplied labels only in that case. New torrents
+    // already received them before profile resolution above.
+    if duplicate && !labels.is_empty() {
         state
             .daemon
             .set_labels(&hash, labels)
@@ -554,8 +574,14 @@ async fn torrent_add(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
     let object = json!({
         "id": id,
         "name": summary.name,
-        "hash_string": summary.info_hash.to_hex(),
-        "hashString": summary.info_hash.to_hex(),
+        "hash_string": summary.info_hash.to_locator(),
+        "hashString": summary.info_hash.to_locator(),
+        "status": transmission_status(summary.state),
+        "download_dir": summary.download_dir.clone().unwrap_or_default(),
+        "downloadDir": summary.download_dir.clone().unwrap_or_default(),
+        "percent_done": clamped_progress(&summary),
+        "percentDone": clamped_progress(&summary),
+        "labels": summary.labels,
     });
     let mut out = Map::new();
     let key = if duplicate {
@@ -627,6 +653,7 @@ async fn torrent_action(
 
 async fn torrent_set(state: &SharedState, request: &RpcRequest) -> RpcResult<Value> {
     let args = request.args();
+    let profile = optional_profile_arg(&args)?;
     let summaries = selected_summaries(state, &args).await?;
     for summary in summaries {
         let hash = summary.info_hash;
@@ -634,6 +661,13 @@ async fn torrent_set(state: &SharedState, request: &RpcRequest) -> RpcResult<Val
             state
                 .daemon
                 .set_labels(&hash, labels)
+                .await
+                .map_err(RpcFailure::from_core)?;
+        }
+        if let Some(profile) = profile.clone() {
+            state
+                .daemon
+                .set_torrent_profile(&hash, profile)
                 .await
                 .map_err(RpcFailure::from_core)?;
         }
@@ -741,11 +775,13 @@ async fn port_test(state: &SharedState, request: &RpcRequest) -> RpcResult<Value
     let args = request.args();
     let ip_protocol = string_arg(&args, &["ip_protocol", "ip-protocol"]);
     let health = state.daemon.network_health().await;
+    let port_test = state.daemon.run_port_test().await;
     Ok(json!({
-        "port_is_open": false,
+        "port_is_open": port_test.state.is_open(),
         "ip_protocol": ip_protocol.unwrap_or_else(|| {
             if health.allow_ipv6 { "ipv6".into() } else { "ipv4".into() }
         }),
+        "port_test_state": port_test.state,
     }))
 }
 
@@ -789,7 +825,10 @@ async fn selected_summaries(state: &SharedState, args: &Value) -> RpcResult<Vec<
             }
             continue;
         }
-        if let Some(hash) = value.as_str().and_then(|s| InfoHash::from_hex(s).ok()) {
+        if let Some(hash) = value
+            .as_str()
+            .and_then(|s| TorrentKey::from_locator(s).ok())
+        {
             hashes.push(hash);
         }
     }
@@ -827,6 +866,41 @@ fn ids_is_recently_active(args: &Value) -> bool {
         .and_then(Value::as_str)
         .map(is_recently_active_selector)
         .unwrap_or(false)
+}
+
+/// Construct a canonical magnet without ever representing a pure-v2 torrent
+/// as a lossy 20-byte v1-style hash. Compatibility APIs expose the same full
+/// identity rules as native routes: v1 is `btih`, v2 is BEP 52 `btmh`, and a
+/// hybrid may carry both exact topics.
+fn magnet_for_key(key: TorrentKey, name: Option<&str>) -> String {
+    let topic = match key {
+        TorrentKey::V1(v1) => format!("xt=urn:btih:{v1}"),
+        TorrentKey::V2(v2) => format!("xt=urn:btmh:{}", v2.to_magnet_multihash()),
+    };
+    append_magnet_name(format!("magnet:?{topic}"), name)
+}
+
+fn magnet_for_summary(summary: &TorrentSummary) -> String {
+    let mut topics = Vec::with_capacity(2);
+    if let Some(v1) = summary.identity.v1_info_hash() {
+        topics.push(format!("xt=urn:btih:{v1}"));
+    }
+    if let Some(v2) = summary.identity.v2_info_hash() {
+        topics.push(format!("xt=urn:btmh:{}", v2.to_magnet_multihash()));
+    }
+    if topics.is_empty() {
+        return magnet_for_key(summary.info_hash, Some(&summary.name));
+    }
+    append_magnet_name(format!("magnet:?{}", topics.join("&")), Some(&summary.name))
+}
+
+fn append_magnet_name(mut magnet: String, name: Option<&str>) -> String {
+    if let Some(name) = name.filter(|name| !name.is_empty()) {
+        let encoded = url::form_urlencoded::byte_serialize(name.as_bytes()).collect::<String>();
+        magnet.push_str("&dn=");
+        magnet.push_str(&encoded);
+    }
+    magnet
 }
 
 fn is_recently_active_selector(s: &str) -> bool {
@@ -892,7 +966,7 @@ fn torrent_field_value(
     match normalize_key(field).as_str() {
         "id" => json!(id),
         "name" => json!(summary.name),
-        "hash_string" => json!(summary.info_hash.to_hex()),
+        "hash_string" => json!(summary.info_hash.to_locator()),
         "status" => json!(transmission_status(summary.state)),
         "total_size" => json!(summary.total_length),
         "percent_done" | "percent_complete" => json!(clamped_progress(summary)),
@@ -920,9 +994,12 @@ fn torrent_field_value(
         "is_stalled" => json!(summary.state.is_error()),
         "error" => json!(if summary.state.is_error() { 1 } else { 0 }),
         "error_string" => json!(if summary.state.is_error() {
-            summary.state.as_str()
+            summary
+                .error
+                .clone()
+                .unwrap_or_else(|| summary.state.as_str().into())
         } else {
-            ""
+            String::new()
         }),
         "labels" => json!(summary.labels),
         "download_dir" => json!(summary.download_dir.clone().unwrap_or_default()),
@@ -933,11 +1010,7 @@ fn torrent_field_value(
         "honors_session_limits" => json!(true),
         "bandwidth_priority" => json!(0),
         "queue_position" => json!(summary.queue_position.unwrap_or(0)),
-        "magnet_link" => json!(format!(
-            "magnet:?xt=urn:btih:{}&dn={}",
-            summary.info_hash.to_hex(),
-            summary.name
-        )),
+        "magnet_link" => json!(magnet_for_summary(summary)),
         "files" => json!(torrent_files(ctx.files.as_deref().unwrap_or(&[]))),
         "file_stats" => json!(torrent_file_stats(ctx.files.as_deref().unwrap_or(&[]))),
         "priorities" => json!(ctx
@@ -1117,7 +1190,7 @@ fn tracker_list(trackers: &[TrackerInfo]) -> String {
     out
 }
 
-async fn apply_file_args(state: &SharedState, hash: &InfoHash, args: &Value) -> RpcResult<()> {
+async fn apply_file_args(state: &SharedState, hash: &TorrentKey, args: &Value) -> RpcResult<()> {
     if let Some(indices) =
         indices_arg_with_all(state, hash, args, &["files_wanted", "files-wanted"]).await?
     {
@@ -1155,7 +1228,7 @@ async fn apply_file_args(state: &SharedState, hash: &InfoHash, args: &Value) -> 
     Ok(())
 }
 
-async fn apply_tracker_args(state: &SharedState, hash: &InfoHash, args: &Value) -> RpcResult<()> {
+async fn apply_tracker_args(state: &SharedState, hash: &TorrentKey, args: &Value) -> RpcResult<()> {
     if let Some(urls) = string_array_arg(args, &["tracker_add", "tracker-add"]) {
         for url in urls {
             state
@@ -1206,7 +1279,7 @@ async fn apply_tracker_args(state: &SharedState, hash: &InfoHash, args: &Value) 
 
 async fn indices_arg_with_all(
     state: &SharedState,
-    hash: &InfoHash,
+    hash: &TorrentKey,
     args: &Value,
     keys: &[&str],
 ) -> RpcResult<Option<Vec<usize>>> {
@@ -1331,6 +1404,25 @@ fn string_array_arg(args: &Value, keys: &[&str]) -> Option<Vec<String>> {
                 .collect()
         })
     })
+}
+
+/// Distinguish an omitted compatibility extension from an explicit `null`,
+/// which clears a previously assigned native profile.
+fn optional_profile_arg(args: &Value) -> RpcResult<Option<Option<String>>> {
+    let Some(value) = value_arg(args, &["profile"]) else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(Some(None));
+    }
+    let Some(profile) = value.as_str() else {
+        return Err(RpcFailure::invalid("profile must be a string or null"));
+    };
+    let profile = profile.trim();
+    if profile.is_empty() {
+        return Err(RpcFailure::invalid("profile must not be empty when set"));
+    }
+    Ok(Some(Some(profile.to_string())))
 }
 
 fn default_session_fields(request: &RpcRequest, fields: &[&str]) -> Vec<String> {
@@ -1471,6 +1563,22 @@ mod tests {
     }
 
     #[test]
+    fn pure_v2_locator_produces_btmh_magnet_without_v1_truncation() {
+        let key = TorrentKey::v2(swarmotter_core::hash::V2InfoHash::from_bytes([0x5a; 32]));
+
+        let magnet = magnet_for_key(key, Some("lawful release"));
+
+        assert_eq!(
+            magnet,
+            format!(
+                "magnet:?xt=urn:btmh:1220{}&dn=lawful+release",
+                "5a".repeat(32)
+            )
+        );
+        assert!(!magnet.contains("btih"));
+    }
+
+    #[test]
     fn tracker_stats_use_last_message_for_successful_announces() {
         let rows = torrent_tracker_stats(&[TrackerInfo {
             id: swarmotter_core::models::tracker::TrackerId("http://tracker.example".into()),
@@ -1485,6 +1593,12 @@ mod tests {
             last_message: Some("announce returned 12 peers".into()),
             next_announce: None,
             last_announce: Some(1234),
+            scrape_status: swarmotter_core::models::tracker::TrackerScrapeStatus::NotContacted,
+            last_scrape: None,
+            scrape_seeders: None,
+            scrape_leechers: None,
+            scrape_downloads: None,
+            last_scrape_error: None,
         }]);
 
         assert_eq!(rows[0]["seeder_count"], json!(42));

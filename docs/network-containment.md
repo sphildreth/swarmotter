@@ -9,7 +9,7 @@ It applies to torrent-related traffic:
 - DHT UDP.
 - PEX-discovered peers.
 - UDP tracker announces.
-- HTTP and HTTPS tracker announces.
+- HTTP and HTTPS tracker announces and supported scrape.
 - Webseeds.
 - Magnet metadata fetching.
 - DNS used by torrent operations.
@@ -60,6 +60,16 @@ When strict containment is enabled and the configured path is unavailable,
 SwarmOtter blocks torrent networking instead of falling back to the default
 route.
 
+Strict mode is the default. Omitting `[network]` does not disable containment:
+it leaves strict mode without an enforceable path and validation fails before
+the control listener or background tasks start. Use explicit disabled mode
+only for local development or a separately enforced boundary:
+
+```toml
+[network]
+mode = "disabled"
+```
+
 ```mermaid
 flowchart TB
     operation["Torrent operation"] --> check{"Required path healthy?"}
@@ -92,6 +102,80 @@ GET /api/v1/network/health
 ```
 
 The Web UI displays the same health state.
+
+## Live gate, recovery intent, and bind failures
+
+One process-wide gate covers binders, engines, trackers, peer sessions,
+webseeds, metadata, DHT, uTP, inbound listeners, and seeders. When a required
+path disappears, the gate blocks before socket-owning tasks are aborted. Every
+block advances the cancellation generation. A task from an older generation
+is therefore cancelled even if recovery follows before it next polls, and a
+connected stream cannot bridge a fail-closed interval. The API/Web UI listener
+is outside this data-plane gate and remains available for diagnostics and
+repair.
+
+HTTP(S) tracker announce/scrape and webseed range reads use one contained
+HTTP/1 codec. Each redirect hop asks the binder to connect to the target host;
+the ordinary contained binder resolves it on the contained path, while an
+enabled SOCKS5 binder keeps the hostname for remote target DNS. TLS wraps only
+that stream. No connector, independent resolver, or pool can open a data-plane
+socket. HTTPS-to-HTTP redirects are rejected, decoded bodies are bounded, and
+exact webseed Range/Content-Range semantics are enforced. UDP scrape is
+unsupported and makes no network call; UDP announce remains contained and
+supported unless SOCKS5 TCP-only mode is enabled.
+
+Only work demonstrably live at the block edge receives durable recovery intent.
+After recovery, SwarmOtter consumes that intent and resumes those downloads,
+metadata fetches, or active seeders. Paused, merely queued, ratio/idle-stopped,
+completed-without-a-live-seeder, and stale blocked records do not start because
+the path recovered.
+
+A source, interface, UDP, or peer-listener bind failure blocks immediately and
+reports `socket_bind_failed`; a generic strict-policy denial reports
+`blocked_fail_closed`. These failures remain latched even if the interface probe
+later reports healthy. To recover, submit an explicit full configuration with
+`PUT /api/v1/settings`. SwarmOtter validates the peer-listener bind and, unless
+SOCKS5 TCP-only mode is enabled, a contained ephemeral UDP bind before clearing
+the latch. If validation or persistence fails, the old configuration remains
+active and traffic stays blocked. A partial settings patch, health tick, or
+torrent resume does not clear the latch.
+
+## SOCKS5 TCP proxy
+
+`[network.socks5]` is an opt-in TCP `CONNECT` layer, not a replacement for the
+configured containment path. The daemon uses the contained binder to resolve
+and connect to the proxy itself. TCP peer IP addresses use SOCKS IP-address
+requests; HTTP(S) tracker, scrape, and webseed hostnames use SOCKS domain
+requests so target DNS happens at the proxy. If a proxy connection or handshake
+fails, the target is not retried directly.
+
+SOCKS5 no-authentication and RFC 1929 username/password authentication are
+supported. The password is redacted from Settings reads and update results. A
+blank password in a full Settings save retains the stored value only when the
+username is unchanged.
+
+The supported proxy mode is deliberately TCP-only. Enabling it requires:
+
+```toml
+[network.socks5]
+enabled = true
+host = "proxy.example"
+
+[torrent]
+utp_enabled = false
+
+[dht]
+enabled = false
+```
+
+The proxy binder blocks UDP sockets and direct target resolution, so UDP
+tracker, DHT, and uTP traffic cannot silently escape outside the proxy. SOCKS5
+UDP ASSOCIATE and proxy-provided inbound forwarding are not implemented. Peer
+listeners remain bound to the configured contained path. NAT-PMP/UPnP mapping
+uses the same containment boundary directly for local router traffic; it is not
+a proxy or torrent-egress fallback. Network diagnostics expose only the
+`socks5_enabled` and `socks5_udp_blocked` state, never proxy host or
+credentials.
 
 ## Dynamic interface binding
 
@@ -148,3 +232,25 @@ Use one of these patterns:
 | `dns_not_constrained` | DNS validation was requested but could not be proven safe. |
 | `network_namespace_unavailable` | The daemon is not in the required namespace. |
 | `blocked_fail_closed` | Strict containment blocked traffic. |
+
+## Privileged local acceptance test
+
+Build and invoke the harness as your normal user. It requests sudo internally
+only for `ip` namespace/link operations:
+
+```bash
+cargo build --locked -p swarmotterd
+scripts/test-network-containment-transition.sh \
+  "$PWD/target/debug/swarmotterd"
+```
+
+The harness uses no external network or default route. It creates two
+PID-qualified namespaces, generates a lawful payload and torrent, and runs a
+compact HTTP tracker plus throttled TCP BitTorrent seed in the peer namespace.
+The raw torrent is registered through the real API and must show partial
+tracker-discovered peer-wire progress. The harness then deletes the daemon veth
+and requires `interface_missing`, `network_blocked`, empty data-plane scheduler
+diagnostics, stable verified bytes, and a responsive `/health` route. The
+tracker, seed, generator, and API clients have no capabilities; SwarmOtter gets
+only `CAP_NET_RAW` for `SO_BINDTODEVICE`. Cleanup removes both namespaces and
+fixture processes.

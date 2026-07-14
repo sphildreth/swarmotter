@@ -52,14 +52,72 @@ including on a configured LAN listener. Every client that can reach such a
 listener can control SwarmOtter, so authenticated mode is strongly recommended
 unless the reachable network is the intended trust boundary.
 
-Browser requests to `/api/v1` must be same-origin: `Origin` must match `Host`,
-and Fetch Metadata marked as cross-site or same-site is rejected. This includes
-WebSocket handshakes. CLI and automation clients that do not send browser origin
-metadata are unaffected. Authenticated reverse proxies must preserve `Host`.
+Browser requests to every control route (`/api/v1`, `/transmission/rpc`, and
+`/api/v2`) must be same-origin, except for the authenticated Chrome extension
+client described below. An Origin-bearing request must provide exactly one
+valid UTF-8 `Origin` and `Host`; an ordinary browser Origin must be only
+`scheme://authority`, its normalized host and explicit port must match Host, and
+it may not contain user information, a path, query, or fragment. `Origin: null`,
+opaque, foreign, malformed, duplicate, multi-value, and invalid-byte headers are
+rejected. Scheme is intentionally not compared, so a TLS-terminating reverse
+proxy is supported when it preserves the public Host authority.
+
+`Sec-Fetch-Site` permits only `same-origin`, `none`, or an absent header.
+`same-site`, `cross-site`, unknown, duplicated, and invalid-byte values are
+rejected. This includes WebSocket and SSE requests. The shared
+`browser_origin_guard` is the outermost control-route layer, before native
+authentication, Transmission session negotiation, qBittorrent SID handling,
+compatibility-enabled checks, request extraction, and daemon operations. The
+same-origin and headerless-client policy is identical whether
+`api.require_auth` is true or false. CLI and automation clients with neither
+Origin nor `Sec-Fetch-Site` are unaffected.
+
+A Chrome Manifest V3 extension service worker with host permission sends an
+Origin such as `chrome-extension://abcdefghijklmnopabcdefghijklmnop`; Chromium
+uses `Sec-Fetch-Site: none` for this privileged request. SwarmOtter accepts this
+cross-origin shape only when all of these conditions hold:
+
+- the Origin contains exactly one valid Chrome extension ID: 32 lowercase
+  characters from `a` through `p`, with no port, path, query, or fragment;
+- `Host` is one valid authority and Fetch Metadata is otherwise permitted;
+- `api.require_auth = true`; and
+- exactly one `Authorization: Bearer <token>` or `X-SwarmOtter-Auth: <token>`
+  value matches `api.auth_token`.
+
+Auth-disabled mode always rejects extension Origins, even if an `auth_token`
+value is present. A valid token never permits a foreign HTTP(S), `null`, opaque,
+or malformed Origin. This is token-authenticated extension access, not a broad
+extension-origin allowlist.
+
+An origin rejection always uses HTTP 403 but preserves the selected surface's
+error format: the native API returns its JSON error envelope with
+`cross_origin_forbidden` or the extension-specific
+`extension_origin_forbidden`, Transmission returns a JSON `error` object, and
+qBittorrent returns plain-text `Forbidden`. The native extension error explains
+that authenticated mode and a valid configured token are required. Rejections
+are never redirected to the Web UI.
 
 API request bodies are capped by `api.max_request_body_bytes`; this applies to
 JSON requests and raw `.torrent` uploads. The root `/health` alias remains a
 control-plane health endpoint outside `/api/v1`.
+
+Bencoded torrent metadata (`.torrent` uploads, bulk base64 `metainfo`, magnet
+`info` dicts fetched via BEP 9, and watch-folder files) is additionally bounded
+by a shared 16 MiB limit (`MAX_TORRENT_METADATA_BYTES`) enforced by the core
+parser before any piece-sized allocation. A `.torrent` body or assembled magnet
+`info` dict that exceeds the metadata limit is rejected with
+`malformed_torrent` (or `bencode_error` for raw decoder overruns). Raw torrent
+uploads are streamed and stop at the lower of the configured request limit and
+16 MiB: when `api.max_request_body_bytes` is lower, crossing that configured
+limit returns HTTP 413 with `payload_too_large` before the metadata-specific
+error. Bulk and Transmission base64 metainfo decoding stops before decoded
+output can exceed 16 MiB.
+
+Restored daemon state uses a versioned local SQLite store, not bencode. A
+validated legacy JSON state document migrates in place on its first successful
+save. Restored metainfo, including retained canonical raw `info` bytes when
+available, must pass `TorrentMeta::validate()` before runtime use. See
+ADR-0050 and ADR-0067.
 
 ## Health, version, and stats
 
@@ -80,6 +138,20 @@ retry-backoff counts, active queue limits, peer-worker budget fields, and
 boolean saturation flags for download slots, metadata fetch slots, and peer
 worker budget.
 
+The authoritative process-wide peer-session fields are:
+
+- `peer_limit`: configured process-wide limit; `0` means unlimited.
+- `peer_permits_in_use`: observed live inbound plus outbound peer sessions.
+- `peer_permits_available`: remaining bounded capacity, or `null` when
+  unlimited.
+- `peer_sessions_denied`: inbound sockets rejected by the global or routed
+  per-torrent cap before a session starts.
+
+The older `peer_worker_global_limit`, `peer_worker_per_torrent_limit`,
+`effective_peer_worker_limit`, `peer_worker_budget`, and saturation values are
+retained compatibility diagnostics for engine worker scheduling. They are not
+the process-wide connection-limit authority.
+
 ## Torrent management
 
 | Method | Path | Description |
@@ -87,10 +159,11 @@ worker budget.
 | GET | `/torrents` | List torrents. |
 | GET | `/torrents/query` | Query torrents with server-side filters, sorting, pagination, counts, and optional grouping. |
 | POST | `/torrents` | Add magnet JSON or raw `.torrent` body. |
-| POST | `/torrents/magnet` | Add magnet JSON: `{ magnet, download_dir?, paused?, start_behavior? }`. |
-| POST | `/torrents/file` | Upload raw `.torrent` body. |
+| POST | `/torrents/magnet` | Add magnet JSON with storage, profile, preview, file-selection, structured exclusion, and active-file-suffix options. |
+| POST | `/torrents/file` | Upload raw `.torrent` body; query supports start, profile, label, preview, selection, active-root, and partial-suffix options. |
 | POST | `/torrents/bulk` | Add multiple magnets and/or base64 `.torrent` payloads. |
 | GET | `/torrents/:hash` | Torrent details. |
+| GET | `/torrents/:hash/metainfo` | Return the retained, byte-exact original `.torrent` document when one exists. |
 | GET | `/torrents/:hash/stats` | Per-torrent counters and live engine diagnostics. |
 | DELETE | `/torrents/:hash?delete_data=bool` | Remove torrent, optionally deleting data. |
 | POST | `/torrents/remove` | Remove multiple torrents: `{ info_hashes, delete_data? }`. |
@@ -103,6 +176,58 @@ worker budget.
 | POST | `/torrents/:hash/move` | Move data: `{ path }`. |
 | POST | `/torrents/:hash/labels` | Set labels: `{ labels }`. |
 | POST | `/torrents/:hash/limits` | Set per-torrent bandwidth limits: `{ download_limit, upload_limit }`, bytes/sec, `0` = unlimited. |
+| PUT | `/torrents/:hash/seeding` | Replace the persisted per-torrent ratio/idle/forever policy. |
+| GET | `/torrents/:hash/policy` | Effective profile values plus the source of every value. |
+| PUT | `/torrents/:hash/policy` | Set/clear explicit profile: `{ profile: "name" }` or `{ profile: null }`. |
+| POST | `/torrents/:hash/storage-preview` | Read-only path proposal: `{ download_dir?, incomplete_dir?, profile? }`. |
+
+Torrent list/detail rows include nullable `error`, `uploaded`, `ratio`,
+`seeding`, `seeding_status`, `effective_ratio_limit`, and
+`effective_idle_limit`. `error` retains the last terminal/runtime failure for
+operator diagnosis and is `null` after a successful retry or lifecycle action
+that clears it. The persisted `seeding` object has nullable `ratio_limit` and
+`idle_limit` fields plus `seed_forever`. Nullable targets inherit `[seeding]`
+globals; explicit zero is an immediate target. `seed_forever: true` makes both
+effective fields `null` without erasing stored overrides.
+
+Rows also include an explicit `identity` object with `kind` (`v1`, `v2`, or
+`hybrid`) and the applicable full hash values. `unknown` is retained only for a
+legacy record that predates the additive identity field. The longstanding
+`info_hash` field is now the canonical torrent locator: 40 lowercase hexadecimal
+characters for v1 and hybrid-primary records, or 64 for pure-v2 records. A
+hybrid's full v2 locator is also accepted as an alias for its canonical v1
+record. The 20-byte peer/tracker/DHT wire value is never an API locator.
+
+When every attempted configured tracker fails and no usable DHT, PEX,
+direct-peer, or webseed source exists, the daemon stops the bounded engine
+attempt in `tracker_error` and exposes the last tracker failure in `error`.
+`POST /torrents/:hash/reannounce` or Resume/Start Now clears the terminal error
+and starts a new attempt. A successful tracker response or usable alternative
+source prevents `tracker_error`.
+
+The replacement request requires exactly these keys:
+
+```json
+{
+  "ratio_limit": 1.5,
+  "idle_limit": 1800,
+  "seed_forever": false
+}
+```
+
+`ratio_limit` must be a finite non-negative number or `null`; `idle_limit`
+must be a non-negative integer number of seconds or `null`; and
+`seed_forever` must be boolean. Missing, unknown, negative, non-finite,
+fractional-idle, or numeric-overflow input returns `invalid_argument`. The
+daemon persists before success, then immediately re-evaluates active or
+automatically stopped complete content. It never auto-resumes a manual pause.
+
+`seeding_status` is one of `not_eligible`, `queued`, `active`,
+`stopped_ratio`, `stopped_idle`, or `stopped_manual`. Fully verified queued
+content is `completed` + `queued`; a live registered seeder is `seeding` +
+`active`; automatic stops return to `completed`; and a complete operator pause
+is `paused` + `stopped_manual`. During containment failure the coarse state is
+`network_blocked` and the fine status is preserved for recovery.
 
 Add requests can start paused while still inserting the torrent into queue
 order. For JSON magnet adds, set either `paused: true` or
@@ -113,8 +238,92 @@ provided. If add-time free-space preflight is configured, add requests can fail
 before write with a storage-capacity error when the target root does not meet the
 reserve configured under `[storage]`.
 
+Set `preview: true` to register a metadata-first preview. A `.torrent` preview
+is paused with its parsed file tree available immediately. A magnet preview may
+use the normal contained BEP 9 metadata path, then becomes paused before any
+payload storage, payload announce, or piece request. Resume or Start Now clears
+the durable preview gate and follows the normal queue and containment paths.
+`preview` cannot be combined with an explicit payload-start request.
+`unwanted_file_indices` is a deduplicated selection captured at add time; for
+magnets it is applied only after the real file tree has been validated. The
+effective policy endpoint exposes the stored intake decision. Add JSON and bulk
+requests may additionally supply `file_exclusion_rules`, `incomplete_dir`, and
+`partial_file_suffix`. A structured rule can combine a path glob, filename
+suffix, path segment, and inclusive minimum/maximum byte length; matching files
+remain unwanted. A partial suffix applies only to active files and is removed
+when all files complete. The storage-preview endpoint is read-only: it shows
+the resolved complete and incomplete paths without creating, moving, or opening
+payload files.
+
+SwarmOtter accepts v1, pure-v2, and hybrid BEP 52 magnets and `.torrent` files.
+Pure-v2 records retain their full SHA-256 locator through registration, queue,
+API, durable state, fast resume, and contained peer/tracker/DHT discovery. The
+pure-v2 engine validates the file tree and SHA-256 piece layers before payload
+transfer. Hybrid records preserve both validated identities and use their v1
+compatibility swarm as the canonical registry record. Invalid or incomplete
+v2/hybrid metadata fails with a typed error; it never falls back to a v1 key,
+piece hash, or network path.
+
+`GET /torrents/:hash/metainfo` returns `application/x-bittorrent` bytes only
+when SwarmOtter retained an original full `.torrent` document at local-file or
+watch-folder intake. It never reconstructs an original document from canonical
+`info` bytes, never starts metadata retrieval, and returns an unavailable/not-
+found error for magnet-only or pre-retention records.
+
 Strict fail-closed network blocking can still put the new torrent in
 `network_blocked` instead of `paused`.
+
+## Policy profiles
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/profiles` | Return the complete `{ profiles, labels }` configuration section. |
+| PUT | `/profiles` | Replace the complete `{ profiles, labels }` section after validation. |
+| PUT | `/torrents/:hash/encryption-mode` | Set a durable per-torrent peer-wire encryption override: `{ "encryption_mode": "disabled" \| "preferred" \| "required" }`; `{ "encryption_mode": null }` clears it. |
+
+Add requests may include `profile` and `labels`; labels are applied before
+resolution so a label mapping can select a profile. Bulk add accepts the same
+top-level `profile` and `labels` values for every item. An unknown or empty
+profile is rejected. Compatibility adapters likewise attach their category or
+labels before registration.
+
+`GET /torrents/:hash/policy` returns the selected profile plus each effective
+storage, queue, seeding, bandwidth, peer-encryption, and create-time intake
+value with a
+machine-readable source:
+`global`, `profile`, `label`, `torrent`, `legacy_torrent`,
+`profile_storage_snapshot`, `registration_storage_snapshot`,
+`existing_storage_snapshot`, `initial_admission_snapshot`, or
+`intake_snapshot`. This lets
+clients explain why a value applies without duplicating daemon precedence
+rules. `registration_storage_snapshot` means the resolved storage choice was
+fixed when the torrent was registered; `initial_admission_snapshot` means the
+one-time start-or-paused decision was captured for that torrent, so later
+profile, label, or global edits do not retroactively change its admission.
+The encryption override endpoint requires the `encryption_mode` key: omitting
+it is rejected, while explicit JSON `null` restores normal inheritance.
+
+Resolved storage is captured at registration, including a global/no-profile
+result. Assigning or clearing a profile, or changing labels later, preserves
+the torrent's existing completed and incomplete locations; use
+`POST /torrents/:hash/move` to relocate data. The initial start-or-paused
+decision is captured too, so profile/global auto-start edits cannot revoke a
+new or migrated queued torrent's admission. Queue priority, seeding, and rate
+caps update live while a torrent inherits them. Legacy state is migrated
+transactionally during a profile configuration replacement.
+
+Profile tracker settings use ordered, case-insensitive host glob rules. The
+first matching rule controls tracker enablement and priority; this remains a
+live profile policy. Intake settings are under
+`[profiles.profiles.<name>.intake]`. `excluded_file_patterns` and structured
+`excluded_file_rules` select unwanted files, while
+`organization_subdirectory`, `incomplete_subdirectory`,
+`force_top_level_folder`, and `partial_file_suffix` determine safe active and
+completed paths. These intake values are snapshotted when a torrent is
+registered, so later profile edits do not rewrite a reviewed selection or
+location. Magnet `so=` selection is a bounded local allowlist that can only
+reduce the selected files; literal `x.pe` endpoints use the ordinary peer
+filter and contained binder without hostname resolution.
 
 Successful add responses mean the torrent record was registered and inserted
 into queue order. The daemon does not wait for queue reconciliation, metadata
@@ -128,19 +337,28 @@ Bulk add requests use:
   "magnets": ["magnet:?xt=urn:btih:..."],
   "torrent_files": [{ "metainfo": "base64 .torrent bytes" }],
   "download_dir": "/data/downloads",
-  "paused": true
+  "incomplete_dir": "/data/.incoming",
+  "paused": true,
+  "preview": true,
+  "unwanted_file_indices": [2, 5],
+  "file_exclusion_rules": [{ "suffix": ".nfo" }],
+  "partial_file_suffix": ".part",
+  "profile": "linux-release",
+  "labels": ["linux"]
 }
 ```
 
-`download_dir`, `paused`, and `start_behavior` apply to every item in the
-batch. The response includes `added` items with `{ kind, index, info_hash }`
-and `failed` items with `{ kind, index, code, message }`, so one invalid or
-duplicate item does not prevent other valid items from being registered.
+`download_dir`, `incomplete_dir`, `paused`, `start_behavior`, `preview`,
+`unwanted_file_indices`, `file_exclusion_rules`, `partial_file_suffix`,
+`profile`, and `labels` apply to every item in the batch. The response includes
+`added` items with `{ kind, index, info_hash }` and `failed` items with
+`{ kind, index, code, message }`, so one invalid or duplicate item does not
+prevent other valid items from being registered.
 
 Bulk remove requests use:
 
 ```json
-{ "info_hashes": ["40hex..."], "delete_data": false }
+{ "info_hashes": ["40-or-64-hex locator..."], "delete_data": false }
 ```
 
 The response includes `removed` and `not_found` info-hash arrays. The daemon
@@ -214,19 +432,50 @@ live signal yet.
 
 Tracker rows expose per-URL announce status. `last_error` is populated only for
 failed announces, while `last_message` carries the latest successful announce
-message. `seeders`, `leechers`, `downloads`, and `last_announce` are populated
-from the last live announce result for that tracker URL when the engine has
-reported one.
+message. They also expose:
+
+- `scrape_status`: `not_contacted`, `updating`, `ok`, `error`, or
+  `unsupported`.
+- `last_scrape`: Unix seconds for the latest attempt.
+- `scrape_seeders`, `scrape_leechers`, and `scrape_downloads`: nullable counts
+  retained from the latest successful exact-key BEP 48 response.
+- `last_scrape_error`: the latest failed-attempt or task-failure detail without
+  erasing retained counts.
+
+Initial download discovery, magnet discovery, explicit/periodic reannounce,
+completion, and active seeder announces schedule supported HTTP/HTTPS scrape.
+Only tracker paths whose final component begins with `announce` are derivable;
+UDP scrape is `unsupported`. `seeders` and `leechers` prefer a successful live
+announce, then fall back to retained scrape counts. `downloads` uses retained
+scrape data when available. Existing compatibility adapters keep their prior
+field shapes.
 
 ## Peers
 
 | Method | Path | Description |
 | --- | --- | --- |
 | GET | `/torrents/:hash/peers` | List peers. |
+| POST | `/torrents/:hash/peers/ban` | Add or update a global manual ban: `{ ip, reason? }`. |
+| POST | `/torrents/:hash/peers/unban` | Remove a global manual ban: `{ ip }`. |
 
 Peer rows include the discovered peer address, direction, current rates, flags,
 and ban state. Negotiated per-peer encryption state is not exposed in this
 phase.
+
+## Peer admission policy
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/peer-filter` | Return active direct rules/import paths, local import results, manual bans, client-ID prefixes, and rejection counters. |
+| PUT | `/peer-filter` | Replace `{ enabled, rules, blocklist_paths, manual_bans, blocked_client_ids }`. |
+| POST | `/peer-filter/unban` | Remove a global manual ban: `{ ip }`. |
+
+Manual bans are global by IP even when created from a torrent peer view. A
+replacement validates and compiles all local sources before it affects live
+peer work. The status response contains trimmed direct `rules`,
+`blocklist_paths`, per-source import outcomes, manual bans, client-ID prefixes,
+and counters for the active compiled policy instance; those counters reset on a
+successful replacement. It also reports any fail-closed loading detail.
 
 ## Queue
 
@@ -241,44 +490,77 @@ phase.
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/settings` | Get configuration with API auth token redacted. |
+| GET | `/settings` | Get configuration with API auth token and SOCKS5 password redacted. |
 | PATCH | `/settings` | Update live-safe runtime settings. |
 | PUT | `/settings` | Replace full configuration atomically after validation. |
 
 `PATCH /settings` updates live-safe bandwidth, queue, and seeding fields.
 
-`PUT /settings` includes `torrent.encryption_mode` and
-`[torrent].encryption_mode` values:
+`PUT /settings` accepts `[torrent].encryption_mode` with these values:
 
 - `disabled`
 - `preferred` (default)
 - `required`
 
-Changing this field is reported in `restart_required_fields` for already-running
-torrent tasks.
+The global mode applies MSE/PE to contained TCP and uTP peer streams. In
+`preferred` mode, failed negotiation may retry plaintext only on the same
+selected contained transport; `required` never retries plaintext. Pure-v2
+sessions use the required 20-byte peer-wire/MSE identity while retaining their
+full SHA-256 API and durable locator, so the same negotiation rules apply
+without a lossy registry fallback. Changing the global field live-rebuilds
+existing data-plane tasks and does not require a process restart. A named
+profile may set `encryption_mode`, and the per-torrent endpoint overrides it
+durably. Profile or label-map changes restart only active download/metadata
+engines whose resolved mode changes after persistence. Future inbound TCP
+seeding sessions use the refreshed mode; existing negotiated sessions retain
+their established wire stream.
 
-Per-profile and per-torrent overrides are not yet documented in this phase.
+Named profiles are part of the full settings configuration under `profiles`;
+the dedicated `/profiles` endpoints are preferred when only that section needs
+to change.
 
 `PUT /settings` validates the full config before persistence, preserves the
 existing `api.auth_token` when omitted, applies live-safe fields immediately,
-and reports fields that require restart.
+and reports fields that require restart. It also preserves a redacted
+`network.socks5.password` only when the submitted SOCKS5 username is unchanged;
+clearing or changing the username requires a complete new credential pair.
 
 ## Network
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/network/health` | Network containment health. |
+| GET | `/network/health` | Network containment health plus non-sensitive port-mapping and listen-port-test status. |
+| GET | `/network/port-mapping` | Read the current opt-in router mapping status without sending router traffic. |
+| POST | `/network/port-mapping/refresh` | Immediately reconcile the configured router mapping through the contained path. |
+| POST | `/network/port-test` | Run or return the fresh cached operator-configured listen-port test. |
 | GET | `/network/diagnostics` | Detailed network/path diagnostics. |
 
 `/network/diagnostics` includes transport settings such as `utp_enabled`,
-`utp_prefer_tcp`, and `peer_encryption_mode`. See
+`utp_prefer_tcp`, `peer_encryption_mode`, `socks5_enabled`, and
+`socks5_udp_blocked`. SOCKS diagnostics reveal neither proxy host nor
+credentials. See
 [Network Containment](network-containment.md) for health state meanings.
+
+The `port_test` object returned by `/network/health` is informational and
+contains `enabled`, `endpoint_configured`, the TCP listener port, state,
+timestamps, and bounded detail—but never the configured endpoint URL. States
+are `unknown`, `open`, `closed`, `error`, or `timeout`. A POST only sends a
+request when testing is enabled and an endpoint is configured; a fresh cached
+result is reused. See [Configuration](configuration.md#router-port-mapping-and-listener-reachability).
+
+The `port_mapping` object returned by `/network/health` and
+`/network/port-mapping` contains its enabled flag, configured protocol order,
+listener/external port, active protocol, local gateway diagnostic, attempt and
+lease timestamps, state, and bounded detail. States are `disabled`, `pending`,
+`active`, `unavailable`, `blocked`, or `error`. `POST /network/port-mapping/refresh`
+does not bypass strict containment: it returns an informational blocked or
+unavailable status if the contained path or router cannot complete the request.
 
 ## Storage
 
 | Method | Path | Description |
 | --- | --- | --- |
-| GET | `/storage/roots` | Return diagnostics for configured storage roots, including free space and availability. |
+| GET | `/storage/roots` | Return diagnostics for configured and state-placement roots, including free space, mount data, actual local I/O, and root controls. |
 
 The storage diagnostics response currently includes per-root identity and space
 data needed by operators and automation. Typical fields include:
@@ -293,6 +575,9 @@ data needed by operators and automation. Typical fields include:
       "is_directory": true,
       "writable": true,
       "filesystem_type": "ext",
+      "mount_point": "/mnt/media",
+      "mount_options": ["rw", "relatime"],
+      "mount_source": "/dev/sdb1",
       "total_space_bytes": 1024,
       "free_space_bytes": 128,
       "available_space_bytes": 120,
@@ -300,8 +585,19 @@ data needed by operators and automation. Typical fields include:
       "reserve_satisfied": true,
       "torrent_count": 4,
       "active_torrents": 2,
+      "active_bytes": 67108864,
       "active_write_rate": 1048576,
       "active_recheck_rate": 0,
+      "sustained_write_bytes_per_second": 1048576,
+      "sustained_verification_bytes_per_second": 524288,
+      "cow_strategy": "conservative",
+      "cow_strategy_supported": true,
+      "active_rechecks": 0,
+      "root_control_path": "/mnt/media",
+      "max_active_downloads": 2,
+      "max_active_bytes": 107374182400,
+      "max_write_bytes_per_second": 52428800,
+      "max_concurrent_rechecks": 1,
       "warnings": []
     }
   ],
@@ -311,6 +607,19 @@ data needed by operators and automation. Typical fields include:
 }
 ```
 
+`active_bytes` is the aggregate declared payload budget reserved by active
+engines, not free space consumed on the filesystem. A limit value of `0` means
+unlimited. `root_control_path` is `null` when no `[[storage.root_controls]]`
+entry applies; nested controls resolve to the most-specific lexical root.
+`sustained_write_bytes_per_second` and
+`sustained_verification_bytes_per_second` are observed local storage I/O, not
+peer transfer rates; verification excludes ordinary seeding reads. Mount fields
+are best-effort and may be `null` in restricted containers or on platforms that
+do not expose compatible mount metadata. Roles also identify configured
+resume/state/temporary/log placement roots. `cow_strategy_supported` is `null`
+when the host cannot determine support safely; an explicit unsupported NOCOW
+request fails before payload bytes are written.
+
 ## Watch folders
 
 | Method | Path | Description |
@@ -318,6 +627,29 @@ data needed by operators and automation. Typical fields include:
 | POST | `/watch/scan` | Trigger a scan. |
 | GET | `/watch/history` | Import history. |
 | GET | `/watch/status` | Watch-folder status, folder readiness, and recent imports. |
+
+Watch `recent_imports`, history rows, and each folder's `last_result` retain the
+compatibility fields `path`, `success`, `info_hash_hex`, `error`, and
+`duplicate`, and add:
+
+- `outcome`: `imported`, `duplicate`, `permanent_failure`, or
+  `transient_failure`.
+- `post_action_error`: `null` or the archive/delete/failure-move error. A
+  post-action error does not replace the primary outcome.
+
+History is insertion ordered, in-memory only, and capped at the newest 10,000
+rows. Unstable first/changed observations produce no row. `pending_torrent_files`
+counts unseen, changed, stabilizing, and transient-retry files, but excludes an
+unchanged fingerprint already processed in this daemon run. Calling status does
+not advance stability.
+
+Watch `duplicate` is a successful operational outcome: the existing torrent
+and queue entry remain byte-for-byte/position-for-position unchanged, and the
+configured success file action runs. This does not change the native torrent-
+add compatibility contract; an API duplicate still returns HTTP 409 with
+`duplicate_torrent`. New API/watch adds share a durable registry/queue
+transaction, so persistence failure returns the existing typed error envelope
+without a visible torrent, queue entry, add event, or scheduled start.
 
 ## Logs and doctor
 
@@ -350,8 +682,14 @@ Current event kinds include `torrent_added`, `torrent_changed`,
 `torrent_removed`, `torrent_error`, `torrent_metadata_received`,
 `torrent_completed`, `torrent_files_changed`, `torrent_trackers_changed`,
 `torrent_peers_changed`, `stats_updated`, `network_status_changed`,
-`watch_folder_imported`, `watch_folder_failed`, `settings_changed`, and
-`daemon_health_changed`.
+`port_mapping_changed`, `port_test_changed`, `watch_folder_imported`,
+`watch_folder_failed`, `settings_changed`, and `daemon_health_changed`.
+
+`watch_folder_imported` covers both `imported` and successful `duplicate`.
+`watch_folder_failed` covers permanent and transient attempts. Their payloads
+contain `path`, `outcome`, `success`, `duplicate`, `info_hash`, `error`, and
+`post_action_error`; the top-level event `info_hash` is present when parsing
+produced one. A changing/unstable observation emits neither event.
 
 ## Per-torrent health
 
@@ -445,6 +783,16 @@ Authentication follows `api.require_auth`:
 - The endpoint enforces `X-Transmission-Session-Id` and returns a new session
   ID header on session mismatch.
 
+The browser-origin policy in [Authentication and limits](#authentication-and-limits)
+runs before the enabled check, authentication, and session negotiation. An
+origin rejection returns HTTP 403 with the Transmission JSON `error` object and
+does not issue a session ID or dispatch an RPC method.
+
+A Chrome extension calling this compatibility route must satisfy the shared
+extension rule before Transmission authentication: enable API auth and send the
+configured token as Bearer or `X-SwarmOtter-Auth`. Transmission Basic auth by
+itself does not identify an allowed extension Origin at the outer guard.
+
 The adapter currently supports common session, torrent lifecycle, queue, and
 helper calls:
 
@@ -456,11 +804,25 @@ helper calls:
 - `queue-move-top`, `queue-move-up`, `queue-move-down`, `queue-move-bottom`
 - `free-space`, `port-test`, `blocklist-update`
 
+Per-torrent seeding policy does not add Transmission adapter options. Existing
+`torrent-get` fields `uploadRatio`/`upload_ratio` and
+`uploadedEver`/`uploaded_ever` use the same truthful native accounting; an
+unsupported per-torrent `seedRatioLimit` request remains `null`.
+
 `torrent-remove` maps `delete-local-data` and `delete_local_data` to the native
 delete-data option.
 
 `torrent-add` accepts magnet links via `filename` and base64 torrent metadata
 via `metainfo`. Remote HTTP/HTTPS torrent metadata URLs are rejected.
+
+`torrent-add` and `torrent-set` additionally accept an optional native
+compatibility extension `profile`. A string selects a configured profile during
+the same durable add/assignment path used by the native API; explicit `null` in
+`torrent-set` clears an existing assignment. Labels are present before profile
+resolution. Add and list responses include truthful state, completion,
+directory, labels, and terminal error data where their established field names
+allow it. Transmission `port-test` maps to the latest configured listener-test
+result and returns `port_is_open: true` only for an `open` result.
 
 ## qBittorrent-compatible API compatibility
 
@@ -481,15 +843,45 @@ Authentication follows `api.require_auth`:
 - qBittorrent-style `SID` flow via `POST /api/v2/auth/login` and a returned `SID`
   cookie.
 
+The browser-origin policy in [Authentication and limits](#authentication-and-limits)
+runs before the enabled check, login/SID handling, form extraction, and daemon
+operations. An origin rejection returns HTTP 403 with plain-text `Forbidden`;
+it does not create a SID or dispatch the requested operation.
+
+A Chrome extension must send the configured Bearer or `X-SwarmOtter-Auth`
+token on every `/api/v2` request. A qBittorrent `SID` cookie alone does not
+authorize the cross-origin exception because the shared guard runs before SID
+handling.
+
 Representative automation endpoints:
 
 - `GET /api/v2/app/version`
 - `GET /api/v2/app/webapiVersion`
 - `GET /api/v2/torrents/info`
+- `GET /api/v2/torrents/categories`
 - `POST /api/v2/torrents/add`
 - `POST /api/v2/torrents/delete`
 - `POST /api/v2/torrents/pause`
 - `POST /api/v2/torrents/resume`
 - `POST /api/v2/torrents/start`
 - `POST /api/v2/torrents/stop`
+- `POST /api/v2/torrents/recheck`
+- `POST /api/v2/torrents/reannounce`
 - `POST /api/v2/torrents/setCategory`
+- `POST /api/v2/torrents/setLocation`
+- `POST /api/v2/torrents/renameFile`
+- `GET /api/v2/torrents/properties?hash=...`
+- `GET /api/v2/torrents/trackers?hash=...`
+- `GET /api/v2/torrents/files?hash=...`
+
+qBittorrent categories are derived from native labels, profile names, and
+label-to-profile mappings; there is no second category store. Supplying a
+category at add time always records the label. If it exactly matches a named
+profile, it also selects that profile before registration so its add-time
+storage and start policy apply. Category mutation continues to use native label
+and profile-assignment transactions. The new lifecycle, location, rename,
+tracker, and file endpoints delegate to their native operations.
+
+The qBittorrent torrent-info response continues to expose its documented
+`ratio` and `uploaded` counters from the native summary. It does not claim
+`ratio_limit` or `seeding_time_limit` policy options.

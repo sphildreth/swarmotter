@@ -44,6 +44,8 @@ pub enum CoreError {
     MalformedTorrent(String),
     #[error("invalid info hash: {0}")]
     InvalidInfoHash(String),
+    #[error("unsupported torrent feature: {0}")]
+    UnsupportedTorrentFeature(String),
     #[error("duplicate torrent: {0}")]
     DuplicateTorrent(String),
     #[error("torrent not found: {0}")]
@@ -52,6 +54,8 @@ pub enum CoreError {
     InvalidConfig(String),
     #[error("network containment failure: {0}")]
     NetworkBlocked(String),
+    #[error("SOCKS5 proxy error: {0}")]
+    Proxy(String),
     #[error("storage error: {0}")]
     Storage(String),
     #[error("io error: {0}")]
@@ -62,6 +66,10 @@ pub enum CoreError {
     Bencode(String),
     #[error("parse error: {0}")]
     Parse(String),
+    #[error("HTTP protocol error: {0}")]
+    HttpProtocol(String),
+    #[error("HTTP status error: {0}")]
+    HttpStatus(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     #[error("internal error: {0}")]
@@ -75,15 +83,21 @@ impl CoreError {
             CoreError::MalformedMagnet(_) => ErrorCode::new("malformed_magnet"),
             CoreError::MalformedTorrent(_) => ErrorCode::new("malformed_torrent"),
             CoreError::InvalidInfoHash(_) => ErrorCode::new("invalid_info_hash"),
+            CoreError::UnsupportedTorrentFeature(_) => {
+                ErrorCode::new("unsupported_torrent_feature")
+            }
             CoreError::DuplicateTorrent(_) => ErrorCode::new("duplicate_torrent"),
             CoreError::NotFound(_) => ErrorCode::new("not_found"),
             CoreError::InvalidConfig(_) => ErrorCode::new("invalid_config"),
             CoreError::NetworkBlocked(_) => ErrorCode::new("network_blocked"),
+            CoreError::Proxy(_) => ErrorCode::new("proxy_error"),
             CoreError::Storage(_) => ErrorCode::new("storage_error"),
             CoreError::Io(_) => ErrorCode::new("io_error"),
             CoreError::Elapsed(_) => ErrorCode::new("timeout"),
             CoreError::Bencode(_) => ErrorCode::new("bencode_error"),
             CoreError::Parse(_) => ErrorCode::new("parse_error"),
+            CoreError::HttpProtocol(_) => ErrorCode::new("http_protocol_error"),
+            CoreError::HttpStatus(_) => ErrorCode::new("http_status_error"),
             CoreError::InvalidArgument(_) => ErrorCode::new("invalid_argument"),
             CoreError::Internal(_) => ErrorCode::new("internal_error"),
         }
@@ -114,5 +128,17 @@ mod tests {
     fn network_blocked_detection() {
         assert!(CoreError::NetworkBlocked("x".into()).is_network_blocked());
         assert!(!CoreError::NotFound("x".into()).is_network_blocked());
+    }
+
+    #[test]
+    fn http_error_codes_are_stable() {
+        assert_eq!(
+            CoreError::HttpProtocol("x".into()).code().as_str(),
+            "http_protocol_error"
+        );
+        assert_eq!(
+            CoreError::HttpStatus("x".into()).code().as_str(),
+            "http_status_error"
+        );
     }
 }

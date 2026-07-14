@@ -23,7 +23,7 @@ use swarmotter_core::dht::{
     self, build_get_peers, build_ping, KrpcResponse, NodeId, RoutingTable, TransactionId,
 };
 use swarmotter_core::error::Result;
-use swarmotter_core::hash::InfoHash;
+use swarmotter_core::hash::PeerInfoHash;
 use swarmotter_core::net::{ContainedUdpSocket, NetworkBinder};
 use swarmotter_core::peer::PeerAddr;
 
@@ -142,7 +142,7 @@ impl DhtRunner {
     /// Iterative `get_peers` with basic reachability counters for diagnostics.
     pub async fn get_peers_with_stats(
         &self,
-        info_hash: InfoHash,
+        info_hash: PeerInfoHash,
         max_rounds: usize,
     ) -> Result<DhtLookupResult> {
         let _socket_guard = self.socket_lock.lock().await;
@@ -207,7 +207,7 @@ impl DhtRunner {
 
     async fn get_peers_with_socket(
         &self,
-        info_hash: InfoHash,
+        info_hash: PeerInfoHash,
         max_rounds: usize,
         socket: Arc<dyn ContainedUdpSocket>,
         family: DhtAddressFamily,
@@ -364,7 +364,7 @@ impl DhtRunner {
     #[allow(dead_code)]
     pub async fn announce_peer(
         &self,
-        info_hash: InfoHash,
+        info_hash: PeerInfoHash,
         port: u16,
         tokens: &[(SocketAddr, Vec<u8>)],
     ) -> Result<()> {
@@ -628,7 +628,7 @@ mod tests {
         // Local "DHT node" UDP socket.
         let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let node_addr = sock.local_addr().unwrap();
-        let info_hash = InfoHash::from_bytes([0xab; 20]);
+        let info_hash = PeerInfoHash::from_bytes([0xab; 20]);
         let info_hash_for_task = info_hash;
         let task = tokio::spawn(async move {
             let mut buf = [0u8; 2048];
@@ -693,7 +693,7 @@ mod tests {
             return;
         };
         let v6_addr = v6_sock.local_addr().unwrap();
-        let info_hash = InfoHash::from_bytes([0xcd; 20]);
+        let info_hash = PeerInfoHash::from_bytes([0xcd; 20]);
 
         let v4_task = tokio::spawn(async move {
             let mut buf = [0u8; 2048];
@@ -803,7 +803,7 @@ mod tests {
             0,
         );
         let result = runner
-            .get_peers_with_stats(InfoHash::from_bytes([0xaa; 20]), 1)
+            .get_peers_with_stats(PeerInfoHash::from_bytes([0xaa; 20]), 1)
             .await
             .unwrap();
 

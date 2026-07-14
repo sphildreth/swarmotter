@@ -214,6 +214,7 @@ impl AtomicTokenBucket {
 pub struct RateLimiter {
     pub download: Arc<AtomicTokenBucket>,
     pub upload: Arc<AtomicTokenBucket>,
+    clock_origin: tokio::time::Instant,
 }
 
 /// Direction of a rate-limited transfer.
@@ -226,10 +227,10 @@ pub enum RateDirection {
 impl RateLimiter {
     /// Build a rate limiter from effective byte/sec limits (0 = unlimited).
     pub fn new(download_bps: u64, upload_bps: u64) -> Self {
-        let now_ms = now_millis();
         Self {
-            download: Arc::new(AtomicTokenBucket::new(download_bps, now_ms)),
-            upload: Arc::new(AtomicTokenBucket::new(upload_bps, now_ms)),
+            download: Arc::new(AtomicTokenBucket::new(download_bps, 0)),
+            upload: Arc::new(AtomicTokenBucket::new(upload_bps, 0)),
+            clock_origin: tokio::time::Instant::now(),
         }
     }
 
@@ -255,7 +256,10 @@ impl RateLimiter {
                 return; // unlimited
             }
 
-            let allowed = bucket.refill_and_consume(now_millis(), bytes);
+            let now_ms = tokio::time::Instant::now()
+                .saturating_duration_since(self.clock_origin)
+                .as_millis() as u64;
+            let allowed = bucket.refill_and_consume(now_ms, bytes);
 
             if allowed >= bytes {
                 return;
@@ -305,13 +309,18 @@ impl RateLimiter {
 /// the global and per-torrent bandwidth limits are enforced live.
 #[derive(Debug, Clone)]
 pub struct ShapedLimiter {
-    pub per_torrent: RateLimiter,
+    pub per_torrent: Arc<RateLimiter>,
     pub global: Option<RateLimiter>,
 }
 
 impl ShapedLimiter {
     /// Wrap a per-torrent limiter with no shared global cap.
     pub fn from_rate_limiter(per_torrent: RateLimiter) -> Self {
+        Self::from_shared_rate_limiter(Arc::new(per_torrent))
+    }
+
+    /// Wrap a retained per-torrent limiter shared by downloader and seeder.
+    pub fn from_shared_rate_limiter(per_torrent: Arc<RateLimiter>) -> Self {
         Self {
             per_torrent,
             global: None,
@@ -340,13 +349,6 @@ impl ShapedLimiter {
             global.acquire(dir, bytes).await;
         }
     }
-}
-
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 /// Compute allowed bytes given a per-second limit and elapsed time.

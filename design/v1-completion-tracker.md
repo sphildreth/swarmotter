@@ -1,9 +1,12 @@
 # SwarmOtter v1.0.0 Completion Tracker
 
-This tracker records progress toward `v1.0.0` as defined by `design/PRD.md` and
-`design/requirements.md`. Progress is tracked by completed capabilities,
+This tracker records the capabilities originally required for `v1.0.0` as
+defined by `design/PRD.md` and `design/requirements.md`. The assembled release
+is `v2.0.0` because the strict-containment default changes the configuration
+compatibility contract. Progress is tracked by completed capabilities,
 acceptance criteria, passing tests, and working end-to-end behavior — never by
-time estimates.
+time estimates. The production/test/document mapping for every completed row is
+indexed in [v1-traceability.md](v1-traceability.md).
 
 ## Status Legend
 
@@ -93,7 +96,21 @@ UDP socket (see ADR-0020).
 - [x] HTTP/HTTPS tracker announce/scrape — announce URL construction, compact
       peer parsing, tiers, private handling, and live announce through the
       `NetworkBinder`; HTTPS is performed as TLS over the contained TCP socket
-      with system-root certificate validation (fail-closed blocks HTTPS)
+      with system-root certificate validation (fail-closed blocks HTTPS).
+      ADR-0055 adds a bounded framed HTTP/1 codec over only binder-provided
+      TCP/TLS streams, redirect/downgrade/authority policy, and real BEP 48
+      HTTP/HTTPS scrape. Download, magnet real-hash, reannounce/completion, and
+      seeder paths schedule scrape; failed attempts retain last-success counts,
+      task failures are counted, native API/Web UI rows expose the snapshot,
+      and UDP scrape is explicitly unsupported. Evidence:
+      `net::http::tests` (15), the seven `tracker::tests` scrape cases,
+      `engine::tests::started_and_reannounce_paths_schedule_contained_scrapes`,
+      `engine::tests::magnet_tracker_activity_scrapes_the_real_magnet_info_hash`,
+      `daemon::tests::seeder_announce_schedules_scrape_into_the_shared_engine_state`,
+      `daemon::tests::list_trackers_exposes_scrape_state_and_falls_back_without_announce_success`,
+      `daemon::tests::tracker_scrape_snapshot_serializes_through_the_real_native_router`,
+      `trackers_crud_and_bad_hash`, and
+      `web_ui_renders_and_escapes_tracker_scrape_state`.
 - [x] UDP tracker announce — live BEP 15 connect + announce through the
       binder's contained UDP socket, compact IPv4 peer parsing, transaction
       IDs, error response handling, tier integration, and local UDP tracker
@@ -189,11 +206,32 @@ UDP socket (see ADR-0020).
 - [x] Recheck / reannounce
 - [x] Move data / rename path / labels
 - [x] All required torrent states exposed (`TorrentState`)
+- [x] Exact per-torrent seeding lifecycle exposed (`SeedingStatus`): native
+      list/detail responses distinguish `not_eligible`, `queued`, `active`,
+      ratio/idle stops, and a manual stop. Lifecycle events carry the truthful
+      coarse state transition and tell clients to refetch the fine status; a
+      live `SeedRegistry` registration is the source of truth for active seeding.
+      `daemon::tests::complete_seeding_lifecycle_policy_slots_tasks_and_limiter_identity_are_truthful`
+      and
+      `daemon::tests::active_seeding_containment_block_preserves_status_and_recovery_rebuilds_task`
+      exercise the production daemon entry points, synchronized readers,
+      containment, task ownership, and event state.
 
 ### Queue, Seeding, Bandwidth
 
 - [x] Queue management logic (limits, up/down/top/bottom, start-now, auto-start)
-- [x] Ratio/seeding limits logic (global and per-torrent, idle, seed-forever)
+- [x] Ratio/seeding limits logic (global and per-torrent, idle, seed-forever):
+      `TorrentSeeding` and `SeedingStatus` persist in version-1 daemon state;
+      nullable overrides inherit global values, explicit zero remains an
+      immediate target, and seed-forever suppresses effective targets without
+      deleting stored overrides. Strict replacement flows through
+      `DaemonOps::set_torrent_seeding` and
+      `PUT /api/v1/torrents/:hash/seeding`; persistence failure leaves the live
+      lifecycle unchanged and restores the prior policy. Evidence:
+      `state_store::tests::every_seeding_status_round_trips_in_version_one_state`,
+      `daemon::tests::seeding_policy_persistence_failure_restores_policy_status_and_state`,
+      `daemon::tests::restart_reconstructs_eligible_seeder_and_preserves_automatic_and_manual_stops`,
+      and `native_seeding_put_replaces_policy_and_list_detail_are_truthful`.
 - [x] Optional selfish completion policy (`torrent.selfish`): when enabled, the
       daemon removes a torrent immediately after its download completes (engine
       and seeder stopped, record removed from the registry) while preserving the
@@ -209,21 +247,50 @@ UDP socket (see ADR-0020).
       engine download path and the seeder upload path. A shared global limiter
       is cloned into every engine and seeder so the configured global cap is a
       true aggregate across active torrents; each torrent also gets a
-      per-torrent limiter (`TorrentBandwidth`, `download_limit`/`upload_limit`
-      on the torrent record), enforced live alongside the global cap. Global
-      and per-torrent limits both shape real transfers (verified by throttling
-      local swarm tests, including a per-torrent cap with an unlimited global
-      limiter); per-torrent limits are settable live via
-      `POST /api/v1/torrents/:hash/limits` and reflected in the torrent summary
+      retained `Arc<RateLimiter>` (`TorrentBandwidth`,
+      `download_limit`/`upload_limit` on the torrent record) shared by the
+      downloader and live seeder. It survives completion, queued seed slots,
+      pause/resume, and containment; removal/reset delete it. Global and
+      per-torrent limits both shape real transfers. The production daemon test
+      `daemon::tests::daemon_limit_update_changes_active_registered_upload_without_replacement`
+      accepts a real TCP peer, updates through `DaemonOps::set_torrent_limits`,
+      checks the old/new token windows, persisted value, and unchanged Arc plus
+      registration identity. Per-torrent limits remain settable via
+      `POST /api/v1/torrents/:hash/limits` and reflected in torrent summaries.
 - [x] Rate-limit state through API/UI (settings patch + per-torrent limits)
 
 ### Watch Folders & Browser Integration
 
-- [x] Watch-folder scanner (stable write detection, recursive)
-- [x] Import success/failure handling (archive/failure/leave/delete)
-- [x] Per-watch-folder defaults (location, labels, paused/start)
+- [x] Watch-folder scanner (stable write detection, recursive) — ADR-0054
+      requires two unchanged observations, complete blocking sorted walks,
+      composite lexical root-relative keys, symlink exclusion, typed
+      changed-during-read reset, whole-scan serialization, successful-scan
+      disappearance pruning, per-folder component-aware archive/failure
+      exclusions, and no durable observation ledger. Evidence includes
+      `watch::tests::configured_scan_exclusions_are_descendant_component_aware_and_per_folder`,
+      `config::tests::watch_paths_reject_whitespace_and_action_destination_equal_to_root`,
+      and the daemon stability/pruning/overlap cases named in
+      `design/testing.md`.
+- [x] Import success/failure handling (archive/failure/leave/delete) — API and
+      watch add share exact durable registry/queue rollback; duplicate is a
+      non-mutating watch success; permanent/transient outcomes have distinct
+      move/retry behavior; create-new actions never overwrite; action errors
+      remain visible; and in-memory insertion-ordered history is capped at
+      10,000 (ADR-0054). `recursive_watch_excludes_in_root_archive_after_success`
+      and `recursive_watch_excludes_in_root_failure_after_permanent_failure`
+      prove moved inputs remain one terminal history result.
+- [x] Per-watch-folder defaults (location, labels, paused/start) — proven by
+      `watch::tests::folder_defaults_apply`, `watch_folder_imports_torrent`, and
+      `watch_folder_start_import_is_queued_for_scheduler`.
 - [x] Browser-friendly magnet API endpoint
-- [x] Watch-folder status through API/UI
+- [x] Watch-folder status through API/UI — pending counts do not advance
+      observations and exclude unchanged processed fingerprints; history and
+      events expose stable outcome and post-action fields, and the UI warns on
+      operator-action failures. Evidence includes
+      `watch_leave_processes_each_fingerprint_once_and_status_excludes_it`,
+      `watch_action_exclusion_does_not_hide_separately_configured_overlapping_root`,
+      `web_ui_renders_stable_watch_outcomes_and_post_action_errors`, and the
+      executable `watch-history.test.js` renderer harness.
 
 ### API
 
@@ -250,11 +317,22 @@ UDP socket (see ADR-0020).
       add/edit/remove controls)
 - [x] Queue controls (start-now, stop, and move top/up/down/bottom in details)
 - [x] Bandwidth controls (global settings and per-torrent limits in details)
-- [x] Ratio/seeding controls (via settings)
+- [x] Ratio/seeding controls (global defaults via Settings and a strict
+      per-torrent replacement in Torrent Details): stored and effective targets,
+      status, uploaded bytes, and ratio are rendered; inheritance is distinct
+      from explicit zero; seed-forever preserves stored overrides; rejected
+      saves show an inline error without optimistic drift. Evidence:
+      `node crates/swarmotter-web/tests/seeding-policy.test.js` and
+      `swarmotter_web::tests::web_ui_renders_and_replaces_seeding_policy_without_optimistic_drift`.
 - [x] Settings
 - [x] Network/VPN health
 - [x] Watch-folder status
 - [x] Logs/errors
+- [x] Production Web UI startup: the complete `app.js` module graph runs
+      against the production index markup, completes the first torrent,
+      statistics, and doctor refresh, and builds the torrent table without an
+      uncaught exception. Evidence: `scripts/check-web-ui-startup.sh` and
+      `swarmotter_web::tests::production_module_graph_completes_initial_ui_refresh`.
 - [x] Per-torrent health indicator — a signal-bars style (0..5) display on
       each torrent list row and on the details header, computed from real
       engine state (availability, throughput, peers, stability, discovery),
@@ -285,15 +363,38 @@ UDP socket (see ADR-0020).
 - [x] Integration tests (API: add magnet/file, lifecycle, settings, network,
       stats, duplicate, per-torrent health serialization; daemon:
       containment fail-closed, watch import, daemon-driven real download
-      via local tracker + seed peer)
+      via local tracker + seed peer). Phase-4 production coverage additionally
+      includes strict seeding replacement validation/list/detail serialization,
+      immediate completion-to-active-seeder reconciliation, persisted restart
+      reconstruction, manual/automatic stop handling, truthful lifecycle
+      events, fail-closed seeder recovery, and a live accepted upload-limit
+      update. Named tests and required assertions are maintained in
+      `design/testing.md`.
+      Phase-6 production coverage additionally includes partial-copy and
+      read-time metadata changes, restart duplicates, exact persistence
+      rollback with no torrent-add/watch-success events or scheduling,
+      permanent/transient retry behavior,
+      destination collisions, per-folder in-root action exclusions,
+      symlink/sorting/pruning semantics, concurrent manual scans, bounded
+      history eviction, the real file-add router contract, and Watch UI outcome
+      rendering (ADR-0054).
+      Final production reachability additionally covers a real contained
+      failing tracker transitioning the daemon/native detail route to
+      `tracker_error`, retaining the last failure, and clearing/retrying through
+      manual reannounce.
 - [x] Network containment live tests (fail-closed via daemon) — `BlockedBinder`
       proves TCP/UDP/listener fail-closed at the binder; daemon strict-mode
-      integration tests cover add-under-blocked and health reporting; live
-      "VPN path removed while active" via the daemon health loop is covered
-      structurally (the health loop stops engines/seeders and marks torrents
-      `network_blocked`)
-- [x] Storage tests — live interrupted-write/missing-file/multi-file boundary
-      /resume roundtrip/recheck covered
+      integration tests cover add-under-blocked and health reporting. The
+      privileged namespace harness transfers verified bytes through a strict,
+      route-less veth, deletes that veth during the active transfer, and proves
+      `interface_missing`, `network_blocked`, empty data-plane diagnostics,
+      stable bytes, and a continuously available control API.
+- [x] Storage tests — live interrupted-write/missing-file/resume/recheck covered;
+      exact verified-byte accounting is asserted for a short final piece and a
+      multi-file boundary after restore, partial forced recheck, and full forced
+      recheck by
+      `daemon::tests::single_file_final_piece_bytes_are_exact_after_restore_and_recheck`
+      and `daemon::tests::boundary_file_bytes_are_exact_after_restore_and_each_recheck`.
 - [x] Local swarm tests — real download completion from a generated payload
       through a local HTTP tracker, a local UDP tracker (BEP 15), and a direct
       seed peer is covered (HTTP + UDP tracker + direct peer paths); webseed
@@ -338,14 +439,20 @@ documented below; no required capability remains marked in progress.
 | Command | Result |
 | --- | --- |
 | `cargo fmt --all -- --check` | pass |
-| `cargo check --workspace --all-targets --all-features` | pass |
-| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | pass (no warnings) |
-| `cargo test --all --all-features` | pass (294 core unit tests, 51 API unit tests, 50 API integration tests, 25 Web tests, plus daemon and generated local-swarm suites) |
+| `cargo check --locked --workspace --all-targets --all-features` | pass |
+| `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings` | pass (no warnings) |
+| `cargo test --locked --workspace --all-targets --all-features` | pass (781 passed, 2 intentional opt-in scale tests ignored; includes 394 core, 54 API unit, 56 API integration, 6 origin-matrix, 33 Web, 195 daemon-library, containment, daemon-download, generated local-swarm, throughput, metadata-ingress, and public-path suites) |
 | `cargo +1.88.0 check --locked --workspace --all-targets --all-features` | pass |
-| `node --check crates/swarmotter-web/assets/theme-bootstrap.js` | pass |
-| `node --check crates/swarmotter-web/assets/app.js` | pass |
-| `docker compose --env-file deploy/.env.example -f deploy/compose.yml config` | pass with `GLUETUN_ENV_FILE=gluetun.env.example` |
+| `scripts/check-web-js-modules.sh` | pass for all 12 JavaScript assets in ES-module mode |
+| `scripts/check-web-ui-startup.sh` | pass for the production module graph and initial API-driven render |
+| `node crates/swarmotter-web/tests/watch-history.test.js` and `node crates/swarmotter-web/tests/seeding-policy.test.js` | pass |
+| `GLUETUN_ENV_FILE=gluetun.env.example docker compose --env-file deploy/.env.example -f deploy/compose.yml config` | pass |
 | `mdbook build` | pass |
+| `cargo test --locked -p swarmotterd ignored_thousand_mixed_state_torrents_keep_scheduler_bounds -- --ignored` | pass |
+| `cargo test --locked -p swarmotter-api --test scale_harness -- --ignored` | pass |
+| `scripts/test-network-containment-transition.sh "$PWD/target/debug/swarmotterd"` | pass as a non-root build user with command-scoped `sudo ip` inside an isolated privileged Linux container |
+| `docker build -f deploy/Dockerfile -t swarmotter:version-check .` and image-label inspection | pass; `org.opencontainers.image.version=2.0.0` |
+| `python3 scripts/do-pr-prechecks.py --no-update-stable --no-install-rust-components --no-install-minimum-rust` | pass, including doctests and every CI-equivalent check |
 | local swarm download (HTTP tracker + direct peer) | pass |
 | local swarm download (UDP tracker, BEP 15) | pass |
 | local swarm seeding (inbound Seeder serves completed download) | pass |
@@ -358,11 +465,17 @@ documented below; no required capability remains marked in progress.
 | local swarm uTP download (contained uTP seed + engine over uTP) | pass |
 | local swarm uTP fail-closed (BlockedBinder blocks uTP download) | pass |
 | local swarm active-download health (live engine reports non-zero health) | pass |
+| daemon seeding lifecycle (slots, ratio/idle/manual stops, restart, containment, truthful events) | pass |
+| daemon active upload-limit replacement (real accepted peer, retained limiter/registration identity) | pass |
+| exact final-piece and multi-file boundary bytes (restore + partial/full recheck) | pass |
+| native strict per-torrent seeding replacement and list/detail serialization | pass |
+| `node crates/swarmotter-web/tests/seeding-policy.test.js` | pass |
 | uTP contained byte-stream round trip over contained socket | pass |
 | DHT get_peers discovery (local KRPC fixture) | pass |
 | uTP reliable exchange over contained socket (local fixture) | pass |
 | HTTPS tracker over contained socket (local TLS fixture) | pass |
 | daemon download through `DaemonOps` | pass |
+| terminal tracker failure through contained HTTP, daemon state, native detail route, and reannounce | pass |
 
 ## ADRs Created or Updated
 
@@ -389,6 +502,12 @@ documented below; no required capability remains marked in progress.
 - ADR-0047: Transactional live data-plane reconfiguration
 - ADR-0048: File selection drives piece scheduling
 - ADR-0049: Configured unauthenticated LAN control plane
+- ADR-0050: Bounded untrusted metainfo parsing
+- ADR-0051: Explicit network path and live containment gate
+- ADR-0052: Persisted per-torrent seeding policy and runtime lifecycle
+- ADR-0053: Process-wide peer-session permit pool
+- ADR-0054: Watch-folder stability, idempotence, and import atomicity
+- ADR-0055: Contained HTTP/1 client framing and redirect policy
 
 ## Notes
 
@@ -423,6 +542,7 @@ above.
   directions. The optional fairness algorithm that rotates an upload slot to
   discover new peers' upload capacity when many leechers contend for upload
   bandwidth is not implemented; the seeder unchokes each interested peer it
-  accepts and serves verified pieces subject to the global upload rate limit.
+  accepts and serves verified pieces subject to the aggregate global and
+  retained per-torrent upload rate limits.
   This is a non-blocking enhancement beyond `v1.0.0` scope, not a missing
   required capability.

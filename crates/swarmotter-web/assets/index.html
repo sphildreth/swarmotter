@@ -141,14 +141,24 @@
         <textarea id="magnet-input" rows="3" placeholder="magnet:?xt=urn:btih:..."></textarea>
         <label for="magnet-dir">Download directory (optional)</label>
         <input id="magnet-dir" type="text">
-        <label class="settings-check"><input id="magnet-paused" type="checkbox"><span>Add paused</span></label>
+        <label for="magnet-profile">Policy profile</label>
+        <select id="magnet-profile"><option value="">Use label or global defaults</option></select>
+        <label for="magnet-labels">Labels (comma-separated)</label>
+        <input id="magnet-labels" type="text">
+        <label class="settings-check"><input id="magnet-paused" type="checkbox"><span>Add paused (otherwise use profile/global start behavior)</span></label>
+        <label class="settings-check"><input id="magnet-preview" type="checkbox"><span>Metadata preview (fetch the file list, then wait for Start before payload transfer)</span></label>
         <button id="add-magnet-btn">Add Magnet</button>
       </div>
       <div class="card">
         <h3>Upload .torrent</h3>
         <label for="torrent-file">Torrent file</label>
         <input id="torrent-file" type="file" accept=".torrent">
-        <label class="settings-check"><input id="file-paused" type="checkbox"><span>Add paused</span></label>
+        <label for="file-profile">Policy profile</label>
+        <select id="file-profile"><option value="">Use label or global defaults</option></select>
+        <label for="file-labels">Labels (comma-separated)</label>
+        <input id="file-labels" type="text">
+        <label class="settings-check"><input id="file-paused" type="checkbox"><span>Add paused (otherwise use profile/global start behavior)</span></label>
+        <label class="settings-check"><input id="file-preview" type="checkbox"><span>Preview before starting payload transfer</span></label>
         <button id="add-file-btn">Upload</button>
       </div>
     </section>
@@ -159,6 +169,20 @@
       <h2 id="details-title"></h2>
       <div id="details-health" class="card"></div>
       <div id="details-summary" class="card"></div>
+      <div id="details-policy" class="card"></div>
+      <div id="details-seeding-summary" class="card">
+        <h3>Seeding</h3>
+        <dl class="kv">
+          <dt>Ratio</dt><dd id="details-seeding-ratio"></dd>
+          <dt>Uploaded bytes</dt><dd id="details-seeding-uploaded"></dd>
+          <dt>Status</dt><dd id="details-seeding-status"></dd>
+          <dt>Stored ratio target</dt><dd id="details-seeding-stored-ratio"></dd>
+          <dt>Effective ratio target</dt><dd id="details-seeding-effective-ratio"></dd>
+          <dt>Stored idle target</dt><dd id="details-seeding-stored-idle"></dd>
+          <dt>Effective idle target</dt><dd id="details-seeding-effective-idle"></dd>
+          <dt>Seed forever</dt><dd id="details-seeding-forever"></dd>
+        </dl>
+      </div>
       <div id="details-controls" class="card">
         <h3>Torrent controls</h3>
         <div class="details-command-row" aria-label="Torrent lifecycle controls">
@@ -175,9 +199,20 @@
           <button id="details-move-btn" type="button">Move Data</button>
           <label class="settings-field"><span>Labels (comma-separated)</span><input id="details-labels" type="text"></label>
           <button id="details-labels-btn" type="button">Save Labels</button>
+          <label class="settings-field"><span>Policy profile</span><select id="details-profile"><option value="">Use label or global defaults</option></select></label>
+          <button id="details-profile-save-btn" type="button">Save Profile</button>
+          <label class="settings-field"><span>Peer encryption</span><select id="details-encryption-mode"><option value="">Inherit profile or global mode</option><option value="disabled">Disabled (plaintext only)</option><option value="preferred">Preferred</option><option value="required">Required</option></select></label>
+          <button id="details-encryption-mode-save-btn" type="button">Save Encryption</button>
           <label class="settings-field"><span>Download limit B/s (0 = unlimited)</span><input id="details-download-limit" type="number" min="0" step="1"></label>
           <label class="settings-field"><span>Upload limit B/s (0 = unlimited)</span><input id="details-upload-limit" type="number" min="0" step="1"></label>
           <button id="details-limits-btn" type="button">Save Limits</button>
+          <label class="settings-check"><input id="details-ratio-inherit" type="checkbox"><span>Inherit global ratio limit</span></label>
+          <label class="settings-field"><span>Ratio limit (0 stops immediately)</span><input id="details-ratio-limit" type="number" min="0" step="0.01"></label>
+          <label class="settings-check"><input id="details-idle-inherit" type="checkbox"><span>Inherit global idle limit</span></label>
+          <label class="settings-field"><span>Idle limit seconds (0 stops immediately)</span><input id="details-idle-limit" type="number" min="0" step="1"></label>
+          <label class="settings-check"><input id="details-seed-forever" type="checkbox"><span>Seed forever (stored targets remain)</span></label>
+          <button id="details-seeding-save-btn" type="button">Save Seeding Policy</button>
+          <p id="details-seeding-error" class="form-error" role="alert" aria-live="polite"></p>
         </div>
       </div>
       <div id="details-autopilot" class="card"></div>
@@ -194,7 +229,7 @@
         <table id="files-table"><thead><tr><th>Path</th><th>Size</th><th>Done</th><th>Priority</th><th>Wanted</th><th>Rename</th></tr></thead><tbody></tbody></table>
       </div>
       <div id="tab-peers" class="tab-pane hidden">
-        <table id="peers-table"><thead><tr><th>Address</th><th>Client</th><th>Progress</th><th>Down</th><th>Up</th></tr></thead><tbody></tbody></table>
+        <table id="peers-table"><thead><tr><th>Address</th><th>Client</th><th>Progress</th><th>Down</th><th>Up</th><th>Actions</th></tr></thead><tbody></tbody></table>
       </div>
       <div id="tab-trackers" class="tab-pane hidden">
         <div class="tracker-add-row">
@@ -202,7 +237,7 @@
           <input id="tracker-add-url" type="url" placeholder="https://tracker.example/announce">
           <button id="tracker-add-btn" type="button">Add Tracker</button>
         </div>
-        <table id="trackers-table"><thead><tr><th>URL</th><th>Tier</th><th>Status</th><th>Seeders</th><th>Leechers</th><th>Actions</th></tr></thead><tbody></tbody></table>
+        <table id="trackers-table"><thead><tr><th>URL</th><th>Tier</th><th>Announce</th><th>Scrape</th><th>Last scrape</th><th>Scrape counts (S/L/D)</th><th>Seeders</th><th>Leechers</th><th>Downloads</th><th>Actions</th></tr></thead><tbody></tbody></table>
       </div>
     </section>
 
@@ -221,6 +256,14 @@
         <div id="network-config" class="card">
           <h3>Configuration</h3>
           <p class="muted">Configured interface and bind targets populate here.</p>
+        </div>
+        <div id="network-port-mapping" class="card">
+          <h3>Router port mapping</h3>
+          <p class="muted">No router mapping status is available.</p>
+        </div>
+        <div id="network-port-test" class="card">
+          <h3>Listen-port reachability</h3>
+          <p class="muted">No reachability test has run.</p>
         </div>
         <div id="network-interfaces" class="card">
           <h3>Interfaces</h3>
@@ -255,9 +298,11 @@
             <button type="button" class="settings-nav-item" data-settings-target="torrent">Torrent</button>
             <button type="button" class="settings-nav-item" data-settings-target="bandwidth">Bandwidth</button>
             <button type="button" class="settings-nav-item" data-settings-target="queue">Queue</button>
+            <button type="button" class="settings-nav-item" data-settings-target="profiles">Policy profiles</button>
             <button type="button" class="settings-nav-item" data-settings-target="seeding">Seeding</button>
             <button type="button" class="settings-nav-item" data-settings-target="dht">DHT</button>
             <button type="button" class="settings-nav-item" data-settings-target="pex">PEX</button>
+            <button type="button" class="settings-nav-item" data-settings-target="peer-filter">Peer admission</button>
             <button type="button" class="settings-nav-item" data-settings-target="watch">Watch folders</button>
             <button type="button" class="settings-nav-item" data-settings-target="logging">Logging</button>
             <button type="button" class="settings-nav-item" data-settings-target="interface">Notifications</button>
@@ -299,11 +344,22 @@
           <div class="settings-form-grid">
             <label class="settings-field"><span>Download directory</span><input id="cfg-storage-download-dir" type="text"></label>
             <label class="settings-field"><span>Incomplete directory</span><input id="cfg-storage-incomplete-dir" type="text"></label>
+            <label class="settings-field"><span>Fast-resume directory</span><input id="cfg-storage-resume-dir" type="text" placeholder="Optional durable metadata root"></label>
+            <label class="settings-field"><span>State directory</span><input id="cfg-storage-state-dir" type="text" placeholder="Used after restart unless state file is explicit"></label>
+            <label class="settings-field"><span>Fallback temporary root</span><input id="cfg-storage-temp-dir" type="text" placeholder="Used only when download directory is unset"></label>
             <label class="settings-field"><span>Minimum free space bytes</span><input id="cfg-storage-minimum-free-space-bytes" type="number" min="0" step="1"></label>
             <label class="settings-field"><span>Minimum free space percent</span><input id="cfg-storage-minimum-free-space-percent" type="number" min="0" max="100" step="1"></label>
+            <label class="settings-field"><span>CoW strategy</span><select id="cfg-storage-cow-strategy"><option value="conservative">Conservative (default filesystem behavior)</option><option value="disable_for_new_files">Disable CoW for new Linux Btrfs files</option></select></label>
             <label class="settings-check"><input id="cfg-storage-preallocate" type="checkbox"><span>Preallocate files</span></label>
             <label class="settings-check"><input id="cfg-storage-sparse" type="checkbox"><span>Sparse files</span></label>
           </div>
+          <p class="muted">State-directory changes require restart. The NOCOW option is explicit, never changes existing files, and fails on unsupported filesystems rather than falling back.</p>
+          <div class="settings-card-heading">
+            <h4>Storage root controls</h4>
+            <button id="add-storage-root-control-btn" type="button" class="secondary">Add root control</button>
+          </div>
+          <p class="muted">Controls use the most-specific matching path. Zero leaves a limit unlimited; existing work can finish safely while later admissions use the new controls.</p>
+          <div id="settings-storage-root-controls" class="settings-storage-root-controls"></div>
         </div>
 
         <div id="settings-network" class="card settings-panel" data-settings-panel="network" tabindex="-1" hidden>
@@ -325,6 +381,34 @@
             <label class="settings-check"><input id="cfg-network-fail-closed" type="checkbox"><span>Fail closed</span></label>
             <label class="settings-check"><input id="cfg-network-validate-route" type="checkbox"><span>Validate route</span></label>
             <label class="settings-check"><input id="cfg-network-validate-dns" type="checkbox"><span>Validate DNS</span></label>
+          </div>
+          <div class="settings-card-heading"><h4>SOCKS5 TCP proxy</h4></div>
+          <p class="muted">Off by default. Peer TCP, HTTP(S) trackers, and webseeds connect through this proxy after the proxy itself is reached through the contained network path. Target hostname resolution is remote through SOCKS5. SOCKS5 UDP is not supported: enabling it requires disabling uTP and DHT, and UDP tracker URLs are refused rather than sent directly.</p>
+          <div class="settings-form-grid">
+            <label class="settings-check"><input id="cfg-network-socks5-enabled" type="checkbox"><span>Enable SOCKS5 proxy</span></label>
+            <label class="settings-field"><span>Proxy host</span><input id="cfg-network-socks5-host" type="text" placeholder="proxy.example"></label>
+            <label class="settings-field"><span>Proxy port</span><input id="cfg-network-socks5-port" type="number" min="1" max="65535" step="1"></label>
+            <label class="settings-field"><span>Username (optional)</span><input id="cfg-network-socks5-username" type="text" autocomplete="username"></label>
+            <label class="settings-field"><span>Password (optional)</span><input id="cfg-network-socks5-password" type="password" autocomplete="new-password" placeholder="Leave blank to preserve existing password"></label>
+          </div>
+          <div class="settings-card-heading"><h4>Listen-port reachability test</h4></div>
+          <p class="muted">Off by default. Configure an HTTP(S) endpoint you operate; the request is made through the contained torrent network path and only reports an informational result.</p>
+          <div class="settings-form-grid">
+            <label class="settings-check"><input id="cfg-port-test-enabled" type="checkbox"><span>Enable reachability testing</span></label>
+            <label class="settings-field"><span>Operator endpoint</span><input id="cfg-port-test-endpoint" type="url" placeholder="https://port-test.example/check"></label>
+            <label class="settings-field"><span>Cache TTL seconds</span><input id="cfg-port-test-cache-ttl-seconds" type="number" min="1" max="86400" step="1"></label>
+            <label class="settings-field"><span>Request timeout seconds</span><input id="cfg-port-test-timeout-seconds" type="number" min="1" max="30" step="1"></label>
+          </div>
+          <div class="settings-card-heading"><h4>Router port mapping</h4></div>
+          <p class="muted">Off by default. Requires strict, fail-closed containment and a required interface. Discovery and lease requests use that same contained path; an unavailable router never changes torrent operation.</p>
+          <div class="settings-form-grid">
+            <label class="settings-check"><input id="cfg-port-mapping-enabled" type="checkbox"><span>Enable router port mapping</span></label>
+            <label class="settings-check"><input id="cfg-port-mapping-nat-pmp" type="checkbox"><span>Try NAT-PMP</span></label>
+            <label class="settings-check"><input id="cfg-port-mapping-upnp" type="checkbox"><span>Try UPnP IGD</span></label>
+            <label class="settings-field"><span>NAT-PMP gateway (optional IPv4)</span><input id="cfg-port-mapping-nat-pmp-gateway" type="text" placeholder="192.168.1.1"></label>
+            <label class="settings-field"><span>UPnP control URL (optional)</span><input id="cfg-port-mapping-upnp-service-url" type="url" placeholder="http://192.168.1.1:49000/control"></label>
+            <label class="settings-field"><span>Requested lease seconds</span><input id="cfg-port-mapping-lease-seconds" type="number" min="2" max="604800" step="1"></label>
+            <label class="settings-field"><span>Renew before expiry seconds</span><input id="cfg-port-mapping-refresh-before-expiry-seconds" type="number" min="1" max="604799" step="1"></label>
           </div>
         </div>
 
@@ -370,6 +454,13 @@
           </div>
         </div>
 
+        <div id="settings-profiles" class="card settings-panel" data-settings-panel="profiles" tabindex="-1" hidden>
+          <h3>Policy profiles</h3>
+          <p class="muted">Profiles apply named storage, queue, seeding, bandwidth, and optional <code>encryption_mode</code> defaults. Storage paths are captured when a torrent is added; other profile fields remain live for inheriting torrents.</p>
+          <label class="settings-field"><span>Profiles JSON</span><textarea id="cfg-profiles-json" class="settings-list" rows="18" spellcheck="false"></textarea></label>
+          <p class="muted">Use <code>profiles</code> for named definitions and <code>labels</code> to map labels to a profile. Save Settings validates the configuration before applying it.</p>
+        </div>
+
         <div id="settings-seeding" class="card settings-panel" data-settings-panel="seeding" tabindex="-1" hidden>
           <h3>Seeding</h3>
           <div class="settings-form-grid">
@@ -393,6 +484,20 @@
             <label class="settings-field"><span>Max peers</span><input id="cfg-pex-max-peers" type="number" min="0" step="1" required></label>
             <label class="settings-check"><input id="cfg-pex-enabled" type="checkbox"><span>Enable PEX</span></label>
           </div>
+        </div>
+
+        <div id="settings-peer-filter" class="card settings-panel" data-settings-panel="peer-filter" tabindex="-1" hidden>
+          <h3>Peer admission</h3>
+          <p class="muted">Optionally reject known abusive or unwanted peer addresses before a peer connection is opened. Local blocklist files are read only from paths you explicitly configure; torrent traffic remains subject to network containment.</p>
+          <div class="settings-form-grid">
+            <label class="settings-check"><input id="cfg-peer-filter-enabled" type="checkbox"><span>Enable peer admission filtering</span></label>
+          </div>
+          <label class="settings-field"><span>Address rules (one IP, CIDR, or inclusive range per line)</span><textarea id="cfg-peer-filter-rules" class="settings-list" rows="5" spellcheck="false"></textarea></label>
+          <label class="settings-field"><span>Local blocklist paths (one path per line)</span><textarea id="cfg-peer-filter-blocklist-paths" class="settings-list" rows="4" spellcheck="false"></textarea></label>
+          <label class="settings-field"><span>Blocked client-ID prefixes (one printable prefix per line)</span><textarea id="cfg-peer-filter-client-ids" class="settings-list" rows="4" spellcheck="false"></textarea></label>
+          <p class="muted">Use the Peers tab for an immediate global manual IP ban. The live policy status and all current manual bans are shown below.</p>
+          <div id="peer-filter-status" class="peer-filter-status" aria-live="polite"><p class="muted">Loading live peer-admission status…</p></div>
+          <div id="peer-filter-manual-bans" class="peer-filter-manual-bans" aria-live="polite"><p class="muted">Loading global manual bans…</p></div>
         </div>
 
         <div id="settings-watch" class="card settings-panel" data-settings-panel="watch" tabindex="-1" hidden>
@@ -505,6 +610,8 @@
   </dialog>
 
   <script src="/vendor/tabulator/tabulator.min.js"></script>
-  <script src="/app.js"></script>
+  <script src="/seeding-policy.js"></script>
+  <script src="/watch-history.js"></script>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>

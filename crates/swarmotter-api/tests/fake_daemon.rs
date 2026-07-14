@@ -6,11 +6,12 @@
 //! public API surface.
 
 use async_trait::async_trait;
+use std::path::PathBuf;
 use std::sync::Arc;
 use swarmotter_core::autopilot::{AutopilotAnalyzer, AutopilotConfig, AutopilotMode};
-use swarmotter_core::config::Config;
+use swarmotter_core::config::{Config, PeerEncryptionMode, StartBehavior};
 use swarmotter_core::error::{CoreError, Result};
-use swarmotter_core::hash::InfoHash;
+use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::magnet::Magnet;
 use swarmotter_core::meta::{self};
 use swarmotter_core::models::network::{
@@ -22,23 +23,32 @@ use swarmotter_core::models::stats::{
 };
 use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::{
-    TrackerId, TrackerInfo, TrackerKind, TrackerStatus, TrackerTier,
+    TrackerId, TrackerInfo, TrackerKind, TrackerScrapeStatus, TrackerStatus, TrackerTier,
 };
 use swarmotter_core::models::{
     ConfigUpdateResult, DiagnosticLevel, DoctorCheck, DoctorReport, LogSnapshot,
     NetworkDiagnostics, NetworkInterfaceDiagnostic, NetworkPathCheck, ResetResult,
     WatchFolderStatus, WatchStatus,
 };
+use swarmotter_core::peer_filter::{ManualPeerBan, PeerFilter, PeerFilterConfig, PeerFilterStatus};
+use swarmotter_core::policy::{
+    apply_intake_file_rules, force_top_level_storage_path, organize_storage_path,
+    validate_intake_selection_indices, validate_partial_file_suffix, EffectiveTorrentPolicy,
+    IntakePolicySnapshot, PolicyProfileOrigin, PolicyStorageSnapshot,
+};
 use swarmotter_core::torrent::{Torrent, TorrentRegistry};
 use swarmotter_core::watch::ImportResult;
 use tokio::sync::Mutex;
 
-use swarmotter_api::state::AddTorrentOptions;
+use swarmotter_api::state::{AddTorrentOptions, StoragePathPreview, StoragePathPreviewRequest};
 
 pub struct FakeDaemon {
     registry: Arc<Mutex<TorrentRegistry>>,
     config: Arc<Mutex<Config>>,
     health: Arc<Mutex<NetworkHealth>>,
+    /// Production-boundary calls observed by route-ordering tests. The origin
+    /// guard must reject an unsafe browser request before this list changes.
+    pub calls: Arc<Mutex<Vec<&'static str>>>,
     pub watch_imports: Arc<Mutex<Vec<ImportResult>>>,
     #[allow(dead_code)]
     pub events: Arc<Mutex<Vec<String>>>,
@@ -60,26 +70,185 @@ impl FakeDaemon {
             registry: Arc::new(Mutex::new(TorrentRegistry::default())),
             config: Arc::new(Mutex::new(config)),
             health: Arc::new(Mutex::new(health)),
+            calls: Arc::new(Mutex::new(Vec::new())),
             events: Arc::new(Mutex::new(Vec::new())),
             watch_imports: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    async fn insert(&self, torrent: Torrent) -> Result<InfoHash> {
-        let hash = torrent.info_hash();
+    async fn insert(&self, torrent: Torrent) -> Result<TorrentKey> {
+        let key = torrent.key();
         let mut reg = self.registry.lock().await;
         reg.add(torrent)
-            .map_err(|_| CoreError::DuplicateTorrent(hash.to_hex()))?;
-        Ok(hash)
+            .map_err(|_| CoreError::DuplicateTorrent(key.to_locator()))?;
+        Ok(key)
     }
 
-    async fn summary(&self, hash: &InfoHash) -> Option<TorrentSummary> {
-        self.registry
+    async fn summary(&self, hash: &TorrentKey) -> Option<TorrentSummary> {
+        let torrent = self.registry.lock().await.get(hash).cloned()?;
+        let config = self.config.lock().await.clone();
+        let policy = EffectiveTorrentPolicy::resolve(&config, &torrent);
+        let mut summary = torrent.to_summary();
+        summary.effective_ratio_limit = (!policy.seed_forever.value)
+            .then_some(policy.ratio_limit.value)
+            .flatten();
+        summary.effective_idle_limit = (!policy.seed_forever.value)
+            .then_some(policy.idle_limit.value)
+            .flatten();
+        Some(summary)
+    }
+
+    async fn record_call(&self, call: &'static str) {
+        self.calls.lock().await.push(call);
+    }
+
+    async fn remove_manual_ban(&self, ip: String) -> Result<PeerFilterStatus> {
+        let ip = ip.trim().parse::<std::net::IpAddr>().map_err(|error| {
+            CoreError::InvalidArgument(format!("manual peer ban IP '{ip}': {error}"))
+        })?;
+        let mut next = self.config.lock().await.clone();
+        next.peer_filter
+            .manual_bans
+            .retain(|existing| existing.ip.trim().parse::<std::net::IpAddr>() != Ok(ip));
+        next.validate()?;
+        *self.config.lock().await = next.clone();
+        Ok(PeerFilter::from_config(&next.peer_filter)?.status())
+    }
+
+    #[allow(dead_code)]
+    pub async fn clear_calls(&self) {
+        self.calls.lock().await.clear();
+    }
+
+    #[allow(dead_code)]
+    pub async fn observed_calls(&self) -> Vec<&'static str> {
+        self.calls.lock().await.clone()
+    }
+
+    /// Snapshot mutable fake-daemon state without recording an API operation.
+    /// This lets security tests prove rejected requests did not cause a hidden
+    /// state transition even if a handler later gains additional calls.
+    #[allow(dead_code)]
+    pub async fn state_snapshot(&self) -> serde_json::Value {
+        let torrents = self
+            .registry
             .lock()
             .await
-            .get(hash)
-            .map(Torrent::to_summary)
+            .list()
+            .iter()
+            .map(|torrent| torrent.to_summary())
+            .collect::<Vec<_>>();
+        let config = self.config.lock().await.clone();
+        serde_json::json!({
+            "torrents": torrents,
+            "config": config,
+        })
     }
+}
+
+async fn apply_fake_add_policy(
+    config: &Mutex<Config>,
+    torrent: &mut Torrent,
+    options: &AddTorrentOptions,
+) -> Result<bool> {
+    torrent.labels = options.labels.clone();
+    if let Some(incomplete_dir) = options.incomplete_dir.clone() {
+        torrent.policy.overrides.incomplete_dir = Some(incomplete_dir);
+    }
+    if let Some(profile) = options.profile.as_ref() {
+        let config = config.lock().await.clone();
+        if !config.profiles.profiles.contains_key(profile) {
+            return Err(CoreError::InvalidArgument(format!(
+                "unknown policy profile {profile}"
+            )));
+        }
+        torrent.policy.profile = Some(profile.clone());
+        torrent.policy.profile_origin = Some(PolicyProfileOrigin::AddRequest);
+    }
+    let config = config.lock().await.clone();
+    let effective = EffectiveTorrentPolicy::resolve(&config, torrent);
+    if torrent.policy.intake_snapshot.is_none() {
+        let mut unwanted_file_indices = options.unwanted_file_indices.clone();
+        unwanted_file_indices.sort_unstable();
+        unwanted_file_indices.dedup();
+        let intake = effective
+            .profile
+            .as_ref()
+            .and_then(|profile| config.profiles.profiles.get(&profile.name))
+            .map(|profile| profile.intake.clone())
+            .unwrap_or_default();
+        let mut excluded_file_rules = intake.excluded_file_rules;
+        for rule in &options.file_exclusion_rules {
+            if !excluded_file_rules.contains(rule) {
+                excluded_file_rules.push(rule.clone());
+            }
+        }
+        torrent.policy.intake_snapshot = Some(IntakePolicySnapshot {
+            profile: effective
+                .profile
+                .as_ref()
+                .map(|profile| profile.name.clone())
+                .unwrap_or_default(),
+            excluded_file_patterns: intake.excluded_file_patterns,
+            excluded_file_rules,
+            organization_subdirectory: intake.organization_subdirectory,
+            incomplete_subdirectory: intake.incomplete_subdirectory,
+            force_top_level_folder: intake.force_top_level_folder,
+            partial_file_suffix: options
+                .partial_file_suffix
+                .clone()
+                .or(intake.partial_file_suffix),
+            unwanted_file_indices,
+        });
+    }
+    if !torrent.needs_metadata {
+        let intake = torrent.policy.intake_snapshot.as_ref().ok_or_else(|| {
+            CoreError::Internal("missing fake intake snapshot after registration policy".into())
+        })?;
+        validate_intake_selection_indices(intake, torrent.meta.files.len())
+            .map_err(CoreError::InvalidArgument)?;
+    }
+    if torrent.policy.storage_snapshot.is_none() {
+        torrent.policy.storage_snapshot = Some(PolicyStorageSnapshot {
+            profile: effective
+                .profile
+                .as_ref()
+                .map(|profile| profile.name.clone())
+                .unwrap_or_default(),
+            preserve_existing_storage: false,
+            download_dir: effective.download_dir.value,
+            incomplete_dir: effective.incomplete_dir.value,
+        });
+    }
+    if !torrent.needs_metadata {
+        apply_intake_file_rules(torrent);
+    }
+    if options.preview {
+        torrent.policy.preview_until_started = true;
+        torrent.policy.initial_start_behavior = Some(StartBehavior::Paused);
+        return Ok(!torrent.needs_metadata);
+    }
+    let initial_start_behavior = if options.start_behavior_explicit {
+        if options.paused {
+            StartBehavior::Paused
+        } else {
+            StartBehavior::Start
+        }
+    } else {
+        effective.start_behavior.value
+    };
+    torrent.policy.initial_start_behavior = Some(initial_start_behavior);
+    let profile_requests_pause = effective
+        .profile
+        .as_ref()
+        .and_then(|assignment| config.profiles.profiles.get(&assignment.name))
+        .and_then(|profile| profile.queue.start_behavior)
+        .is_some_and(|behavior| matches!(behavior, StartBehavior::Paused));
+    Ok(if options.start_behavior_explicit {
+        options.paused
+    } else {
+        profile_requests_pause
+    })
 }
 
 impl Default for FakeDaemon {
@@ -91,35 +260,57 @@ impl Default for FakeDaemon {
 #[async_trait]
 impl swarmotter_api::state::DaemonOps for FakeDaemon {
     async fn list_torrents(&self) -> Vec<TorrentSummary> {
-        self.registry
+        let torrents = self
+            .registry
             .lock()
             .await
             .list()
             .iter()
-            .map(|t| t.to_summary())
+            .map(|t| (*t).clone())
+            .collect::<Vec<_>>();
+        let config = self.config.lock().await.clone();
+        torrents
+            .iter()
+            .map(|torrent| {
+                let policy = EffectiveTorrentPolicy::resolve(&config, torrent);
+                let mut summary = torrent.to_summary();
+                summary.effective_ratio_limit = (!policy.seed_forever.value)
+                    .then_some(policy.ratio_limit.value)
+                    .flatten();
+                summary.effective_idle_limit = (!policy.seed_forever.value)
+                    .then_some(policy.idle_limit.value)
+                    .flatten();
+                summary
+            })
             .collect()
     }
-    async fn get_torrent(&self, hash: &InfoHash) -> Option<TorrentSummary> {
+    async fn get_torrent(&self, hash: &TorrentKey) -> Option<TorrentSummary> {
         self.summary(hash).await
     }
     async fn add_torrent_file(
         &self,
         bytes: Vec<u8>,
         options: AddTorrentOptions,
-    ) -> Result<InfoHash> {
+    ) -> Result<TorrentKey> {
+        self.record_call("add_torrent_file").await;
         let meta = meta::parse_torrent(&bytes)?;
         let mut t = Torrent::new(meta, now());
-        t.download_dir = options.download_dir;
-        if options.paused {
+        t.download_dir = options.download_dir.clone();
+        let paused = apply_fake_add_policy(&self.config, &mut t, &options).await?;
+        if paused {
             t.state = TorrentState::Paused;
         }
         self.insert(t).await
     }
-    async fn add_magnet(&self, magnet: &str, options: AddTorrentOptions) -> Result<InfoHash> {
+    async fn add_magnet(&self, magnet: &str, options: AddTorrentOptions) -> Result<TorrentKey> {
+        self.record_call("add_magnet").await;
         let m = Magnet::parse(magnet)?;
+        let key = m.identity.primary_key().ok_or_else(|| {
+            CoreError::InvalidArgument("magnet has no usable torrent identity".into())
+        })?;
         // Build a minimal single-file meta from the magnet for testing.
         let bytes = meta::build_single_file_torrent(
-            m.display_name.as_deref().unwrap_or("magnet"),
+            m.display_name.as_deref().unwrap_or(&key.to_locator()),
             b"magnet placeholder data",
             16,
             m.trackers.first().map(|s| s.as_str()),
@@ -127,15 +318,22 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         );
         let meta = meta::parse_torrent(&bytes)?;
         let mut t = Torrent::new(meta, now());
-        t.state = if options.paused {
+        t.needs_metadata = true;
+        t.magnet_info_hash = m.v1_info_hash();
+        t.magnet_identity = Some(m.identity.clone());
+        t.magnet_name = m.display_name.clone();
+        t.magnet_trackers = m.trackers.clone();
+        t.download_dir = options.download_dir.clone();
+        let paused = apply_fake_add_policy(&self.config, &mut t, &options).await?;
+        t.state = if paused {
             TorrentState::Paused
         } else {
             TorrentState::DownloadingMetadata
         };
-        t.download_dir = options.download_dir;
         self.insert(t).await
     }
-    async fn remove_torrent(&self, hash: &InfoHash, _delete_data: bool) -> Result<()> {
+    async fn remove_torrent(&self, hash: &TorrentKey, _delete_data: bool) -> Result<()> {
+        self.record_call("remove_torrent").await;
         self.registry
             .lock()
             .await
@@ -143,7 +341,8 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             .map(|_| ())
             .ok_or_else(|| CoreError::NotFound("torrent".into()))
     }
-    async fn pause(&self, hash: &InfoHash) -> Result<()> {
+    async fn pause(&self, hash: &TorrentKey) -> Result<()> {
+        self.record_call("pause").await;
         let mut reg = self.registry.lock().await;
         match reg.get_mut(hash) {
             Some(t) => {
@@ -153,7 +352,8 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             None => Err(CoreError::NotFound("torrent".into())),
         }
     }
-    async fn resume(&self, hash: &InfoHash) -> Result<()> {
+    async fn resume(&self, hash: &TorrentKey) -> Result<()> {
+        self.record_call("resume").await;
         let mut reg = self.registry.lock().await;
         match reg.get_mut(hash) {
             Some(t) => {
@@ -163,13 +363,13 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             None => Err(CoreError::NotFound("torrent".into())),
         }
     }
-    async fn start_now(&self, hash: &InfoHash) -> Result<()> {
+    async fn start_now(&self, hash: &TorrentKey) -> Result<()> {
         self.resume(hash).await
     }
-    async fn stop(&self, hash: &InfoHash) -> Result<()> {
+    async fn stop(&self, hash: &TorrentKey) -> Result<()> {
         self.pause(hash).await
     }
-    async fn recheck(&self, hash: &InfoHash) -> Result<()> {
+    async fn recheck(&self, hash: &TorrentKey) -> Result<()> {
         let mut reg = self.registry.lock().await;
         match reg.get_mut(hash) {
             Some(t) => {
@@ -179,10 +379,10 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             None => Err(CoreError::NotFound("torrent".into())),
         }
     }
-    async fn reannounce(&self, _hash: &InfoHash) -> Result<()> {
+    async fn reannounce(&self, _hash: &TorrentKey) -> Result<()> {
         Ok(())
     }
-    async fn move_data(&self, hash: &InfoHash, path: String) -> Result<()> {
+    async fn move_data(&self, hash: &TorrentKey, path: String) -> Result<()> {
         let mut reg = self.registry.lock().await;
         match reg.get_mut(hash) {
             Some(t) => {
@@ -194,16 +394,34 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
     }
     async fn rename_path(
         &self,
-        _hash: &InfoHash,
+        _hash: &TorrentKey,
         _file_index: usize,
         _new_path: String,
     ) -> Result<()> {
         Ok(())
     }
-    async fn set_labels(&self, hash: &InfoHash, labels: Vec<String>) -> Result<()> {
+    async fn set_labels(&self, hash: &TorrentKey, labels: Vec<String>) -> Result<()> {
+        let config = self.config.lock().await.clone();
         let mut reg = self.registry.lock().await;
         match reg.get_mut(hash) {
             Some(t) => {
+                if t.policy.storage_snapshot.is_none() {
+                    let effective = EffectiveTorrentPolicy::resolve(&config, t);
+                    t.policy.storage_snapshot = Some(PolicyStorageSnapshot {
+                        profile: String::new(),
+                        preserve_existing_storage: true,
+                        download_dir: if t.download_dir.is_none() {
+                            effective.download_dir.value
+                        } else {
+                            None
+                        },
+                        incomplete_dir: if t.policy.overrides.incomplete_dir.is_none() {
+                            effective.incomplete_dir.value
+                        } else {
+                            None
+                        },
+                    });
+                }
                 t.labels = labels;
                 Ok(())
             }
@@ -212,7 +430,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
     }
     async fn set_torrent_limits(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         limits: swarmotter_core::bandwidth::TorrentBandwidth,
     ) -> Result<()> {
         let mut reg = self.registry.lock().await;
@@ -220,12 +438,34 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             Some(t) => {
                 t.download_limit = limits.download;
                 t.upload_limit = limits.upload;
+                t.policy.overrides.download_limit = Some(limits.download);
+                t.policy.overrides.upload_limit = Some(limits.upload);
                 Ok(())
             }
             None => Err(CoreError::NotFound("torrent".into())),
         }
     }
-    async fn list_files(&self, hash: &InfoHash) -> Option<Vec<TorrentFile>> {
+    async fn set_torrent_seeding(
+        &self,
+        hash: &TorrentKey,
+        seeding: swarmotter_core::ratio::TorrentSeeding,
+    ) -> Result<TorrentSummary> {
+        self.record_call("set_torrent_seeding").await;
+        {
+            let mut reg = self.registry.lock().await;
+            let torrent = reg
+                .get_mut(hash)
+                .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+            torrent.seeding = seeding;
+            torrent.policy.overrides.ratio_limit = torrent.seeding.ratio_limit;
+            torrent.policy.overrides.idle_limit = torrent.seeding.idle_limit;
+            torrent.policy.overrides.seed_forever = Some(torrent.seeding.seed_forever);
+        }
+        self.summary(hash)
+            .await
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))
+    }
+    async fn list_files(&self, hash: &TorrentKey) -> Option<Vec<TorrentFile>> {
         self.registry
             .lock()
             .await
@@ -234,7 +474,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
     }
     async fn set_wanted(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         file_indices: Vec<usize>,
         wanted: bool,
     ) -> Result<()> {
@@ -254,7 +494,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
     }
     async fn set_priority(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         file_indices: Vec<usize>,
         priority: FilePriority,
     ) -> Result<()> {
@@ -272,7 +512,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             None => Err(CoreError::NotFound("torrent".into())),
         }
     }
-    async fn list_trackers(&self, hash: &InfoHash) -> Option<Vec<TrackerInfo>> {
+    async fn list_trackers(&self, hash: &TorrentKey) -> Option<Vec<TrackerInfo>> {
         self.registry.lock().await.get(hash).map(|t| {
             let mut out = Vec::new();
             let mut tier = 0;
@@ -290,6 +530,12 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
                     last_message: None,
                     next_announce: None,
                     last_announce: None,
+                    scrape_status: TrackerScrapeStatus::NotContacted,
+                    last_scrape: None,
+                    scrape_seeders: None,
+                    scrape_leechers: None,
+                    scrape_downloads: None,
+                    last_scrape_error: None,
                 });
                 tier += 1;
             }
@@ -308,6 +554,12 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
                         last_message: None,
                         next_announce: None,
                         last_announce: None,
+                        scrape_status: TrackerScrapeStatus::NotContacted,
+                        last_scrape: None,
+                        scrape_seeders: None,
+                        scrape_leechers: None,
+                        scrape_downloads: None,
+                        last_scrape_error: None,
                     });
                 }
                 tier += 1;
@@ -315,13 +567,13 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             out
         })
     }
-    async fn add_tracker(&self, hash: &InfoHash, _url: String) -> Result<()> {
+    async fn add_tracker(&self, hash: &TorrentKey, _url: String) -> Result<()> {
         if self.registry.lock().await.get(hash).is_none() {
             return Err(CoreError::NotFound("torrent".into()));
         }
         Ok(())
     }
-    async fn remove_tracker(&self, hash: &InfoHash, _url: String) -> Result<()> {
+    async fn remove_tracker(&self, hash: &TorrentKey, _url: String) -> Result<()> {
         if self.registry.lock().await.get(hash).is_none() {
             return Err(CoreError::NotFound("torrent".into()));
         }
@@ -329,7 +581,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
     }
     async fn edit_tracker(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         _old_url: String,
         _new_url: String,
     ) -> Result<()> {
@@ -338,26 +590,82 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         }
         Ok(())
     }
-    async fn list_peers(&self, hash: &InfoHash) -> Option<Vec<Peer>> {
+    async fn list_peers(&self, hash: &TorrentKey) -> Option<Vec<Peer>> {
         self.registry.lock().await.get(hash)?;
         Some(Vec::new())
     }
-    async fn queue_move_up(&self, _hash: &InfoHash) -> Result<()> {
+    async fn peer_filter_status(&self) -> PeerFilterStatus {
+        let config = self.config.lock().await.clone();
+        PeerFilter::from_config(&config.peer_filter)
+            .unwrap_or_else(|error| PeerFilter::fail_closed(error.to_string()))
+            .status()
+    }
+    async fn replace_peer_filter(&self, peer_filter: PeerFilterConfig) -> Result<PeerFilterStatus> {
+        self.record_call("replace_peer_filter").await;
+        let mut next = self.config.lock().await.clone();
+        next.peer_filter = peer_filter;
+        next.validate()?;
+        *self.config.lock().await = next.clone();
+        Ok(PeerFilter::from_config(&next.peer_filter)?.status())
+    }
+    async fn ban_peer(&self, hash: &TorrentKey, ban: ManualPeerBan) -> Result<PeerFilterStatus> {
+        self.record_call("ban_peer").await;
+        if self.registry.lock().await.get(hash).is_none() {
+            return Err(CoreError::NotFound("torrent".into()));
+        }
+        let ip = ban.ip.trim().parse::<std::net::IpAddr>().map_err(|error| {
+            CoreError::InvalidArgument(format!("manual peer ban IP '{}': {error}", ban.ip))
+        })?;
+        let mut next = self.config.lock().await.clone();
+        next.peer_filter.enabled = true;
+        let ban = ManualPeerBan {
+            ip: ip.to_string(),
+            reason: ban.reason.map(|reason| reason.trim().to_string()),
+        };
+        if let Some(existing) = next.peer_filter.manual_bans.iter_mut().find(|existing| {
+            existing
+                .ip
+                .trim()
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|current| current == ip)
+        }) {
+            *existing = ban;
+        } else {
+            next.peer_filter.manual_bans.push(ban);
+        }
+        next.validate()?;
+        *self.config.lock().await = next.clone();
+        Ok(PeerFilter::from_config(&next.peer_filter)?.status())
+    }
+    async fn unban_peer(&self, hash: &TorrentKey, ip: String) -> Result<PeerFilterStatus> {
+        self.record_call("unban_peer").await;
+        if self.registry.lock().await.get(hash).is_none() {
+            return Err(CoreError::NotFound("torrent".into()));
+        }
+        self.remove_manual_ban(ip).await
+    }
+    async fn unban_global_peer(&self, ip: String) -> Result<PeerFilterStatus> {
+        self.record_call("unban_global_peer").await;
+        self.remove_manual_ban(ip).await
+    }
+    async fn queue_move_up(&self, _hash: &TorrentKey) -> Result<()> {
         Ok(())
     }
-    async fn queue_move_down(&self, _hash: &InfoHash) -> Result<()> {
+    async fn queue_move_down(&self, _hash: &TorrentKey) -> Result<()> {
         Ok(())
     }
-    async fn queue_move_to_top(&self, _hash: &InfoHash) -> Result<()> {
+    async fn queue_move_to_top(&self, _hash: &TorrentKey) -> Result<()> {
         Ok(())
     }
-    async fn queue_move_to_bottom(&self, _hash: &InfoHash) -> Result<()> {
+    async fn queue_move_to_bottom(&self, _hash: &TorrentKey) -> Result<()> {
         Ok(())
     }
     async fn get_config(&self) -> Config {
+        self.record_call("get_config").await;
         self.config.lock().await.clone()
     }
     async fn update_settings(&self, patch: swarmotter_api::state::SettingsPatch) -> Result<()> {
+        self.record_call("update_settings").await;
         let mut cfg = self.config.lock().await;
         if let Some(b) = patch.bandwidth {
             cfg.bandwidth = b;
@@ -374,10 +682,12 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         Ok(())
     }
     async fn replace_config(&self, config: Config) -> Result<ConfigUpdateResult> {
+        self.record_call("replace_config").await;
         config.validate()?;
         *self.config.lock().await = config.clone();
         let mut redacted = config;
         redacted.api.auth_token = None;
+        redacted.network.socks5.password = None;
         Ok(ConfigUpdateResult {
             persisted: false,
             config_path: None,
@@ -386,6 +696,197 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             applied_runtime_fields: vec!["config".into()],
             config: redacted,
         })
+    }
+    async fn torrent_policy(
+        &self,
+        hash: &TorrentKey,
+    ) -> Option<swarmotter_core::policy::EffectiveTorrentPolicy> {
+        let torrent = self.registry.lock().await.get(hash).cloned()?;
+        let config = self.config.lock().await.clone();
+        Some(EffectiveTorrentPolicy::resolve(&config, &torrent))
+    }
+    async fn preview_torrent_storage_paths(
+        &self,
+        hash: &TorrentKey,
+        request: StoragePathPreviewRequest,
+    ) -> Result<StoragePathPreview> {
+        let config = self.config.lock().await.clone();
+        let mut torrent = self
+            .registry
+            .lock()
+            .await
+            .get(hash)
+            .cloned()
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+        if let Some(profile) = request.profile {
+            if profile.trim().is_empty() || !config.profiles.profiles.contains_key(&profile) {
+                return Err(CoreError::InvalidArgument(format!(
+                    "unknown or empty policy profile {profile:?}"
+                )));
+            }
+            if torrent.policy.storage_snapshot.is_none() {
+                let effective = EffectiveTorrentPolicy::resolve(&config, &torrent);
+                torrent.policy.storage_snapshot = Some(PolicyStorageSnapshot {
+                    profile: String::new(),
+                    preserve_existing_storage: true,
+                    download_dir: torrent
+                        .download_dir
+                        .is_none()
+                        .then_some(effective.download_dir.value)
+                        .flatten(),
+                    incomplete_dir: torrent
+                        .policy
+                        .overrides
+                        .incomplete_dir
+                        .is_none()
+                        .then_some(effective.incomplete_dir.value)
+                        .flatten(),
+                });
+            }
+            torrent.policy.profile = Some(profile);
+            torrent.policy.profile_origin = Some(PolicyProfileOrigin::Torrent);
+        }
+        if let Some(download_dir) = request.download_dir {
+            if download_dir.trim().is_empty() {
+                return Err(CoreError::InvalidArgument(
+                    "download_dir must not be empty when previewing placement".into(),
+                ));
+            }
+            torrent.download_dir = Some(download_dir);
+        }
+        if let Some(incomplete_dir) = request.incomplete_dir {
+            if incomplete_dir.trim().is_empty() {
+                return Err(CoreError::InvalidArgument(
+                    "incomplete_dir must not be empty when previewing placement".into(),
+                ));
+            }
+            torrent.policy.overrides.incomplete_dir = Some(incomplete_dir);
+        }
+        let effective = EffectiveTorrentPolicy::resolve(&config, &torrent);
+        let complete_base = effective.download_dir.value.unwrap_or_else(|| {
+            std::env::temp_dir()
+                .join("swarmotter-downloads")
+                .display()
+                .to_string()
+        });
+        let incomplete_base = effective
+            .incomplete_dir
+            .value
+            .unwrap_or_else(|| complete_base.clone());
+        let snapshot = torrent.policy.intake_snapshot.as_ref();
+        let complete_dir = force_top_level_storage_path(
+            organize_storage_path(
+                complete_base,
+                snapshot.and_then(|snapshot| snapshot.organization_subdirectory.as_deref()),
+            ),
+            &torrent.meta.name,
+            torrent.meta.is_multi_file,
+            snapshot.is_some_and(|snapshot| snapshot.force_top_level_folder),
+        );
+        let incomplete_dir = force_top_level_storage_path(
+            organize_storage_path(
+                incomplete_base,
+                snapshot.and_then(|snapshot| {
+                    snapshot
+                        .incomplete_subdirectory
+                        .as_deref()
+                        .or(snapshot.organization_subdirectory.as_deref())
+                }),
+            ),
+            &torrent.meta.name,
+            torrent.meta.is_multi_file,
+            snapshot.is_some_and(|snapshot| snapshot.force_top_level_folder),
+        );
+        let partial_file_suffix =
+            snapshot.and_then(|snapshot| snapshot.partial_file_suffix.clone());
+        validate_partial_file_suffix(partial_file_suffix.as_deref())
+            .map_err(CoreError::InvalidArgument)?;
+        const FILE_LIMIT: usize = 256;
+        let complete_storage = swarmotter_core::storage::StorageIo::new(
+            torrent.meta.clone(),
+            PathBuf::from(&complete_dir),
+        );
+        let incomplete_storage = swarmotter_core::storage::StorageIo::new(
+            torrent.meta.clone(),
+            PathBuf::from(&incomplete_dir),
+        );
+        let mut complete_files = Vec::with_capacity(torrent.meta.files.len().min(FILE_LIMIT));
+        let mut incomplete_files = Vec::with_capacity(torrent.meta.files.len().min(FILE_LIMIT));
+        for index in 0..torrent.meta.files.len().min(FILE_LIMIT) {
+            complete_files.push(complete_storage.file_path(index)?.display().to_string());
+            let mut path = incomplete_storage.file_path(index)?;
+            if let Some(suffix) = partial_file_suffix.as_deref() {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        CoreError::Storage(
+                            "storage preview path does not have a UTF-8 file name".into(),
+                        )
+                    })?;
+                path.set_file_name(format!("{name}{suffix}"));
+            }
+            incomplete_files.push(path.display().to_string());
+        }
+        Ok(StoragePathPreview {
+            complete_dir,
+            incomplete_dir,
+            partial_file_suffix,
+            complete_files,
+            incomplete_files,
+            file_count: torrent.meta.files.len(),
+            truncated: torrent.meta.files.len() > FILE_LIMIT,
+        })
+    }
+    async fn set_torrent_profile(&self, hash: &TorrentKey, profile: Option<String>) -> Result<()> {
+        let config = self.config.lock().await.clone();
+        if let Some(profile) = profile.as_ref() {
+            if !config.profiles.profiles.contains_key(profile) {
+                return Err(CoreError::InvalidArgument(format!(
+                    "unknown policy profile {profile}"
+                )));
+            }
+        }
+        let mut registry = self.registry.lock().await;
+        let torrent = registry
+            .get_mut(hash)
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+        if torrent.policy.storage_snapshot.is_none() {
+            let effective = EffectiveTorrentPolicy::resolve(&config, torrent);
+            torrent.policy.storage_snapshot = Some(PolicyStorageSnapshot {
+                profile: String::new(),
+                preserve_existing_storage: true,
+                download_dir: if torrent.download_dir.is_none() {
+                    effective.download_dir.value
+                } else {
+                    None
+                },
+                incomplete_dir: if torrent.policy.overrides.incomplete_dir.is_none() {
+                    effective.incomplete_dir.value
+                } else {
+                    None
+                },
+            });
+        }
+        torrent.policy.profile = profile;
+        torrent.policy.profile_origin = torrent
+            .policy
+            .profile
+            .as_ref()
+            .map(|_| PolicyProfileOrigin::Torrent);
+        Ok(())
+    }
+    async fn set_torrent_encryption_mode(
+        &self,
+        hash: &TorrentKey,
+        encryption_mode: Option<PeerEncryptionMode>,
+    ) -> Result<()> {
+        let mut registry = self.registry.lock().await;
+        let torrent = registry
+            .get_mut(hash)
+            .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
+        torrent.policy.overrides.encryption_mode = encryption_mode;
+        Ok(())
     }
     async fn reset_downloads(&self) -> Result<ResetResult> {
         let removed = self.registry.lock().await.torrents.len();
@@ -411,6 +912,8 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             utp_enabled: cfg.torrent.utp_enabled,
             utp_prefer_tcp: cfg.torrent.utp_prefer_tcp,
             peer_encryption_mode: cfg.torrent.encryption_mode,
+            socks5_enabled: cfg.network.socks5.enabled,
+            socks5_udp_blocked: cfg.network.socks5.enabled,
             interfaces: vec![NetworkInterfaceDiagnostic {
                 name: "lo".into(),
                 status: "up".into(),
@@ -496,13 +999,13 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             ..Default::default()
         }
     }
-    async fn torrent_stats(&self, hash: &InfoHash) -> Option<TorrentDiagnostics> {
+    async fn torrent_stats(&self, hash: &TorrentKey) -> Option<TorrentDiagnostics> {
         let reg = self.registry.lock().await;
         let t = reg.get(hash)?;
         let total_length = t.meta.total_length;
         let bytes_completed = t.bytes_completed();
         Some(TorrentDiagnostics {
-            info_hash: t.info_hash(),
+            info_hash: t.key(),
             name: t.name().to_string(),
             state: t.state,
             total_length,
@@ -543,7 +1046,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
     async fn autopilot_status(&self) -> AutopilotConfig {
         self.config.lock().await.autopilot.clone()
     }
-    async fn torrent_autopilot_decision(&self, hash: &InfoHash) -> Option<AutopilotDecision> {
+    async fn torrent_autopilot_decision(&self, hash: &TorrentKey) -> Option<AutopilotDecision> {
         let torrent = self.registry.lock().await.get(hash).cloned()?;
         let mode = {
             let cfg = self.config.lock().await;
@@ -598,7 +1101,7 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
     }
     async fn set_torrent_autopilot_mode_override(
         &self,
-        hash: &InfoHash,
+        hash: &TorrentKey,
         mode: Option<AutopilotMode>,
     ) -> Result<()> {
         let mut reg = self.registry.lock().await;
@@ -652,15 +1155,23 @@ pub fn fake_state() -> swarmotter_api::state::SharedState {
 }
 
 pub fn fake_state_with_config(config: Config) -> swarmotter_api::state::SharedState {
+    fake_state_with_config_and_daemon(config).0
+}
+
+pub fn fake_state_with_config_and_daemon(
+    config: Config,
+) -> (swarmotter_api::state::SharedState, Arc<FakeDaemon>) {
     use swarmotter_api::state::{AppState, BuildInfo};
-    Arc::new(AppState {
-        daemon: Arc::new(FakeDaemon::with_config(config.clone())),
+    let daemon = Arc::new(FakeDaemon::with_config(config.clone()));
+    let state = Arc::new(AppState {
+        daemon: daemon.clone(),
         config: Arc::new(Mutex::new(config)),
         build: BuildInfo::default(),
         broker: swarmotter_api::handlers::events::EventBroker::default(),
         transmission: swarmotter_api::state::TransmissionCompatState::default(),
         qbittorrent: swarmotter_api::state::QbittorrentCompatState::default(),
-    })
+    });
+    (state, daemon)
 }
 
 // Suppress unused import warnings for models referenced only in trait impls.

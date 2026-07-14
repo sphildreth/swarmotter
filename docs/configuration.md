@@ -7,6 +7,16 @@ settings.
 Most sections can be omitted entirely. When a section is present with only a
 few fields, unspecified fields use their documented defaults.
 
+## v2.0.0 containment migration
+
+In `1.x`, omitting `[network]` could select disabled containment. In `v2.0.0`,
+omission selects strict mode without an enforceable path and validation fails.
+Existing installations must configure the intended interface, source address,
+or namespace, or explicitly set `mode = "disabled"` only when local development
+or a separately enforced boundary supplies containment. Check the migrated file
+with `swarmotterd --check-config --config PATH` before replacing a running
+daemon.
+
 ## Environment overrides
 
 Environment variables use the `SWARMOTTER_` prefix. Nested fields are separated
@@ -19,10 +29,17 @@ SWARMOTTER_API__AUTH_TOKEN=replace-with-a-long-random-token
 SWARMOTTER_AUTOPILOT__MODE=act
 SWARMOTTER_NETWORK__MODE=strict
 SWARMOTTER_NETWORK__REQUIRED_INTERFACE=br0
+SWARMOTTER_NETWORK__SOCKS5__ENABLED=true
+SWARMOTTER_NETWORK__SOCKS5__HOST=proxy.example
+# SOCKS5 support is TCP-only, so its required UDP features must be disabled.
+SWARMOTTER_TORRENT__UTP_ENABLED=false
+SWARMOTTER_DHT__ENABLED=false
 SWARMOTTER_TORRENT__LISTEN_PORT=51413
 SWARMOTTER_TORRENT__ENCRYPTION_MODE=preferred
 SWARMOTTER_COMPATIBILITY__QBITTORRENT__ENABLED=true
 SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED=true
+SWARMOTTER_STORAGE__RESUME_DIR=/srv/swarmotter/resume
+SWARMOTTER_STORAGE__STATE_DIR=/srv/swarmotter/state
 ```
 
 ## Runtime configuration editing
@@ -32,6 +49,9 @@ SwarmOtter exposes two update modes:
 - `PATCH /api/v1/settings` updates live-safe fields (bandwidth, queue, and seeding policy).
 - `PUT /api/v1/settings` replaces the full config after validation and persists it atomically.
   The existing `api.auth_token` is preserved when omitted from the request body.
+  A redacted `network.socks5.password` is likewise preserved when the SOCKS5
+  username is unchanged; clearing or changing that username requires a complete
+  new credential pair.
 
 The `PUT /api/v1/settings` response reports which fields were applied live, which
 fields require restart, and whether the write was persisted.
@@ -56,9 +76,14 @@ containment or security setting from silently falling back to a default.
 
 ## Durable daemon state
 
-Torrent records, queue order, labels, file choices, and per-torrent controls
-are stored separately from configuration in a versioned state file. Select its
-path with `--state-file PATH` or `SWARMOTTER_STATE_FILE=PATH`.
+Torrent records, queue order, labels, file choices, per-torrent controls,
+canonical metainfo, and library-operation indexes are stored separately from
+configuration in a versioned local SQLite state store. Select its path with
+`--state-file PATH` or `SWARMOTTER_STATE_FILE=PATH`. Those explicit choices
+take precedence over `storage.state_dir`; when that setting is present, the
+daemon uses `storage.state_dir/state.json` on its next start. The legacy file
+name is retained for path compatibility even after its contents migrate to
+SQLite.
 
 Without an explicit path, the daemon uses the first available location:
 
@@ -68,9 +93,37 @@ Without an explicit path, the daemon uses the first available location:
 4. `$HOME/.local/state/swarmotter/state.json`.
 5. `./swarmotter-state.json`.
 
-The state file is atomically replaced and mode `0600` on Unix. Corrupt or
-unsupported state stops startup with an explicit error instead of presenting
-an empty library. Restored completed torrents are rechecked before seeding.
+Existing version-one JSON state is read for upgrade compatibility and migrates
+in place on its first successful save. The migration first writes and
+checkpoints a complete temporary SQLite database, then atomically replaces the
+legacy file. SQLite writes use a durable local transaction and checkpoint
+before a rollback snapshot; the database file is mode `0600` on Unix. Corrupt
+or unsupported state stops startup with an explicit error instead of presenting
+an empty library. SwarmOtter does not rebuild a damaged library database from
+payload or fast-resume files because those sources are not authoritative for
+queue and control-plane state; restore a valid state backup or re-add the
+torrents intentionally. Restored completed torrents are rechecked before
+seeding.
+
+The SQLite store retains indexed library/queue state, canonical metainfo,
+byte-exact original locally supplied `.torrent` files, bounded audit history,
+and rolling metric history. It uses full 40-character v1/hybrid-primary or
+64-character pure-v2 locators; a v2 peer-wire truncation is never persisted as
+a library key. To rebuild only verified indexes and projections after an
+interrupted projection update, stop the daemon and run:
+
+```bash
+swarmotterd --state-file /path/to/state.json --rebuild-state-projections
+```
+
+This offline command validates the existing supported SQLite database first.
+It refuses missing, legacy, corrupt, or unsupported files; it never creates a
+new state file, migrates JSON, reconstructs payload state, or repairs a corrupt
+database. The command deliberately does not load `--config` or consult
+`storage.state_dir`: it resolves only `--state-file` (including
+`SWARMOTTER_STATE_FILE`) or the platform compatibility default, so it remains
+usable when the normal configuration is invalid or its strict network path is
+unavailable.
 
 ## Common configuration: bind torrents to `br0`
 
@@ -86,6 +139,9 @@ auth_token = "replace-with-a-long-random-token"
 [storage]
 download_dir = "/mnt/incoming/swarmotter/downloads"
 incomplete_dir = "/mnt/incoming/swarmotter/incomplete"
+# resume_dir = "/var/lib/swarmotter/resume"
+# state_dir = "/var/lib/swarmotter/state"
+# temp_dir = "/var/cache/swarmotter"
 
 [network]
 required_interface = "br0"
@@ -228,6 +284,15 @@ mode = "act"  # optional; defaults to act
 | `auth_token` | unset | Required when `require_auth = true`. |
 | `max_request_body_bytes` | `16777216` | Maximum API request body size, including `.torrent` uploads. |
 
+Chrome Manifest V3 extension service workers are deliberate cross-origin API
+clients. Extension access requires `require_auth = true` and a valid configured
+token sent as `Authorization: Bearer <token>` or `X-SwarmOtter-Auth: <token>`.
+An extension Origin is rejected when auth is disabled, even if `auth_token`
+remains populated. No extension ID allowlist is inferred from configuration;
+the token is mandatory, and ordinary foreign HTTP(S) browser Origins remain
+forbidden even when they send it. The extension manifest must separately grant
+host permission for the exact SwarmOtter HTTP and/or HTTPS API origin.
+
 ### `[compatibility.qbittorrent]`
 
 | Option | Default | Meaning |
@@ -291,8 +356,12 @@ Remote HTTP/HTTPS URLs for torrent metadata are rejected by this adapter.
 | --- | --- | --- |
 | `download_dir` | unset | Final directory for verified completed downloads. |
 | `incomplete_dir` | unset | Active write directory for incomplete downloads. |
+| `resume_dir` | unset | Dedicated durable fast-resume directory. Resume filenames use the full canonical torrent locator; unset preserves adjacent active-data placement. |
+| `state_dir` | unset | Default directory for the durable state store (the compatible default filename is `state.json`) when no `--state-file` or `SWARMOTTER_STATE_FILE` is supplied; changing it through Settings requires restart. |
+| `temp_dir` | unset | Root for the fallback `swarmotter-downloads` payload layout when `download_dir` is unset. It does not relocate atomic state/resume temporary files. |
 | `preallocate` | `false` | Pre-size files before downloading. |
 | `sparse` | `true` | When `false`, active payload files are sized up front even if `preallocate = false`. |
+| `cow_strategy` | `conservative` | `conservative` preserves filesystem defaults. `disable_for_new_files` requests NOCOW for newly created Linux Btrfs payload files, never modifies existing files, and fails a write explicitly when the root or existing file cannot satisfy that policy. |
 | `minimum_free_space_bytes` | `0` | If > 0, reject new adds when target-root usable space falls below this number of bytes. |
 | `minimum_free_space_percent` | `0` | If > 0, reject new adds when free space on the target root falls below this percent of total root size. |
 
@@ -300,22 +369,190 @@ The minimum reserve fields apply to add/start-time preflight and are checked
 before payload data is written. Both fields are optional; when both are set,
 the preflight uses the stricter reserve.
 
-When `incomplete_dir` is set, SwarmOtter writes partial pieces and partial
-fast-resume metadata there while the torrent is downloading. After every piece
-is verified, the daemon moves the torrent data into `download_dir` and removes
-SwarmOtter fast-resume metadata so the completed directory contains only user
-payload files. If `incomplete_dir` is unset, the active and final directory are
-both `download_dir`. With `preallocate = false` and `sparse = true`, active
+When `incomplete_dir` is set, SwarmOtter writes partial pieces there while the
+torrent is downloading. `resume_dir`, when configured, stores fast-resume
+metadata separately under a full canonical torrent-locator filename; configuring it never moves
+payload data. After every piece is verified, the daemon moves torrent data into
+`download_dir` and removes its fast-resume metadata so the completed directory
+contains only user payload files. If `incomplete_dir` is unset, the active and
+final directory are both `download_dir`. With `preallocate = false` and `sparse = true`, active
 single-file torrents still create a zero-length placeholder in
 `incomplete_dir` when the engine starts; the file is not sized to the full
 payload until data is written. With `sparse = false`, active payload files are
 sized up front.
 
+`temp_dir` only controls the fallback payload root used when `download_dir` is
+unset. It is not a general replacement for atomic temporary files: daemon
+state and resume writes use a temporary sibling beside their final file, flush
+it, rename it atomically, and sync the target directory. This deliberately
+avoids a cross-filesystem rename weakening crash recovery.
+
+### CoW, preallocation, and sparse files
+
+The default `cow_strategy = "conservative"` never changes filesystem flags.
+Use it unless you have evaluated the filesystem and workload trade-offs.
+`cow_strategy = "disable_for_new_files"` is an explicit Linux Btrfs-only
+choice: before a newly created payload file is sized or written, SwarmOtter
+requests the NOCOW inode flag. It does not touch existing files; an existing
+file that lacks NOCOW is rejected for further writes rather than being changed
+or silently accepted under a different strategy. The daemon also fails the
+start rather than silently applying a different strategy if Btrfs, the
+required capability, or the flag operation is unavailable.
+
+On Btrfs, NOCOW changes filesystem-level behavior: data checksumming,
+compression, snapshots, and fragmentation characteristics can differ. It does
+not replace SwarmOtter piece-hash verification or forced rechecks. `preallocate`
+and `sparse` remain independent choices: preallocation reserves/sizes files
+up front, while sparse layout delays allocation until payload writes. Choose
+them based on capacity and fragmentation needs, not as an integrity setting.
+
+### Per-root storage controls
+
+Use repeatable `[[storage.root_controls]]` entries to give different local
+storage roots independent admission, write-pressure, and recheck budgets:
+
+```toml
+[[storage.root_controls]]
+path = "/srv/torrents/hdd"
+max_active_downloads = 2
+max_active_bytes = 107374182400
+max_write_bytes_per_second = 52428800
+max_concurrent_rechecks = 1
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `path` | required | Lexical root path. A control applies to this path and descendants. |
+| `max_active_downloads` | `0` | Maximum active torrent engines on the root; `0` is unlimited. |
+| `max_active_bytes` | `0` | Maximum sum of admitted declared payload bytes on the root; `0` is unlimited. |
+| `max_write_bytes_per_second` | `0` | Shared sustained rate for verified local payload writes; `0` is unlimited. |
+| `max_concurrent_rechecks` | `0` | Maximum full rechecks running on the root; `0` is unlimited. |
+
+Nested controls are allowed; the most-specific lexical path wins. Duplicate
+normalized paths are rejected. The active write directory determines the
+matching control, so an `incomplete_dir` below a root shares its budget with
+other descendants. Active-engine count and declared payload bytes are reserved
+before an engine starts; a saturated root leaves eligible work queued until
+capacity becomes available. A magnet reservation is updated after its metadata
+is verified. `max_active_bytes` is a scheduling budget, not a replacement for
+the free-space reserve preflight.
+
+The write ceiling delays verified local payload writes without dropping or
+modifying data. Full rechecks wait for a root slot and release it even if their
+request is cancelled. Existing work may finish safely during a configuration
+replacement; subsequent admissions use the replacement controls.
+
+### `[profiles]`
+
+Named policy profiles keep category-style defaults consistent without copying
+queue, seeding, or bandwidth values into every torrent. A profile can supply
+storage paths, queue priority, initial start behavior, ratio/idle defaults,
+seed-forever, per-torrent transfer caps, an optional peer-wire
+`encryption_mode`, and intake-time file-selection/content-organization rules.
+Labels map case-insensitively to profiles; when more than one mapped label is
+present, the normalized label name makes the selection deterministic.
+
+```toml
+[profiles.labels]
+linux = "linux-release"
+
+[profiles.profiles.linux-release]
+encryption_mode = "required" # disabled, preferred, or required
+
+[profiles.profiles.linux-release.storage]
+download_dir = "/srv/releases/linux"
+incomplete_dir = "/srv/releases/.incoming"
+
+[profiles.profiles.linux-release.queue]
+priority = "high"       # low, normal, or high
+start_behavior = "start" # start or paused
+
+[profiles.profiles.linux-release.seeding]
+ratio_limit = 2.0
+idle_limit = 86400
+seed_forever = false
+
+[profiles.profiles.linux-release.bandwidth]
+download_limit = 0       # bytes/sec; 0 is unlimited
+upload_limit = 5242880
+
+[profiles.profiles.linux-release.tracker]
+# First matching case-insensitive host glob wins. Omit enabled to leave a
+# matching tracker eligible; high/normal/low determines attempt ordering.
+host_rules = [
+  { host_pattern = "*.example.invalid", enabled = false },
+  { host_pattern = "tracker.example.org", priority = "high" },
+]
+
+[profiles.profiles.linux-release.intake]
+# Case-insensitive * and ? patterns against slash-separated torrent paths.
+excluded_file_patterns = ["*.nfo", "samples/*"]
+# Safe relative path below both selected storage roots.
+organization_subdirectory = "lawful/linux"
+# Optional independent staging directory below the incomplete root.
+incomplete_subdirectory = "review"
+# Put single-file torrents below a directory named after the torrent.
+force_top_level_folder = true
+# Active files are named `original-name.part` until completion.
+partial_file_suffix = ".part"
+
+[[profiles.profiles.linux-release.intake.excluded_file_rules]]
+# Every populated field in one rule must match; any matching rule excludes.
+path_segment = "samples"
+max_size_bytes = 104857600
+
+[[profiles.profiles.linux-release.intake.excluded_file_rules]]
+suffix = ".txt"
+```
+
+An explicit profile supplied at add time, by a watch folder, or through the
+torrent policy API wins over a label mapping. Per-torrent limits and seeding
+settings then win for their individual fields. A durable per-torrent encryption
+override is set with `PUT /api/v1/torrents/:hash/encryption-mode`; its body
+must contain `encryption_mode`, and JSON `null` explicitly clears the override
+to restore profile/label/global inheritance. Profile queue priority, seeding,
+rate limits, and encryption remain live for inheriting torrents.
+`start_behavior` controls initial admission; changing it never stops
+already-running work.
+
+Encryption precedence is explicit torrent override, selected profile, then
+global `torrent.encryption_mode`. A profile or label-map replacement restarts
+only active download/metadata engines whose effective mode changes; future
+inbound TCP seeding sessions use the refreshed mode, while an already
+negotiated peer session retains its wire stream. Pure-v2 MSE/PE uses its
+20-byte peer-wire identity only at the protocol boundary; the full SHA-256
+identity remains the durable/API key. Profiles do not create a separate network
+path or proxy.
+
+Storage is deliberately different: the resolved completed and incomplete
+paths are captured when a torrent is registered, including the global/no-
+profile result. Editing a profile, changing labels on an existing torrent, or
+assigning a profile later never relocates data. The resolved start-or-paused
+decision is captured at registration too, so later profile or global
+auto-start edits cannot revoke a queued torrent's admission. Use the move-data
+operation for an intentional relocation. State restored from before these
+fields is migrated transactionally from its preceding effective values when a
+profile configuration replacement is applied; until then it retains legacy
+global queue behavior.
+
+Intake rules are also create-time snapshots. Exclusion patterns mark matching
+files unwanted before payload transfer; an add request may supply additional
+`unwanted_file_indices` or structured suffix/path-glob/path-segment/size rules.
+For a magnet, those choices are retained until its contained metadata fetch
+exposes the real file tree. `organization_subdirectory` and
+`incomplete_subdirectory` must be non-empty relative paths with normal
+components only; absolute, current-directory, and parent-directory paths are
+rejected. `partial_file_suffix` is applied only to active payload names and is
+removed on complete verification. Later profile edits never silently rewrite
+an existing torrent's reviewed selection or location. Tracker host rules remain
+live profile policy, so they can control discovery without rewriting the intake
+snapshot.
+
 ### `[network]`
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `mode` | `disabled` when the entire table is omitted; `strict` inside a partial table | Torrent data-plane containment mode. |
+| `mode` | `strict` | Torrent data-plane containment mode. An omitted `[network]` table produces strict mode without a path, which fails startup with `invalid_config`. Explicit `mode = "disabled"` is for development or a separately enforced boundary only. See ADR-0051. |
 | `required_interface` | unset | Interface name, such as `br0` or `tun0`. |
 | `required_source_ipv4` | unset | Required IPv4 source address. |
 | `required_source_ipv6` | unset | Required IPv6 source address. |
@@ -325,10 +562,130 @@ sized up front.
 | `validate_route` | `false` | Requires route validation when supported by the probe. |
 | `validate_dns` | `false` | Reports `dns_not_constrained` in network health when DNS cannot be proven constrained. Hostname resolution is still fail-closed unless DNS is constrained or a network namespace is used. |
 
-Strict mode requires at least one enforceable path: interface, source address,
-or network namespace. On Linux, route and DNS path validation invoke
+### `[network.socks5]`
+
+SOCKS5 is an explicit, opt-in TCP `CONNECT` transport layered on top of the
+configured network path. The daemon resolves and connects to the proxy through
+the contained binder first. For peer TCP addresses it sends SOCKS IP-address
+forms; HTTP(S) tracker, scrape, and webseed hostnames use SOCKS domain forms so
+their target DNS resolution happens at the proxy. A failed proxy connection or
+handshake returns an error; SwarmOtter never retries the target directly.
+
+```toml
+[network.socks5]
+enabled = true
+host = "proxy.example"
+port = 1080
+# Omit both for SOCKS5 no-authentication, or set both for RFC 1929 auth.
+# username = "operator"
+# password = "supply-with-your-secret-manager"
+
+[torrent]
+utp_enabled = false
+
+[dht]
+enabled = false
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Enables the contained SOCKS5 TCP `CONNECT` wrapper. |
+| `host` | unset | Required when enabled. The proxy hostname is resolved through the configured containment path. |
+| `port` | `1080` | SOCKS5 listener port; must be nonzero. |
+| `username` | unset | RFC 1929 username. Must be supplied together with `password`, or both must be omitted for no-authentication. |
+| `password` | unset | RFC 1929 password. API settings reads and replacement responses redact it. |
+
+SOCKS5 `CONNECT` is intentionally TCP-only. Configuration validation requires
+`torrent.utp_enabled = false` and `dht.enabled = false` when it is enabled. A
+UDP tracker URL is rejected through the proxy binder rather than routed directly;
+SOCKS5 UDP ASSOCIATE is not implemented. The Network diagnostics view reports
+only that SOCKS5 is enabled and that its UDP path is blocked; it never exposes
+the proxy host or credentials. NAT-PMP/UPnP router mapping remains a local
+gateway operation on the same contained path, not a proxy bypass for torrent
+traffic. See ADR-0062.
+
+Strict mode is the default and requires at least one enforceable path: interface,
+source address, or network namespace. **Breaking change (ADR-0051):** an omitted
+`[network]` table no longer selects disabled mode. It produces strict mode
+without a path and the daemon fails at startup with `invalid_config`. Existing
+users who relied on the disabled default must configure a strict path or set
+`mode = "disabled"` explicitly. Never infer disabled mode from a missing
+file/table, platform, bind failure, or unavailable interface; never auto-change
+strict to preferred or disabled.
+
+The daemon observes one process-wide containment gate shared by every torrent
+data-plane component (binder, DHT, listener, engine, seeder, tracker, webseed,
+metadata). On live path loss the gate blocks immediately, the inbound listener
+and DHT runner stop, data-plane tasks are aborted, and active torrents enter
+`network_blocked` while the control plane remains available. On recovery the
+gate reopens and only work carrying durable formerly-live recovery intent
+resumes; paused, queued, stale blocked, and automatically seed-stopped torrents
+remain stopped. Every block advances the gate generation, so tasks from before
+a blocked interval cancel even if recovery is immediate.
+
+Concrete bind failures block synchronously and latch `socket_bind_failed` (or
+`blocked_fail_closed` for a generic policy denial). A healthy probe alone does
+not clear the latch. Only an explicit `PUT /api/v1/settings` replacement whose
+peer-listener bind and, outside SOCKS5 TCP-only mode, contained UDP bind
+validation succeeds may recover it; a failed replacement preserves the prior
+configuration and blocked state. On Linux, route and DNS path validation invoke
 `ip route get`; direct and tarball installs must provide the `ip` utility from
 the distribution's `iproute2` or `iproute` package.
+
+Tracker announce, supported HTTP/HTTPS BEP 48 scrape, and webseed ranges use a
+framed HTTP/1 client only over binder-provided streams. Redirects repeat
+contained resolution/connect, follow at most five hops, allow HTTP-to-HTTPS,
+and reject HTTPS-to-HTTP. Tracker decoded bodies are capped at 2 MiB; webseed
+responses must be exact 206 ranges and are capped at the requested byte count.
+No cookies, authorization, or connection pool are retained. Scrape is derived
+only from an HTTP(S) tracker whose final path component begins `announce`;
+other paths and UDP scrape report `unsupported` without disabling announce.
+
+## Router port mapping and listener reachability
+
+Router port mapping is optional and disabled by default. When enabled,
+`[port_mapping]` maps the configured TCP `[torrent].listen_port` through a
+local NAT-PMP or UPnP IGD gateway, refreshes its lease before expiry, and
+reports the result through the network API and Web UI.
+
+Mapping is intentionally stricter than ordinary torrent operation: it requires
+`network.mode = "strict"`, `network.fail_closed = true`, and a concrete
+`network.required_interface`. NAT-PMP discovery/UDP, UPnP SSDP discovery, and
+UPnP SOAP control traffic all use that contained interface. If the path is
+blocked or the router rejects a mapping, SwarmOtter does not fall back to the
+default route; it reports the mapping as unavailable or blocked while leaving
+an otherwise healthy torrent data plane unchanged.
+
+```toml
+[port_mapping]
+enabled = true
+protocols = ["nat_pmp", "upnp"]
+# Optional overrides for constrained environments:
+# nat_pmp_gateway = "192.0.2.1"
+# upnp_service_url = "http://192.0.2.1:49000/control/WANIPConn1"
+lease_seconds = 3600
+refresh_before_expiry_seconds = 300
+```
+
+`[port_test]` is a separate, opt-in diagnostic. SwarmOtter never contacts a
+hardcoded public service. Configure an HTTP(S) endpoint you operate; a request
+through the same data-plane binder appends `listen_port`, `protocol=tcp`, and
+`format=swarmotter-port-test-v1`. The endpoint may return plain `open` or
+`closed`, or JSON with `reachable`/`open` boolean or `status: "open" | "closed"`.
+
+```toml
+[port_test]
+enabled = true
+endpoint = "https://reachability.example.invalid/check"
+cache_ttl_seconds = 900
+timeout_seconds = 10
+```
+
+Results are cached, serialized, and informational (`unknown`, `open`,
+`closed`, `error`, or `timeout`). A failed request or negative result never
+changes containment health or starts an uncontained retry. The API status does
+not repeat the configured endpoint URL. A successful mapping lease can refresh
+this diagnostic through the same contained runtime path.
 
 ### `[autopilot]`
 
@@ -344,8 +701,28 @@ the distribution's `iproute2` or `iproute` package.
 | `allow_ipv6` | `true` | Enables IPv6 peers when network containment also allows IPv6; when false, IPv6 peers are filtered before connecting. |
 | `utp_enabled` | `true` | Enables uTP peer transport through contained UDP sockets. |
 | `utp_prefer_tcp` | `true` | Tries TCP first, with uTP fallback. |
-| `encryption_mode` | `preferred` | TCP MSE/PE peer wire mode. `disabled` permits plaintext handshakes. `preferred` enables MSE/PE with plaintext fallback for TCP attempts while preserving the configured TCP/uTP preference. `required` refuses plaintext and requires encrypted TCP stream negotiation. Changing this setting rebuilds active data-plane tasks before it is reported as applied. |
+| `encryption_mode` | `preferred` | Contained TCP/uTP MSE/PE peer-wire mode. `disabled` uses plaintext only. `preferred` attempts MSE/PE first, then retries plaintext only on the same selected contained transport. `required` refuses plaintext and never falls back. Pure-v2 uses its required 20-byte peer-wire identity only for MSE/PE while retaining its full SHA-256 library key. Changing this global setting rebuilds active data-plane tasks before it is reported as applied. |
 | `selfish` | `false` | Removes a torrent after verified completion and does not seed it; already-completed managed records are also removed on runtime reconciliation while preserving downloaded data. |
+
+### `[port_mapping]`
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Opts into router mapping of the TCP peer listener. Requires strict fail-closed containment and `network.required_interface`. |
+| `protocols` | `["nat_pmp", "upnp"]` | Deterministic NAT-PMP/UPnP attempt order. |
+| `nat_pmp_gateway` | unset | Optional IPv4 NAT-PMP gateway. Without it, Linux discovery is limited to the configured interface. |
+| `upnp_service_url` | unset | Optional HTTP WANIP/WANPPP control URL; credentials and fragments are rejected. Without it, contained SSDP discovery is used. |
+| `lease_seconds` | `3600` | Requested mapping lifetime, bounded to seven days. |
+| `refresh_before_expiry_seconds` | `300` | Lead time for renewal; must be positive and shorter than the lease. |
+
+### `[port_test]`
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Opts into an operator-configured external TCP listener test. |
+| `endpoint` | unset | Required HTTP(S) URL when enabled. It is contacted only through the data-plane binder and is not shown in status responses. |
+| `cache_ttl_seconds` | `900` | Reuse window for the latest result, from 1 through 86,400 seconds. |
+| `timeout_seconds` | `10` | Per-request bound, from 1 through 30 seconds. |
 
 ### `[bandwidth]`
 
@@ -356,8 +733,8 @@ the distribution's `iproute2` or `iproute` package.
 | `alt_download` | `0` | Alternate download bytes/sec. |
 | `alt_upload` | `0` | Alternate upload bytes/sec. |
 | `alt_enabled` | `false` | Uses alternate limits when true. |
-| `max_peers` | `0` | Global peer worker cap divided across active downloads, `0` means no global cap. |
-| `max_peers_per_torrent` | `0` | Per-torrent peer worker cap. `0` uses the daemon default worker pool of 64. |
+| `max_peers` | `0` | Exact process-wide peer-session cap shared by inbound and outbound peer TCP/uTP across all torrents. `0` is unlimited. Trackers, webseeds, DHT, and DNS are excluded. |
+| `max_peers_per_torrent` | `0` | Additional per-torrent session cap shared by inbound and outbound peers. `0` uses the daemon default of 64. |
 
 ### `[queue]`
 
@@ -388,12 +765,19 @@ maintain responsive performance:
   torrents consume upload bandwidth and peer connections.
 
 **Peer limits:**
-- Set `max_peers` to cap total peer connections across all torrents. With
-  1,000 torrents and 50 peers each, that's 50,000 connections. A global cap
-  of 5,000-10,000 is often sufficient.
+- Set `max_peers` to a nonzero value to hard-bound total peer sessions across
+  all torrents. Size it together with the service file-descriptor limit and
+  leave headroom for files, trackers, DHT, and control-plane descriptors.
 - Set `max_peers_per_torrent` to limit per-torrent peer connections (default
   64). Lower values (e.g., 30-50) reduce resource usage with minimal impact
   on download speed for well-seeded torrents.
+
+Both limits apply for the full peer-session lifetime, including metadata,
+normal serial/parallel, endgame, seeding, TCP, and uTP paths. An inbound socket
+that cannot obtain capacity is closed before its peer session starts. Live
+changes replace the permit pools and synchronously reconstruct eligible work;
+if reconstruction or full-config persistence fails, the old limits and live
+ownership remain in effect.
 
 **Bandwidth limits:**
 - Set `global_download` and `global_upload` to prevent network saturation.
@@ -404,9 +788,9 @@ maintain responsive performance:
 
 **File descriptors:**
 - Ensure the daemon has sufficient file descriptor limits (see
-  [Deployment](deployment.md#file-descriptor-requirements)). Each active
-  torrent requires 50+ file descriptors for peer connections, trackers, and
-  file handles.
+  [Deployment](deployment.md#file-descriptor-requirements)). Peer descriptors
+  are bounded by `max_peers` when configured, with additional workload-specific
+  file, tracker, DHT, and control-plane overhead.
 
 **Autopilot:**
 - Enable `autopilot.mode = "act"` (default) to allow automatic queue slot
@@ -442,6 +826,16 @@ mode = "act"
 
 Omit a field to use its default.
 
+`global_ratio_limit` must be finite and non-negative. Invalid negative or
+non-finite values fail configuration validation with `invalid_config`.
+
+Per-torrent policy is stored in durable daemon state rather than TOML. Set it
+with `PUT /api/v1/torrents/:hash/seeding`: a `null` ratio/idle value inherits
+these globals, explicit zero is a real immediate target, and `seed_forever`
+temporarily suppresses both effective targets without deleting the stored
+values. Policy and automatic/manual status survive restart without a daemon
+state version bump because legacy records default to inherited targets.
+
 ### `[dht]`
 
 | Option | Default | Meaning |
@@ -459,6 +853,34 @@ In strict mode, bootstrap hostnames are subject to DNS containment policy.
 | `enabled` | `true` | Enables peer exchange for non-private torrents. |
 | `max_peers` | `0` | PEX peer addition cap, `0` means unlimited. |
 
+### `[peer_filter]`
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `false` | Enables global peer-admission filtering. |
+| `rules` | `[]` | IP addresses, CIDRs, or inclusive IP ranges to reject. |
+| `blocklist_paths` | `[]` | Explicit local eMule/PeerGuardian-style blocklist files to load. |
+| `manual_bans` | `[]` | Global IP bans created by an operator or the Peer UI action. |
+| `blocked_client_ids` | `[]` | Printable peer-ID prefixes to reject after a BitTorrent handshake. |
+
+Each manual-ban entry has an `ip` and optional nonblank 1–240-character
+`reason`. Client-ID prefixes must be 1–20 printable ASCII characters.
+
+Blocklist imports are local-only UTF-8 regular files. Each is limited to 32 MiB
+and 4 KiB per line; configured/imported rule sets are capped at 250,000 rules.
+Blank and comment lines are ignored. A malformed otherwise non-empty import
+line is skipped and counted in that source's `skipped_lines` status, while an
+overlong line, unreadable/non-UTF-8/non-regular file, or limit excess rejects
+the configuration update. SwarmOtter never fetches blocklists itself.
+
+A policy update rebuilds peer work transactionally, so a persistence or
+reconstruction failure restores the prior compiled policy and session
+instance. The status counters belong to the active compiled policy instance and
+reset after a successful replacement. IP rules reject candidate peers before a
+socket is opened and inbound peers before service; peer-ID-prefix rules run
+after the BitTorrent handshake. Neither rule type replaces the required
+network-containment path.
+
 ### `[[watch]]`
 
 | Option | Default | Meaning |
@@ -467,10 +889,63 @@ In strict mode, bootstrap hostnames are subject to DNS containment policy.
 | `recursive` | `false` | Scans child folders when true. |
 | `download_dir` | unset | Per-watch download directory override. |
 | `label` | unset | Label applied to imports. |
+| `profile` | unset | Named profile applied before the torrent is registered. It must exist in `[profiles.profiles]`. |
 | `start_behavior` | `"start"` | `"start"` or `"paused"`. |
 | `archive_dir` | unset | Where imported files are archived. |
 | `failure_dir` | unset | Where failed imports are moved. |
 | `delete_after_import` | `true` | Deletes imported watch files when no archive is configured. |
+
+Watch files are read through a bounded reader that enforces the shared 16 MiB
+metadata limit (`MAX_TORRENT_METADATA_BYTES`) before parsing and before any
+piece-sized allocation, regardless of `max_request_body_bytes`. Oversized or
+malformed watch files are rejected as `malformed_torrent` / `bencode_error`
+and never panic the daemon. See ADR-0050.
+
+Watch `profile`, `label`, and `download_dir` defaults are applied before policy
+resolution. A watch profile therefore captures its storage paths for a newly
+imported torrent; later edits affect only the profile's live inheriting fields.
+
+Watch ingestion is stability-gated (ADR-0054). The scanner walks in a blocking
+filesystem task, sorts root-relative paths, rejects a configured symlink root,
+and skips every child symlink without descending through symlinked directories.
+A file is eligible only after two consecutive scans report the same length and
+modified timestamp. The bounded read rechecks both the path and opened-file
+metadata; a change discards the bytes and restarts stability without recording
+an import result. Manual and automatic scans are serialized.
+
+`path`, `archive_dir`, and `failure_dir` must not be whitespace-only. An archive
+or failure directory must not lexically normalize to the watch root itself. If
+one is a strict descendant of its watch root, that destination and its subtree
+are excluded from this configured folder's scan; this prevents recursive scans
+from re-importing moved inputs. Exclusion uses path-component boundaries
+without resolving symlinks; similarly named siblings are not excluded. A
+separately configured overlapping watch root evaluates its own destinations and
+can still scan that path.
+
+Observations are memory-only. Restart requires a fresh first observation. An
+unchanged registered torrent then becomes a successful `duplicate` on the
+second scan: its existing path, labels, queue position/bypass, and settings are
+unchanged, while the configured success action runs once. With no archive and
+`delete_after_import = false`, `leave` marks that fingerprint processed, so it
+does not repeat until length or modified time changes. Watch status does not
+advance stability and excludes unchanged processed files from its pending
+count.
+
+Only bencode, malformed-torrent, invalid-info-hash, and parse errors are
+permanent input failures; they execute `failure_dir` handling and do not retry
+unchanged input. Storage, I/O, persistence, containment, and internal failures
+are transient: the source stays and a later stable scan retries it. Archive and
+failure directories are created when absent, and create-new copy/remove actions
+never overwrite a destination. A delete/copy/remove/collision error preserves
+the primary result, appears as `post_action_error`, and leaves the fingerprint
+processed for manual resolution. A crash during an archive/failure copy can
+leave source plus a partial destination; recovery will not overwrite it.
+
+`GET /api/v1/watch/history` and Watch status retain the newest 10,000 results in
+insertion order for the current daemon run. Each result keeps compatibility
+fields (`success`, `duplicate`, `error`) and reports `outcome` as `imported`,
+`duplicate`, `permanent_failure`, or `transient_failure`, plus an optional
+`post_action_error`. This operational history is not persisted.
 
 ### `[logging]`
 

@@ -20,13 +20,45 @@ enabled = false
 [storage]
 download_dir = "/data/downloads"
 incomplete_dir = "/data/incomplete"
+# Optional high-write-state placement. Explicit --state-file or
+# SWARMOTTER_STATE_FILE still wins over state_dir.
+# resume_dir = "/config/swarmotter/resume"
+# state_dir = "/config/swarmotter/state"
+# temp_dir = "/tmp/swarmotter"
 minimum_free_space_bytes = 0
 minimum_free_space_percent = 0
 preallocate = false
 sparse = true
+# Keep the container filesystem's default CoW behavior unless the mounted
+# filesystem and operator policy explicitly support disable_for_new_files.
+cow_strategy = "conservative"
+
+# Optional per-root local resource controls. The most-specific lexical path
+# wins; a zero limit is unlimited. These govern local storage work only.
+# [[storage.root_controls]]
+# path = "/data/downloads"
+# max_active_downloads = 2
+# max_active_bytes = 0
+# max_write_bytes_per_second = 0
+# max_concurrent_rechecks = 1
 
 [network]
+# This explicit exception is valid only because deploy/compose.yml joins the
+# Gluetun network namespace (`network_mode: service:vpn`), whose firewall and
+# kill switch are the fail-closed boundary. Do not copy disabled mode into a
+# standalone container or native deployment.
 mode = "disabled"
+
+# Optional TCP-only SOCKS5 proxy. The proxy connection remains inside the VPN
+# sidecar's network namespace; target DNS is sent to the proxy. Enable this
+# only after setting torrent.utp_enabled = false and [dht] enabled = false,
+# because UDP tracker, DHT, and uTP paths are deliberately blocked.
+[network.socks5]
+enabled = false
+# host = "proxy.example"
+port = 1080
+# username = "operator"
+# password = "set-through-a-secret-manager"
 
 [autopilot]
 # Optional: disabled (off), observe (reasons only), or act (bounded actions).
@@ -40,14 +72,30 @@ utp_prefer_tcp = true
 encryption_mode = "preferred"
 selfish = false
 
+# Router port mapping cannot be enabled in this example because `[network]`
+# deliberately uses disabled mode and relies on the VPN sidecar boundary.
+# SwarmOtter requires strict fail-closed mode plus `required_interface` before
+# it will issue NAT-PMP or UPnP requests.
+[port_mapping]
+enabled = false
+
+# Optional operator-hosted TCP listen-port diagnostic. No endpoint is bundled.
+# In this shared-namespace deployment, any enabled request follows the same
+# data-plane path supplied by the VPN sidecar.
+[port_test]
+enabled = false
+# endpoint = "https://reachability.example.invalid/check"
+cache_ttl_seconds = 900
+timeout_seconds = 10
+
 [bandwidth]
 global_download = 0
 global_upload = 0
 alt_download = 0
 alt_upload = 0
 alt_enabled = false
-max_peers = 0
-max_peers_per_torrent = 0
+max_peers = 0             # all inbound/outbound peer sessions; 0 = unlimited
+max_peers_per_torrent = 0 # additional per-torrent cap; 0 = daemon default 64
 
 [queue]
 max_active_downloads = 5
@@ -58,6 +106,33 @@ auto_start = true
 [seeding]
 global_ratio_limit = 2.0
 global_idle_limit = 1800
+
+# Optional named policy profiles. Explicit add/watch/torrent profiles win over
+# label mappings. Resolved storage and the initial start-or-paused decision are
+# captured at registration; queue/seeding/bandwidth/encryption values remain
+# live while inherited.
+# [profiles.labels]
+# linux = "linux-release"
+#
+# [profiles.profiles.linux-release]
+# encryption_mode = "required" # disabled, preferred, or required
+#
+# [profiles.profiles.linux-release.storage]
+# download_dir = "/data/releases/linux"
+# incomplete_dir = "/data/incomplete/linux"
+#
+# [profiles.profiles.linux-release.queue]
+# priority = "high"
+# start_behavior = "start"
+#
+# [profiles.profiles.linux-release.seeding]
+# ratio_limit = 2.0
+# idle_limit = 86400
+# seed_forever = false
+#
+# [profiles.profiles.linux-release.bandwidth]
+# download_limit = 0
+# upload_limit = 5242880
 
 [dht]
 enabled = true
@@ -70,6 +145,15 @@ bootstrap_nodes = [
 [pex]
 enabled = true
 max_peers = 0
+
+# Optional local-only peer-admission filtering. Rules are IPs, CIDRs, or
+# inclusive ranges; manual bans are normally managed through the native API/UI.
+[peer_filter]
+enabled = false
+rules = []
+blocklist_paths = []
+manual_bans = []
+blocked_client_ids = []
 
 [logging]
 level = "info"

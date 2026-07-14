@@ -22,7 +22,27 @@ use axum::{
 };
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
-const APP_JS: &str = include_str!("../assets/app.js");
+const APP_JS_ENTRY: &str = include_str!("../assets/app.js");
+const API_JS: &str = include_str!("../assets/js/api.js");
+const STATE_JS: &str = include_str!("../assets/js/state.js");
+const TORRENTS_JS: &str = include_str!("../assets/js/torrents.js");
+const DETAILS_JS: &str = include_str!("../assets/js/details.js");
+const SETTINGS_JS: &str = include_str!("../assets/js/settings.js");
+const EVENTS_JS: &str = include_str!("../assets/js/events.js");
+const UI_JS: &str = include_str!("../assets/js/ui.js");
+#[cfg(test)]
+const APP_JS: &str = concat!(
+    include_str!("../assets/app.js"),
+    include_str!("../assets/js/api.js"),
+    include_str!("../assets/js/state.js"),
+    include_str!("../assets/js/torrents.js"),
+    include_str!("../assets/js/details.js"),
+    include_str!("../assets/js/settings.js"),
+    include_str!("../assets/js/events.js"),
+    include_str!("../assets/js/ui.js"),
+);
+const SEEDING_POLICY_JS: &str = include_str!("../assets/seeding-policy.js");
+const WATCH_HISTORY_JS: &str = include_str!("../assets/watch-history.js");
 const THEME_BOOTSTRAP_JS: &str = include_str!("../assets/theme-bootstrap.js");
 const STYLE_CSS: &str = include_str!("../assets/style.css");
 const TABULATOR_JS: &str = include_str!("../assets/vendor/tabulator/tabulator.min.js");
@@ -52,6 +72,15 @@ pub fn web_router() -> Router {
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
+        .route("/js/api.js", get(api_js))
+        .route("/js/state.js", get(state_js))
+        .route("/js/torrents.js", get(torrents_js))
+        .route("/js/details.js", get(details_js))
+        .route("/js/settings.js", get(settings_js))
+        .route("/js/events.js", get(events_js))
+        .route("/js/ui.js", get(ui_js))
+        .route("/seeding-policy.js", get(seeding_policy_js))
+        .route("/watch-history.js", get(watch_history_js))
         .route("/theme-bootstrap.js", get(theme_bootstrap_js))
         .route("/style.css", get(style_css))
         .route("/vendor/tabulator/tabulator.min.js", get(tabulator_js))
@@ -80,12 +109,66 @@ async fn index() -> Response {
 }
 
 async fn app_js() -> Response {
+    javascript(APP_JS_ENTRY)
+}
+
+async fn api_js() -> Response {
+    javascript(API_JS)
+}
+
+async fn state_js() -> Response {
+    javascript(STATE_JS)
+}
+
+async fn torrents_js() -> Response {
+    javascript(TORRENTS_JS)
+}
+
+async fn details_js() -> Response {
+    javascript(DETAILS_JS)
+}
+
+async fn settings_js() -> Response {
+    javascript(SETTINGS_JS)
+}
+
+async fn events_js() -> Response {
+    javascript(EVENTS_JS)
+}
+
+async fn ui_js() -> Response {
+    javascript(UI_JS)
+}
+
+fn javascript(source: &'static str) -> Response {
     (
         [(
             axum::http::header::CONTENT_TYPE,
             "application/javascript; charset=utf-8",
         )],
-        APP_JS,
+        source,
+    )
+        .into_response()
+}
+
+async fn seeding_policy_js() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        SEEDING_POLICY_JS,
+    )
+        .into_response()
+}
+
+async fn watch_history_js() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        WATCH_HISTORY_JS,
     )
         .into_response()
 }
@@ -224,6 +307,14 @@ mod tests {
     fn assets_are_nonempty() {
         assert!(!INDEX_HTML.is_empty());
         assert!(!APP_JS.is_empty());
+        assert!(!APP_JS_ENTRY.is_empty());
+        assert!(!API_JS.is_empty());
+        assert!(!STATE_JS.is_empty());
+        assert!(!TORRENTS_JS.is_empty());
+        assert!(!DETAILS_JS.is_empty());
+        assert!(!SETTINGS_JS.is_empty());
+        assert!(!EVENTS_JS.is_empty());
+        assert!(!UI_JS.is_empty());
         assert!(!THEME_BOOTSTRAP_JS.is_empty());
         assert!(!STYLE_CSS.is_empty());
         assert!(!TABULATOR_JS.is_empty());
@@ -333,6 +424,30 @@ mod tests {
     }
 
     #[test]
+    fn web_ui_per_torrent_encryption_override_is_wired() {
+        for id in [
+            "details-encryption-mode",
+            "details-encryption-mode-save-btn",
+        ] {
+            assert!(
+                INDEX_HTML.contains(&format!("id=\"{id}\"")),
+                "Web UI is missing per-torrent encryption control {id}"
+            );
+        }
+        for needle in [
+            "function renderDetailsEncryptionSelector(policy)",
+            "function explicitEncryptionMode(policy)",
+            "`/torrents/${hash}/encryption-mode`",
+            "encryption_mode: encryptionMode",
+        ] {
+            assert!(
+                DETAILS_JS.contains(needle),
+                "Web UI is missing per-torrent encryption wiring {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn web_ui_sends_api_auth_token_when_configured() {
         for needle in [
             "const API_TOKEN_STORAGE_KEY = \"swarmotter.apiToken\";",
@@ -375,10 +490,10 @@ mod tests {
             );
         }
         for needle in [
-            "let selectedTorrents = new Map();",
-            "let visibleTorrents = [];",
-            "let torrentTable = null;",
-            "let bulkRemoveInFlight = false;",
+            "selectedTorrents: new Map(),",
+            "visibleTorrents: [],",
+            "torrentTable: null,",
+            "bulkRemoveInFlight: false,",
             "new Tabulator(\"#torrent-table\"",
             "function torrentSelectionFormatter(",
             "function renderTorrentSelection(",
@@ -390,7 +505,7 @@ mod tests {
             "api(\"/torrents/remove\"",
             "info_hashes: selected.map(([hash]) => hash)",
             "not_found",
-            "selectedTorrents.delete(hash);",
+            "state.selectedTorrents.delete(hash);",
             "$(\"#select-all-torrents-btn\").addEventListener(\"click\", selectAllVisibleTorrents);",
             "$(\"#deselect-all-torrents-btn\").addEventListener(\"click\", deselectAllTorrents);",
             "$(\"#remove-selected-torrents-btn\").addEventListener(\"click\", removeSelectedTorrents);",
@@ -442,11 +557,11 @@ mod tests {
             "headerFilterFunc: numericHeaderFilter",
             "function parseNumericFilter(",
             "function clearTorrentFilters(",
-            "let torrentTableReady = Promise.resolve();",
-            "torrentTable.on(\"tableBuilt\"",
-            "await torrentTableReady;",
-            "torrentTable.replaceData(rows)",
-            "torrentTable.getRows(\"active\")",
+            "torrentTableReady: Promise.resolve(),",
+            "state.torrentTable.on(\"tableBuilt\"",
+            "await state.torrentTableReady;",
+            "state.torrentTable.replaceData(rows)",
+            "state.torrentTable.getRows(\"active\")",
         ] {
             assert!(
                 APP_JS.contains(needle),
@@ -492,7 +607,7 @@ mod tests {
             "function saveTorrentQueryView(",
             "function loadTorrentQueryView(",
             "function clearTorrentQueryView(",
-            "torrentTable.on(\"dataSorted\"",
+            "state.torrentTable.on(\"dataSorted\"",
             "function handleTorrentTableSort(",
             "function renderTorrentQuerySummary(",
             "$(\"#save-torrent-view-btn\").addEventListener(\"click\", saveTorrentQueryView);",
@@ -548,7 +663,7 @@ mod tests {
             "function toggleTheme(",
             "document.documentElement.dataset.theme = next;",
             "tableElement.dataset.theme = theme;",
-            "torrentTable.redraw(true)",
+            "state.torrentTable.redraw(true)",
             "window.localStorage.setItem(THEME_STORAGE_KEY, next);",
             "themeToggle.addEventListener(\"click\", toggleTheme);",
         ] {
@@ -699,6 +814,13 @@ mod tests {
             "details-download-limit",
             "details-upload-limit",
             "details-limits-btn",
+            "details-ratio-inherit",
+            "details-ratio-limit",
+            "details-idle-inherit",
+            "details-idle-limit",
+            "details-seed-forever",
+            "details-seeding-save-btn",
+            "details-seeding-error",
             "tracker-add-btn",
         ] {
             assert!(
@@ -714,13 +836,138 @@ mod tests {
             "\"/move\"",
             "\"/labels\"",
             "\"/limits\"",
+            "/seeding`",
             "/trackers/edit",
             "/files/${fi}/rename",
             "function renderDetailsActivity(",
         ] {
             assert!(
-                APP_JS.contains(needle),
+                APP_JS.contains(needle) || SEEDING_POLICY_JS.contains(needle),
                 "Web UI operation wiring is missing {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_ui_renders_and_replaces_seeding_policy_without_optimistic_drift() {
+        for needle in [
+            "[\"Ratio\", finiteNumber(t.ratio)",
+            "[\"Uploaded\", fmtBytes(t.uploaded)]",
+            "[\"Seeding status\"",
+            "[\"Stored ratio target\"",
+            "[\"Effective ratio target\"",
+            "[\"Stored idle target\"",
+            "[\"Effective idle target\"",
+            "ratio_limit: ratio",
+            "idle_limit: idle",
+            "seed_forever: field(document, \"details-seed-forever\").checked",
+            "method: \"PUT\"",
+            "Number.isSafeInteger(idle)",
+            "errorPanel.textContent = error?.message",
+            "await openDetails(hash);",
+        ] {
+            assert!(
+                APP_JS.contains(needle) || SEEDING_POLICY_JS.contains(needle),
+                "Seeding policy UI behavior is missing {needle}"
+            );
+        }
+        assert!(INDEX_HTML.contains("0 stops immediately"));
+        assert!(INDEX_HTML.contains("Inherit global ratio limit"));
+        assert!(INDEX_HTML.contains("Inherit global idle limit"));
+    }
+
+    #[test]
+    fn executable_seeding_policy_dom_state_harness_passes() {
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/seeding-policy.test.js");
+        let output = std::process::Command::new("node")
+            .arg(script)
+            .output()
+            .expect("Node.js is required by the Web UI quality gate");
+        assert!(
+            output.status.success(),
+            "seeding policy DOM harness failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn web_ui_renders_stable_watch_outcomes_and_post_action_errors() {
+        for needle in [
+            "src=\"/watch-history.js\"",
+            "<th>Outcome</th>",
+            "watchHistoryUi.outcomeLabel(item)",
+            "watchHistoryUi.statusKey(item)",
+            "watchHistoryUi.detail(item)",
+        ] {
+            assert!(
+                INDEX_HTML.contains(needle) || APP_JS.contains(needle),
+                "watch history renderer is missing {needle}"
+            );
+        }
+        for needle in [
+            "permanent_failure",
+            "transient_failure",
+            "item?.post_action_error",
+            "Existing torrent retained; success action applied.",
+        ] {
+            assert!(
+                WATCH_HISTORY_JS.contains(needle),
+                "watch history outcome module is missing {needle}"
+            );
+        }
+    }
+
+    #[test]
+    fn executable_watch_history_renderer_harness_passes() {
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/watch-history.test.js");
+        let output = std::process::Command::new("node")
+            .arg(script)
+            .output()
+            .expect("Node.js is required by the Web UI quality gate");
+        assert!(
+            output.status.success(),
+            "watch history renderer harness failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn web_ui_renders_and_escapes_tracker_scrape_state() {
+        for heading in [
+            "<th>Scrape</th>",
+            "<th>Last scrape</th>",
+            "Scrape counts (S/L/D)",
+        ] {
+            assert!(
+                INDEX_HTML.contains(heading),
+                "tracker table is missing {heading}"
+            );
+        }
+        for field in [
+            "t.scrape_status",
+            "t.last_scrape_error",
+            "t.last_scrape",
+            "t.scrape_seeders",
+            "t.scrape_leechers",
+            "t.scrape_downloads",
+        ] {
+            assert!(
+                APP_JS.contains(field),
+                "tracker renderer is missing {field}"
+            );
+        }
+        for escaped in [
+            "escapeHtml(scrapeDetail)",
+            "escapeHtml(fmtUnixSeconds(t.last_scrape))",
+            "escapeHtml(scrapeCounts)",
+        ] {
+            assert!(
+                APP_JS.contains(escaped),
+                "tracker renderer does not safely escape {escaped}"
             );
         }
     }
@@ -741,11 +988,11 @@ mod tests {
     #[test]
     fn web_ui_scopes_removal_observation_to_the_active_query() {
         for needle in [
-            "let lastTorrentObservationKey = null;",
+            "lastTorrentObservationKey: null,",
             "observeTorrentRemovals(torrents, queryParams, query);",
-            "const observesCompleteLibrary = !torrentQueryState.q",
+            "const observesCompleteLibrary = !state.torrentQueryState.q",
             "if (!observesCompleteLibrary)",
-            "if (observationKey !== lastTorrentObservationKey)",
+            "if (observationKey !== state.lastTorrentObservationKey)",
         ] {
             assert!(
                 APP_JS.contains(needle),
@@ -761,7 +1008,7 @@ mod tests {
             "function beginDetailsLoad()",
             "if (!detailsRequestIsCurrent(hash)) return;",
             "#details-controls\").classList.add(\"hidden\")",
-            "const hash = currentHash;",
+            "const hash = state.currentHash;",
             "button.dataset.pendingHash = hash;",
             "if (button.dataset.pendingHash === hash)",
         ] {
@@ -896,7 +1143,7 @@ mod tests {
 
         for needle in [
             "function renderSettingsEditor(",
-            "let activeSettingsPanel = \"api\";",
+            "activeSettingsPanel: \"api\"",
             "function activateSettingsPanel(",
             "$$(\".settings-nav-item\").forEach",
             "const panel = invalid?.closest(\"[data-settings-panel]\")?.dataset.settingsPanel;",
@@ -918,7 +1165,7 @@ mod tests {
             "api(\"/reset\"",
             "Reset all downloads?",
             "let resetError = null;",
-            "selectedTorrents.clear();",
+            "state.selectedTorrents.clear();",
             "const remaining = finiteNumber(query?.total);",
             "Reset incomplete",
             "torrents are still listed after reset.",
@@ -1025,6 +1272,79 @@ mod tests {
     }
 
     #[test]
+    fn every_embedded_javascript_asset_parses_as_an_es_module() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        for (name, source) in [
+            ("app.js", APP_JS_ENTRY),
+            ("js/api.js", API_JS),
+            ("js/state.js", STATE_JS),
+            ("js/torrents.js", TORRENTS_JS),
+            ("js/details.js", DETAILS_JS),
+            ("js/settings.js", SETTINGS_JS),
+            ("js/events.js", EVENTS_JS),
+            ("js/ui.js", UI_JS),
+            ("seeding-policy.js", SEEDING_POLICY_JS),
+            ("watch-history.js", WATCH_HISTORY_JS),
+            ("theme-bootstrap.js", THEME_BOOTSTRAP_JS),
+            ("vendor/tabulator/tabulator.min.js", TABULATOR_JS),
+        ] {
+            let mut child = Command::new("node")
+                .args(["--input-type=module", "--check"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("Node.js is required by the Web UI quality gate");
+            child
+                .stdin
+                .take()
+                .expect("module checker stdin is piped")
+                .write_all(source.as_bytes())
+                .expect("embedded JavaScript can be written to Node.js");
+            let output = child
+                .wait_with_output()
+                .expect("module syntax checker exits");
+            assert!(
+                output.status.success(),
+                "JavaScript module syntax failed for {name}:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+
+    #[test]
+    fn production_module_graph_completes_initial_ui_refresh() {
+        let script =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/app-startup.test.mjs");
+        let output = std::process::Command::new("node")
+            .arg(script)
+            .output()
+            .expect("Node.js is required by the Web UI quality gate");
+        assert!(
+            output.status.success(),
+            "Web UI startup harness failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn torrent_details_exposes_terminal_error_diagnostics() {
+        for needle in [
+            "[\"Last error\", t.error || \"\"]",
+            "renderDetailsSummary(t)",
+        ] {
+            assert!(
+                APP_JS.contains(needle),
+                "Torrent Details is missing terminal error diagnostics {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn web_ui_renders_health_for_sample_torrent_summary() {
         // Mimic the renderHealth output for a sample summary and assert
         // the produced HTML is a valid container with the right number of
@@ -1071,6 +1391,11 @@ mod tests {
                 "application/javascript; charset=utf-8",
             ),
             (
+                "/seeding-policy.js",
+                "application/javascript; charset=utf-8",
+            ),
+            ("/watch-history.js", "application/javascript; charset=utf-8"),
+            (
                 "/vendor/tabulator/tabulator_midnight.min.css",
                 "text/css; charset=utf-8",
             ),
@@ -1092,6 +1417,51 @@ mod tests {
                 content_type
             );
         }
+    }
+
+    #[tokio::test]
+    async fn es_module_routes_preserve_security_and_cache_policy() {
+        let app = web_router();
+        for path in [
+            "/app.js",
+            "/js/api.js",
+            "/js/state.js",
+            "/js/torrents.js",
+            "/js/details.js",
+            "/js/settings.js",
+            "/js/events.js",
+            "/js/ui.js",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("request is valid"),
+                )
+                .await
+                .expect("module route responds");
+            assert_eq!(response.status(), StatusCode::OK, "route {path}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/javascript; charset=utf-8",
+                "route {path}",
+            );
+            assert!(
+                response
+                    .headers()
+                    .get(header::CONTENT_SECURITY_POLICY)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.contains("script-src 'self'")),
+                "route {path}",
+            );
+            assert!(
+                response.headers().get(header::CACHE_CONTROL).is_none(),
+                "module route {path} must retain the entry script's uncached policy",
+            );
+        }
+        assert!(INDEX_HTML.contains("<script type=\"module\" src=\"/app.js\"></script>"));
     }
 
     #[tokio::test]

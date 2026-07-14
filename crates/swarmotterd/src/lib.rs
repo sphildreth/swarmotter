@@ -3,12 +3,14 @@
 //! Library facade for `swarmotterd` so integration tests can access the
 //! runtime modules. The binary entry point lives in `main.rs`.
 
+pub mod containment_gate;
 pub mod daemon;
 pub mod dht;
 pub mod engine;
 pub mod logging;
 pub mod metadata;
 pub mod netbinder;
+pub mod peer_permits;
 pub mod runtime;
 pub mod seeder;
 pub mod state_store;

@@ -4,6 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{CoreError, Result};
+
 /// A slice of a file covered by a piece.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileSlice {
@@ -56,20 +58,24 @@ impl StorageLayout {
 }
 
 /// File layout helper mapping file indices to byte ranges across the torrent.
+#[derive(Debug)]
 pub struct FileLayout {
     pub files: Vec<(usize, u64, u64)>, // (index, start, end)
 }
 
 impl FileLayout {
     /// Build from a list of (index, length).
-    pub fn from_lengths(files: &[(usize, u64)]) -> Self {
+    pub fn from_lengths(files: &[(usize, u64)]) -> Result<Self> {
         let mut out = Vec::with_capacity(files.len());
         let mut offset = 0u64;
         for (index, length) in files {
-            out.push((*index, offset, offset + length));
-            offset += length;
+            let end = offset.checked_add(*length).ok_or_else(|| {
+                CoreError::MalformedTorrent(format!("file offset overflow at file index {index}"))
+            })?;
+            out.push((*index, offset, end));
+            offset = end;
         }
-        Self { files: out }
+        Ok(Self { files: out })
     }
 
     /// Return file indices overlapping `[start, end)`.
@@ -141,8 +147,18 @@ mod tests {
     #[test]
     fn file_layout_overlapping() {
         let files = vec![(0usize, 10u64), (1, 10), (2, 10)];
-        let fl = FileLayout::from_lengths(&files);
+        let fl = FileLayout::from_lengths(&files).unwrap();
         assert_eq!(fl.overlapping(5, 15), vec![0, 1]);
         assert_eq!(fl.overlapping(0, 30), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn file_layout_rejects_offset_overflow_without_panicking() {
+        let files = vec![(0usize, u64::MAX), (1, 1)];
+        let result = std::panic::catch_unwind(|| FileLayout::from_lengths(&files));
+        assert!(result.is_ok(), "file offset overflow must not panic");
+        let error = result.unwrap().unwrap_err();
+        assert!(matches!(&error, CoreError::MalformedTorrent(_)));
+        assert!(error.to_string().contains("file index 1"));
     }
 }

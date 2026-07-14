@@ -70,23 +70,51 @@ infringement.
 - UI operations-console updates for large libraries, with
   a sortable/filterable Tabulator table, theme toggle, and efficient large-list
   workflows.
-- Magnet links and `.torrent` file intake.
+- Magnet links and `.torrent` file intake, including metadata-first previews
+  with deterministic profile/request file exclusions, BEP 53 selection,
+  contained literal `x.pe` hints, and explainable content organization.
+- BEP 52 v2/hybrid support: explicit full SHA-1/SHA-256 identities, `btmh`
+  magnets, SHA-256 file-tree/piece-layer verification, contained pure-v2 peer
+  transfer and discovery, and collision-safe 40/64-character API and durable
+  locators. Hybrid records retain their v1 primary locator and resolve their
+  full v2 identity as an alias.
 - TCP and uTP peer wire protocol support.
-- TCP peer-wire protocol encryption (MSE/PE) with configurable mode:
-  `disabled`, `preferred` (default), or `required`.
+- Contained TCP/uTP peer-wire protocol encryption (MSE/PE) with configurable
+  global, profile, and durable per-torrent modes: `disabled`, `preferred`
+  (default), or `required`.
+- Opt-in contained SOCKS5 TCP `CONNECT` proxy support for outbound peer TCP,
+  HTTP(S) tracker/scrape, and webseed requests, with remote target DNS and no
+  direct fallback. Proxy mode intentionally blocks DHT, uTP, and UDP trackers.
 - DHT, PEX, HTTP/HTTPS trackers, UDP trackers, and webseeds.
 - BEP 9 magnet metadata fetching.
-- Fast resume and forced recheck.
+- Fast resume and forced recheck for v1, v2, and hybrid records.
+- Versioned local SQLite durable library state with migration from legacy JSON
+  state, full v1/v2 keys, retained exact original metainfo, bounded audit and
+  metric history, and an integrity-checked projection rebuild command.
 - Watch-folder import.
 - File selection, file prioritization, and path rename controls.
 - Queue, bandwidth, ratio, and seeding controls.
+- Named policy profiles with deterministic label selection, durable resolved
+  storage and initial-admission snapshots, and explainable effective values.
+- Profile-scoped tracker-host enablement/priority, force-top-level folders,
+  per-torrent incomplete paths, active-only partial suffixes, and storage-path
+  previews before move or organization changes.
 - Adaptive swarm performance autopilot with per-torrent diagnostics and
   override controls.
-- Disk-aware storage optimizer: storage-root diagnostics and add-time free-space
-  preflight via `[storage].minimum_free_space_bytes`,
-  `[storage].minimum_free_space_percent`, and `GET /api/v1/storage/roots`.
+- Disk-aware storage controls: storage-root diagnostics, add-time free-space
+  preflight, and per-root active-work, declared-byte, verified-write, and
+  full-recheck budgets via `[[storage.root_controls]]` and
+  `GET /api/v1/storage/roots`.
+- Filesystem-aware storage diagnostics and placement: best-effort mount data,
+  sustained local write/verification rates, deliberate log/resume/state/fallback
+  roots, and an explicit conservative-or-Btrfs-NOCOW strategy that never
+  modifies existing payload files.
 - Settings two-panel layout for dense configuration in the Web UI.
 - Strict VPN/NIC traffic containment with fail-closed behavior.
+- Opt-in NAT-PMP/UPnP TCP listener mapping and operator-hosted reachability
+  checks, both constrained to the same data-plane path.
+- Expanded qBittorrent and Transmission automation compatibility for profiles,
+  categories, lifecycle, location, file, and tracker workflows.
 - Container and homelab-friendly deployment.
 - Lawful-use project posture.
 
@@ -108,10 +136,27 @@ NIC), including:
 - Webseeds
 - Magnet metadata fetching
 - DNS used by torrent operations
+- Opt-in NAT-PMP/UPnP router mapping and listener reachability diagnostics
 
 The daemon **fails closed** and never silently falls back to the default route
 if the configured path is unavailable. The Web UI/API control plane is separate
 from the torrent data plane.
+
+Containment is strict by default. Omitting `[network]` leaves strict mode
+without an enforceable path and fails configuration validation; disabled mode
+must be selected explicitly and is limited to development or a separately
+enforced boundary such as the supplied Gluetun shared namespace. Live path loss
+blocks one process-wide gate before socket-owning tasks are aborted. Concrete
+socket bind failures block immediately and remain latched until an explicit,
+fully validated configuration replacement proves the peer-listener bind and,
+outside SOCKS5 TCP-only mode, an ephemeral UDP bind succeed; a healthy
+interface probe alone never reopens traffic.
+
+This default is the breaking configuration change in `v2.0.0`. Existing `1.x`
+installations that relied on omitted network configuration must add a strict
+interface/source/namespace path before upgrading, or explicitly set
+`mode = "disabled"` only when development or another boundary supplies the
+required containment.
 
 See [`docs/network-containment.md`](docs/network-containment.md).
 

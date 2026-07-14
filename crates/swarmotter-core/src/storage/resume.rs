@@ -3,10 +3,10 @@
 //! Fast resume metadata: persisted piece bitfield and per-torrent accounting.
 //!
 //! The fast-resume format is JSON (`.swarmotter.resume`) so it is human-readable
-//! and debuggable. It records the info hash, piece bitfield, byte counts, and
+//! and debuggable. It records the full torrent key, piece bitfield, byte counts, and
 //! file priorities so a torrent can resume without a full recheck.
 
-use crate::hash::InfoHash;
+use crate::hash::TorrentKey;
 use crate::models::torrent::FilePriority;
 use serde::{Deserialize, Serialize};
 
@@ -76,7 +76,11 @@ impl PieceBitfield {
 /// Fast resume data persisted to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FastResume {
-    pub info_hash: InfoHash,
+    /// Full durable torrent identity. New records serialize this as
+    /// `torrent_key`; the old v1-only `info_hash` spelling remains accepted
+    /// so pre-v2 resume files safely retain their 40-character identity.
+    #[serde(rename = "torrent_key", alias = "info_hash")]
+    pub key: TorrentKey,
     pub name: String,
     pub piece_bitfield: PieceBitfield,
     pub piece_count: usize,
@@ -160,7 +164,7 @@ mod tests {
     #[test]
     fn resume_roundtrip() {
         let resume = FastResume {
-            info_hash: InfoHash::ZERO,
+            key: TorrentKey::from(crate::hash::InfoHash::ZERO),
             name: "test".into(),
             piece_bitfield: PieceBitfield::new(10),
             piece_count: 10,
@@ -177,7 +181,7 @@ mod tests {
         };
         let json = resume.serialize_json().unwrap();
         let back = FastResume::parse_json(&json).unwrap();
-        assert_eq!(back.info_hash, resume.info_hash);
+        assert_eq!(back.key, resume.key);
         assert_eq!(back.piece_count, 10);
         assert_eq!(back.priorities.len(), 2);
         assert_eq!(back.wanted, vec![true, false]);

@@ -25,14 +25,35 @@ enabled = false
 [storage]
 download_dir = "/data/downloads"
 incomplete_dir = "/data/incomplete"
+# Optional high-write-state placement. `resume_dir` uses info-hash file names;
+# `state_dir` is used only when --state-file/SWARMOTTER_STATE_FILE are absent.
+# temp_dir controls the fallback payload root when download_dir is unset.
+# resume_dir = "/var/lib/swarmotter/resume"
+# state_dir = "/var/lib/swarmotter/state"
+# temp_dir = "/var/cache/swarmotter"
 minimum_free_space_bytes = 0
 minimum_free_space_percent = 0
 preallocate = false
 sparse = true
+# Keep filesystem defaults unless an operator deliberately wants Linux Btrfs
+# NOCOW for newly created payload files: "disable_for_new_files".
+cow_strategy = "conservative"
+
+# Optional per-root local resource controls. The most-specific lexical path
+# wins; a zero limit is unlimited. These govern local storage work only.
+# [[storage.root_controls]]
+# path = "/data/downloads"
+# max_active_downloads = 2
+# max_active_bytes = 0
+# max_write_bytes_per_second = 0
+# max_concurrent_rechecks = 1
 
 # --- Network containment (release-critical) ---
 # Strict mode forces all torrent traffic through the configured path and
 # fails closed if that path is unavailable. See design/vpn-network-containment.md.
+# Do not remove this table: omission selects strict mode without a path and
+# fails startup validation. Concrete bind failures remain blocked until an
+# explicit full configuration replacement validates the repaired bind path.
 [network]
 mode = "strict"
 required_interface = "br0"
@@ -45,6 +66,19 @@ validate_route = true
 # Linux/systemd-resolved interface DNS is validated against required_interface
 # before torrent hostname resolution is allowed.
 validate_dns = true
+
+# --- Optional contained SOCKS5 TCP CONNECT proxy ---
+# The proxy hostname is resolved and connected through the network path above.
+# Target hostnames use SOCKS5 remote DNS; proxy failures never retry a target
+# directly. SOCKS5 CONNECT cannot carry UDP, so enable it only with
+# torrent.utp_enabled = false and [dht] enabled = false. UDP tracker URLs are
+# then rejected rather than sent outside the proxy.
+[network.socks5]
+enabled = false
+# host = "proxy.example"
+port = 1080
+# username = "operator"
+# password = "set-through-a-secret-manager"
 
 # --- Autopilot ---
 [autopilot]
@@ -62,8 +96,9 @@ utp_enabled = true
 # When uTP is enabled, prefer TCP (try TCP first, fall back to uTP). Set to
 # false to prefer uTP.
 utp_prefer_tcp = true
-# TCP peer-wire encryption policy: disabled, preferred, or required. Preferred
-# attempts MSE/PE first while preserving plaintext fallback for compatibility.
+# TCP/uTP peer-wire encryption policy: disabled, preferred, or required.
+# Preferred attempts MSE/PE first on the selected contained transport while
+# preserving a plaintext fallback for compatibility; required never falls back.
 encryption_mode = "preferred"
 # Selfish mode removes a torrent from SwarmOtter immediately after the download
 # completes. Already-completed managed records are also removed on runtime
@@ -73,6 +108,29 @@ encryption_mode = "preferred"
 # and seeding behavior).
 selfish = false
 
+# --- Optional contained router port mapping ---
+# This is disabled by default. Enabling it requires strict fail-closed
+# containment and network.required_interface above. NAT-PMP, SSDP discovery,
+# and UPnP SOAP requests use that same contained interface; no default-route
+# router traffic is attempted.
+[port_mapping]
+enabled = false
+protocols = ["nat_pmp", "upnp"]
+# nat_pmp_gateway = "192.0.2.1"
+# upnp_service_url = "http://192.0.2.1:49000/control/WANIPConn1"
+lease_seconds = 3600
+refresh_before_expiry_seconds = 300
+
+# --- Optional operator-hosted TCP listen-port test ---
+# No public endpoint is bundled. When enabled, SwarmOtter appends
+# listen_port, protocol=tcp, and format=swarmotter-port-test-v1 to this URL
+# and calls it through the contained data-plane path.
+[port_test]
+enabled = false
+# endpoint = "https://reachability.example.invalid/check"
+cache_ttl_seconds = 900
+timeout_seconds = 10
+
 # --- Bandwidth ---
 [bandwidth]
 global_download = 0       # bytes/sec, 0 = unlimited
@@ -80,8 +138,8 @@ global_upload = 0
 alt_download = 0
 alt_upload = 0
 alt_enabled = false
-max_peers = 0
-max_peers_per_torrent = 0
+max_peers = 0             # all inbound/outbound peer sessions; 0 = unlimited
+max_peers_per_torrent = 0 # additional per-torrent cap; 0 = daemon default 64
 
 # --- Queue ---
 [queue]
@@ -94,6 +152,33 @@ auto_start = true
 [seeding]
 global_ratio_limit = 2.0
 global_idle_limit = 1800   # seconds
+
+# --- Optional named policy profiles ---
+# Explicit add/watch/torrent profiles win over label mappings. Resolved storage
+# and the initial start-or-paused decision are captured at registration;
+# queue/seeding/bandwidth/encryption values remain live while inherited.
+# [profiles.labels]
+# linux = "linux-release"
+#
+# [profiles.profiles.linux-release]
+# encryption_mode = "required" # disabled, preferred, or required
+#
+# [profiles.profiles.linux-release.storage]
+# download_dir = "/data/releases/linux"
+# incomplete_dir = "/data/incomplete/linux"
+#
+# [profiles.profiles.linux-release.queue]
+# priority = "high"       # low, normal, or high
+# start_behavior = "start" # start or paused
+#
+# [profiles.profiles.linux-release.seeding]
+# ratio_limit = 2.0
+# idle_limit = 86400
+# seed_forever = false
+#
+# [profiles.profiles.linux-release.bandwidth]
+# download_limit = 0       # bytes/sec, 0 = unlimited
+# upload_limit = 5242880
 
 # --- DHT ---
 [dht]
@@ -109,7 +194,21 @@ bootstrap_nodes = [
 enabled = true
 max_peers = 0
 
+# --- Optional peer-admission filtering ---
+# Rules accept a single IP, CIDR, or inclusive IP range. Local blocklist files
+# are loaded only from these explicit paths; SwarmOtter never fetches a list.
+[peer_filter]
+enabled = false
+rules = []
+blocklist_paths = []
+manual_bans = []
+blocked_client_ids = []
+
 # --- Watch folders (uncomment and adjust) ---
+# Files require two unchanged scans; symlinks are ignored and archive/failure
+# destinations are never overwritten. In-root archive/failure descendants are
+# excluded from this folder's recursive scan; no watch/action path may be blank
+# or normalize to the watch root itself.
 # [[watch]]
 # path = "/data/watch"
 # recursive = false

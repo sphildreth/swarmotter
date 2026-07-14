@@ -29,6 +29,7 @@ The Web UI supports:
 - Magnet link entry.
 - File picker upload for `.torrent` files.
 - Drag-and-drop upload for `.torrent` files anywhere in the app window.
+- Metadata-preview checkboxes for magnet and `.torrent` intake.
 
 Dropped `.torrent` files are sent to:
 
@@ -37,6 +38,13 @@ POST /api/v1/torrents/file
 ```
 
 The app refreshes the torrent list after successful upload.
+
+Selecting **Metadata preview** adds a `.torrent` in a paused state, or lets a
+magnet fetch and verify only its metadata through the contained daemon path.
+Once a magnet preview has its file list, Torrent Details shows the captured
+intake policy and the payload gate. Choose file priorities as needed, then use
+**Start** or **Resume** to allow normal payload transfer. A preview never turns
+into a payload download merely because a profile or queue setting changes.
 
 ## Torrent list
 
@@ -47,6 +55,11 @@ column. Per-row torrent actions are icon buttons with accessible labels. The
 Details action opens keyboard-accessible lifecycle, queue, move, label,
 bandwidth-limit, file-rename, and tracker-edit controls. Removing one torrent
 offers separate Cancel, keep-data, and delete-data choices.
+
+Torrent Details displays an explicit identity row. Hybrid torrents show both
+their v1 SHA-1 and v2 SHA-256 identifiers; this avoids presenting the v2 value
+as if it were a v1 registry hash. Older daemon responses retain the legacy
+v1-hash fallback during an upgrade.
 
 The torrent list is an interactive table. Click a column header to sort by
 that column, and click it again to reverse the direction. Header filters can
@@ -60,6 +73,50 @@ Torrent rows can be selected with checkboxes. The torrent toolbar can select
 all currently visible rows, clear the current selection, and remove all selected
 torrents. Bulk removal removes torrent records through `POST
 /api/v1/torrents/remove` and keeps downloaded data.
+
+## Tracker details
+
+Torrent Details → Trackers keeps announce status separate from scrape status.
+The table shows the last scrape time, retained seeders/leechers/downloads in
+`S / L / D` order, and the compatibility counts used elsewhere. A scrape error
+is displayed beside `error` while the last successful counts remain visible;
+`unsupported` means the tracker is UDP or its final path is not derivable from
+`announce*`. UDP announce remains supported—only UDP scrape is unsupported.
+
+All tracker URL, status, time, count, and error values are escaped before being
+inserted into the table. Scrape is operational telemetry scheduled by download,
+magnet, reannounce, completion, and active seeder tracker activity; it is not a
+separate user mutation.
+
+The Details summary also displays **Last error** from the native torrent
+summary. If every attempted configured tracker fails and no usable alternative
+source exists, the state becomes `tracker error` and this row retains the last
+tracker failure. Reannounce, Resume, or Start Now clears the terminal error and
+starts a new attempt.
+
+## Per-torrent seeding policy
+
+Torrent Details includes a Seeding Policy card. Its read-only summary reports
+the uploaded-byte count, ratio, exact seeding status, stored ratio/idle targets,
+effective ratio/idle targets after global inheritance, and whether seed-forever
+is enabled. Status values are displayed as `not eligible`, `queued`, `active`,
+`stopped ratio`, `stopped idle`, or `stopped manual`.
+
+Use the Ratio target and Idle target controls as follows:
+
+- Select **Inherit global ratio** or **Inherit global idle** to store `null` and
+  use the corresponding value from Settings > Seeding.
+- Clear inheritance and enter `0` to request an immediate automatic stop. Zero
+  is a real target; it is not the same as inheritance.
+- Select **Seed forever** to suppress both effective automatic targets while
+  preserving the stored overrides for later use.
+
+**Save Seeding Policy** replaces all three per-torrent fields together. The UI
+waits for the server response and reloads Torrent Details before displaying the
+new summary; it does not predict a status transition locally. Invalid input or
+a persistence failure is shown in the card's alert and leaves the last rendered
+stored/effective values unchanged. A policy edit never resumes a torrent that
+an operator manually paused; use Resume or Start Now when that is intentional.
 
 ## Large-library operations console
 
@@ -83,12 +140,53 @@ SwarmOtter can negotiate MSE/PE peer encryption. The Settings screen exposes
 `torrent.encryption_mode` with these choices:
 
 - `disabled` (plaintext handshakes only),
-- `preferred` (TCP attempts use MSE/PE first, with plaintext fallback),
-- `required` (refuse plaintext).
+- `preferred` (contained TCP/uTP attempts use MSE/PE first, with a plaintext
+  fallback only on the same selected transport),
+- `required` (refuse plaintext with no fallback).
 
 The default is `preferred`. The UI keeps this control in the same Settings edit
 flow as other daemon config because it changes peer-wire compatibility behavior.
-Per-profile and per-torrent override controls are planned for a later phase.
+
+## Policy profiles
+
+Settings includes a **Policy profiles** editor for the persisted `profiles`
+configuration section. The Add screen can choose a profile and labels before
+registration. Torrent Details shows every effective profile value with its
+source and can set or clear an explicit profile assignment. Profiles may set
+an optional `encryption_mode`; Torrent Details shows its effective source and
+can set an explicit per-torrent encryption mode or choose **Inherit profile or
+global mode** to send an explicit `null` clear. Storage paths and the initial
+start-or-paused decision are shown as create-time snapshots: profile
+reassignment does not move existing data or revoke a queued torrent's
+admission. Queue priority, seeding, bandwidth, and peer encryption remain
+explainable live inheritance.
+
+Profiles can also define ordered tracker-host enablement/priority plus
+create-time intake exclusions, complete/incomplete content organization,
+single-file top-level folders, and active-only partial suffixes. Torrent
+Details displays the effective live tracker policy, stored structured exclusion
+rules, organization values, resolved complete/incomplete path preview,
+explicitly unwanted file indices, and whether a metadata-preview gate remains
+active. Those intake choices are fixed at registration; later profile edits do
+not silently alter an existing torrent, while tracker-host policy remains live.
+
+## Peer admission
+
+Settings includes a **Peer admission** panel for the global local-rule,
+blocklist-path, manual-ban, and peer-ID-prefix policy. It reads the live policy
+from `GET /api/v1/peer-filter`, showing the effective direct rules, local-source
+load/skipped-line results, manual bans, rejection counters, and any fail-closed
+detail. The editable fields remain part of the full Settings configuration
+snapshot, so reloading or saving Settings preserves the complete peer-admission
+configuration rather than overwriting it with status data.
+
+The torrent Details **Peers** tab can ban an IP. These are global manual bans,
+not torrent-local exceptions, and the Settings panel lists them with a global
+Unban action through `POST /api/v1/peer-filter/unban`. A peer row is marked
+**banned** only when its IP is in that explicit manual-ban list; merely viewing
+the table does not perform a new admission decision or change rejection
+counters. Peer admission rejects unwanted candidates but does not replace the
+required contained network path.
 
 ## Storage root diagnostics
 
@@ -97,12 +195,27 @@ so operators can:
 
 - review per-root free/available bytes before large add bursts,
 - identify which roots are close to configured reserve thresholds, and
-- diagnose storage pressure alongside active write/recheck activity in future views.
+- diagnose storage pressure alongside active write/recheck activity and
+  configured root controls, mount options, CoW strategy support, and observed
+  sustained payload-write/verification throughput.
 
 Storage reserve fields in configuration are `[storage].minimum_free_space_bytes`
 and `[storage].minimum_free_space_percent`. When configured, add operations are
 rejected before writing data when the target root cannot satisfy the configured
 reserve.
+
+The Storage settings panel also manages repeatable `[[storage.root_controls]]`
+entries. Each row exposes a lexical path plus active-download, active-byte,
+write-rate, and concurrent-recheck limits. The Doctor table shows the matching
+control root, declared active bytes, active rechecks, and saturation warnings
+so an operator can distinguish a local root budget from global queue limits.
+It also exposes durable placement for fast-resume metadata, daemon-state
+defaults, and fallback temporary payload storage, plus the explicit CoW
+strategy. A state-directory change is shown as restart-required; a resume
+directory change is rejected while unfinished data remains. The UI does not
+offer an implicit filesystem optimization: NOCOW is explicit, applies only to
+new supported Btrfs files, leaves existing files unchanged, and errors rather
+than falling back silently when an existing writable file lacks the flag.
 
 ## Performance diagnostics and autopilot visibility
 
@@ -171,6 +284,53 @@ Detailed network checks and path diagnostics use:
 GET /api/v1/network/diagnostics
 ```
 
+### SOCKS5 TCP proxy
+
+Settings > Network exposes an opt-in SOCKS5 TCP `CONNECT` card with proxy host,
+port, and optional username/password fields. Enabling it clears the uTP and DHT
+controls because this release deliberately blocks UDP tracker, DHT, and uTP
+paths rather than sending them directly outside the proxy. Server-side
+validation remains authoritative if a client submits an incompatible full
+configuration.
+
+The Settings API never returns the SOCKS5 password to the browser, so the
+password field is blank after reload. Saving it blank preserves the existing
+credential only while the username is unchanged; clear the username to remove
+authentication, or supply both a new username and password to replace it. The
+Network summary reports only that SOCKS5 is enabled and TCP-only/UDP-blocked;
+it does not display the proxy host or credentials.
+
+### Router port mapping and listener reachability
+
+The Network view has separate cards for **Router port mapping** and
+**Listen-port reachability**. Both are opt-in diagnostics and controls for the
+configured TCP peer listener; neither a failed mapping nor a failed
+reachability result pauses, resumes, or otherwise changes torrent lifecycle.
+
+Router mapping is disabled by default. In Settings > Network, enable it only
+when the daemon uses `strict` network containment with fail-closed behavior and
+a required interface. The same settings card chooses NAT-PMP and/or UPnP IGD,
+optionally supplies a NAT-PMP gateway or UPnP control URL, and sets the
+requested lease and renewal lead time. Saving Settings preserves these values
+in the full configuration snapshot.
+
+The mapping card shows the current state, configured protocols, local and
+external ports, active protocol, local gateway diagnostic, last attempt, lease
+expiry, and bounded detail. **Refresh mapping** requests an immediate
+reconciliation through the contained network path. The daemon renews successful
+leases and attempts a best-effort deletion during graceful shutdown; it never
+falls back to a default-route socket when a contained path or router is
+unavailable.
+
+The reachability test is configured separately with an HTTP(S) endpoint the
+operator controls, a cache lifetime, and a request timeout. The Network card
+shows only whether an endpoint is configured—not its URL—alongside the
+open/closed/unknown/error result and cache timing. **Run port test** uses the
+same contained path and reuses a fresh cached result. A successful router
+mapping asks an enabled reachability test to run, but the two results remain
+independent: router acceptance does not prove external reachability, and a
+test failure does not invalidate a mapping.
+
 If the UI shows `interface_missing`, the daemon cannot see the configured
 interface name in its current network namespace. See
 [Troubleshooting](troubleshooting.md).
@@ -183,6 +343,18 @@ Operational diagnostics in the UI come from:
 - `GET /api/v1/logs/recent` for live-tail style log snapshots.
 - `GET /api/v1/doctor` for a consolidated operational check summary.
 - `GET /api/v1/version` for the application version shown in the Doctor view.
+
+The Watch history table has a separate stable Outcome column: `imported`,
+`duplicate`, `permanent failure`, or `transient failure`. Duplicate means the
+existing torrent was retained unchanged and the configured success action ran.
+Transient failures remain eligible for a later stable scan; permanent failures
+do not retry an unchanged fingerprint. The Status column is warning-colored
+when `post_action_error` is present even if the primary outcome is imported or
+duplicate, and Detail shows both the primary error and archive/delete/failure-
+move error so the operator can resolve a retained source or destination
+collision. Pending counts include unseen, changed, stabilizing, and transient-
+retry files but exclude unchanged processed files. Watch history contains only
+the current daemon run and retains its newest 10,000 results.
 
 The Settings view also exposes a destructive Reset action. After confirmation,
 it calls `POST /api/v1/reset` to stop torrent activity, remove torrent records,

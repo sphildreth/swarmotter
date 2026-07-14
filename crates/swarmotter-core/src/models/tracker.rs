@@ -39,7 +39,7 @@ impl TrackerKind {
     }
 }
 
-/// Tracker status reported by announce/scrape.
+/// Tracker announce status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
@@ -51,6 +51,20 @@ pub enum TrackerStatus {
     Ok,
     Error,
     Disabled,
+}
+
+/// Status of the most recent tracker scrape attempt. Scrape support is
+/// independent of announce support: HTTP(S) tracker paths may be derivable,
+/// while UDP and non-`announce*` paths are explicitly unsupported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackerScrapeStatus {
+    #[default]
+    NotContacted,
+    Updating,
+    Ok,
+    Error,
+    Unsupported,
 }
 
 /// A tracker URL and its tier grouping.
@@ -79,6 +93,12 @@ pub struct TrackerInfo {
     pub last_message: Option<String>,
     pub next_announce: Option<u64>,
     pub last_announce: Option<u64>,
+    pub scrape_status: TrackerScrapeStatus,
+    pub last_scrape: Option<u64>,
+    pub scrape_seeders: Option<u64>,
+    pub scrape_leechers: Option<u64>,
+    pub scrape_downloads: Option<u64>,
+    pub last_scrape_error: Option<String>,
 }
 
 /// Build effective BEP 12 tracker tiers. `announce-list` takes precedence over
@@ -144,5 +164,18 @@ mod tests {
         assert_eq!(tiers[0].tier, 0);
         assert_eq!(tiers[2].url, "http://d/a");
         assert_eq!(tiers[2].tier, 1);
+    }
+
+    #[test]
+    fn scrape_status_has_stable_wire_values() {
+        for (status, expected) in [
+            (TrackerScrapeStatus::NotContacted, "\"not_contacted\""),
+            (TrackerScrapeStatus::Updating, "\"updating\""),
+            (TrackerScrapeStatus::Ok, "\"ok\""),
+            (TrackerScrapeStatus::Error, "\"error\""),
+            (TrackerScrapeStatus::Unsupported, "\"unsupported\""),
+        ] {
+            assert_eq!(serde_json::to_string(&status).unwrap(), expected);
+        }
     }
 }

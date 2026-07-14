@@ -16,12 +16,20 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha1 = { workspace = true }
+sha2 = { workspace = true }
 hex = { workspace = true }
 url = { workspace = true }
 async-trait = { workspace = true }
 libc = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
 
 [dev-dependencies]
+rcgen = "0.13"
 
 [features]
 default = []

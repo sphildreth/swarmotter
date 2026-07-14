@@ -18,13 +18,15 @@
 
 pub mod binder;
 pub mod config;
+pub mod http;
 pub mod probe;
+pub mod socks5;
 
-pub use binder::{
-    parse_http_response, ContainedUdpSocket, HttpResponse, NetworkBinder, PeerListener,
-};
-pub use config::NetworkConfig;
+pub use binder::{ContainedUdpSocket, NetworkBinder, PeerListener};
+pub use config::{NetworkConfig, Socks5ProxyConfig};
+pub use http::{ContainedHttpClient, HttpResponse, MAX_TRACKER_HTTP_BODY_BYTES};
 pub use probe::{InterfaceInfo, InterfaceProbe, InterfaceStatus, OsInterfaceProbe};
+pub use socks5::Socks5Binder;
 
 use crate::error::{CoreError, Result};
 use crate::models::network::{NetworkContainmentMode, NetworkContainmentStatus, NetworkHealth};
@@ -230,6 +232,7 @@ mod tests {
             fail_closed: true,
             validate_route: true,
             validate_dns: true,
+            socks5: Socks5ProxyConfig::default(),
         }
     }
 

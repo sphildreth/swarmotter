@@ -11,9 +11,40 @@ use crate::autopilot::AutopilotConfig;
 use crate::bandwidth::BandwidthLimits;
 use crate::error::{CoreError, Result};
 use crate::net::NetworkConfig;
+use crate::peer_filter::PeerFilterConfig;
+use crate::policy::{validate_profiles, PolicyProfilesConfig};
+use crate::port_mapping::PortMappingConfig;
+use crate::port_test::PortTestConfig;
 use crate::queue::QueueLimits;
 use crate::ratio::SeedingPolicy;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::path::{Component, Path, PathBuf};
+
+/// Lexically normalize a path into an absolute path without resolving any
+/// symlink. Parent components cannot escape the filesystem root.
+pub fn lexical_absolute_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(CoreError::from)?.join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                }
+            }
+        }
+    }
+    Ok(normalized)
+}
 
 /// Top-level daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -35,12 +66,29 @@ pub struct Config {
     pub queue: QueueLimits,
     #[serde(default)]
     pub seeding: SeedingPolicy,
+    /// Named reusable policies and label assignments. Resolved storage and
+    /// initial admission are selected when a torrent is created; queue,
+    /// seeding, and per-torrent caps inherit live.
+    #[serde(default)]
+    pub profiles: PolicyProfilesConfig,
     #[serde(default)]
     pub autopilot: AutopilotConfig,
     #[serde(default)]
     pub dht: DhtConfig,
     #[serde(default)]
     pub pex: PexConfig,
+    /// Global peer-admission filtering for abuse mitigation. This is separate
+    /// from, and never relaxes, the contained torrent network path.
+    #[serde(default)]
+    pub peer_filter: PeerFilterConfig,
+    /// Opt-in router forwarding for the contained TCP peer listener. Mapping
+    /// traffic is never allowed to use an uncontained interface.
+    #[serde(default)]
+    pub port_mapping: PortMappingConfig,
+    /// Opt-in, operator-configured diagnostic for the TCP peer listen port.
+    /// Requests always use the contained data-plane binder at runtime.
+    #[serde(default)]
+    pub port_test: PortTestConfig,
     #[serde(default)]
     pub watch: Vec<WatchFolderConfig>,
     #[serde(default)]
@@ -113,6 +161,20 @@ pub struct StorageConfig {
     pub download_dir: Option<String>,
     #[serde(default)]
     pub incomplete_dir: Option<String>,
+    /// Optional directory for durable fast-resume metadata. When unset,
+    /// resume files remain beside active payload data for compatibility.
+    #[serde(default)]
+    pub resume_dir: Option<String>,
+    /// Optional directory for the daemon's durable state file when no
+    /// explicit `--state-file` or `SWARMOTTER_STATE_FILE` is supplied.
+    #[serde(default)]
+    pub state_dir: Option<String>,
+    /// Optional scratch root used for the daemon's fallback download layout
+    /// when no download directory is configured. Atomic state and resume
+    /// replacements intentionally continue to use same-directory temporary
+    /// files so a cross-filesystem configuration cannot weaken durability.
+    #[serde(default)]
+    pub temp_dir: Option<String>,
     /// Minimum free bytes to keep available on storage roots after planned
     /// torrent writes. `0` disables byte-reserve enforcement.
     #[serde(default)]
@@ -127,6 +189,116 @@ pub struct StorageConfig {
     /// Use sparse files where supported.
     #[serde(default = "default_true")]
     pub sparse: bool,
+    /// Explicit CoW strategy for newly created payload files. The default
+    /// preserves filesystem defaults and never changes inode flags.
+    #[serde(default)]
+    pub cow_strategy: CowStrategy,
+    /// Per-root admission, write-pressure, and recheck controls. A control
+    /// applies to its lexical path and descendants; the most specific matching
+    /// control wins.
+    #[serde(default)]
+    pub root_controls: Vec<StorageRootControl>,
+}
+
+/// Copy-on-write handling for newly created payload files.
+///
+/// This is deliberately conservative: opting into `disable_for_new_files`
+/// only succeeds on supported Btrfs filesystems before data is written. It
+/// never changes an existing file and never silently substitutes a different
+/// write strategy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CowStrategy {
+    /// Preserve the filesystem's default CoW behavior.
+    #[default]
+    Conservative,
+    /// Disable CoW for newly created payload files on supported Linux Btrfs
+    /// roots. Unsupported or ineligible files fail explicitly.
+    DisableForNewFiles,
+}
+
+impl CowStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Conservative => "conservative",
+            Self::DisableForNewFiles => "disable_for_new_files",
+        }
+    }
+}
+
+/// Disk-scheduling controls for one lexical storage-root boundary.
+///
+/// A value of `0` leaves the corresponding control unlimited. The daemon
+/// applies controls to the active write directory, so an `incomplete_dir`
+/// beneath this path shares one budget with all of its descendants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageRootControl {
+    /// Lexical storage-root path. Relative paths are resolved from the daemon
+    /// working directory during validation.
+    pub path: String,
+    /// Maximum active torrent engines using this root (0 = unlimited).
+    #[serde(default)]
+    pub max_active_downloads: usize,
+    /// Maximum declared payload bytes across active engines (0 = unlimited).
+    #[serde(default)]
+    pub max_active_bytes: u64,
+    /// Shared sustained payload-write ceiling for this root in bytes/sec
+    /// (0 = unlimited).
+    #[serde(default)]
+    pub max_write_bytes_per_second: u64,
+    /// Maximum simultaneous full rechecks using this root (0 = unlimited).
+    #[serde(default)]
+    pub max_concurrent_rechecks: usize,
+}
+
+impl StorageRootControl {
+    /// Return the lexical absolute version of this configured root.
+    pub fn normalized_path(&self) -> Result<PathBuf> {
+        lexical_absolute_path(Path::new(&self.path))
+    }
+}
+
+impl StorageConfig {
+    /// Find the most-specific configured root containing `path`.
+    ///
+    /// Validation rejects duplicate normalized roots, while nested roots are
+    /// intentional and deterministic: the longest lexical boundary wins.
+    pub fn root_control_for_path(&self, path: &Path) -> Option<&StorageRootControl> {
+        let path = lexical_absolute_path(path).ok()?;
+        self.root_controls
+            .iter()
+            .filter_map(|control| {
+                let root = control.normalized_path().ok()?;
+                path.starts_with(&root).then_some((root, control))
+            })
+            .max_by_key(|(root, _)| root.components().count())
+            .map(|(_, control)| control)
+    }
+
+    /// Return an optional durable state directory as a lexical absolute path.
+    pub fn state_dir_path(&self) -> Result<Option<PathBuf>> {
+        self.state_dir
+            .as_deref()
+            .map(|path| lexical_absolute_path(Path::new(path)))
+            .transpose()
+    }
+
+    /// Return an optional fast-resume directory as a lexical absolute path.
+    pub fn resume_dir_path(&self) -> Result<Option<PathBuf>> {
+        self.resume_dir
+            .as_deref()
+            .map(|path| lexical_absolute_path(Path::new(path)))
+            .transpose()
+    }
+
+    /// Return an optional scratch directory as a lexical absolute path.
+    pub fn temp_dir_path(&self) -> Result<Option<PathBuf>> {
+        self.temp_dir
+            .as_deref()
+            .map(|path| lexical_absolute_path(Path::new(path)))
+            .transpose()
+    }
 }
 
 fn default_true() -> bool {
@@ -138,10 +310,15 @@ impl Default for StorageConfig {
         Self {
             download_dir: None,
             incomplete_dir: None,
+            resume_dir: None,
+            state_dir: None,
+            temp_dir: None,
             minimum_free_space_bytes: 0,
             minimum_free_space_percent: 0,
             preallocate: false,
             sparse: true,
+            cow_strategy: CowStrategy::Conservative,
+            root_controls: Vec::new(),
         }
     }
 }
@@ -164,9 +341,10 @@ pub struct TorrentConfig {
     /// the other transport remains available.
     #[serde(default = "default_true")]
     pub utp_prefer_tcp: bool,
-    /// Peer wire encryption policy for TCP peers. `preferred` attempts MSE/PE
-    /// first and falls back to plaintext; `required` refuses plaintext peer
-    /// wire sessions and disables uTP fallback until encrypted uTP is added.
+    /// Peer-wire encryption policy for contained TCP and uTP streams.
+    /// `preferred` attempts MSE/PE first and falls back to plaintext on the
+    /// selected contained transport; `required` refuses plaintext peer-wire
+    /// sessions without silently changing transport.
     #[serde(default)]
     pub encryption_mode: PeerEncryptionMode,
     /// Selfish mode: when true, SwarmOtter removes a torrent from the daemon
@@ -279,6 +457,9 @@ pub struct WatchFolderConfig {
     pub download_dir: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+    /// Optional named profile assigned to imports from this folder.
+    #[serde(default)]
+    pub profile: Option<String>,
     /// "start" or "paused".
     #[serde(default)]
     pub start_behavior: StartBehavior,
@@ -290,7 +471,7 @@ pub struct WatchFolderConfig {
     pub delete_after_import: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartBehavior {
     #[default]
@@ -402,6 +583,50 @@ impl Config {
     /// Validate the full configuration.
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
+        self.peer_filter.validate()?;
+        self.port_mapping.validate()?;
+        self.port_test.validate()?;
+        if self.network.socks5.enabled && (self.torrent.utp_enabled || self.dht.enabled) {
+            // SOCKS5 UDP ASSOCIATE is deliberately not implemented. Refuse an
+            // ambiguous configuration rather than presenting a proxy as if it
+            // covered UDP traffic or allowing a contained-direct fallback.
+            return Err(CoreError::InvalidConfig(
+                "network.socks5 is TCP CONNECT only; set torrent.utp_enabled = false and dht.enabled = false when enabling it (UDP tracker URLs are rejected at runtime)".into(),
+            ));
+        }
+        if self.port_mapping.enabled
+            && (self.network.mode != crate::models::network::NetworkContainmentMode::Strict
+                || !self.network.fail_closed
+                || self.network.required_interface.is_none())
+        {
+            // NAT-PMP gateway discovery and SSDP multicast must be scoped to
+            // one concrete device. Source-only, preferred, and disabled modes
+            // cannot prove that a router request avoids the default route.
+            return Err(CoreError::InvalidConfig(
+                "port_mapping.enabled requires network.mode = \"strict\", network.fail_closed = true, and network.required_interface".into(),
+            ));
+        }
+        if self
+            .seeding
+            .global_ratio_limit
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(CoreError::InvalidConfig(
+                "seeding.global_ratio_limit must be a finite non-negative number or omitted".into(),
+            ));
+        }
+        if self.bandwidth.max_peers > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(CoreError::InvalidConfig(format!(
+                "bandwidth.max_peers must be <= {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
+        }
+        if self.bandwidth.max_peers_per_torrent > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(CoreError::InvalidConfig(format!(
+                "bandwidth.max_peers_per_torrent must be <= {}",
+                tokio::sync::Semaphore::MAX_PERMITS
+            )));
+        }
         if self.api.bind_address.is_empty() {
             return Err(CoreError::InvalidConfig(
                 "api.bind_address must not be empty".into(),
@@ -457,11 +682,89 @@ impl Config {
                 "storage.minimum_free_space_percent must be between 0 and 100".into(),
             ));
         }
+        for (field, path) in [
+            ("storage.resume_dir", self.storage.resume_dir.as_deref()),
+            ("storage.state_dir", self.storage.state_dir.as_deref()),
+            ("storage.temp_dir", self.storage.temp_dir.as_deref()),
+        ] {
+            if let Some(path) = path {
+                if path.trim().is_empty() {
+                    return Err(CoreError::InvalidConfig(format!(
+                        "{field} must not be empty when set"
+                    )));
+                }
+                lexical_absolute_path(Path::new(path)).map_err(|error| {
+                    CoreError::InvalidConfig(format!("{field} could not be normalized: {error}"))
+                })?;
+            }
+        }
+        let mut normalized_storage_roots = BTreeSet::new();
+        for control in &self.storage.root_controls {
+            if control.path.trim().is_empty() {
+                return Err(CoreError::InvalidConfig(
+                    "storage.root_controls.path must not be empty".into(),
+                ));
+            }
+            let path = control.normalized_path().map_err(|error| {
+                CoreError::InvalidConfig(format!(
+                    "storage.root_controls.path could not be normalized: {error}"
+                ))
+            })?;
+            if !normalized_storage_roots.insert(path.clone()) {
+                return Err(CoreError::InvalidConfig(format!(
+                    "storage.root_controls contains duplicate path {}",
+                    path.display()
+                )));
+            }
+        }
+        validate_profiles(&self.profiles).map_err(CoreError::InvalidConfig)?;
         for w in &self.watch {
-            if w.path.is_empty() {
+            if w.path.trim().is_empty() {
                 return Err(CoreError::InvalidConfig(
                     "watch folder path must not be empty".into(),
                 ));
+            }
+            if let Some(profile) = w.profile.as_deref() {
+                if profile.trim().is_empty() {
+                    return Err(CoreError::InvalidConfig(
+                        "watch folder profile must not be empty when set".into(),
+                    ));
+                }
+                if !self.profiles.profiles.contains_key(profile) {
+                    return Err(CoreError::InvalidConfig(format!(
+                        "watch folder references unknown profile {profile}"
+                    )));
+                }
+            }
+            let root = lexical_absolute_path(Path::new(&w.path)).map_err(|error| {
+                CoreError::InvalidConfig(format!(
+                    "watch folder path could not be normalized: {error}"
+                ))
+            })?;
+            for (field, configured_destination) in [
+                ("archive_dir", w.archive_dir.as_deref()),
+                ("failure_dir", w.failure_dir.as_deref()),
+            ] {
+                let Some(configured_destination) = configured_destination else {
+                    continue;
+                };
+                if configured_destination.trim().is_empty() {
+                    return Err(CoreError::InvalidConfig(format!(
+                        "watch folder {field} must not be empty when set"
+                    )));
+                }
+                let destination = lexical_absolute_path(Path::new(configured_destination))
+                    .map_err(|error| {
+                        CoreError::InvalidConfig(format!(
+                            "watch folder {field} could not be normalized: {error}"
+                        ))
+                    })?;
+                if destination == root {
+                    return Err(CoreError::InvalidConfig(format!(
+                        "watch folder {field} must not normalize to its watch root: {}",
+                        root.display()
+                    )));
+                }
             }
         }
         Ok(())
@@ -499,9 +802,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_config_validates() {
+    fn default_config_strict_requires_path() {
         let cfg = Config::default();
-        assert!(cfg.validate().is_ok());
+        // The default is strict containment without a path, so validation
+        // fails with invalid_config. See ADR-0051.
+        let err = cfg.validate().unwrap_err();
+        assert_eq!(err.code().as_str(), "invalid_config");
+        assert!(err.to_string().contains("strict network containment"));
         assert_eq!(cfg.torrent.listen_port, 51413);
         assert_eq!(cfg.api.bind_address, "127.0.0.1:9091");
         assert!(cfg.network.allow_ipv6);
@@ -519,8 +826,105 @@ mod tests {
     }
 
     #[test]
+    fn default_config_with_disabled_mode_validates() {
+        let mut cfg = Config::default();
+        cfg.network.mode = crate::models::network::NetworkContainmentMode::Disabled;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn watch_paths_reject_whitespace_and_action_destination_equal_to_root() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("config-watch-validation-root");
+        let mut cfg = Config::default();
+        cfg.network.mode = crate::models::network::NetworkContainmentMode::Disabled;
+        cfg.watch = vec![WatchFolderConfig {
+            path: root.display().to_string(),
+            recursive: true,
+            download_dir: None,
+            label: None,
+            profile: None,
+            start_behavior: StartBehavior::Paused,
+            archive_dir: Some(root.join("archive").display().to_string()),
+            failure_dir: Some(root.join("failure").display().to_string()),
+            delete_after_import: false,
+        }];
+        assert!(cfg.validate().is_ok(), "distinct descendants are valid");
+
+        let root_string = root.display().to_string();
+        let equivalent_root = root.join("child").join("..").display().to_string();
+        for (path, archive_dir, failure_dir, expected) in [
+            (" \t".to_string(), None, None, "watch folder path"),
+            (
+                root_string.clone(),
+                Some(" \t".to_string()),
+                None,
+                "archive_dir",
+            ),
+            (
+                root_string.clone(),
+                None,
+                Some(" \t".to_string()),
+                "failure_dir",
+            ),
+            (
+                root_string.clone(),
+                Some(equivalent_root),
+                None,
+                "archive_dir",
+            ),
+            (root_string.clone(), None, Some(root_string), "failure_dir"),
+        ] {
+            cfg.watch[0].path = path;
+            cfg.watch[0].archive_dir = archive_dir;
+            cfg.watch[0].failure_dir = failure_dir;
+            let error = cfg.validate().unwrap_err();
+            assert_eq!(error.code().as_str(), "invalid_config");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn rejects_negative_and_non_finite_global_ratio_limits() {
+        for invalid in [-1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            let mut cfg = Config::default();
+            cfg.network.mode = crate::models::network::NetworkContainmentMode::Disabled;
+            cfg.seeding.global_ratio_limit = Some(invalid);
+            let error = cfg.validate().unwrap_err();
+            assert_eq!(error.code().as_str(), "invalid_config");
+            assert!(error.to_string().contains("global_ratio_limit"));
+        }
+    }
+
+    #[test]
+    fn peer_limits_accept_runtime_boundary_and_reject_one_over() {
+        let mut cfg = Config::default();
+        cfg.network.mode = crate::models::network::NetworkContainmentMode::Disabled;
+        cfg.bandwidth.max_peers = tokio::sync::Semaphore::MAX_PERMITS;
+        cfg.bandwidth.max_peers_per_torrent = tokio::sync::Semaphore::MAX_PERMITS;
+        assert!(cfg.validate().is_ok());
+
+        cfg.bandwidth.max_peers = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        assert!(matches!(cfg.validate(), Err(CoreError::InvalidConfig(_))));
+        cfg.bandwidth.max_peers = 0;
+        cfg.bandwidth.max_peers_per_torrent = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        assert!(matches!(cfg.validate(), Err(CoreError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn default_config_with_strict_path_validates() {
+        let mut cfg = Config::default();
+        cfg.network.required_interface = Some("tun0".into());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn autopilot_config_defaults_to_act() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [torrent]
 listen_port = 51413
 "#;
@@ -534,6 +938,9 @@ listen_port = 51413
     #[test]
     fn autopilot_config_parses_and_env_override() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [autopilot]
 mode = "observe"
 "#;
@@ -544,7 +951,10 @@ mode = "observe"
         ));
 
         let cfg = Config::default();
-        let env = vec![("SWARMOTTER_AUTOPILOT__MODE".into(), "disabled".into())];
+        let env = vec![
+            ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
+            ("SWARMOTTER_AUTOPILOT__MODE".into(), "disabled".into()),
+        ];
         let cfg = cfg.apply_env_overrides(&env).unwrap();
         assert!(matches!(
             cfg.autopilot.mode,
@@ -585,6 +995,9 @@ selfish = true
     #[test]
     fn partial_runtime_limit_tables_use_defaults() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [bandwidth]
 global_download = 1024
 
@@ -643,6 +1056,9 @@ listen_port = 51413
     fn storage_free_space_percent_validates_range() {
         let err = Config::from_toml_str(
             r#"
+[network]
+mode = "disabled"
+
 [storage]
 minimum_free_space_percent = 101
 "#,
@@ -655,6 +1071,7 @@ minimum_free_space_percent = 101
     fn storage_reserve_env_overrides_apply() {
         let cfg = Config::default()
             .apply_env_overrides(&[
+                ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
                 (
                     "SWARMOTTER_STORAGE__MINIMUM_FREE_SPACE_BYTES".into(),
                     "4096".into(),
@@ -667,6 +1084,110 @@ minimum_free_space_percent = 101
             .unwrap();
         assert_eq!(cfg.storage.minimum_free_space_bytes, 4096);
         assert_eq!(cfg.storage.minimum_free_space_percent, 7);
+    }
+
+    #[test]
+    fn storage_state_placement_and_cow_strategy_parse_with_safe_defaults() {
+        let cfg = Config::from_toml_str(
+            r#"
+[network]
+mode = "disabled"
+
+[storage]
+resume_dir = "runtime/resume"
+state_dir = "runtime/state"
+temp_dir = "runtime/scratch"
+cow_strategy = "disable_for_new_files"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.storage.resume_dir_path().unwrap().unwrap(),
+            lexical_absolute_path(Path::new("runtime/resume")).unwrap()
+        );
+        assert_eq!(
+            cfg.storage.state_dir_path().unwrap().unwrap(),
+            lexical_absolute_path(Path::new("runtime/state")).unwrap()
+        );
+        assert_eq!(cfg.storage.cow_strategy, CowStrategy::DisableForNewFiles);
+
+        let defaults = StorageConfig::default();
+        assert_eq!(defaults.cow_strategy, CowStrategy::Conservative);
+        assert!(defaults.resume_dir.is_none());
+        assert!(defaults.state_dir.is_none());
+        assert!(defaults.temp_dir.is_none());
+    }
+
+    #[test]
+    fn storage_state_placement_rejects_blank_paths() {
+        for field in ["resume_dir", "state_dir", "temp_dir"] {
+            let error = Config::from_toml_str(&format!(
+                "[network]\nmode = \"disabled\"\n\n[storage]\n{field} = \"  \"\n"
+            ))
+            .unwrap_err();
+            assert_eq!(error.code().as_str(), "invalid_config");
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn storage_root_controls_use_most_specific_lexical_root() {
+        let cfg = Config::from_toml_str(
+            r#"
+[network]
+mode = "disabled"
+
+[[storage.root_controls]]
+path = "/srv/torrents"
+max_active_downloads = 2
+max_active_bytes = 100
+
+[[storage.root_controls]]
+path = "/srv/torrents/ssd"
+max_active_downloads = 1
+max_write_bytes_per_second = 1024
+"#,
+        )
+        .unwrap();
+
+        let broad = cfg
+            .storage
+            .root_control_for_path(Path::new("/srv/torrents/hdd/incomplete"))
+            .unwrap();
+        assert_eq!(broad.max_active_downloads, 2);
+        let nested = cfg
+            .storage
+            .root_control_for_path(Path::new("/srv/torrents/ssd/incomplete"))
+            .unwrap();
+        assert_eq!(nested.max_active_downloads, 1);
+        assert_eq!(nested.max_write_bytes_per_second, 1024);
+        assert!(cfg
+            .storage
+            .root_control_for_path(Path::new("/var/lib/swarmotter"))
+            .is_none());
+    }
+
+    #[test]
+    fn storage_root_controls_reject_empty_and_duplicate_paths() {
+        for controls in [
+            r#"
+[[storage.root_controls]]
+path = "  "
+"#,
+            r#"
+[[storage.root_controls]]
+path = "/srv/torrents"
+
+[[storage.root_controls]]
+path = "/srv/torrents/child/.."
+"#,
+        ] {
+            let error =
+                Config::from_toml_str(&format!("[network]\nmode = \"disabled\"\n\n{controls}"))
+                    .unwrap_err();
+            assert_eq!(error.code().as_str(), "invalid_config");
+            assert!(error.to_string().contains("storage.root_controls"));
+        }
     }
 
     #[test]
@@ -688,6 +1209,9 @@ minimum_free_space_percent = 101
     #[test]
     fn compatibility_parses_and_env_overrides() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [compatibility.transmission]
 enabled = true
 
@@ -700,6 +1224,7 @@ enabled = true
 
         let cfg = Config::default();
         let env = vec![
+            ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
             (
                 "SWARMOTTER_COMPATIBILITY__TRANSMISSION__ENABLED".into(),
                 "true".into(),
@@ -726,6 +1251,9 @@ listen_port = 0
     #[test]
     fn torrent_selfish_defaults_false() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [torrent]
 listen_port = 51413
 "#;
@@ -736,6 +1264,9 @@ listen_port = 51413
     #[test]
     fn torrent_selfish_parses_true() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [torrent]
 selfish = true
 "#;
@@ -746,7 +1277,10 @@ selfish = true
     #[test]
     fn torrent_selfish_env_override() {
         let cfg = Config::default();
-        let env = vec![("SWARMOTTER_TORRENT__SELFISH".into(), "true".into())];
+        let env = vec![
+            ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
+            ("SWARMOTTER_TORRENT__SELFISH".into(), "true".into()),
+        ];
         let cfg = cfg.apply_env_overrides(&env).unwrap();
         assert!(cfg.torrent.selfish);
     }
@@ -754,6 +1288,9 @@ selfish = true
     #[test]
     fn torrent_encryption_mode_parses_and_env_override() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [torrent]
 encryption_mode = "required"
 "#;
@@ -761,18 +1298,41 @@ encryption_mode = "required"
         assert_eq!(cfg.torrent.encryption_mode, PeerEncryptionMode::Required);
 
         let cfg = Config::default();
-        let env = vec![(
-            "SWARMOTTER_TORRENT__ENCRYPTION_MODE".into(),
-            "disabled".into(),
-        )];
+        let env = vec![
+            ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
+            (
+                "SWARMOTTER_TORRENT__ENCRYPTION_MODE".into(),
+                "disabled".into(),
+            ),
+        ];
         let cfg = cfg.apply_env_overrides(&env).unwrap();
         assert_eq!(cfg.torrent.encryption_mode, PeerEncryptionMode::Disabled);
+    }
+
+    #[test]
+    fn profile_encryption_mode_parses_as_an_optional_override() {
+        let toml = r#"
+[network]
+mode = "disabled"
+
+[torrent]
+encryption_mode = "disabled"
+
+[profiles.profiles.secure]
+encryption_mode = "required"
+"#;
+        let cfg = Config::from_toml_str(toml).unwrap();
+        assert_eq!(
+            cfg.profiles.profiles["secure"].encryption_mode,
+            Some(PeerEncryptionMode::Required)
+        );
     }
 
     #[test]
     fn env_overrides_apply() {
         let cfg = Config::default();
         let env = vec![
+            ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
             ("SWARMOTTER_TORRENT__LISTEN_PORT".into(), "60000".into()),
             (
                 "SWARMOTTER_API__BIND_ADDRESS".into(),
@@ -790,6 +1350,9 @@ encryption_mode = "required"
     fn unauthenticated_api_can_use_a_non_loopback_bind() {
         let cfg = Config::from_toml_str(
             r#"
+[network]
+mode = "disabled"
+
 [api]
 bind_address = "0.0.0.0:9091"
 require_auth = false
@@ -801,6 +1364,9 @@ require_auth = false
 
         let cfg = Config::from_toml_str(
             r#"
+[network]
+mode = "disabled"
+
 [api]
 bind_address = "[::1]:9091"
 "#,
@@ -813,15 +1379,21 @@ bind_address = "[::1]:9091"
     fn environment_overrides_are_applied_before_final_validation() {
         let cfg = Config::parse_toml_str(
             r#"
+[network]
+mode = "disabled"
+
 [api]
 require_auth = true
 "#,
         )
         .unwrap()
-        .apply_env_overrides(&[(
-            "SWARMOTTER_API__AUTH_TOKEN".into(),
-            "environment-token".into(),
-        )])
+        .apply_env_overrides(&[
+            ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
+            (
+                "SWARMOTTER_API__AUTH_TOKEN".into(),
+                "environment-token".into(),
+            ),
+        ])
         .unwrap();
 
         assert!(cfg.api.require_auth);
@@ -832,6 +1404,7 @@ require_auth = true
     fn command_environment_is_not_treated_as_config_fields() {
         let cfg = Config::default()
             .apply_env_overrides(&[
+                ("SWARMOTTER_NETWORK__MODE".into(), "disabled".into()),
                 ("SWARMOTTER_CONFIG".into(), "/tmp/swarmotter.toml".into()),
                 ("SWARMOTTER_STATE_FILE".into(), "/tmp/state.json".into()),
             ])
@@ -843,12 +1416,18 @@ require_auth = true
     #[test]
     fn auth_requires_token() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [api]
 require_auth = true
 "#;
         assert!(Config::from_toml_str(toml).is_err());
 
         let toml = r#"
+[network]
+mode = "disabled"
+
 [api]
 require_auth = true
 auth_token = "secret"
@@ -859,6 +1438,9 @@ auth_token = "secret"
     #[test]
     fn request_body_limit_must_be_positive() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [api]
 max_request_body_bytes = 0
 "#;
@@ -868,6 +1450,9 @@ max_request_body_bytes = 0
     #[test]
     fn dht_port_must_be_positive() {
         let toml = r#"
+[network]
+mode = "disabled"
+
 [dht]
 port = 0
 "#;
@@ -878,6 +1463,9 @@ port = 0
     fn dht_partial_config_uses_default_bootstrap_nodes() {
         let cfg = Config::from_toml_str(
             r#"
+[network]
+mode = "disabled"
+
 [dht]
 port = 55145
 "#,
@@ -890,6 +1478,9 @@ port = 55145
     fn logging_defaults_to_file_enabled() {
         let cfg = Config::from_toml_str(
             r#"
+[network]
+mode = "disabled"
+
 [logging]
 json = true
 "#,

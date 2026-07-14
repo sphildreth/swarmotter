@@ -31,6 +31,13 @@ peer-worker global and per-torrent limits, effective peer-worker budget, active
 peer workers, and saturation booleans for download slots, metadata fetch slots,
 and peer-worker budget.
 
+ADR-0053 adds `peer_limit`, `peer_permits_in_use`,
+`peer_permits_available`, and `peer_sessions_denied` from the runtime-owned
+process pool. These are authoritative for process-wide peer-session
+enforcement. The older peer-worker limit/budget/saturation fields remain
+compatibility telemetry for engine scheduling pressure and must not be
+interpreted as connection grants.
+
 The snapshot is diagnostic. It does not replace the queue planner or engine
 resource acquisition paths. Future scheduler work may move active downloads,
 metadata fetches, tracker announces, connection attempts, and peer workers to a
@@ -58,3 +65,4 @@ by the scheduler.
 - [API Documentation](../../docs/api.md)
 - [Scaling Implementation Plan](../scaling-implementation-plan.md)
 - [ADR-0041: Set-Backed Queue and Metadata Fetch Budget](0041-set-backed-queue-and-metadata-fetch-budget.md)
+- [ADR-0053: Process-Wide Peer Session Permit Pool](0053-process-wide-peer-session-permit-pool.md)
