@@ -20,12 +20,7 @@
 </p>
 
 <p align="center">
-  <em>A fast little Rust BitTorrent daemon that keeps your swarm safely in its tunnel.</em>
-</p>
-
-<p align="center">
-  SwarmOtter is a performance-first Rust BitTorrent daemon with a practical web
-  UI, complete API, and fail-closed VPN/NIC traffic containment.
+  <em>A fast, secure Rust BitTorrent daemon with strict network containment and a practical web UI.</em>
 </p>
 
 <p align="center">
@@ -38,97 +33,48 @@
 
 ## What SwarmOtter Is
 
-- A **Rust BitTorrent daemon** built for Linux/server and homelab deployments.
-- **API-first** — the daemon and its API are the primary product surfaces.
-- **Web UI included** — practical, function-over-form, consuming the same API
-  exposed to external automation.
-- **Performance-first** — efficient async networking, disk I/O, and bounded
-  memory under many active torrents and peers.
-- **Operationally correct** — predictable behavior, safe recovery, and clear
-  diagnostics.
-- **Containment-native** — VPN/NIC fail-closed traffic containment is a core
-  requirement, not a deployment afterthought.
+SwarmOtter is a performance-first Rust BitTorrent daemon built for Linux/server and homelab deployments. It features:
+
+- **API-first** — the daemon and its API are the primary product surfaces
+- **Web UI included** — practical, function-over-form, consuming the same API exposed to external automation
+- **Performance-focused** — efficient async networking, disk I/O, and bounded memory usage
+- **Operationally correct** — predictable behavior, safe recovery, and clear diagnostics
+- **Containment-native** — VPN/NIC fail-closed traffic containment is a core requirement
 
 ## What SwarmOtter Is Not
 
-SwarmOtter is **not** a torrent indexer, search engine, piracy assistant, or
-content-discovery tool.
-
-It does not include bundled torrent indexes, infringing magnet links,
-copyrighted media examples, or documentation encouraging copyright
-infringement.
+SwarmOtter is not a torrent indexer, search engine, or piracy assistant. It's designed for lawful content distribution and does not include:
+- Bundled torrent indexes
+- Infringing magnet links
+- Copyrighted media examples
 
 ## Features
 
-- Performance-first Rust daemon with a live BitTorrent data plane.
-- Native REST API with WebSocket and Server-Sent Events.
-- Optional Transmission RPC compatibility endpoint at `/transmission/rpc` for
-  Transmission-style tools and scripts.
-- Optional qBittorrent-compatible `/api/v2` endpoint for
-  Sonarr/Radarr/Flood-style automation.
-- Practical Web UI that uses the same API exposed to external automation.
-- UI operations-console updates for large libraries, with
-  a sortable/filterable Tabulator table, theme toggle, and efficient large-list
-  workflows.
-- Magnet links and `.torrent` file intake, including metadata-first previews
-  with deterministic profile/request file exclusions, BEP 53 selection,
-  contained literal `x.pe` hints, and explainable content organization.
-- BEP 52 v2/hybrid support: explicit full SHA-1/SHA-256 identities, `btmh`
-  magnets, SHA-256 file-tree/piece-layer verification, contained pure-v2 peer
-  transfer and discovery, and collision-safe 40/64-character API and durable
-  locators. Hybrid records retain their v1 primary locator and resolve their
-  full v2 identity as an alias.
-- TCP and uTP peer wire protocol support.
-- Contained TCP/uTP peer-wire protocol encryption (MSE/PE) with configurable
-  global, profile, and durable per-torrent modes: `disabled`, `preferred`
-  (default), or `required`.
-- Opt-in contained SOCKS5 TCP `CONNECT` proxy support for outbound peer TCP,
-  HTTP(S) tracker/scrape, and webseed requests, with remote target DNS and no
-  direct fallback. Proxy mode intentionally blocks DHT, uTP, and UDP trackers.
-- DHT, PEX, HTTP/HTTPS trackers, UDP trackers, and webseeds.
-- BEP 9 magnet metadata fetching.
-- Fast resume and forced recheck for v1, v2, and hybrid records.
-- Versioned local SQLite durable library state with migration from legacy JSON
-  state, full v1/v2 keys, retained exact original metainfo, bounded audit and
-  metric history, and an integrity-checked projection rebuild command.
-- Watch-folder import.
-- File selection, file prioritization, and path rename controls.
-- Queue, bandwidth, ratio, and seeding controls.
-- Named policy profiles with deterministic label selection, durable resolved
-  storage and initial-admission snapshots, and explainable effective values.
-- Profile-scoped tracker-host enablement/priority, force-top-level folders,
-  per-torrent incomplete paths, active-only partial suffixes, and storage-path
-  previews before move or organization changes.
-- Adaptive swarm performance autopilot with per-torrent diagnostics and
-  override controls.
-- Disk-aware storage controls: storage-root diagnostics, add-time free-space
-  preflight, and per-root active-work, declared-byte, verified-write, and
-  full-recheck budgets via `[[storage.root_controls]]` and
-  `GET /api/v1/storage/roots`.
-- Filesystem-aware storage diagnostics and placement: best-effort mount data,
-  sustained local write/verification rates, deliberate log/resume/state/fallback
-  roots, and an explicit conservative-or-Btrfs-NOCOW strategy that never
-  modifies existing payload files.
-- Settings two-panel layout for dense configuration in the Web UI.
-- Strict VPN/NIC traffic containment with fail-closed behavior.
-- Opt-in NAT-PMP/UPnP TCP listener mapping and operator-hosted reachability
-  checks, both constrained to the same data-plane path.
-- Expanded qBittorrent and Transmission automation compatibility for profiles,
-  categories, lifecycle, location, file, and tracker workflows.
-- Container and homelab-friendly deployment.
-- Lawful-use project posture.
+SwarmOtter provides a comprehensive set of BitTorrent features:
+
+- **Performance-focused daemon** with live BitTorrent data plane
+- **Native REST API** with WebSocket and Server-Sent Events
+- **Optional compatibility** with Transmission and qBittorrent automation tools
+- **Practical Web UI** that uses the same API as external automation
+- **Advanced torrent handling** including magnet links, .torrent files, metadata-first previews
+- **BEP 52 v2/hybrid support** with full SHA-1/SHA-256 identities
+- **Protocol support** for TCP and uTP peer wire protocols
+- **Encryption** with MSE/PE support in configurable modes
+- **Containment features** including SOCKS5 proxy support and strict network boundaries
+- **DHT, PEX, HTTP/HTTPS trackers**, UDP trackers, and webseeds
+- **Fast resume** and forced recheck capabilities
+- **Versioned SQLite storage** with migration from legacy JSON state
+- **Watch-folder import** functionality
+- **Advanced controls** for file selection, queueing, bandwidth, ratio, and seeding
+- **Policy profiles** with deterministic label selection
+- **Disk-aware storage** with filesystem diagnostics and placement
+- **Container-friendly deployment** options
 
 ## Network Containment
 
-SwarmOtter treats network containment as a product requirement, not a
-deployment afterthought.
+SwarmOtter enforces strict network containment as a core requirement. All torrent-related traffic is constrained through configured network paths including:
 
-All torrent-related traffic must be constrained through the configured network
-path (VPN interface, source IP, network namespace, or explicitly configured
-NIC), including:
-
-- Peer TCP
-- Peer UDP / uTP
+- Peer TCP and UDP / uTP
 - DHT UDP
 - PEX-discovered peers
 - UDP trackers
@@ -136,50 +82,31 @@ NIC), including:
 - Webseeds
 - Magnet metadata fetching
 - DNS used by torrent operations
-- Opt-in NAT-PMP/UPnP router mapping and listener reachability diagnostics
 
-The daemon **fails closed** and never silently falls back to the default route
-if the configured path is unavailable. The Web UI/API control plane is separate
-from the torrent data plane.
+The daemon **fails closed** and never silently falls back to the default route if configured path is unavailable. The Web UI/API control plane operates separately from the torrent data plane.
 
-Containment is strict by default. Omitting `[network]` leaves strict mode
-without an enforceable path and fails configuration validation; disabled mode
-must be selected explicitly and is limited to development or a separately
-enforced boundary such as the supplied Gluetun shared namespace. Live path loss
-blocks one process-wide gate before socket-owning tasks are aborted. Concrete
-socket bind failures block immediately and remain latched until an explicit,
-fully validated configuration replacement proves the peer-listener bind and,
-outside SOCKS5 TCP-only mode, an ephemeral UDP bind succeed; a healthy
-interface probe alone never reopens traffic.
+Containment is strict by default - omitting `[network]` requires a valid path for configuration validation. For development scenarios, disabled mode can be explicitly set. Live path loss blocks all traffic until explicit configuration replacement proves connectivity.
 
-This default is the breaking configuration change in `v2.0.0`. Existing `1.x`
-installations that relied on omitted network configuration must add a strict
-interface/source/namespace path before upgrading, or explicitly set
-`mode = "disabled"` only when development or another boundary supplies the
-required containment.
-
-See [`docs/network-containment.md`](docs/network-containment.md).
+See [`docs/network-containment.md`](docs/network-containment.md) for detailed information.
 
 ## Lawful Use
 
-SwarmOtter is a general-purpose BitTorrent client intended for lawful
-downloading, sharing, and seeding of content that users have the right to
-access and distribute.
+SwarmOtter is designed for lawful downloading, sharing, and seeding of content that users have the right to access and distribute. It supports:
 
-Examples include Linux distributions, open-source project releases,
-public-domain media, open datasets, user-owned files, and
-organization-approved distribution workflows.
+- Linux distributions
+- Open-source project releases
+- Public-domain media
+- Open datasets
+- User-owned files
+- Organization-approved distribution workflows
 
-Users are responsible for ensuring their use complies with applicable laws and
-the rights of content owners. This is project policy and documentation, not
-legal advice.
+Users are responsible for ensuring their use complies with applicable laws and the rights of content owners. This is project policy and documentation, not legal advice.
 
-See:
-
+For more information on lawful use, see:
 - [`docs/lawful-use.md`](docs/lawful-use.md)
 - [`docs/legal.md`](docs/legal.md)
 
-## Developer Onboarding
+## Getting Started
 
 ### Prerequisites
 
@@ -188,11 +115,17 @@ See:
 - Git
 - Linux is recommended for network-containment development and testing
 
-### First-Time Setup
+### Installation
 
 ```bash
 git clone https://github.com/sphildreth/swarmotter.git
 cd swarmotter
+cargo build --release
+```
+
+### First-Time Setup
+
+```bash
 cargo fmt
 cargo check
 cargo test
@@ -209,7 +142,7 @@ SwarmOtter is a Cargo workspace with four crates:
 | `crates/swarmotter-api` | API layer |
 | `crates/swarmotter-web` | Web UI / static asset support |
 
-## Repository Layout
+## Repository Structure
 
 ```text
 swarmotter/
@@ -244,7 +177,7 @@ swarmotter/
 └── .github/                   # Issue and PR templates
 ```
 
-## ADRs and Decision Records
+## Architecture Decision Records
 
 Important technical, legal, operational, and dependency decisions are recorded
 as Architecture Decision Records (ADRs) in
@@ -254,27 +187,24 @@ New architecture, legal, dependency, or network-containment decisions require
 ADRs. When in doubt, create one. See
 [`design/adr/README.md`](design/adr/README.md) for the format and lifecycle.
 
-## Simple Homelab Deployment
+## Homelab Deployment
 
 A typical homelab deployment:
 
-1. Run a VPN container or VPN-enabled network namespace.
-2. Run `swarmotterd` inside that network path.
-3. Mount persistent config and download directories.
-4. Expose only the Web UI/API port to the LAN.
-5. Keep torrent peer / tracker / DHT traffic constrained to the VPN path.
+1. Run a VPN container or VPN-enabled network namespace
+2. Run `swarmotterd` inside that network path
+3. Mount persistent config and download directories
+4. Expose only the Web UI/API port to the LAN
+5. Keep torrent peer / tracker / DHT traffic constrained to the VPN path
 
-The full runbook lives in [`docs/deployment.md`](docs/deployment.md). Common
-configuration patterns live in [`docs/configuration.md`](docs/configuration.md).
+See [`docs/deployment.md`](docs/deployment.md) for detailed deployment instructions.
 
 ## Documentation
 
 Published user guide:
-
 - <https://sphildreth.github.io/swarmotter/>
 
 User-facing documentation:
-
 - [User guide](docs/index.md)
 - [Configuration](docs/configuration.md)
 - [API reference](docs/api.md)
@@ -285,7 +215,6 @@ User-facing documentation:
 - [Legal and content policy](docs/legal.md)
 
 Project design documentation:
-
 - [Requirements](design/requirements.md)
 - [Architecture](design/architecture.md)
 - [API design](design/api.md)
@@ -296,16 +225,12 @@ Project design documentation:
 
 ## Contributing
 
-Contributions are welcome. To contribute:
-
-- Read [`AGENTS.md`](AGENTS.md) for coding-agent and contributor governance.
-- Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for workflow and conventions.
-- Create or update an ADR in [`design/adr/`](design/adr/) for decisions with
-  lasting architectural, legal, dependency, or containment impact.
-- Do **not** submit piracy-oriented features, indexers, infringing magnets, or
-  copyrighted-content examples; see [`docs/legal.md`](docs/legal.md).
-- Run `cargo fmt`, `cargo check`, and `cargo test` before considering work
-  done.
+Contributions are welcome! To contribute:
+- Read [`AGENTS.md`](AGENTS.md) for coding-agent and contributor governance
+- Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for workflow and conventions
+- Create or update an ADR in [`design/adr/`](design/adr/) for decisions with lasting architectural, legal, dependency, or containment impact
+- Follow the project's lawful use guidelines; see [`docs/legal.md`](docs/legal.md)
+- Run `cargo fmt`, `cargo check`, and `cargo test` before submitting work
 
 ## License
 
