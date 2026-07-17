@@ -2,6 +2,58 @@
 
 use super::*;
 
+fn torrent_piece_count(torrent: &Torrent) -> usize {
+    torrent
+        .meta
+        .data_piece_count()
+        .unwrap_or_else(|_| torrent.meta.piece_count())
+}
+
+fn validate_torrent_piece_progress(torrent: &Torrent, piece_count: usize) -> Result<()> {
+    let expected_bitfield_bytes = piece_count.div_ceil(8);
+    if torrent.progress.total != piece_count
+        || torrent.progress.bitfield().as_bytes().len() != expected_bitfield_bytes
+        || (piece_count..expected_bitfield_bytes.saturating_mul(8))
+            .any(|index| torrent.progress.bitfield().has(index))
+    {
+        return Err(CoreError::Storage(format!(
+            "daemon state for {} has inconsistent piece progress (total={}, expected_total={}, bitfield_bytes={}, expected_bitfield_bytes={})",
+            torrent.key(),
+            torrent.progress.total,
+            piece_count,
+            torrent.progress.bitfield().as_bytes().len(),
+            expected_bitfield_bytes,
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_legacy_unresolved_magnet_progress(torrent: &mut Torrent, piece_count: usize) -> bool {
+    if piece_count == 0
+        || !torrent.needs_metadata
+        || torrent.progress.total != 0
+        || torrent.progress.pieces_have() != 0
+        || !torrent.progress.bitfield().as_bytes().is_empty()
+        || torrent.files.iter().any(|file| file.bytes_completed != 0)
+    {
+        return false;
+    }
+
+    let empty = swarmotter_core::storage::PieceBitfield::new(piece_count);
+    torrent.progress.replace_from_bitfield(&empty, piece_count);
+    true
+}
+
+fn daemon_state_for_persistence(
+    torrents: Vec<Torrent>,
+    queue: QueueState<TorrentKey>,
+) -> Result<crate::state_store::DaemonState> {
+    for torrent in &torrents {
+        validate_torrent_piece_progress(torrent, torrent_piece_count(torrent))?;
+    }
+    Ok(crate::state_store::DaemonState::new(torrents, queue))
+}
+
 impl DaemonRuntime {
     pub async fn restore_persisted_state(&self) -> Result<usize> {
         let Some(path) = self.state_path.clone() else {
@@ -16,6 +68,7 @@ impl DaemonRuntime {
         let traffic_allowed = self.network_health.read().await.traffic_allowed;
         let restore_config = self.config.read().await.clone();
         let mut restored = TorrentRegistry::default();
+        let mut normalized_legacy_progress = 0usize;
         for mut torrent in stored.torrents.drain(..) {
             let persisted_state = torrent.state;
             if torrent
@@ -87,21 +140,11 @@ impl DaemonRuntime {
                     ))
                 })?;
             }
-            let piece_count = torrent
-                .meta
-                .data_piece_count()
-                .unwrap_or_else(|_| torrent.meta.piece_count());
-            let expected_bitfield_bytes = piece_count.div_ceil(8);
-            if torrent.progress.total != piece_count
-                || torrent.progress.bitfield().as_bytes().len() != expected_bitfield_bytes
-                || (piece_count..expected_bitfield_bytes.saturating_mul(8))
-                    .any(|index| torrent.progress.bitfield().has(index))
-            {
-                return Err(CoreError::Storage(format!(
-                    "daemon state for {} has inconsistent piece progress",
-                    torrent.key()
-                )));
+            let piece_count = torrent_piece_count(&torrent);
+            if normalize_legacy_unresolved_magnet_progress(&mut torrent, piece_count) {
+                normalized_legacy_progress += 1;
             }
+            validate_torrent_piece_progress(&torrent, piece_count)?;
             let restored_bitfield = torrent.progress.bitfield().clone();
             torrent
                 .progress
@@ -196,6 +239,12 @@ impl DaemonRuntime {
             restored.add(torrent).map_err(|_| {
                 CoreError::Storage(format!("duplicate torrent {hash} in daemon state"))
             })?;
+        }
+        if normalized_legacy_progress > 0 {
+            tracing::warn!(
+                count = normalized_legacy_progress,
+                "normalized legacy unresolved-magnet piece progress during state restore"
+            );
         }
 
         let config = self.config.read().await.clone();
@@ -342,7 +391,7 @@ impl DaemonRuntime {
             .cloned()
             .collect();
         let queue = self.queue.lock().await.clone();
-        let state = crate::state_store::DaemonState::new(torrents, queue);
+        let state = daemon_state_for_persistence(torrents, queue)?;
         tokio::task::spawn_blocking(move || {
             crate::state_store::save_with_original_metainfo(&path, &state, original_metainfo)
         })
@@ -407,7 +456,7 @@ impl DaemonRuntime {
             .cloned()
             .collect();
         let queue = self.queue.lock().await.clone();
-        let state = crate::state_store::DaemonState::new(torrents, queue);
+        let state = daemon_state_for_persistence(torrents, queue)?;
         let write_path = path.clone();
         let persisted =
             tokio::task::spawn_blocking(move || crate::state_store::save(&write_path, &state))
@@ -1341,11 +1390,19 @@ impl DaemonRuntime {
                 .cloned()
                 .collect();
             let queue = self.queue.lock().await.clone();
-            let state = crate::state_store::DaemonState::new(torrents, queue);
-            let write_path = path.clone();
-            tokio::task::spawn_blocking(move || crate::state_store::save(&write_path, &state))
-                .await
-                .map_err(|error| CoreError::Storage(format!("save daemon state task: {error}")))?
+            match daemon_state_for_persistence(torrents, queue) {
+                Ok(state) => {
+                    let write_path = path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::state_store::save(&write_path, &state)
+                    })
+                    .await
+                    .map_err(|error| {
+                        CoreError::Storage(format!("save daemon state task: {error}"))
+                    })?
+                }
+                Err(error) => Err(error),
+            }
         } else {
             Ok(())
         };

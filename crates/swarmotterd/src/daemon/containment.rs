@@ -314,9 +314,16 @@ impl DaemonRuntime {
                         },
                     ));
                 }
-                t.progress
-                    .replace_from_bitfield(&s.pieces_have, s.piece_count);
-                t.recompute_file_bytes_completed();
+                // A metadata engine has no payload piece space until BEP 9
+                // resolves the real metainfo, and a newly spawned payload
+                // engine can briefly expose its default snapshot before
+                // initialization. Keep the last internally consistent progress
+                // until the engine reports the authoritative piece space.
+                if !t.needs_metadata && Self::engine_progress_matches_torrent(t, s) {
+                    t.progress
+                        .replace_from_bitfield(&s.pieces_have, s.piece_count);
+                    t.recompute_file_bytes_completed();
+                }
                 t.downloaded = s.downloaded;
                 t.uploaded = s.uploaded;
                 t.active_peer_workers = s.active_peers;
@@ -408,6 +415,18 @@ impl DaemonRuntime {
                 self.persist_state_best_effort("engine_progress").await;
             }
         }
+    }
+
+    fn engine_progress_matches_torrent(torrent: &Torrent, state: &EngineState) -> bool {
+        let piece_count = torrent
+            .meta
+            .data_piece_count()
+            .unwrap_or_else(|_| torrent.meta.piece_count());
+        let expected_bitfield_bytes = piece_count.div_ceil(8);
+        state.piece_count == piece_count
+            && state.pieces_have.as_bytes().len() == expected_bitfield_bytes
+            && !(piece_count..expected_bitfield_bytes.saturating_mul(8))
+                .any(|index| state.pieces_have.has(index))
     }
 
     /// Periodically compute autopilot decisions from contained runtime
