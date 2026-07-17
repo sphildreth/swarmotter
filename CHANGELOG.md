@@ -7,6 +7,18 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [2.0.1] - [2026-07-17]
+
+### Fixed
+
+- **Durable torrent restarts:** metadata-discovery snapshots no longer replace
+  synthetic placeholder progress with an incompatible zero-piece bitfield, and
+  transient uninitialized payload-engine snapshots cannot overwrite valid
+  progress. Persistence now rejects piece-progress mismatches before commit,
+  while startup narrowly normalizes the legacy zero-completion shape already
+  written for unresolved magnets so one affected record cannot prevent the
+  daemon and control plane from starting.
+
 ## [2.0.0] - [2026-07-14]
 
 ### Upgrade notes

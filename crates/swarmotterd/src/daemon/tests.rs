@@ -1605,6 +1605,144 @@ async fn durable_restore_rejects_colliding_paths_and_invalid_progress() {
 }
 
 #[tokio::test]
+async fn durable_restore_normalizes_legacy_zero_progress_unresolved_magnet() {
+    let root = unique_dir("restore-legacy-unresolved-progress");
+    let state_path = root.join("state.sqlite");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.queue.auto_start = false;
+    let placeholder =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "generated-metadata-placeholder.bin",
+            b"generated metadata placeholder payload",
+            16,
+            None,
+            false,
+        ))
+        .unwrap();
+    let piece_count = placeholder.piece_count();
+    assert!(piece_count > 0);
+    let key =
+        TorrentKey::v1(InfoHash::from_hex("8a15da1c44b064473f826a02aa01c39ae577da16").unwrap());
+    let mut unresolved = Torrent::new(placeholder, now());
+    unresolved.needs_metadata = true;
+    set_test_v1_magnet_identity(&mut unresolved, key);
+    unresolved.state = TorrentState::Error;
+    unresolved.error = Some("generated metadata discovery failure".into());
+    unresolved.progress = swarmotter_core::storage::PieceProgress::new(0);
+    crate::state_store::save(
+        &state_path,
+        &crate::state_store::DaemonState::new(vec![unresolved], QueueState::new(cfg.queue.clone())),
+    )
+    .unwrap();
+
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        cfg.clone(),
+        disabled_health(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    assert_eq!(runtime.restore_persisted_state().await.unwrap(), 1);
+    let restored = runtime.registry.lock().await.get(&key).cloned().unwrap();
+    assert!(restored.needs_metadata);
+    assert_eq!(restored.progress.total, piece_count);
+    assert_eq!(restored.progress.pieces_have(), 0);
+    assert_eq!(
+        restored.progress.bitfield().as_bytes().len(),
+        piece_count.div_ceil(8)
+    );
+    drop(runtime);
+
+    let persisted = crate::state_store::load(&state_path)
+        .unwrap()
+        .unwrap()
+        .torrents
+        .into_iter()
+        .find(|torrent| torrent.key() == key)
+        .unwrap();
+    assert_eq!(persisted.progress.total, piece_count);
+    assert_eq!(persisted.progress.pieces_have(), 0);
+    assert_eq!(
+        persisted.progress.bitfield().as_bytes().len(),
+        piece_count.div_ceil(8)
+    );
+
+    let restarted = DaemonRuntime::with_paths_broker_and_state(
+        cfg,
+        disabled_health(),
+        None,
+        None,
+        Some(state_path),
+        EventBroker::default(),
+    );
+    assert_eq!(restarted.restore_persisted_state().await.unwrap(), 1);
+    assert_eq!(
+        restarted
+            .registry
+            .lock()
+            .await
+            .get(&key)
+            .unwrap()
+            .progress
+            .total,
+        piece_count
+    );
+    drop(restarted);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn persistence_rejects_inconsistent_piece_progress_before_commit() {
+    let root = unique_dir("persist-invalid-progress");
+    let state_path = root.join("state.sqlite");
+    let cfg = Config::default();
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        cfg,
+        disabled_health(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let meta =
+        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
+            "generated-persistence-fixture.bin",
+            b"generated persistence validation payload",
+            8,
+            None,
+            false,
+        ))
+        .unwrap();
+    let key = TorrentKey::v1(meta.info_hash);
+    runtime
+        .registry
+        .lock()
+        .await
+        .add(Torrent::new(meta, now()))
+        .unwrap();
+    runtime.queue.lock().await.add(key);
+    runtime.persist_state().await.unwrap();
+    let valid_generation = std::fs::read(&state_path).unwrap();
+
+    runtime
+        .registry
+        .lock()
+        .await
+        .get_mut(&key)
+        .unwrap()
+        .progress
+        .total += 1;
+    let error = runtime.persist_state().await.unwrap_err();
+    assert!(error.to_string().contains("inconsistent piece progress"));
+    assert_eq!(std::fs::read(&state_path).unwrap(), valid_generation);
+
+    drop(runtime);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn durable_restore_rejects_legacy_zero_v1_magnet_identity() {
     let root = unique_dir("restore-zero-v1-magnet");
     let state_path = root.join("state.sqlite");
@@ -4024,13 +4162,19 @@ async fn reconcile_applies_resolved_magnet_metadata_while_engine_runs() {
 
 #[tokio::test]
 async fn reconcile_keeps_unresolved_magnet_in_metadata_state() {
-    let cfg = Config::default();
-    let health = NetworkHealth::blocked(
-        NetworkContainmentMode::Disabled,
-        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
-        "disabled",
+    let root = unique_dir("unresolved-magnet-progress-restart");
+    let state_path = root.join("state.sqlite");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.queue.auto_start = false;
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        cfg.clone(),
+        disabled_health(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
     );
-    let runtime = DaemonRuntime::new(cfg, health);
     let placeholder_bytes = swarmotter_core::meta::build_single_file_torrent(
         "magnet placeholder",
         b"placeholder",
@@ -4039,6 +4183,7 @@ async fn reconcile_keeps_unresolved_magnet_in_metadata_state() {
         false,
     );
     let placeholder_meta = swarmotter_core::meta::parse_torrent(&placeholder_bytes).unwrap();
+    let placeholder_piece_count = placeholder_meta.piece_count();
     let magnet_info_hash =
         swarmotter_core::hash::InfoHash::from_hex("95c6c298c84fee2eee10c044d673537da158f0f8")
             .unwrap();
@@ -4066,8 +4211,36 @@ async fn reconcile_keeps_unresolved_magnet_in_metadata_state() {
     let summary = runtime.get_torrent(&hash).await.unwrap();
     assert_eq!(summary.state, TorrentState::DownloadingMetadata);
     assert_eq!(summary.total_length, "placeholder".len() as u64);
+    let unresolved = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    assert_eq!(unresolved.progress.total, placeholder_piece_count);
+    assert_eq!(unresolved.progress.pieces_have(), 0);
+    assert_eq!(
+        unresolved.progress.bitfield().as_bytes().len(),
+        placeholder_piece_count.div_ceil(8)
+    );
 
     runtime.force_stop_engine(&hash).await;
+    drop(runtime);
+
+    let restarted = DaemonRuntime::with_paths_broker_and_state(
+        cfg,
+        disabled_health(),
+        None,
+        None,
+        Some(state_path),
+        EventBroker::default(),
+    );
+    assert_eq!(restarted.restore_persisted_state().await.unwrap(), 1);
+    let restored = restarted.registry.lock().await.get(&hash).cloned().unwrap();
+    assert!(restored.needs_metadata);
+    assert_eq!(restored.progress.total, placeholder_piece_count);
+    assert_eq!(restored.progress.pieces_have(), 0);
+    assert_eq!(
+        restored.progress.bitfield().as_bytes().len(),
+        placeholder_piece_count.div_ceil(8)
+    );
+    drop(restarted);
+    std::fs::remove_dir_all(root).ok();
 }
 
 #[tokio::test]
