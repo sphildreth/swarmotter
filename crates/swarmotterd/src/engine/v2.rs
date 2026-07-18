@@ -497,14 +497,12 @@ impl TorrentEngine {
         layout: &V2PieceLayout,
     ) -> Result<PieceBitfield> {
         if let Some(resume) = storage.load_resume_v2(&self.torrent_key, layout).await? {
-            let payload_bytes = storage.payload_bytes_on_disk().await?;
             let current_stamps = storage.resume_file_stamps().await?;
             let stamps_match = !resume.file_stamps.is_empty()
                 && resume.file_stamps.len() == current_stamps.len()
                 && resume.file_stamps == current_stamps;
-            let sparse_bytes_mismatch =
-                self.sparse && !self.preallocate && payload_bytes != resume.bytes_completed;
-            if sparse_bytes_mismatch || !stamps_match {
+            if !stamps_match {
+                let payload_bytes = storage.payload_bytes_on_disk().await?;
                 tracing::info!(
                     torrent_key = %self.torrent_key,
                     payload_bytes,
