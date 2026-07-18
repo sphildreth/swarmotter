@@ -20,6 +20,7 @@ use tower::ServiceExt;
 
 use swarmotter_api::state::{AddTorrentOptions, AppState, BuildInfo, DaemonOps};
 use swarmotter_core::config::{Config, PeerEncryptionMode};
+use swarmotter_core::error::CoreError;
 use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::meta::{build_single_file_torrent, parse_torrent, TorrentMeta};
 use swarmotter_core::models::network::{
@@ -50,6 +51,30 @@ fn pick_port() -> u16 {
         .local_addr()
         .unwrap()
         .port()
+}
+
+async fn replace_config_with_available_listener(runtime: &Arc<DaemonRuntime>, config: &mut Config) {
+    const MAX_PORT_ATTEMPTS: usize = 16;
+    let mut last_addr_in_use = None;
+
+    for _ in 0..MAX_PORT_ATTEMPTS {
+        // The listener cannot remain reserved while replacement validates the
+        // same address. Retry only the narrow TOCTOU case where another
+        // parallel test claims the ephemeral port after pick_port() drops it.
+        config.torrent.listen_port = pick_port();
+        match runtime.replace_config(config.clone()).await {
+            Ok(_) => return,
+            Err(CoreError::NetworkBlocked(detail)) if detail.contains("Address already in use") => {
+                last_addr_in_use = Some(detail);
+            }
+            Err(error) => panic!("configuration replacement unexpectedly failed: {error}"),
+        }
+    }
+
+    panic!(
+        "configuration replacement could not reserve a listener after {MAX_PORT_ATTEMPTS} attempts: {}",
+        last_addr_in_use.unwrap_or_else(|| "address remained unavailable".into())
+    );
 }
 
 fn strict_config_with_interface(iface: &str, source: &str, root: &std::path::Path) -> Config {
@@ -703,8 +728,7 @@ async fn recovery_intent_survives_restart_while_path_remains_blocked() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_source_bind_failure_latches_until_validated_config_replacement() {
     let root = unique_dir("bind-latch");
-    let mut bad = strict_config_with_interface("lo", "192.0.2.254", &root);
-    bad.torrent.listen_port = pick_port();
+    let bad = strict_config_with_interface("lo", "192.0.2.254", &root);
     let probe = healthy_probe("lo", "192.0.2.254");
     let runtime = healthy_runtime(probe.clone(), bad.clone());
     let binder = runtime.data_plane_binder_for_test().await;
@@ -746,7 +770,7 @@ async fn real_source_bind_failure_latches_until_validated_config_replacement() {
         InterfaceStatus::Up,
         vec!["127.0.0.1".parse().unwrap()],
     );
-    runtime.replace_config(repaired).await.unwrap();
+    replace_config_with_available_listener(&runtime, &mut repaired).await;
     assert!(runtime.containment_gate().traffic_allowed());
     assert_eq!(
         runtime.network_health().await.status,
