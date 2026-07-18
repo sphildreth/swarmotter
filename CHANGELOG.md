@@ -7,6 +7,19 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [2.0.2] - [2026-07-18]
+
+### Fixed
+
+- **Bounded multi-file storage memory:** read-only verification and seeding
+  handles are no longer retained after each operation, and the reusable
+  writable-handle working set is capped. This prevents Tokio's per-file I/O
+  buffers and descriptors from exhausting daemon memory while rechecking or
+  downloading torrents with large file counts. Sparse fast resume now trusts
+  structurally valid piece progress when complete file identity/change stamps
+  still match, rather than comparing sparse logical file lengths with verified
+  bytes and forcing a full recheck after every restart.
+
 ## [2.0.1] - [2026-07-17]
 
 ### Fixed

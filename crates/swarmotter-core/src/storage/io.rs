@@ -37,6 +37,12 @@ use crate::v2::V2PieceLayout;
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+// Tokio retains an internal read/write buffer of up to 2 MiB in every
+// `tokio::fs::File`. Keep only a bounded working set of writable handles and
+// never cache read-only handles, so a recheck of a large multi-file torrent
+// cannot retain one such buffer per payload file.
+const MAX_CACHED_WRITABLE_FILE_HANDLES: usize = 64;
+
 /// Per-torrent storage handle performing real disk I/O.
 #[derive(Clone)]
 pub struct StorageIo {
@@ -54,6 +60,9 @@ pub struct StorageIo {
     /// Optional dedicated root for fast-resume state. When absent, preserve
     /// the historical adjacent-to-active-data placement.
     resume_dir: Option<PathBuf>,
+    /// Bounded cache of writable handles. Read-only verification/seeding
+    /// handles are deliberately short-lived because Tokio retains its I/O
+    /// buffer for as long as the handle remains alive.
     file_handles: Arc<Mutex<HashMap<usize, CachedFileHandle>>>,
     resume_write_lock: Arc<Mutex<()>>,
     /// Optional shared sustained payload-write limiter. The daemon gives every
@@ -811,16 +820,25 @@ impl StorageIo {
             writable: create_if_missing,
         };
 
-        let mut handles = self.file_handles.lock().await;
-        if create_if_missing {
-            handles.insert(index, file.clone());
+        // A read-only handle is used by one operation and then dropped. Tokio
+        // keeps its internal buffer in the File object after the read, so
+        // inserting these handles into the long-lived cache makes resident
+        // memory grow by up to 2 MiB for every file traversed by a recheck.
+        if !create_if_missing {
             return Ok(file.file);
         }
-        Ok(handles
-            .entry(index)
-            .or_insert_with(|| file.clone())
-            .file
-            .clone())
+
+        let mut handles = self.file_handles.lock().await;
+        // Another writer may have populated the cache while this file was
+        // being opened. Preserve one shared seek/write lock for that index.
+        if let Some(existing) = handles.get(&index).filter(|handle| handle.writable) {
+            return Ok(existing.file.clone());
+        }
+        if handles.len() >= MAX_CACHED_WRITABLE_FILE_HANDLES {
+            handles.clear();
+        }
+        handles.insert(index, file.clone());
+        Ok(file.file)
     }
 
     async fn write_v2_file_range(&self, file_index: usize, offset: u64, data: &[u8]) -> Result<()> {
@@ -2276,6 +2294,62 @@ mod tests {
         assert_eq!(clone.read_block(0, 0, 8).await.unwrap(), &content[..8]);
         assert_eq!(clone.file_handles.lock().await.len(), 1);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn read_only_recheck_does_not_retain_payload_handles() {
+        let files = vec![
+            (vec!["a.bin".into()], 4u64),
+            (vec!["b.bin".into()], 4u64),
+            (vec!["c.bin".into()], 4u64),
+        ];
+        let contents: Vec<&[u8]> = vec![b"aaaa", b"bbbb", b"cccc"];
+        let bytes = build_multi_file_torrent("recheck", &files, &contents, 4, None);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("read-handles-not-retained");
+        let store = StorageIo::new(meta.clone(), dir.clone());
+        for (index, content) in contents.iter().enumerate() {
+            let path = store.file_path(index).unwrap();
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(path, content).await.unwrap();
+        }
+
+        let verified = store.recheck().await.unwrap();
+
+        assert_eq!(verified.count(meta.piece_count()), meta.piece_count());
+        assert!(
+            store.file_handles.lock().await.is_empty(),
+            "read-only rechecks must not retain Tokio file buffers"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn writable_file_handle_cache_is_bounded() {
+        let file_count = MAX_CACHED_WRITABLE_FILE_HANDLES + 1;
+        let files = (0..file_count)
+            .map(|index| (vec![format!("file-{index}.bin")], 1u64))
+            .collect::<Vec<_>>();
+        let owned_contents = (0..file_count)
+            .map(|index| vec![(index % 251) as u8])
+            .collect::<Vec<_>>();
+        let contents = owned_contents.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let bytes = build_multi_file_torrent("bounded", &files, &contents, 1, None);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir("bounded-write-handles");
+        let store = StorageIo::new(meta, dir.clone());
+
+        for (index, content) in contents.iter().enumerate() {
+            store.write_piece(index, content).await.unwrap();
+        }
+
+        assert!(
+            store.file_handles.lock().await.len() <= MAX_CACHED_WRITABLE_FILE_HANDLES,
+            "writable handle cache exceeded its fixed working-set bound"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

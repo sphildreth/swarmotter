@@ -1005,6 +1005,82 @@ async fn progress_update_does_not_count_rechecked_bytes_as_downloaded() {
 }
 
 #[tokio::test]
+async fn sparse_fast_resume_trusts_matching_file_stamps() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let payload = b"abcdefghABCDEFGHijklmnop";
+    let bytes = build_single_file_torrent("sparse-resume.bin", payload, 8, None, false);
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let dir = unique_dir("sparse-resume-matching-stamps");
+    let storage = StorageIo::new(meta.clone(), dir.clone());
+    storage.write_piece(2, &payload[16..24]).await.unwrap();
+
+    let mut have = PieceBitfield::new(meta.piece_count());
+    have.set(2);
+    let piece_lengths = (0..meta.piece_count())
+        .map(|index| {
+            if index + 1 == meta.piece_count() {
+                meta.last_piece_length()
+            } else {
+                meta.piece_length
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut resume = swarmotter_core::storage::io::build_resume(
+        TorrentKey::v1(meta.info_hash),
+        meta.name.clone(),
+        have.clone(),
+        meta.piece_count(),
+        8,
+        0,
+        meta.total_length,
+        Some(dir.display().to_string()),
+        now_secs(),
+        None,
+        &vec![FilePriority::Normal; meta.files.len()],
+        &piece_lengths,
+    );
+    resume.file_stamps = storage.resume_file_stamps().await.unwrap();
+    assert_ne!(
+        storage.payload_bytes_on_disk().await.unwrap(),
+        resume.bytes_completed,
+        "the fixture must model an out-of-order sparse write"
+    );
+    storage.save_resume(&resume).await.unwrap();
+
+    let rechecks = Arc::new(AtomicUsize::new(0));
+    let observed_rechecks = rechecks.clone();
+    let binder = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let engine = TorrentEngine::new(
+        meta,
+        dir.clone(),
+        [0u8; 20],
+        binder,
+        state,
+        rx,
+        vec![],
+        6881,
+    )
+    .with_sparse(true)
+    .with_preallocate(false)
+    .with_storage_recheck_executor(Arc::new(move |_storage| {
+        let rechecks = observed_rechecks.clone();
+        Box::pin(async move {
+            rechecks.fetch_add(1, Ordering::AcqRel);
+            Ok(PieceBitfield::new(3))
+        })
+    }));
+
+    let recovered = engine.load_or_recheck(&storage).await.unwrap();
+
+    assert_eq!(rechecks.load(Ordering::Acquire), 0);
+    assert_eq!(recovered, have);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
 async fn stale_fast_resume_rechecks_payload_ahead_of_resume() {
     let payload = b"abcdefghABCDEFGHijklmnop";
     let bytes = build_single_file_torrent("stale.bin", payload, 8, None, false);
