@@ -144,6 +144,9 @@ SwarmOtter can expose an optional compatibility endpoint at
 `/transmission/rpc` for existing Transmission-style clients and scripts when
 `compatibility.transmission.enabled = true`.
 
+The endpoint accepts header-only `GET` session negotiation used by clients such
+as Prowlarr; RPC methods continue to use `POST`.
+
 ```toml
 [compatibility.transmission]
 enabled = true
@@ -154,6 +157,20 @@ Auth mapping uses the same API token flow as the native API:
 - `Authorization` and `X-SwarmOtter-Auth` are accepted by the daemon.
 - If a client uses HTTP Basic auth, the username is ignored and the password must
   equal `api.auth_token`.
+
+### Prowlarr 2.3.x
+
+SwarmOtter's Transmission adapter has been successfully interoperability-tested
+with Prowlarr 2.3.x. Configure Prowlarr's Transmission download client with:
+
+- URL base: `/transmission/`
+- Host and port: the SwarmOtter control-plane listener (port `9091` by default)
+- SSL: enable only when the listener or its reverse proxy serves HTTPS
+- Username: any nonempty value when authentication is required
+- Password: the configured `api.auth_token`
+
+The validated flow covers Basic authentication, Transmission session
+negotiation, the client-version check, and listing existing torrents.
 
 The adapter supports `torrent-add` for:
 

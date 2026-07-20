@@ -33,7 +33,10 @@ pub fn app_router(state: SharedState) -> Router {
 pub fn app_router_with_body_limit(state: SharedState, max_request_body_bytes: usize) -> Router {
     let v1 = api_v1_router(state.clone(), max_request_body_bytes);
     let transmission = Router::new()
-        .route("/transmission/rpc", post(handlers::transmission::rpc))
+        .route(
+            "/transmission/rpc",
+            get(handlers::transmission::negotiate_session).post(handlers::transmission::rpc),
+        )
         .layer(DefaultBodyLimit::max(max_request_body_bytes));
     let qbittorrent = Router::new()
         .route("/api/v2/auth/login", post(handlers::qbittorrent::login))
