@@ -27,6 +27,7 @@ use crate::routes::constant_time_eq;
 use crate::state::{AddTorrentOptions, SharedState};
 
 const SESSION_HEADER: &str = "x-transmission-session-id";
+const TRANSMISSION_COMPAT_VERSION: &str = "4.0.0";
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -95,16 +96,29 @@ impl RpcFailure {
 
 type RpcResult<T> = std::result::Result<T, RpcFailure>;
 
+/// Negotiate the Transmission session header for clients that probe with
+/// `GET /transmission/rpc` before sending RPC requests with `POST`.
+pub async fn negotiate_session(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let cfg = state.daemon.get_config().await;
+    if !cfg.compatibility.transmission.enabled {
+        return compatibility_disabled_response();
+    }
+
+    if let Some(response) = require_auth(&headers, &cfg) {
+        return response;
+    }
+    if let Some(response) = require_session(&headers, &state) {
+        return response;
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
 /// Handle `POST /transmission/rpc`.
 pub async fn rpc(State(state): State<SharedState>, headers: HeaderMap, body: Bytes) -> Response {
     let cfg = state.daemon.get_config().await;
     if !cfg.compatibility.transmission.enabled {
-        return (
-            StatusCode::NOT_FOUND,
-            [(header::CONTENT_TYPE, "application/json")],
-            json!({ "error": "transmission rpc compatibility is disabled" }).to_string(),
-        )
-            .into_response();
+        return compatibility_disabled_response();
     }
 
     if let Some(response) = require_auth(&headers, &cfg) {
@@ -131,6 +145,15 @@ pub async fn rpc(State(state): State<SharedState>, headers: HeaderMap, body: Byt
         Ok(arguments) => rpc_success(&request, arguments),
         Err(error) => rpc_error(&request, error),
     }
+}
+
+fn compatibility_disabled_response() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "application/json")],
+        json!({ "error": "transmission rpc compatibility is disabled" }).to_string(),
+    )
+        .into_response()
 }
 
 fn require_auth(headers: &HeaderMap, cfg: &Config) -> Option<Response> {
@@ -277,7 +300,10 @@ async fn session_get(state: &SharedState, cfg: &Config, request: &RpcRequest) ->
     for field in requested {
         let normalized = normalize_key(&field);
         let value = match normalized.as_str() {
-            "version" => json!(format!("SwarmOtter {}", state.build.version)),
+            "version" => json!(format!(
+                "{TRANSMISSION_COMPAT_VERSION} (SwarmOtter {})",
+                state.build.version
+            )),
             "rpc_version" => json!(17),
             "rpc_version_minimum" => json!(1),
             "rpc_version_semver" => json!("6.0.0"),
@@ -918,7 +944,7 @@ impl TorrentFieldContext {
         let needs_files = fields.iter().any(|field| {
             matches!(
                 normalize_key(field).as_str(),
-                "files" | "file_stats" | "priorities" | "wanted"
+                "file_count" | "files" | "file_stats" | "priorities" | "wanted"
             )
         });
         let needs_trackers = fields.iter().any(|field| {
@@ -976,6 +1002,22 @@ fn torrent_field_value(
         "downloaded_ever" => json!(summary.downloaded),
         "uploaded_ever" => json!(summary.uploaded),
         "upload_ratio" => json!(summary.ratio),
+        "seconds_downloading" | "seconds_seeding" => json!(0),
+        "seed_ratio_limit" => json!(summary.effective_ratio_limit.unwrap_or(0.0)),
+        "seed_ratio_mode" => json!(if summary.effective_ratio_limit.is_some() {
+            1
+        } else {
+            2
+        }),
+        "seed_idle_limit" => json!(summary
+            .effective_idle_limit
+            .map(|seconds| seconds.div_ceil(60))
+            .unwrap_or(0)),
+        "seed_idle_mode" => json!(if summary.effective_idle_limit.is_some() {
+            1
+        } else {
+            2
+        }),
         "added_date" => json!(summary.date_added),
         "done_date" => json!(summary.date_completed.unwrap_or(0)),
         "activity_date" | "edit_date" => json!(summary.date_added),

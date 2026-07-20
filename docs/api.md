@@ -766,7 +766,19 @@ block cap at `25`; torrents with no discovery and no connected peers cap at
 ## Transmission RPC compatibility
 
 When enabled, `POST /transmission/rpc` is a compatibility adapter over native
-daemon operations. It is not part of the native `/api/v1` surface.
+daemon operations. Compatibility clients that negotiate a session with
+`GET /transmission/rpc`, including Prowlarr, receive the same authentication and
+`X-Transmission-Session-Id` challenge without dispatching an RPC method. The
+adapter is not part of the native `/api/v1` surface.
+
+The Transmission `session-get.version` field begins with the adapter's
+Transmission compatibility level and includes the SwarmOtter product version
+in parentheses. Native `/api/v1/version` remains authoritative for the
+SwarmOtter release version.
+
+The compatibility baseline has been successfully tested with Prowlarr 2.3.x,
+including authenticated session negotiation, version validation, and torrent
+listing through Prowlarr's Transmission download-client integration.
 
 Enable it with:
 
@@ -804,10 +816,13 @@ helper calls:
 - `queue-move-top`, `queue-move-up`, `queue-move-down`, `queue-move-bottom`
 - `free-space`, `port-test`, `blocklist-update`
 
-Per-torrent seeding policy does not add Transmission adapter options. Existing
-`torrent-get` fields `uploadRatio`/`upload_ratio` and
-`uploadedEver`/`uploaded_ever` use the same truthful native accounting; an
-unsupported per-torrent `seedRatioLimit` request remains `null`.
+Existing `torrent-get` fields `uploadRatio`/`upload_ratio` and
+`uploadedEver`/`uploaded_ever` use the same truthful native accounting.
+`seedRatioLimit`, `seedRatioMode`, `seedIdleLimit`, and `seedIdleMode` expose
+effective native seeding targets as Transmission-compatible numeric values;
+unlimited targets use mode `2` and a zero limit. SwarmOtter does not retain
+accumulated active download and seed durations, so `secondsDownloading` and
+`secondsSeeding` return the numeric neutral value `0` rather than `null`.
 
 `torrent-remove` maps `delete-local-data` and `delete_local_data` to the native
 delete-data option.

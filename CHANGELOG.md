@@ -7,6 +7,19 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [2.0.3] - [2026-07-20]
+
+### Fixed
+
+- **Prowlarr Transmission compatibility:** the Transmission adapter now
+  accepts safe `GET /transmission/rpc` session negotiation, returns the
+  required session challenge before Prowlarr sends RPC methods with `POST`, and
+  reports a parseable Transmission compatibility version separately from the
+  native SwarmOtter product version. Prowlarr's required torrent-list duration
+  and seeding-policy fields now return compatible numeric values instead of
+  `null`; the complete connection and listing flow is verified with Prowlarr
+  2.3.x.
+
 ## [2.0.2] - [2026-07-18]
 
 ### Fixed

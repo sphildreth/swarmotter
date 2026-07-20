@@ -2295,10 +2295,10 @@ async fn transmission_rpc_session_handshake_and_legacy_envelope() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["result"], "success");
     assert_eq!(body["tag"], 7);
-    assert!(body["arguments"]["version"]
-        .as_str()
-        .unwrap()
-        .contains("SwarmOtter"));
+    assert_eq!(
+        body["arguments"]["version"],
+        format!("4.0.0 (SwarmOtter {})", env!("CARGO_PKG_VERSION"))
+    );
     assert_eq!(body["arguments"]["session-id"], session);
 
     let payload = serde_json::json!({
@@ -2394,7 +2394,116 @@ async fn transmission_rpc_reuses_api_token_for_basic_auth() {
 }
 
 #[tokio::test]
-async fn compatibility_keeps_only_previously_supported_ratio_and_upload_fields() {
+async fn transmission_rpc_supports_prowlarr_get_session_negotiation() {
+    let mut cfg = Config::default();
+    cfg.compatibility.transmission.enabled = true;
+    cfg.api.require_auth = true;
+    cfg.api.auth_token = Some("test-token".into());
+    let state = fake_daemon::fake_state_with_config(cfg);
+    let app = swarmotter_api::app_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/transmission/rpc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let auth = "Basic dXNlcjp0ZXN0LXRva2Vu";
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/transmission/rpc")
+                .header("authorization", auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let session = resp
+        .headers()
+        .get("x-transmission-session-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("Prowlarr negotiation session header")
+        .to_string();
+
+    let payload = serde_json::json!({ "method": "session-get" });
+    let (status, body) = transmission_rpc(app.clone(), &session, payload, Some(auth)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"], "success");
+    assert!(body["arguments"]["version"]
+        .as_str()
+        .is_some_and(|version| version.starts_with("4.0.0 (SwarmOtter ")));
+
+    let add = serde_json::json!({
+        "method": "torrent-add",
+        "arguments": { "filename": known_magnet(), "paused": true }
+    });
+    let (status, body) = transmission_rpc(app.clone(), &session, add, Some(auth)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"], "success");
+
+    let get = serde_json::json!({
+        "method": "torrent-get",
+        "arguments": {
+            "fields": [
+                "id", "hashString", "name", "downloadDir", "totalSize",
+                "leftUntilDone", "isFinished", "eta", "status",
+                "secondsDownloading", "secondsSeeding", "errorString",
+                "uploadedEver", "downloadedEver", "seedRatioLimit",
+                "seedRatioMode", "seedIdleLimit", "seedIdleMode", "fileCount"
+            ]
+        }
+    });
+    let (status, body) = transmission_rpc(app.clone(), &session, get, Some(auth)).await;
+    assert_eq!(status, StatusCode::OK);
+    let row = &body["arguments"]["torrents"][0];
+    for field in [
+        "id",
+        "totalSize",
+        "leftUntilDone",
+        "eta",
+        "status",
+        "secondsDownloading",
+        "secondsSeeding",
+        "uploadedEver",
+        "downloadedEver",
+        "seedRatioLimit",
+        "seedRatioMode",
+        "seedIdleLimit",
+        "seedIdleMode",
+        "fileCount",
+    ] {
+        assert!(row[field].is_number(), "{field} must be numeric");
+    }
+    assert!(row["isFinished"].is_boolean());
+    for field in ["hashString", "name", "downloadDir", "errorString"] {
+        assert!(row[field].is_string(), "{field} must be a string");
+    }
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/transmission/rpc")
+                .header("authorization", auth)
+                .header("x-transmission-session-id", session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn compatibility_reports_effective_seeding_limits_and_upload_fields() {
     let mut cfg = Config::default();
     cfg.compatibility.transmission.enabled = true;
     cfg.compatibility.qbittorrent.enabled = true;
@@ -2420,7 +2529,10 @@ async fn compatibility_keeps_only_previously_supported_ratio_and_upload_fields()
         serde_json::json!({
             "method": "torrent-get",
             "arguments": {
-                "fields": ["hashString", "uploadRatio", "uploadedEver", "seedRatioLimit"]
+                "fields": [
+                    "hashString", "uploadRatio", "uploadedEver", "seedRatioLimit",
+                    "seedRatioMode", "seedIdleLimit", "seedIdleMode"
+                ]
             }
         }),
         None,
@@ -2430,7 +2542,10 @@ async fn compatibility_keeps_only_previously_supported_ratio_and_upload_fields()
     let row = &body["arguments"]["torrents"][0];
     assert_eq!(row["uploadRatio"], 0.0);
     assert_eq!(row["uploadedEver"], 0);
-    assert!(row["seedRatioLimit"].is_null());
+    assert_eq!(row["seedRatioLimit"], 1.25);
+    assert_eq!(row["seedRatioMode"], 1);
+    assert_eq!(row["seedIdleLimit"], 2);
+    assert_eq!(row["seedIdleMode"], 1);
 
     let (status, text) = qb_get(app, "/api/v2/torrents/info", None, None).await;
     assert_eq!(status, StatusCode::OK);
