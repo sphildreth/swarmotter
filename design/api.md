@@ -52,7 +52,8 @@ ADR-0009 and ADR-0010.
   ADR-0054.
 - Batch add and remove endpoints are part of the native `/api/v1` compatibility
   contract for clients that submit or operate on many torrents at once; see
-  ADR-0031.
+  ADR-0031. Bulk lifecycle actions (pause, resume, recheck, restart) extend the
+  same per-item result contract to the Web UI selection workflow; see ADR-0069.
 - `GET /api/v1/torrents` remains the legacy full-array list endpoint. Large
   libraries should use `GET /api/v1/torrents/query` for explicit filtering,
   sorting, pagination, counts, and grouping without changing the legacy

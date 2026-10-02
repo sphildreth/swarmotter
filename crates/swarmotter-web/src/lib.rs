@@ -471,6 +471,10 @@ mod tests {
         for id in [
             "select-all-torrents-btn",
             "deselect-all-torrents-btn",
+            "pause-selected-torrents-btn",
+            "resume-selected-torrents-btn",
+            "recheck-selected-torrents-btn",
+            "restart-selected-torrents-btn",
             "remove-selected-torrents-btn",
             "selection-summary",
         ] {
@@ -482,6 +486,10 @@ mod tests {
         for needle in [
             "cssClass: \"selection-column\"",
             "aria-label=\"Torrent selection actions\"",
+            "Pause Selected",
+            "Resume Selected",
+            "Recheck Selected",
+            "Restart Selected",
             "Remove Selected",
         ] {
             assert!(
@@ -501,14 +509,18 @@ mod tests {
             "function selectAllVisibleTorrents(",
             "function deselectAllTorrents(",
             "async function removeSelectedTorrents(",
+            "async function applyBulkTorrentAction(",
             "Downloaded data will be kept.",
             "api(\"/torrents/remove\"",
+            "api(path, {",
             "info_hashes: selected.map(([hash]) => hash)",
             "not_found",
             "state.selectedTorrents.delete(hash);",
+            "bulkLifecycleInFlight: false,",
             "$(\"#select-all-torrents-btn\").addEventListener(\"click\", selectAllVisibleTorrents);",
             "$(\"#deselect-all-torrents-btn\").addEventListener(\"click\", deselectAllTorrents);",
             "$(\"#remove-selected-torrents-btn\").addEventListener(\"click\", removeSelectedTorrents);",
+            "applyBulkTorrentAction(act)",
         ] {
             assert!(APP_JS.contains(needle), "Web UI is missing bulk selection JS {needle}");
         }

@@ -96,10 +96,8 @@ impl Sack {
             ));
         }
         let mut words = Vec::with_capacity(buf.len() / 4);
-        for chunk in buf.chunks_exact(4) {
-            words.push(u32::from_le_bytes(chunk.try_into().map_err(|_| {
-                CoreError::Parse("uTP SACK extension word truncated".into())
-            })?));
+        for chunk in buf.as_chunks::<4>().0 {
+            words.push(u32::from_le_bytes(*chunk));
         }
         Ok(Self { words })
     }

@@ -167,6 +167,10 @@ the process-wide connection-limit authority.
 | GET | `/torrents/:hash/stats` | Per-torrent counters and live engine diagnostics. |
 | DELETE | `/torrents/:hash?delete_data=bool` | Remove torrent, optionally deleting data. |
 | POST | `/torrents/remove` | Remove multiple torrents: `{ info_hashes, delete_data? }`. |
+| POST | `/torrents/bulk/pause` | Pause all selected torrents: `{ info_hashes }`. |
+| POST | `/torrents/bulk/resume` | Resume (unpause) all selected torrents: `{ info_hashes }`. |
+| POST | `/torrents/bulk/recheck` | Force recheck for all selected torrents: `{ info_hashes }`. |
+| POST | `/torrents/bulk/restart` | Stop and start again all selected torrents: `{ info_hashes }`. |
 | POST | `/torrents/:hash/pause` | Pause. |
 | POST | `/torrents/:hash/resume` | Resume. |
 | POST | `/torrents/:hash/start` | Start now, bypassing queue. |
@@ -180,6 +184,16 @@ the process-wide connection-limit authority.
 | GET | `/torrents/:hash/policy` | Effective profile values plus the source of every value. |
 | PUT | `/torrents/:hash/policy` | Set/clear explicit profile: `{ profile: "name" }` or `{ profile: null }`. |
 | POST | `/torrents/:hash/storage-preview` | Read-only path proposal: `{ download_dir?, incomplete_dir?, profile? }`. |
+
+The bulk lifecycle endpoints (`/torrents/bulk/pause`, `/torrents/bulk/resume`,
+`/torrents/bulk/recheck`, and `/torrents/bulk/restart`) accept
+`{ info_hashes: [locator, ...] }` and apply the action to every selected
+torrent sequentially. Restart stops the live engine and starts the torrent
+again. Each request returns `{ action, succeeded, failed, not_found }`:
+`succeeded` lists locators the action was applied to, `not_found` lists
+locators that no longer exist, and `failed` lists per-item
+`{ info_hash, code, message }` entries. One missing or malformed locator never
+fails the rest of the batch, and duplicates are collapsed. See ADR-0069.
 
 Torrent list/detail rows include nullable `error`, `uploaded`, `ratio`,
 `seeding`, `seeding_status`, `effective_ratio_limit`, and

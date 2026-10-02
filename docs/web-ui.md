@@ -70,9 +70,13 @@ filter across common torrent summary fields, and Clear Filters resets both the
 toolbar search and column filters.
 
 Torrent rows can be selected with checkboxes. The torrent toolbar can select
-all currently visible rows, clear the current selection, and remove all selected
-torrents. Bulk removal removes torrent records through `POST
-/api/v1/torrents/remove` and keeps downloaded data.
+all currently visible rows, clear the current selection, and apply bulk
+actions to the selection: pause, resume (unpause), recheck, restart, and
+remove. Pause, resume, recheck, and restart use the bulk lifecycle endpoints
+(`POST /api/v1/torrents/bulk/{pause,resume,recheck,restart}`) and report
+succeeded, missing, and failed counts per action; restart stops the live
+engine and starts the torrent again. Bulk removal removes torrent records
+through `POST /api/v1/torrents/remove` and keeps downloaded data.
 
 ## Tracker details
 

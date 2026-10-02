@@ -147,6 +147,9 @@ impl AddTorrentOptions {
 ///
 /// The daemon implements this trait against its real state. Tests can provide
 /// a fake implementation.
+// `async_trait` adds `#[must_use]` to the boxed futures it generates; newer
+// clippy flags that as redundant because `Future` is already `must_use`.
+#[allow(clippy::double_must_use)]
 #[async_trait::async_trait]
 pub trait DaemonOps: Send + Sync + 'static {
     /// List all torrents.

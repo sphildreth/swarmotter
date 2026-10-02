@@ -1107,7 +1107,9 @@ fn v2_hash_response(
     while layers.last()?.len() > 1 {
         let next = layers
             .last()?
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| v2_hash_pair(pair[0], pair[1]))
             .collect::<Vec<_>>();
         layers.push(next);

@@ -921,6 +921,138 @@ async fn bulk_add_accepts_many_magnets_paused() {
     assert!(torrents.iter().all(|torrent| torrent["state"] == "paused"));
 }
 
+async fn post_bulk_lifecycle(app: &Router, path: &str, hashes: &[String]) -> serde_json::Value {
+    let body = serde_json::json!({ "info_hashes": hashes }).to_string();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    v["data"].clone()
+}
+
+async fn listed_torrent_states(app: &Router) -> Vec<String> {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    v["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["state"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn bulk_lifecycle_actions_apply_to_selection_with_per_item_results() {
+    let state = fake_daemon::fake_state();
+    let app = swarmotter_api::app_router(state);
+
+    let mut hashes = Vec::new();
+    for index in 0..3 {
+        let body = serde_json::json!({ "magnet": bulk_magnet(index) }).to_string();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/torrents/magnet")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        hashes.push(v["data"].as_str().unwrap().to_string());
+    }
+
+    // Bulk pause: every selected torrent is paused.
+    let result = post_bulk_lifecycle(&app, "/api/v1/torrents/bulk/pause", &hashes).await;
+    assert_eq!(result["action"], "pause");
+    let succeeded: Vec<&str> = result["succeeded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    let expected: Vec<&str> = hashes.iter().map(|s| s.as_str()).collect();
+    assert_eq!(succeeded, expected);
+    assert!(result["failed"].as_array().unwrap().is_empty());
+    assert!(result["not_found"].as_array().unwrap().is_empty());
+    let states = listed_torrent_states(&app).await;
+    assert_eq!(states.len(), 3);
+    assert!(states.iter().all(|s| s == "paused"));
+
+    // Bulk resume (unpause).
+    let result = post_bulk_lifecycle(&app, "/api/v1/torrents/bulk/resume", &hashes).await;
+    assert_eq!(result["action"], "resume");
+    assert_eq!(result["succeeded"].as_array().unwrap().len(), 3);
+    let states = listed_torrent_states(&app).await;
+    assert!(states.iter().all(|s| s == "downloading"));
+
+    // Bulk recheck.
+    let result = post_bulk_lifecycle(&app, "/api/v1/torrents/bulk/recheck", &hashes).await;
+    assert_eq!(result["action"], "recheck");
+    assert_eq!(result["succeeded"].as_array().unwrap().len(), 3);
+    let states = listed_torrent_states(&app).await;
+    assert!(states.iter().all(|s| s == "checking"));
+
+    // Bulk restart rebuilds the engines and leaves the torrents running.
+    let result = post_bulk_lifecycle(&app, "/api/v1/torrents/bulk/restart", &hashes).await;
+    assert_eq!(result["action"], "restart");
+    assert_eq!(result["succeeded"].as_array().unwrap().len(), 3);
+    let states = listed_torrent_states(&app).await;
+    assert!(states.iter().all(|s| s == "downloading"));
+
+    // Missing and malformed locators are reported per item without failing
+    // the whole batch.
+    let mut mixed = hashes.clone();
+    mixed.push("0123456789abcdef0123456789abcdef01234567".to_string());
+    mixed.push("not-a-hash".to_string());
+    let result = post_bulk_lifecycle(&app, "/api/v1/torrents/bulk/pause", &mixed).await;
+    assert_eq!(result["succeeded"].as_array().unwrap().len(), 3);
+    let not_found: Vec<&str> = result["not_found"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(not_found, vec!["0123456789abcdef0123456789abcdef01234567"]);
+    let failed = result["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0]["info_hash"], "not-a-hash");
+    assert_eq!(failed[0]["code"], "invalid_info_hash");
+}
+
 #[tokio::test]
 async fn bulk_metainfo_base64_accepts_exact_decoded_limit_and_rejects_one_over() {
     let state = fake_daemon::fake_state();

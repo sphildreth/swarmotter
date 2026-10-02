@@ -171,105 +171,127 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             "/torrents/remove",
             post(handlers::torrents::remove_torrents),
         )
+        .route("/torrents/bulk/pause", post(handlers::torrents::bulk_pause))
         .route(
-            "/torrents/:hash/metainfo",
+            "/torrents/bulk/resume",
+            post(handlers::torrents::bulk_resume),
+        )
+        .route(
+            "/torrents/bulk/recheck",
+            post(handlers::torrents::bulk_recheck),
+        )
+        .route(
+            "/torrents/bulk/restart",
+            post(handlers::torrents::bulk_restart),
+        )
+        .route(
+            "/torrents/{hash}/metainfo",
             get(handlers::torrents::export_metainfo),
         )
         .route(
-            "/torrents/:hash",
+            "/torrents/{hash}",
             get(handlers::torrents::get_torrent).delete(handlers::torrents::remove_torrent),
         )
-        .route("/torrents/:hash/stats", get(handlers::stats::torrent_stats))
         .route(
-            "/torrents/:hash/policy",
+            "/torrents/{hash}/stats",
+            get(handlers::stats::torrent_stats),
+        )
+        .route(
+            "/torrents/{hash}/policy",
             get(handlers::policies::torrent_policy).put(handlers::policies::set_torrent_profile),
         )
         .route(
-            "/torrents/:hash/storage-preview",
+            "/torrents/{hash}/storage-preview",
             post(handlers::policies::storage_path_preview),
         )
         .route(
-            "/torrents/:hash/encryption-mode",
+            "/torrents/{hash}/encryption-mode",
             put(handlers::policies::set_torrent_encryption_mode),
         )
         .route(
-            "/torrents/:hash/autopilot",
+            "/torrents/{hash}/autopilot",
             get(handlers::autopilot::get_torrent_autopilot)
                 .post(handlers::autopilot::set_torrent_autopilot),
         )
-        .route("/torrents/:hash/pause", post(handlers::torrents::pause))
-        .route("/torrents/:hash/resume", post(handlers::torrents::resume))
-        .route("/torrents/:hash/start", post(handlers::torrents::start_now))
-        .route("/torrents/:hash/stop", post(handlers::torrents::stop))
-        .route("/torrents/:hash/recheck", post(handlers::torrents::recheck))
+        .route("/torrents/{hash}/pause", post(handlers::torrents::pause))
+        .route("/torrents/{hash}/resume", post(handlers::torrents::resume))
         .route(
-            "/torrents/:hash/reannounce",
+            "/torrents/{hash}/start",
+            post(handlers::torrents::start_now),
+        )
+        .route("/torrents/{hash}/stop", post(handlers::torrents::stop))
+        .route(
+            "/torrents/{hash}/recheck",
+            post(handlers::torrents::recheck),
+        )
+        .route(
+            "/torrents/{hash}/reannounce",
             post(handlers::torrents::reannounce),
         )
-        .route("/torrents/:hash/move", post(handlers::torrents::move_data))
+        .route("/torrents/{hash}/move", post(handlers::torrents::move_data))
         .route(
-            "/torrents/:hash/labels",
+            "/torrents/{hash}/labels",
             post(handlers::torrents::set_labels),
         )
         .route(
-            "/torrents/:hash/limits",
+            "/torrents/{hash}/limits",
             post(handlers::torrents::set_limits),
         )
         .route(
-            "/torrents/:hash/seeding",
+            "/torrents/{hash}/seeding",
             put(handlers::torrents::set_seeding),
         )
         .route(
-            "/torrents/:hash/files",
+            "/torrents/{hash}/files",
             get(handlers::files::list_files).patch(handlers::files::patch_files),
         )
         .route(
-            "/torrents/:hash/files/wanted",
+            "/torrents/{hash}/files/wanted",
             post(handlers::files::set_wanted),
         )
         .route(
-            "/torrents/:hash/files/priority",
+            "/torrents/{hash}/files/priority",
             post(handlers::files::set_priority),
         )
         .route(
-            "/torrents/:hash/files/:index/rename",
+            "/torrents/{hash}/files/{index}/rename",
             post(handlers::files::rename_path),
         )
         .route(
-            "/torrents/:hash/trackers",
+            "/torrents/{hash}/trackers",
             get(handlers::trackers::list_trackers).post(handlers::trackers::add_tracker),
         )
         .route(
-            "/torrents/:hash/trackers/:url",
+            "/torrents/{hash}/trackers/{url}",
             axum::routing::delete(handlers::trackers::remove_tracker),
         )
         .route(
-            "/torrents/:hash/trackers/edit",
+            "/torrents/{hash}/trackers/edit",
             post(handlers::trackers::edit_tracker),
         )
-        .route("/torrents/:hash/peers", get(handlers::peers::list_peers))
+        .route("/torrents/{hash}/peers", get(handlers::peers::list_peers))
         .route(
-            "/torrents/:hash/peers/ban",
+            "/torrents/{hash}/peers/ban",
             post(handlers::peer_filter::ban),
         )
         .route(
-            "/torrents/:hash/peers/unban",
+            "/torrents/{hash}/peers/unban",
             post(handlers::peer_filter::unban),
         )
         .route(
-            "/torrents/:hash/queue/move-up",
+            "/torrents/{hash}/queue/move-up",
             post(handlers::queue::move_up),
         )
         .route(
-            "/torrents/:hash/queue/move-down",
+            "/torrents/{hash}/queue/move-down",
             post(handlers::queue::move_down),
         )
         .route(
-            "/torrents/:hash/queue/move-top",
+            "/torrents/{hash}/queue/move-top",
             post(handlers::queue::move_top),
         )
         .route(
-            "/torrents/:hash/queue/move-bottom",
+            "/torrents/{hash}/queue/move-bottom",
             post(handlers::queue::move_bottom),
         )
         // Settings

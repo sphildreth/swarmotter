@@ -121,6 +121,7 @@ export const state = {
   torrentTableBuilt: false,
   torrentTableReady: Promise.resolve(),
   bulkRemoveInFlight: false,
+  bulkLifecycleInFlight: false,
   magnetAddInFlight: false,
   logEventStreamController: null,
   lastEventStreamErrorAt: 0,

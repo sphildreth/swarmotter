@@ -275,6 +275,10 @@ pub(super) async fn read_body_bounded(
     Ok(bytes)
 }
 
+// `Response` is intentionally the error type: every failure path here already
+// carries a fully formed HTTP response, matching the axum handler style used
+// throughout this crate.
+#[allow(clippy::result_large_err)]
 pub(super) async fn read_torrent_metadata_body(
     body: Body,
     configured_limit: usize,

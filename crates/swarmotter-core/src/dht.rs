@@ -380,7 +380,7 @@ pub fn parse_response(buf: &[u8]) -> Result<KrpcResponse> {
 /// Parse compact node info (26 bytes each: 20 id + 4 ip + 2 port).
 pub fn parse_compact_nodes(bytes: &[u8]) -> Vec<DhtNode> {
     let mut out = Vec::with_capacity(bytes.len() / 26);
-    for chunk in bytes.chunks_exact(26) {
+    for chunk in bytes.as_chunks::<26>().0 {
         let mut id = [0u8; 20];
         id.copy_from_slice(&chunk[0..20]);
         let ip = Ipv4Addr::new(chunk[20], chunk[21], chunk[22], chunk[23]);
@@ -396,7 +396,7 @@ pub fn parse_compact_nodes(bytes: &[u8]) -> Vec<DhtNode> {
 /// Parse compact IPv6 node info (38 bytes each: 20 id + 16 ip + 2 port).
 pub fn parse_compact_nodes6(bytes: &[u8]) -> Vec<DhtNode> {
     let mut out = Vec::with_capacity(bytes.len() / 38);
-    for chunk in bytes.chunks_exact(38) {
+    for chunk in bytes.as_chunks::<38>().0 {
         let mut id = [0u8; 20];
         id.copy_from_slice(&chunk[0..20]);
         let mut octets = [0u8; 16];

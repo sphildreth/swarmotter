@@ -41,8 +41,9 @@ pub use bulk::{
     AddTorrentsResult,
 };
 pub use lifecycle::{
-    get_torrent, pause, reannounce, recheck, remove_torrent, remove_torrents, resume, start_now,
-    stop, RemoveTorrentsBody, RemoveTorrentsResult,
+    bulk_pause, bulk_recheck, bulk_restart, bulk_resume, get_torrent, pause, reannounce, recheck,
+    remove_torrent, remove_torrents, resume, start_now, stop, BulkActionFailure,
+    BulkTorrentActionBody, BulkTorrentActionResult, RemoveTorrentsBody, RemoveTorrentsResult,
 };
 pub use metainfo::export_metainfo;
 pub use query::{

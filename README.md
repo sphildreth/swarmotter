@@ -57,6 +57,7 @@ SwarmOtter provides a comprehensive set of BitTorrent features:
 - **Optional compatibility** with Transmission and qBittorrent automation tools
 - **Practical Web UI** that uses the same API as external automation
 - **Advanced torrent handling** including magnet links, .torrent files, metadata-first previews
+- **Bulk operations** for batch add, remove, pause, resume, recheck, and restart with per-item results
 - **BEP 52 v2/hybrid support** with full SHA-1/SHA-256 identities
 - **Protocol support** for TCP and uTP peer wire protocols
 - **Encryption** with MSE/PE support in configurable modes
@@ -131,6 +132,22 @@ cargo check
 cargo test
 ```
 
+CI additionally enforces `cargo clippy --workspace --all-targets --all-features
+-- -D warnings` and a supply-chain audit via `cargo deny check` (see
+[`deny.toml`](deny.toml)), so run those before submitting work as well.
+
+### Running the Daemon
+
+Start from the example configuration:
+
+```bash
+cp config/swarmotter.toml.example config/swarmotter.toml
+./target/release/swarmotterd --check-config --config config/swarmotter.toml
+./target/release/swarmotterd --config config/swarmotter.toml
+```
+
+See [Getting Started](docs/getting-started.md) for the full walkthrough.
+
 ### Workspace Layout
 
 SwarmOtter is a Cargo workspace with four crates:
@@ -155,12 +172,14 @@ swarmotter/
 ├── THIRD_PARTY_LICENSES.md
 ├── CHANGELOG.md
 ├── Cargo.toml                 # Workspace root
+├── deny.toml                  # cargo-deny supply-chain audit config (CI-enforced)
+├── book.toml                  # mdBook config for the published user guide
 ├── crates/
 │   ├── swarmotterd/           # Daemon binary
 │   ├── swarmotter-core/       # Core types and engine logic
 │   ├── swarmotter-api/        # API layer
 │   └── swarmotter-web/        # Embedded/static web support
-├── docs/                      # User guide and operator documentation
+├── docs/                      # User guide and operator documentation (mdBook source)
 ├── design/                    # Requirements, architecture, policy, ADRs
 │   ├── requirements.md
 │   ├── architecture.md
@@ -173,8 +192,11 @@ swarmotter/
 │   ├── content-policy.md
 │   ├── legal.md
 │   └── adr/                   # Architecture decision records
-├── assets/                    # Logo and brand graphics
-└── .github/                   # Issue and PR templates
+├── config/                    # Example configuration files
+├── deploy/                    # Docker, compose, systemd, and packaging support
+├── scripts/                   # Development, CI, and release helper scripts
+├── assets/                    # Logo, brand graphics, and screenshots
+└── .github/                   # CI workflows, issue/PR templates, code owners
 ```
 
 ## Architecture Decision Records
@@ -206,13 +228,18 @@ Published user guide:
 
 User-facing documentation:
 - [User guide](docs/index.md)
+- [Getting started](docs/getting-started.md)
 - [Configuration](docs/configuration.md)
 - [API reference](docs/api.md)
 - [Network containment](docs/network-containment.md)
+- [Web UI](docs/web-ui.md)
 - [Deployment](docs/deployment.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Lawful use](docs/lawful-use.md)
 - [Legal and content policy](docs/legal.md)
+
+The guide is built with mdBook from `docs/` (`book.toml`) and published to
+GitHub Pages.
 
 Project design documentation:
 - [Requirements](design/requirements.md)
@@ -230,7 +257,7 @@ Contributions are welcome! To contribute:
 - Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for workflow and conventions
 - Create or update an ADR in [`design/adr/`](design/adr/) for decisions with lasting architectural, legal, dependency, or containment impact
 - Follow the project's lawful use guidelines; see [`docs/legal.md`](docs/legal.md)
-- Run `cargo fmt`, `cargo check`, and `cargo test` before submitting work
+- Run `cargo fmt`, `cargo check`, `cargo test`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo deny check` before submitting work
 
 ## License
 

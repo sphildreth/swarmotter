@@ -257,7 +257,7 @@ pub fn parse_announce_response(body: &[u8]) -> Result<AnnounceResponse> {
 /// Parse compact IPv4 peer list (6 bytes per peer).
 pub fn parse_compact_ipv4(bytes: &[u8]) -> Vec<PeerAddr> {
     let mut out = Vec::with_capacity(bytes.len() / 6);
-    for chunk in bytes.chunks_exact(6) {
+    for chunk in bytes.as_chunks::<6>().0 {
         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
         out.push(PeerAddr {
@@ -271,7 +271,7 @@ pub fn parse_compact_ipv4(bytes: &[u8]) -> Vec<PeerAddr> {
 /// Parse compact IPv6 peer list (18 bytes per peer).
 pub fn parse_compact_ipv6(bytes: &[u8]) -> Vec<PeerAddr> {
     let mut out = Vec::with_capacity(bytes.len() / 18);
-    for chunk in bytes.chunks_exact(18) {
+    for chunk in bytes.as_chunks::<18>().0 {
         let mut octets = [0u8; 16];
         octets.copy_from_slice(&chunk[0..16]);
         let ip = Ipv6Addr::from(octets);
@@ -870,8 +870,8 @@ mod tests {
         let body = scrape_body(&[(hash, 10, 11, 12)]);
         let certified = rcgen::generate_simple_self_signed(vec!["secure.test".into()]).unwrap();
         let certificate = certified.cert.der().clone();
-        let key =
-            rustls::pki_types::PrivateKeyDer::try_from(certified.key_pair.serialize_der()).unwrap();
+        let key = rustls::pki_types::PrivateKeyDer::try_from(certified.signing_key.serialize_der())
+            .unwrap();
         let server_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![certificate.clone()], key)

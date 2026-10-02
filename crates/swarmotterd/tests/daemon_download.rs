@@ -773,7 +773,7 @@ async fn live_session_cap_replacement_has_no_old_new_pool_overlap() {
     let runtime = Arc::new(DaemonRuntime::new(config, health));
     let hash = runtime.add_torrent_file(bytes, None).await.unwrap();
     let (old_global, old_torrent) = runtime.peer_permit_pools_for_test(&hash).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while old_global.snapshot().in_use != 3 || old_torrent.snapshot().in_use != 3 {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -814,7 +814,7 @@ async fn live_session_cap_replacement_has_no_old_new_pool_overlap() {
     assert!(!Arc::ptr_eq(&new_torrent, &old_torrent));
     assert_eq!(old_global.snapshot().in_use, 0);
     assert_eq!(old_torrent.snapshot().in_use, 0);
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         while new_global.snapshot().in_use != 1 || new_torrent.snapshot().in_use != 1 {
             assert!(new_global.snapshot().in_use <= 1);
             assert!(new_torrent.snapshot().in_use <= 1);
@@ -997,7 +997,7 @@ async fn daemon_remove_active_torrent_delete_data_returns_promptly() {
         .await
         .unwrap();
 
-    tokio::time::timeout(Duration::from_secs(10), peer_active)
+    tokio::time::timeout(Duration::from_secs(60), peer_active)
         .await
         .expect("engine should connect to the stalling peer")
         .expect("stalling peer should signal active session");

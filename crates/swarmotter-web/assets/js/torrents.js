@@ -723,13 +723,23 @@ export function updateSelectionControls() {
   const selectedCount = state.selectedTorrents.size;
   const visibleCount = state.visibleTorrents.length;
   const allVisibleSelected = visibleCount > 0 && state.visibleTorrents.every(t => state.selectedTorrents.has(t.hash));
+  const busy = state.bulkRemoveInFlight || state.bulkLifecycleInFlight;
   const selectAll = $("#select-all-torrents-btn");
   const deselectAll = $("#deselect-all-torrents-btn");
   const removeSelected = $("#remove-selected-torrents-btn");
   const summary = $("#selection-summary");
-  if (selectAll) selectAll.disabled = visibleCount === 0 || allVisibleSelected || state.bulkRemoveInFlight;
-  if (deselectAll) deselectAll.disabled = selectedCount === 0 || state.bulkRemoveInFlight;
-  if (removeSelected) removeSelected.disabled = selectedCount === 0 || state.bulkRemoveInFlight;
+  if (selectAll) selectAll.disabled = visibleCount === 0 || allVisibleSelected || busy;
+  if (deselectAll) deselectAll.disabled = selectedCount === 0 || busy;
+  if (removeSelected) removeSelected.disabled = selectedCount === 0 || busy;
+  for (const id of [
+    "pause-selected-torrents-btn",
+    "resume-selected-torrents-btn",
+    "recheck-selected-torrents-btn",
+    "restart-selected-torrents-btn",
+  ]) {
+    const button = $(`#${id}`);
+    if (button) button.disabled = selectedCount === 0 || busy;
+  }
   if (summary) summary.textContent = `${selectedCount} selected`;
 }
 
@@ -743,6 +753,61 @@ export function deselectAllTorrents() {
   state.selectedTorrents.clear();
   updateRenderedSelection();
   updateSelectionControls();
+}
+
+const BULK_LIFECYCLE_ENDPOINTS = {
+  pause: "/torrents/bulk/pause",
+  resume: "/torrents/bulk/resume",
+  recheck: "/torrents/bulk/recheck",
+  restart: "/torrents/bulk/restart",
+};
+const BULK_LIFECYCLE_LABELS = {
+  pause: "Paused",
+  resume: "Resumed",
+  recheck: "Recheck started",
+  restart: "Restarted",
+};
+
+export async function applyBulkTorrentAction(act) {
+  const path = BULK_LIFECYCLE_ENDPOINTS[act];
+  if (!path) return;
+  if (state.bulkLifecycleInFlight || state.bulkRemoveInFlight) return;
+  const selected = Array.from(state.selectedTorrents.entries());
+  if (selected.length === 0) return;
+  state.bulkLifecycleInFlight = true;
+  updateSelectionControls();
+  try {
+    const result = await api(path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ info_hashes: selected.map(([hash]) => hash) }),
+    });
+    const succeeded = new Set(result?.succeeded || []);
+    const failed = result?.failed || [];
+    const notFoundCount = (result?.not_found || []).length;
+    await refreshTorrents();
+    const label = BULK_LIFECYCLE_LABELS[act] || act;
+    const noun = succeeded.size === 1 ? "torrent" : "torrents";
+    if (succeeded.size > 0) showToast(`${label} ${succeeded.size} ${noun}`, "", "info");
+    if (notFoundCount > 0) {
+      showToast(
+        `${notFoundCount} selected ${notFoundCount === 1 ? "torrent was" : "torrents were"} no longer present`,
+        "",
+        "warning",
+      );
+    }
+    if (failed.length > 0) {
+      const first = failed[0];
+      const detail = failed.length === 1 ? `${first.info_hash}: ${first.message}` : `${first.info_hash}: ${first.message} (and ${failed.length - 1} more)`;
+      showError(`${label.charAt(0).toUpperCase()}${label.slice(1)} failed for ${failed.length} ${failed.length === 1 ? "torrent" : "torrents"}`, detail);
+    }
+  } catch (e) {
+    showError(`${String(act)} selected failed`, e);
+    log(`bulk ${act} error: ${e.message}`);
+  } finally {
+    state.bulkLifecycleInFlight = false;
+    updateSelectionControls();
+  }
 }
 
 export async function removeSelectedTorrents() {
@@ -1035,3 +1100,11 @@ $("#clear-torrent-view-btn").addEventListener("click", clearTorrentQueryView);
 $("#select-all-torrents-btn").addEventListener("click", selectAllVisibleTorrents);
 $("#deselect-all-torrents-btn").addEventListener("click", deselectAllTorrents);
 $("#remove-selected-torrents-btn").addEventListener("click", removeSelectedTorrents);
+for (const [act, id] of [
+  ["pause", "pause-selected-torrents-btn"],
+  ["resume", "resume-selected-torrents-btn"],
+  ["recheck", "recheck-selected-torrents-btn"],
+  ["restart", "restart-selected-torrents-btn"],
+]) {
+  $(`#${id}`).addEventListener("click", () => applyBulkTorrentAction(act));
+}

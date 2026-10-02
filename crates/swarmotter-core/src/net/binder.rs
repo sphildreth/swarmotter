@@ -36,6 +36,9 @@ use crate::error::Result;
 /// Implementations are returned as a boxed trait object so the engine and
 /// tracker logic remain independent of the concrete `tokio::net::UdpSocket`
 /// and can be exercised in tests via the `LoopbackBinder`.
+// `async_trait` adds `#[must_use]` to the boxed futures it generates; newer
+// clippy flags that as redundant because `Future` is already `must_use`.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait ContainedUdpSocket: Send + Sync {
     /// Send a datagram to `addr`.
@@ -53,6 +56,7 @@ pub trait ContainedUdpSocket: Send + Sync {
 /// A contained, fail-closed TCP listener for inbound peer connections
 /// (seeding). Accepts only through the configured network path; the binder
 /// refuses to bind it in strict fail-closed mode when the path is unavailable.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait PeerListener: Send + Sync {
     /// Accept the next inbound peer connection as a `tokio::net::TcpStream`.
@@ -72,6 +76,7 @@ pub trait PeerListener: Send + Sync {
 /// the real (source-bound) implementation and the test loopback
 /// implementation produce real TCP streams, so the peer protocol code is
 /// identical in production and tests.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait NetworkBinder: Send + Sync {
     /// Open a TCP connection to a peer address through the contained path.

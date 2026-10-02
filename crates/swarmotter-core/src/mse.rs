@@ -507,8 +507,8 @@ impl Big768 {
 
     fn from_be_bytes(bytes: [u8; DH_BYTES]) -> Self {
         let mut limbs = [0u64; 12];
-        for (idx, chunk) in bytes.chunks_exact(8).rev().enumerate() {
-            limbs[idx] = u64::from_be_bytes(chunk.try_into().unwrap());
+        for (idx, chunk) in bytes.as_chunks::<8>().0.iter().rev().enumerate() {
+            limbs[idx] = u64::from_be_bytes(*chunk);
         }
         Self(limbs)
     }

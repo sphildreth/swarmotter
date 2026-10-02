@@ -7,6 +7,55 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [2.1.0] - [2026-10-02]
+
+### Added
+
+- **Bulk lifecycle actions for selected torrents:** new native API endpoints
+  `POST /api/v1/torrents/bulk/{pause,resume,recheck,restart}` (ADR-0069) apply
+  a lifecycle action to a whole selection with per-item results (`succeeded`,
+  `failed`, `not_found`), following the ADR-0031 bulk contract. The Web UI
+  selection toolbar gains Pause/Resume/Recheck/Restart Selected buttons for
+  multi-row operations with summary toasts.
+
+### Changed
+
+- **Supply-chain auditing in CI:** a new `cargo-deny` CI job (ADR-0068) fails
+  builds on RustSec advisories, yanked crates, and licenses outside the
+  permissive allow list, configured by `deny.toml`. Resolved the
+  `h2` unbounded empty DATA frames and `rustls` TLS 1.3 encryption-level
+  boundary advisories with lockfile-only updates (`h2` 0.4.19,
+  `rustls` 0.23.45).
+- **Dependency updates:** refreshed the full dependency tree to the latest
+  compatible releases and raised direct requirements across semver-incompatible
+  boundaries: `axum` 0.8 (path-parameter route syntax `{name}`), `thiserror` 2,
+  `rusqlite` 0.40 (bundled SQLite), `sha1`/`sha2` 0.11, `toml` 1, `tower-http`
+  0.7, `webpki-roots` 1, and test-only `rcgen` 0.14, plus a full
+  `Cargo.lock` refresh. The minimum supported Rust toolchain remains 1.88 and
+  all compatibility surfaces (native `/api/v1` contract, adapters,
+  configuration, state, and containment behavior) are unchanged.
+
+### Fixed
+
+- **Clippy-clean on current toolchains:** replaced `chunks_exact`-with-
+  constant-size patterns with `as_chunks` across DHT, extension, tracker,
+  metadata, MSE, uTP, and seeder code, annotated two API helpers whose
+  error type is intentionally a fully formed HTTP response, and scoped
+  `clippy::double_must_use` allowances on `async_trait` traits, keeping
+  `cargo clippy --workspace --all-targets -- -D warnings` green on current
+  stable toolchains.
+- **Reduced test flakiness under load:** raised the condition-wait timeouts in
+  the live peer-cap replacement and stalled-peer daemon download tests from
+  10 seconds to 60 seconds so full-suite parallel runs do not expire the
+  budgets; the semantic removal-bound assertion is unchanged.
+
+### Documentation
+
+- Updated `AGENTS.md` to describe the shipped release model (`v1.0.0`
+  assembled as `v2.0.0`) instead of pre-release guidance, and closed the
+  `design/v1-completion-tracker.md` status record now that every `v1.0.0`
+  capability is complete.
+
 ## [2.0.3] - [2026-07-20]
 
 ### Fixed

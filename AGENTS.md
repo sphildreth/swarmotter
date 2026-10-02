@@ -11,22 +11,26 @@ for lawful torrent use cases such as Linux distributions, open-source project
 releases, public-domain media, open datasets, and other legally distributed
 files.
 
-The first product release is `v1.0.0`. There is no MVP: `v1.0.0` is reached only
-when every required feature in `design/requirements.md` is implemented, tested,
-documented, and usable. The live torrent data-plane engine, network containment,
-API, and Web UI are implemented; remaining work is tracked by completed
-capability and acceptance criteria in `design/requirements.md` and
-`design/v1-completion-tracker.md`.
+The first release, `v1.0.0`, required every capability in
+`design/requirements.md` to be implemented, tested, documented, and usable —
+there was no MVP. The required feature set (live torrent data-plane engine,
+network containment, API, and Web UI) is complete: the assembled release was
+published as `v2.0.0` because the strict-containment default changed the
+configuration compatibility contract (see `design/VERSIONING_GUIDE.md` and
+`design/v1-completion-tracker.md`). Follow-on releases continue semantic
+versioning; keep every shipped capability complete, tested, and documented —
+do not regress, weaken, or downgrade any of them to "future enhancements".
 
 ## Non-negotiable rules
 
 1. **No MVP.** SwarmOtter does not use an MVP release model. The first release
-   is `v1.0.0`, reached only when every required feature in
-   `design/requirements.md` is implemented, tested, documented, and usable. Do
-   not create wording that implies DHT, PEX, UDP trackers, watch folders,
-   browser magnet handling, file prioritization, queueing, bandwidth controls,
-   fast resume, VPN/NIC containment, or legal documentation are optional
-   future enhancements.
+   was reached only when every required feature in `design/requirements.md`
+   was implemented, tested, documented, and usable (see the project summary).
+   All of these capabilities — DHT, PEX, UDP trackers, watch folders, browser
+   magnet handling, file prioritization, queueing, bandwidth controls, fast
+   resume, VPN/NIC containment, and legal documentation — are shipped and must
+   remain so. Do not create wording that implies they are optional future
+   enhancements, and do not remove or degrade them.
 
 2. **No time estimates.** Do not provide calendar, sprint, week, month, or
    duration estimates. Track work by completed capabilities and acceptance
@@ -49,9 +53,12 @@ capability and acceptance criteria in `design/requirements.md` and
    materially improve operations. The API and daemon are the primary product
    surfaces.
 
-6. **Do not implement the torrent engine prematurely.** Follow the design and
-   acceptance criteria. The engine is not to be built ad hoc; it is tracked
-   against `design/requirements.md`.
+6. **Engine changes follow the design.** The torrent data-plane engine is
+   implemented; it is not to be rebuilt ad hoc or extended outside the design
+   and acceptance criteria in `design/requirements.md`,
+   `design/architecture.md`, and the relevant ADRs (peer wire protocol,
+   tracker strategy, DHT, uTP, storage). Preserve specified behavior and the
+   fail-closed containment guarantees when changing engine code.
 
 ## ADR requirements
 
@@ -117,7 +124,13 @@ sequential four-digit number, kebab-case title, and fill out every section.
   logic), integration tests (API and lifecycle behavior), network containment
   tests (fail-closed conditions), storage tests, and local swarm tests.
 - Run `cargo fmt`, `cargo check`, and `cargo test` before considering work
-  done. Fix all reported issues.
+  done. Fix all reported issues. Clippy (`cargo clippy --workspace
+  --all-targets -- -D warnings`) must also be clean; fix new lints rather
+  than adding allows without justification.
+- CI additionally enforces a supply-chain audit (`cargo deny check`, see
+  `deny.toml` and ADR-0068): RustSec advisories and yanked crates fail the
+  build. Resolve them with lockfile-only updates where a patched version
+  exists.
 - See `design/testing.md`.
 
 ## Rust quality expectations
@@ -151,6 +164,8 @@ sequential four-digit number, kebab-case title, and fill out every section.
   complexity, and whether they affect torrent traffic containment.
 - Record dependency additions or removals in `THIRD_PARTY_LICENSES.md` where
   applicable, and create an ADR when the dependency is significant.
+- New dependencies must keep `cargo deny check` green; extend the `deny.toml`
+  license allow list only with an explicit, justified change.
 - Dependency traffic must respect the network containment layer; a dependency
   that cannot be constrained must not be used for torrent operations.
 

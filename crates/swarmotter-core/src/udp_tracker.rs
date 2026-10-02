@@ -223,7 +223,7 @@ fn decode_announce(buf: &[u8], expected_txn: u32) -> Result<AnnounceResponse> {
 /// Parse compact IPv4 peers from a UDP announce response tail (6 bytes each).
 fn parse_compact_ipv4_udp(bytes: &[u8]) -> Vec<PeerAddr> {
     let mut out = Vec::with_capacity(bytes.len() / 6);
-    for chunk in bytes.chunks_exact(6) {
+    for chunk in bytes.as_chunks::<6>().0 {
         let ip = Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]);
         let port = u16::from_be_bytes([chunk[4], chunk[5]]);
         out.push(PeerAddr {

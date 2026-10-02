@@ -128,7 +128,7 @@ pub async fn ws_handler(
             loop {
                 tokio::select! {
                     _ = ping.tick() => {
-                        if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                        if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
                             break;
                         }
                     }
@@ -140,13 +140,13 @@ pub async fn ws_handler(
                                         continue;
                                     }
                                 }
-                                if socket.send(Message::Text(event.json.to_string())).await.is_err() {
+                                if socket.send(Message::Text(event.json.to_string().into())).await.is_err() {
                                     break;
                                 }
                             }
                             Some(Err(BroadcastStreamRecvError::Lagged(skipped))) => {
                                 let payload = lagged_event_json(skipped);
-                                if socket.send(Message::Text(payload)).await.is_err() {
+                                if socket.send(Message::Text(payload.into())).await.is_err() {
                                     break;
                                 }
                             }

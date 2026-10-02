@@ -38,6 +38,14 @@ jobs:
           cp deploy/gluetun.env.example deploy/gluetun.env
           docker compose --env-file deploy/.env.example -f deploy/compose.yml config >/dev/null
 
+  supply-chain:
+    name: Supply-chain audit (cargo-deny)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run cargo-deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+
   rust-1-88-check:
     name: Rust 1.88 check
     runs-on: ubuntu-latest

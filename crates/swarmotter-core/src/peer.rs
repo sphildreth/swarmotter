@@ -528,7 +528,9 @@ impl Message {
                     decode_v2_hash_message_header(&payload[..48])?;
                 validate_v2_hash_request(index, length)?;
                 let hashes = payload[48..]
-                    .chunks_exact(32)
+                    .as_chunks::<32>()
+                    .0
+                    .iter()
                     .map(|hash| {
                         let mut bytes = [0u8; 32];
                         bytes.copy_from_slice(hash);

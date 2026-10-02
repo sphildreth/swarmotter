@@ -227,7 +227,9 @@ pub fn v2_piece_root(data: &[u8], piece_length: u64) -> Result<V2InfoHash> {
 
     while level.len() > 1 {
         level = level
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| v2_hash_pair(pair[0], pair[1]))
             .collect();
     }
@@ -256,7 +258,9 @@ pub fn v2_file_root(data: &[u8]) -> Result<V2InfoHash> {
     level.resize(width, V2InfoHash::ZERO);
     while level.len() > 1 {
         level = level
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| v2_hash_pair(pair[0], pair[1]))
             .collect();
     }
@@ -326,7 +330,9 @@ mod tests {
         level.resize(piece_length / V2_BLOCK_LENGTH as usize, V2InfoHash::ZERO);
         while level.len() > 1 {
             level = level
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|pair| v2_hash_pair(pair[0], pair[1]))
                 .collect();
         }

@@ -15,30 +15,22 @@ indexed in [v1-traceability.md](v1-traceability.md).
 - [x] Complete
 - [!] Blocked
 
-## Current Focus
+## Status Record
 
-Pure logic layers, API, Web UI, daemon runtime, and network containment
-enforcement are implemented and tested. The live torrent data-plane engine
-is implemented and exercised end to end against local fixtures: real TCP and
-uTP peer wire protocol (handshake, messages, request/piece, block assembly,
-SHA-1 verification), HTTP tracker announce (compact peer parsing, tiers), real
-disk I/O with fast-resume save/load/recheck, a per-torrent engine task wired
-into the daemon, and a local-swarm integration harness that completes a real
-download from a generated payload through a local tracker and seed peer.
+This release is complete: every capability originally required for `v1.0.0`
+assembled as `v2.0.0` (see the upgrade notes in `CHANGELOG.md`), with all
+acceptance criteria satisfied. The record below is retained as a closed
+checklist; the production/test/document mapping for every row is indexed in
+[v1-traceability.md](v1-traceability.md).
 
-Full production uTP is now implemented: LEDBAT congestion control, selective
-ACK, the full SYN/STATE/DATA/FIN/RESET connection lifecycle, timestamp echo and
-one-way delay measurement, retransmission, idle timeout, graceful close, and
-TCP/uTP transport selection in the engine. The network binder supports
-contained UDP sockets, inbound TCP listeners, outbound TCP, tracker HTTP,
-tracker HTTPS (TLS over contained socket), HTTP/HTTPS webseed range requests,
-and UDP trackers — all fail-closed.
-Real TCP and uTP peer protocol, HTTP/HTTPS/UDP tracker announce, HTTP/HTTPS
-webseed range downloads, PEX (BEP 10/11), BEP 9 magnet metadata fetch, DHT
-(BEP 5), inbound seeding/upload, endgame mode, live bandwidth shaping, real
-disk I/O with fast-resume, and a local-swarm download harness (HTTP + UDP
-trackers + direct peer + webseed + seeding + endgame + bandwidth + PEX +
-magnet + uTP) are implemented and tested. Platform-specific
+Implementation highlights of the shipped release: real TCP and uTP peer wire
+protocol (LEDBAT congestion control, selective ACK, full connection
+lifecycle), HTTP/HTTPS/UDP tracker announce, HTTP/HTTPS webseed range
+downloads, PEX (BEP 10/11), BEP 9 magnet metadata fetch, DHT (BEP 5), BEP 52
+v2/hybrid interoperability, inbound seeding/upload, endgame mode, live
+bandwidth shaping, real disk I/O with fast-resume, and a local-swarm download
+harness covering HTTP + UDP trackers + direct peer + webseed + seeding +
+endgame + bandwidth + PEX + magnet + uTP. Platform-specific
 interface/source binding is abstracted behind `InterfaceProbe`; the OS probe
 surfaces `interface_missing` in strict mode by default, which is correct
 fail-closed behavior. Live sockets are centralized behind the `NetworkBinder`

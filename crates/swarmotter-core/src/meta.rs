@@ -642,7 +642,9 @@ fn parse_v1_torrent_root(root: &[(Vec<u8>, Value)], info_bytes: &[u8]) -> Result
         )));
     }
     let pieces: Vec<[u8; 20]> = pieces_bytes
-        .chunks_exact(20)
+        .as_chunks::<20>()
+        .0
+        .iter()
         .map(|c| {
             let mut a = [0u8; 20];
             a.copy_from_slice(c);
@@ -1052,7 +1054,9 @@ fn parse_v2_piece_layers(
             )));
         }
         let hashes = hashes
-            .chunks_exact(32)
+            .as_chunks::<32>()
+            .0
+            .iter()
             .map(|hash| parse_v2_hash_bytes(hash, "BEP 52 piece-layer hash"))
             .collect::<Result<Vec<_>>>()?;
         parsed.push(V2PieceLayer {
@@ -1291,7 +1295,9 @@ pub fn v2_piece_layer_root(hashes: &[V2InfoHash], piece_length: u64) -> Result<V
     level.resize(target_len, zero);
     while level.len() > 1 {
         level = level
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| hash_v2_pair(pair[0], pair[1]))
             .collect();
     }

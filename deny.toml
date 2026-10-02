@@ -1,0 +1,53 @@
+# cargo-deny configuration for SwarmOtter.
+#
+# Run with `cargo deny check`. CI enforces this configuration on every push
+# and pull request (see .github/workflows/ci.yml). The license allow list is
+# derived from the crates in Cargo.lock; all of them are permissively licensed
+# and compatible with the project's Apache-2.0 licensing (see
+# THIRD_PARTY_LICENSES.md and ADR-0068).
+
+[advisories]
+version = 2
+# Fail the check when a crate with a known advisory (RustSec) is in use.
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+    # Apache-2.0 family (the project license)
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    # MIT family
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    # BSD family
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # Other permissive licenses observed in the dependency tree
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+]
+
+[[licenses.clarify]]
+# The bundled SQLite amalgamation carried by libsqlite3-sys is public domain;
+# the crate itself is shipped under Apache-2.0 OR MIT.
+name = "libsqlite3-sys"
+expression = "Apache-2.0 OR MIT"
+license-files = []
+
+[bans]
+multiple-versions = "warn"
+# Workspace members depend on each other with wildcard version requirements
+# (standard for path dependencies inside a workspace); only warn.
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

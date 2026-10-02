@@ -673,6 +673,10 @@ fn is_remote_torrent_url(value: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://")
 }
 
+// `Response` is intentionally the error type: every failure path here already
+// carries a fully formed HTTP response, matching the axum handler style used
+// throughout this crate.
+#[allow(clippy::result_large_err)]
 async fn resolve_hashes(
     state: &SharedState,
     value: Option<&str>,
