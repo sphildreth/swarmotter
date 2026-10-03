@@ -18,7 +18,7 @@ pub use diagnostics::{
     check_storage_preflight, inspect_storage_root, required_free_space_bytes, StoragePreflight,
     StorageRootUsage,
 };
-pub use io::{StorageIo, StoragePathOwnership};
+pub use io::{StorageHandleBudget, StorageIo, StoragePathOwnership};
 pub use layout::{FileLayout, FileSlice, StorageLayout};
 pub use metrics::{StorageIoMetrics, StorageThroughput};
 pub use resume::{FastResume, PieceBitfield};

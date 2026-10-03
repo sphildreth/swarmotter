@@ -1379,3 +1379,114 @@ async fn progress_persistence_rewrites_only_changed_records() {
 
     std::fs::remove_dir_all(root).ok();
 }
+
+#[tokio::test]
+async fn changed_fingerprints_preserve_metadata_labels_and_queue_boundaries() {
+    let root = unique_dir("changed-fingerprint-boundaries");
+    let state_path = root.join("state.sqlite");
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        Config::default(),
+        disabled_health(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let first_bytes = swarmotter_core::meta::build_single_file_torrent(
+        "fingerprint-first.bin",
+        b"generated first payload",
+        8,
+        None,
+        false,
+    );
+    let second_bytes = swarmotter_core::meta::build_single_file_torrent(
+        "fingerprint-second.bin",
+        b"generated second payload",
+        8,
+        None,
+        false,
+    );
+    let first = runtime
+        .add_torrent_file_with_options(first_bytes, AddTorrentOptions::new(None, true))
+        .await
+        .unwrap();
+    let second = runtime
+        .add_torrent_file_with_options(second_bytes, AddTorrentOptions::new(None, true))
+        .await
+        .unwrap();
+    runtime
+        .set_labels(&first, vec!["a".into(), "bc".into()])
+        .await
+        .unwrap();
+    runtime.persist_state_full().await.unwrap();
+
+    runtime
+        .set_labels(&first, vec!["ab".into(), "c".into()])
+        .await
+        .unwrap();
+    let tracker = "https://tracker.example.invalid/announce".to_string();
+    runtime.add_tracker(&first, tracker.clone()).await.unwrap();
+
+    {
+        let mut queue = runtime.queue.lock().await;
+        queue.order = vec![first];
+        queue.bypass = vec![second];
+    }
+    runtime.persist_state_full().await.unwrap();
+    {
+        let mut queue = runtime.queue.lock().await;
+        queue.order = vec![first, second];
+        queue.bypass.clear();
+    }
+    runtime.persist_state().await.unwrap();
+    drop(runtime);
+
+    let stored = crate::state_store::load(&state_path).unwrap().unwrap();
+    let torrent = stored
+        .torrents
+        .iter()
+        .find(|torrent| torrent.key() == first)
+        .unwrap();
+    assert_eq!(torrent.labels, vec!["ab", "c"]);
+    assert_eq!(torrent.meta.announce.as_deref(), Some(tracker.as_str()));
+    assert_eq!(stored.queue.order, vec![first, second]);
+    assert!(stored.queue.bypass.is_empty());
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn removal_after_incremental_saves_deletes_the_durable_record() {
+    let root = unique_dir("incremental-removal");
+    let state_path = root.join("state.sqlite");
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        Config::default(),
+        disabled_health(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "removed-after-incremental.bin",
+        b"generated removal payload",
+        8,
+        None,
+        false,
+    );
+    let hash = runtime
+        .add_torrent_file_with_options(bytes, AddTorrentOptions::new(None, true))
+        .await
+        .unwrap();
+    runtime
+        .set_labels(&hash, vec!["changed".into()])
+        .await
+        .unwrap();
+    runtime.remove_torrent(&hash, false).await.unwrap();
+
+    let stored = crate::state_store::load(&state_path).unwrap().unwrap();
+    assert!(stored.torrents.is_empty());
+    assert!(!stored.queue.order.contains(&hash));
+    drop(runtime);
+    std::fs::remove_dir_all(root).ok();
+}

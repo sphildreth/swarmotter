@@ -117,6 +117,7 @@ impl TorrentEngine {
 
         let complete_storage = StorageIo::new(self.meta.clone(), self.complete_dir.clone())
             .with_torrent_key(self.torrent_key)
+            .with_handle_budget(self.storage_handle_budget.clone())
             .with_resume_dir(self.resume_dir.clone())
             .with_cow_strategy(self.cow_strategy)
             .with_metrics(self.storage_metrics.clone());
@@ -132,6 +133,7 @@ impl TorrentEngine {
 
         let storage = StorageIo::new(self.meta.clone(), self.download_dir.clone())
             .with_torrent_key(self.torrent_key)
+            .with_handle_budget(self.storage_handle_budget.clone())
             .with_resume_dir(self.resume_dir.clone())
             .with_partial_file_suffix(self.partial_file_suffix.clone())
             .with_cow_strategy(self.cow_strategy)
@@ -573,6 +575,7 @@ impl TorrentEngine {
         if self.download_dir != self.complete_dir {
             let active_storage = StorageIo::new(self.meta.clone(), self.download_dir.clone())
                 .with_torrent_key(self.torrent_key)
+                .with_handle_budget(self.storage_handle_budget.clone())
                 .with_resume_dir(self.resume_dir.clone())
                 .with_partial_file_suffix(self.partial_file_suffix.clone())
                 .with_cow_strategy(self.cow_strategy)

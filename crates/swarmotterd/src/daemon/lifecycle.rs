@@ -762,7 +762,7 @@ impl DaemonOps for DaemonRuntime {
         if let Some(current) = self.registry.lock().await.get_mut(hash) {
             current.download_dir = Some(path);
         }
-        let persist_result = self.persist_state().await;
+        let persist_result = self.persist_state_full().await;
         let result = if let Err(persist_error) = persist_result {
             match moved_storage
                 .move_to_with_partial_file_suffix(source_path, payload_partial_file_suffix)
@@ -875,7 +875,7 @@ impl DaemonOps for DaemonRuntime {
             torrent.meta = std::sync::Arc::new(renamed_meta);
             torrent.files[file_index].path = new_path;
         }
-        let result = if let Err(persist_error) = self.persist_state().await {
+        let result = if let Err(persist_error) = self.persist_state_full().await {
             match rollback_payload_rename(&old_path, &new_file_path, disk_outcome).await {
                 Ok(()) => {
                     if let Some(current) = self.registry.lock().await.get_mut(hash) {
@@ -1850,7 +1850,7 @@ impl DaemonOps for DaemonRuntime {
         }
 
         self.clear_download_runtime_state().await;
-        self.persist_state().await?;
+        self.persist_state_full().await?;
 
         tracing::warn!(
             torrents_removed = torrents.len(),

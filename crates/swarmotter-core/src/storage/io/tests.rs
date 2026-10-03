@@ -1291,6 +1291,99 @@ async fn global_handle_budget_evicts_across_handle_sets() {
 }
 
 #[tokio::test]
+async fn acquisition_prunes_released_retired_handles() {
+    let budget = StorageHandleBudget::new(1);
+    let first_bytes = build_single_file_torrent("retired-budget-a", b"a", 1, None, false);
+    let second_bytes = build_single_file_torrent("retired-budget-b", b"b", 1, None, false);
+    let first_meta = parse_torrent(&first_bytes).unwrap();
+    let second_meta = parse_torrent(&second_bytes).unwrap();
+    let first_dir = unique_dir("retired-budget-a");
+    let second_dir = unique_dir("retired-budget-b");
+    let first =
+        StorageIo::new(first_meta, first_dir.clone()).with_handle_budget(Some(budget.clone()));
+    let second =
+        StorageIo::new(second_meta, second_dir.clone()).with_handle_budget(Some(budget.clone()));
+
+    first.write_piece(0, b"a").await.unwrap();
+    let (index, handle) = first
+        .writable_cache
+        .lock()
+        .await
+        .handles
+        .drain()
+        .next()
+        .unwrap();
+    first
+        .writable_cache
+        .lock()
+        .await
+        .retired
+        .entry(index)
+        .or_default()
+        .push(RetiredWritableHandle {
+            file: handle.file,
+            flush_pending: false,
+        });
+    assert_eq!(budget.live_handles(), 1);
+
+    second.write_piece(0, b"b").await.unwrap();
+    assert_eq!(budget.live_handles(), 1);
+    assert_eq!(second.read_piece(0).await.unwrap(), b"b");
+    std::fs::remove_dir_all(first_dir).ok();
+    std::fs::remove_dir_all(second_dir).ok();
+}
+
+#[tokio::test]
+async fn reopening_retries_a_pending_retired_handle_flush() {
+    let bytes = build_single_file_torrent("pending-retired-flush", b"x", 1, None, false);
+    let meta = parse_torrent(&bytes).unwrap();
+    let dir = unique_dir("pending-retired-flush");
+    let store = StorageIo::new(meta, dir.clone());
+
+    store.ensure_active_layout().await.unwrap();
+    store.write_piece(0, b"x").await.unwrap();
+    let handle = store
+        .writable_cache
+        .lock()
+        .await
+        .handles
+        .remove(&0)
+        .unwrap();
+    store
+        .writable_cache
+        .lock()
+        .await
+        .retired
+        .entry(0)
+        .or_default()
+        .push(RetiredWritableHandle {
+            file: handle.file,
+            flush_pending: true,
+        });
+
+    let replacement = store.open_file_handle(0, true).await.unwrap();
+    assert_eq!(replacement.lock().await.metadata().await.unwrap().len(), 1);
+    assert!(store.writable_cache.lock().await.retired.is_empty());
+    assert_eq!(store.read_piece(0).await.unwrap(), b"x");
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn failed_writable_open_releases_its_budget_slot() {
+    let bytes = build_single_file_torrent("failed-open-budget", b"x", 1, None, false);
+    let meta = parse_torrent(&bytes).unwrap();
+    let dir = unique_dir("failed-open-budget");
+    let file_path = dir.join(&meta.name);
+    std::fs::create_dir_all(&file_path).unwrap();
+    let budget = StorageHandleBudget::new(1);
+    let store = StorageIo::new(meta, dir.clone()).with_handle_budget(Some(budget.clone()));
+
+    assert!(store.write_piece(0, b"x").await.is_err());
+    assert_eq!(budget.live_handles(), 0);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
 async fn injected_flush_failure_at_eviction_reaches_the_caller() {
     let file_count = MAX_CACHED_WRITABLE_FILE_HANDLES + 2;
     let files = (0..file_count)
@@ -1320,6 +1413,9 @@ async fn injected_flush_failure_at_eviction_reaches_the_caller() {
         "failure must appear at an eviction boundary, not on the first files"
     );
     assert!(error.to_string().contains("injected"), "{error}");
+    assert!(store.writable_cache.lock().await.handles.contains_key(&0));
+    store.flush_all_writable_handles().await.unwrap();
+    assert_eq!(store.read_piece(0).await.unwrap(), b"\x07");
     // Pieces written before the failure remain verifiable: no trusted claim
     // extends past the failing boundary.
     for earlier in 0..index {

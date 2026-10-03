@@ -970,6 +970,7 @@ impl DaemonRuntime {
         .with_partial_file_suffix(partial_file_suffix)
         .with_storage_reserve(minimum_free_space_bytes, minimum_free_space_percent)
         .with_storage_write_limiter(storage_write_limiter)
+        .with_storage_handle_budget(Some(daemon_storage_handle_budget()))
         .with_storage_metrics(storage_metrics);
         engine = match engine
             .with_file_selection(snapshot.priorities.clone(), snapshot.wanted.clone())
@@ -999,38 +1000,36 @@ impl DaemonRuntime {
         // (ADR-0075). The engine registers its resolved metadata and active
         // storage through this hook once its download loop starts; teardown
         // paths drop the registration and signal the serve shutdown watch.
-        if !needs_metadata {
-            let (serve_shutdown_tx, serve_shutdown_rx) = tokio::sync::watch::channel(false);
-            self.downloader_serve_shutdowns
-                .lock()
-                .await
-                .insert(hash, serve_shutdown_tx);
-            let serves = self.downloader_serves.clone();
-            let serve_budget = peer_session_budget.clone();
-            engine = engine.with_downloader_serve_registration(Arc::new(
-                move |registration: crate::engine::DownloaderServeRegistration| {
-                    let serves = serves.clone();
-                    let shutdown = serve_shutdown_rx.clone();
-                    let budget = serve_budget.clone();
-                    Box::pin(async move {
-                        serves.write().await.insert(
-                            registration.torrent_key,
-                            crate::seeder::DownloaderServeContext {
-                                key: registration.torrent_key,
-                                meta: registration.meta,
-                                storage: registration.storage,
-                                state: registration.state,
-                                limiter: registration.limiter,
-                                peer_id: registration.peer_id,
-                                peer_session_budget: budget,
-                                shutdown,
-                                encryption_mode: None,
-                            },
-                        );
-                    })
-                },
-            ));
-        }
+        let (serve_shutdown_tx, serve_shutdown_rx) = tokio::sync::watch::channel(false);
+        self.downloader_serve_shutdowns
+            .lock()
+            .await
+            .insert(hash, serve_shutdown_tx);
+        let serves = self.downloader_serves.clone();
+        let serve_budget = peer_session_budget.clone();
+        engine = engine.with_downloader_serve_registration(Arc::new(
+            move |registration: crate::engine::DownloaderServeRegistration| {
+                let serves = serves.clone();
+                let shutdown = serve_shutdown_rx.clone();
+                let budget = serve_budget.clone();
+                Box::pin(async move {
+                    serves.write().await.insert(
+                        registration.torrent_key,
+                        crate::seeder::DownloaderServeContext {
+                            key: registration.torrent_key,
+                            meta: registration.meta,
+                            storage: registration.storage,
+                            state: registration.state,
+                            limiter: registration.limiter,
+                            peer_id: registration.peer_id,
+                            peer_session_budget: budget,
+                            shutdown,
+                            encryption_mode: Some(encryption_mode),
+                        },
+                    );
+                })
+            },
+        ));
         if !tracker_host_rules.is_empty() {
             engine = engine.with_tracker_host_rules(tracker_host_rules);
         }
