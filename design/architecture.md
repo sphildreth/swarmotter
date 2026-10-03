@@ -85,6 +85,14 @@ SwarmOtter is a Rust async daemon with these layers:
   durable state store uses versioned SQLite migrations, full WAL checkpoints,
   and the existing serialized write/rollback boundary (see ADR-0016,
   ADR-0046, ADR-0052, ADR-0065, ADR-0066, and ADR-0067).
+- **Discovery recovery:** the last successful announce's swarm population
+  signal survives thin/unusable peer lists and transient tracker failures.
+  Empty-peer recovery forces a completed DHT lookup for the unusable-peer
+  episode before starting a bounded empty-swarm grace period; skipped refreshes
+  supply no evidence. Exhausted transient attempts use the existing retry queue.
+  `tracker_error` requires every attempted tracker to explicitly reject the
+  announce with no successful announce or usable alternative source, and manual
+  Reannounce/Resume/Start Now clears it (ADR-0070).
 - **Per-torrent health** (`swarmotter-core::models::health`): a deterministic
   calculator that turns live engine state (piece availability, peer
   usefulness, throughput, recent stability, discovery) into a `TorrentHealth`

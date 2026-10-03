@@ -7,6 +7,19 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [Unreleased]
+
+### Fixed
+
+- **Discovery-aware download recovery:** thin successful announces reporting
+  swarm population keep the engine alive while peers fail or cool down. The
+  no-peer path gives enabled DHT a completed lookup despite cadence suppression;
+  genuinely empty engines retain a bounded exit. Announce timeouts, connection,
+  and I/O failures use the existing retry queue. `tracker_error` requires
+  explicit rejection from every attempted tracker with no successful announce
+  or usable alternative;
+  Reannounce, Resume, and Start Now still clear the retained error (ADR-0070).
+
 ## [2.1.0] - [2026-10-02]
 
 ### Added

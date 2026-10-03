@@ -195,6 +195,9 @@ struct TrackerAnnounceOutcome {
 #[derive(Debug, Clone)]
 pub struct TrackerAnnounceSnapshot {
     pub status: TrackerStatus,
+    /// A protocol-level rejection (`failure reason` or BEP 15 error), rather
+    /// than a timeout, connection failure, or malformed response.
+    pub explicit_failure: bool,
     pub seeders: u64,
     pub leechers: u64,
     pub downloads: u64,
@@ -235,6 +238,9 @@ pub struct EngineState {
     /// Per-peer telemetry used for health scoring.
     pub peer_health: HashMap<std::net::SocketAddr, EnginePeerHealth>,
     pub tracker_ok: bool,
+    /// Population reported by the last successful announce, retained across
+    /// transport failures. A thin peer list does not establish an empty swarm.
+    pub tracker_swarm_populated: bool,
     pub tracker_message: Option<String>,
     pub tracker_announces: HashMap<String, TrackerAnnounceSnapshot>,
     pub tracker_scrapes: HashMap<String, TrackerScrapeSnapshot>,
@@ -261,9 +267,11 @@ pub struct EngineState {
     pub last_valid_block: Option<std::time::Instant>,
     /// Timestamp of the latest DHT discovery result.
     pub dht_last_seen: Option<std::time::Instant>,
-    /// Timestamp of the latest DHT lookup attempt, including failures. This
-    /// prevents no-peer retry paths from bypassing the discovery cadence.
+    /// Timestamp of the latest DHT lookup attempt, including failures.
     pub dht_last_lookup: Option<std::time::Instant>,
+    /// Start time of the latest completed lookup, including empty results,
+    /// errors, and timeouts. Unlike an attempt, this proves discovery finished.
+    pub dht_last_lookup_completed: Option<std::time::Instant>,
     /// Timestamp of the latest PEX discovery result.
     pub pex_last_seen: Option<std::time::Instant>,
     /// Timestamp of the latest successful tracker announce.
@@ -279,33 +287,25 @@ pub struct EngineState {
 
 impl EngineState {
     /// Return the terminal tracker error when every attempted configured
-    /// tracker failed and no non-tracker source produced a usable candidate or
-    /// payload. A successful tracker response (even with zero peers) and any
-    /// successful DHT, PEX, peer, or webseed signal prevent this classification.
+    /// tracker explicitly rejected the announce and no non-tracker source
+    /// produced a usable candidate or payload. A successful tracker response
+    /// (even with zero peers) and any successful DHT, PEX, peer, or webseed
+    /// signal prevent this classification.
     pub fn terminal_tracker_error(&self) -> Option<String> {
         if self.finished
             || self.stopped_by_command
             || self.tracker_ok
+            || self.tracker_last_ok.is_some()
             || self.tracker_announces.is_empty()
         {
             return None;
         }
 
-        let attempted = u32::try_from(self.tracker_announces.len()).unwrap_or(u32::MAX);
-        let explicit_failures = u32::try_from(
-            self.tracker_announces
-                .values()
-                .filter(|snapshot| snapshot.status == TrackerStatus::Error)
-                .count(),
-        )
-        .unwrap_or(u32::MAX);
-        let any_success = self
+        if !self
             .tracker_announces
             .values()
-            .any(|snapshot| snapshot.status == TrackerStatus::Ok);
-        let all_attempts_failed = !any_success
-            && (explicit_failures == attempted || self.tracker_failures_recent >= attempted);
-        if !all_attempts_failed {
+            .all(|snapshot| snapshot.status == TrackerStatus::Error && snapshot.explicit_failure)
+        {
             return None;
         }
 

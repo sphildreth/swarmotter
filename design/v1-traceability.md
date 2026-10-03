@@ -100,13 +100,27 @@ where the rows share the same production path, acceptance suite, and documents.
 
 - `TorrentState::TrackerError` is produced only by
   `EngineState::terminal_tracker_error` at real daemon task completion when all
-  configured tracker attempts failed and no usable peer/DHT/PEX/webseed signal
-  exists. The last tracker failure is retained in `TorrentSummary.error` and
-  Torrent Details. `terminal_tracker_failure_sets_tracker_error_and_reannounce_retries`
-  proves the real contained HTTP tracker failure, native summary, and manual
-  retry path. A successful tracker response or non-tracker signal prevents the
-  classification, covered by
+  attempted trackers explicitly rejected the announce, none succeeded during
+  the run, and no usable peer/DHT/PEX/webseed signal exists. The last rejection
+  is retained in `TorrentSummary.error` and Torrent Details.
+  `terminal_tracker_failure_sets_tracker_error_and_reannounce_retries` proves
+  real contained HTTP protocol rejections, native summary/API visibility, and
+  manual Reannounce/Resume/Start Now recovery for private and DHT-disabled
+  torrents. The classifier matrix is
   `terminal_tracker_error_requires_all_failures_and_no_successful_alternative`.
+  `tracker_announce_timeout_waits_for_dht_then_queues_for_retry` proves transient
+  announce failure remains retryable while DHT is pending and reaches the real
+  incomplete-engine queue. ADR-0070 defines this contract.
+- Thin successful announces reporting population prevent empty-swarm give-up:
+  `thin_successful_announce_keeps_failed_peer_swarm_alive`,
+  `populated_announce_survives_empty_or_filtered_peer_lists`, and
+  `successful_population_is_retained_across_retryable_announce_failure`.
+  Empty engines await
+  a real completed discovery attempt, never treating skipped refreshes as
+  evidence: `no_peer_path_forces_dht_after_known_peers_fail_despite_cadence`,
+  `no_peer_path_waits_for_forced_dht_timeout_before_bounded_exit`, and
+  `trackerless_without_dht_exits_after_bounded_empty_discovery` prove forced
+  DHT discovery and bounded empty exits.
 - Every `NetworkContainmentStatus` has a production mapper: nine arise from
   `net::evaluate/enforce` and are covered by the named `net::tests`; concrete
   `SocketBindFailed` arises from `ContainedBinder` bind reporting; and generic

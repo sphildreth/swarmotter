@@ -781,6 +781,7 @@ impl DaemonRuntime {
                             true,
                             crate::engine::TrackerAnnounceSnapshot {
                                 status: TrackerStatus::Ok,
+                                explicit_failure: false,
                                 seeders: response.seeders,
                                 leechers: response.leechers,
                                 downloads: 0,
@@ -805,6 +806,7 @@ impl DaemonRuntime {
                             false,
                             crate::engine::TrackerAnnounceSnapshot {
                                 status: TrackerStatus::Error,
+                                explicit_failure: true,
                                 seeders: response.seeders,
                                 leechers: response.leechers,
                                 downloads: 0,
@@ -827,6 +829,7 @@ impl DaemonRuntime {
                             false,
                             crate::engine::TrackerAnnounceSnapshot {
                                 status: TrackerStatus::Error,
+                                explicit_failure: false,
                                 seeders: 0,
                                 leechers: 0,
                                 downloads: 0,
@@ -847,6 +850,7 @@ impl DaemonRuntime {
                             false,
                             crate::engine::TrackerAnnounceSnapshot {
                                 status: TrackerStatus::Error,
+                                explicit_failure: false,
                                 seeders: 0,
                                 leechers: 0,
                                 downloads: 0,

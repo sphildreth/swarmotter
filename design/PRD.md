@@ -735,10 +735,19 @@ Required torrent states:
 - `tracker_error`
 
 `tracker_error` is a reachable terminal state for a bounded engine attempt:
-every attempted configured tracker failed and no usable DHT, PEX, direct-peer,
-or webseed source existed. The native summary retains the last tracker failure;
-manual reannounce or resume clears it and retries. Any successful tracker or
-usable alternative source prevents this classification.
+every attempted configured tracker explicitly rejected the announce, no
+announce succeeded during that run, and no usable DHT, PEX, direct-peer, or
+webseed signal existed. The native summary retains the last rejection; manual
+reannounce, resume, or start clears it and retries. Timeouts, connection, and
+I/O failures are retryable through the incomplete-engine queue (ADR-0070).
+
+A successful announce reporting any seeders or leechers keeps discovery alive
+even with an empty, filtered, failing, or cooling-down peer list. Enabled DHT
+must complete a lookup after known peers become unusable, bypassing normal
+cadence when necessary. A skipped refresh supplies no empty-swarm evidence.
+Once discovery has actually finished and no population signal or usable peers
+remain, a bounded grace period permits retry-queue recovery. Trackerless
+torrents with DHT disabled also retain a bounded exit.
 
 ## Queue Management Requirements
 

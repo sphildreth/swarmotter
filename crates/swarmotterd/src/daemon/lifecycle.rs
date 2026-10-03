@@ -499,6 +499,10 @@ impl DaemonOps for DaemonRuntime {
             if let Some(torrent) = reg.get_mut(hash) {
                 torrent.containment_recovery_intent = None;
                 torrent.policy.preview_until_started = false;
+                if torrent.state == TorrentState::TrackerError {
+                    torrent.state = TorrentState::Queued;
+                    torrent.error = None;
+                }
             } else {
                 return Err(CoreError::NotFound("torrent".into()));
             }

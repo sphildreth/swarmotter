@@ -161,6 +161,7 @@ impl TorrentEngine {
         }
 
         // Discover peers via tracker announce (HTTP/UDP) on each tier.
+        let discovery_started = Instant::now();
         let mut discovered = self.announce(AnnounceEvent::Started).await;
         // Merge any directly-supplied seed peers (local swarm / PEX / DHT).
         for p in &self.seed_peers {
@@ -179,12 +180,12 @@ impl TorrentEngine {
         let mut peer_backoff: HashMap<SocketAddr, Instant> = HashMap::new();
         let mut last_discovery_refresh = Instant::now();
         let mut candidate_cursor: usize = 0;
-        // Bounded consecutive no-peer rounds: if we never discover any peers
-        // after a bounded number of announce attempts, give up gracefully
-        // rather than looping forever. This handles trackerless torrents with
-        // no seed peers and no DHT result without hanging the engine.
-        const NO_PEER_ROUNDS_MAX: u32 = 5;
-        let mut no_peer_rounds: u32 = 0;
+        // Only completed discovery can establish an empty swarm. Skipped
+        // refreshes do not supply evidence; once discovery has finished, a
+        // bounded grace period still lets genuinely empty engines exit.
+        const NO_PEER_RETRY_GRACE: Duration = Duration::from_secs(10);
+        let mut unusable_since = None;
+        let mut empty_since: Option<tokio::time::Instant> = None;
 
         loop {
             // Handle pending commands.
@@ -242,6 +243,10 @@ impl TorrentEngine {
                 self.peer_filter.as_ref(),
             );
             balance_peer_families(&mut eligible);
+            if !eligible.is_empty() || made_progress {
+                unusable_since = None;
+                empty_since = None;
+            }
             let mut scheduler = PeerSchedulerDiagnostics {
                 discovered_peers: candidate_counts.discovered,
                 eligible_peers: candidate_counts.eligible,
@@ -364,9 +369,15 @@ impl TorrentEngine {
                     self.peer_filter.as_ref(),
                 );
                 if no_usable_peer_candidates(&latest_counts) {
-                    // No usable peers; back off briefly and retry announce.
+                    let since = *unusable_since.get_or_insert_with(|| {
+                        if discovered.is_empty() {
+                            discovery_started
+                        } else {
+                            Instant::now()
+                        }
+                    });
                     self.sleep_or_stop(Duration::from_secs(2)).await;
-                    let refreshed = self.refresh_discovery_peers(false).await;
+                    let refreshed = self.refresh_discovery_peers_after(false, Some(since)).await;
                     merge_unique_peers(&mut discovered, refreshed);
                     dedupe_peers(&mut discovered);
                     self.state.lock().await.peers = discovered.clone();
@@ -378,7 +389,6 @@ impl TorrentEngine {
                         self.peer_filter.as_ref(),
                     );
                     if no_usable_peer_candidates(&refreshed_counts) {
-                        no_peer_rounds = no_peer_rounds.saturating_add(1);
                         let mut state = self.state.lock().await;
                         let existing = state.tracker_message.clone();
                         let reason = peer_scheduler_reason(&refreshed_counts)
@@ -389,23 +399,41 @@ impl TorrentEngine {
                                 None => reason,
                             });
                         }
+                        // The initial announce is a real attempt even when
+                        // subsequent refreshes respect a long tracker interval.
+                        // A trackerless/DHT-disabled engine has no discovery
+                        // work to await and retains the same bounded exit.
+                        let trackers_attempted = !state.tracker_announces.is_empty()
+                            || swarmotter_core::policy::prioritized_tracker_tiers(
+                                self.meta.announce.as_deref(),
+                                &self.meta.announce_list,
+                                &self.tracker_host_rules,
+                            )
+                            .is_empty();
+                        let dht_finished = !self.dht_enabled()
+                            || state
+                                .dht_last_lookup_completed
+                                .is_some_and(|last| last >= since);
+                        let empty_confirmed =
+                            trackers_attempted && dht_finished && !state.tracker_swarm_populated;
                         drop(state);
-                        // Bounded give-up: a torrent that never has usable peers
-                        // (no peers, or only peers filtered/failed out) cannot
-                        // progress. Stop the engine so the daemon/test does not
-                        // hang; the torrent remains incomplete and the user can
-                        // add trackers or seed peers and re-start it.
-                        if no_peer_rounds >= NO_PEER_ROUNDS_MAX {
+                        if !empty_confirmed {
+                            empty_since = None;
+                            continue;
+                        }
+                        let empty_at = empty_since.get_or_insert_with(tokio::time::Instant::now);
+                        if empty_at.elapsed() >= NO_PEER_RETRY_GRACE {
                             let tracker_message = self.state.lock().await.tracker_message.clone();
                             tracing::info!(
                                 info_hash = %self.meta.info_hash,
                                 tracker_message = ?tracker_message,
-                                "stopping engine: no usable peers after bounded retries"
+                                "stopping engine: no usable peers after completed discovery and bounded retries"
                             );
                             break;
                         }
                     } else {
-                        no_peer_rounds = 0;
+                        unusable_since = None;
+                        empty_since = None;
                     }
                 } else {
                     self.sleep_or_stop(Duration::from_millis(500)).await;

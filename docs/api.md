@@ -212,12 +212,15 @@ characters for v1 and hybrid-primary records, or 64 for pure-v2 records. A
 hybrid's full v2 locator is also accepted as an alias for its canonical v1
 record. The 20-byte peer/tracker/DHT wire value is never an API locator.
 
-When every attempted configured tracker fails and no usable DHT, PEX,
-direct-peer, or webseed source exists, the daemon stops the bounded engine
-attempt in `tracker_error` and exposes the last tracker failure in `error`.
+When every attempted configured tracker explicitly rejects the announce, no
+announce succeeded during the run, and no usable DHT, PEX, direct-peer, or
+webseed source exists, the daemon stops the bounded engine attempt in
+`tracker_error` and exposes the last tracker failure in `error`.
 `POST /torrents/:hash/reannounce` or Resume/Start Now clears the terminal error
 and starts a new attempt. A successful tracker response or usable alternative
-source prevents `tracker_error`.
+source prevents `tracker_error`. Announce timeouts, connection, and I/O failures
+use the automatic retry queue. Thin successful announces reporting swarm
+population keep discovery alive even when their returned peers are unusable.
 
 The replacement request requires exactly these keys:
 

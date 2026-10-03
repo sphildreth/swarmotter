@@ -93,10 +93,13 @@ magnet, reannounce, completion, and active seeder tracker activity; it is not a
 separate user mutation.
 
 The Details summary also displays **Last error** from the native torrent
-summary. If every attempted configured tracker fails and no usable alternative
-source exists, the state becomes `tracker error` and this row retains the last
-tracker failure. Reannounce, Resume, or Start Now clears the terminal error and
-starts a new attempt.
+summary. If every attempted configured tracker explicitly rejects the
+announce, none succeeded during the run, and no usable alternative source
+exists, the state becomes `tracker error` and this row retains the last tracker
+failure. Reannounce, Resume, or Start Now clears the terminal error and
+starts a new attempt. Announce timeouts, connection, and I/O failures use the
+automatic retry queue. Thin successful announces reporting swarm population
+keep discovery alive even when their returned peers are unusable.
 
 ## Per-torrent seeding policy
 

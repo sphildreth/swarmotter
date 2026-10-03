@@ -35,6 +35,7 @@ async fn list_trackers_exposes_scrape_state_and_falls_back_without_announce_succ
         primary.into(),
         crate::engine::TrackerAnnounceSnapshot {
             status: TrackerStatus::Ok,
+            explicit_failure: false,
             seeders: 256,
             leechers: 12,
             downloads: 0,
@@ -47,6 +48,7 @@ async fn list_trackers_exposes_scrape_state_and_falls_back_without_announce_succ
         secondary.into(),
         crate::engine::TrackerAnnounceSnapshot {
             status: TrackerStatus::Error,
+            explicit_failure: false,
             seeders: 0,
             leechers: 0,
             downloads: 0,
