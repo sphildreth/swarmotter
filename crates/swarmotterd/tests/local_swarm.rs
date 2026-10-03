@@ -42,7 +42,7 @@ use swarmotterd::engine::{EngineCommand, EngineState, TorrentEngine};
 /// payload to a single connecting leecher.
 struct SeedPeer {
     content: Vec<u8>,
-    meta: swarmotter_core::meta::TorrentMeta,
+    meta: std::sync::Arc<swarmotter_core::meta::TorrentMeta>,
     info_hash: swarmotter_core::hash::InfoHash,
     peer_id: [u8; 20],
 }
@@ -139,7 +139,7 @@ type SharedParallelSeedStats = Arc<StdMutex<ParallelSeedStats>>;
 /// simultaneous peer workers remain observable.
 struct InstrumentedSeedPeer {
     content: Vec<u8>,
-    meta: swarmotter_core::meta::TorrentMeta,
+    meta: std::sync::Arc<swarmotter_core::meta::TorrentMeta>,
     info_hash: swarmotter_core::hash::InfoHash,
     peer_id: [u8; 20],
     peer_index: usize,
@@ -539,7 +539,7 @@ async fn local_swarm_downloads_from_webseed_url_list() {
     let state = Arc::new(Mutex::new(EngineState::default()));
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let engine = TorrentEngine::new(
-        meta.clone(),
+        Arc::new(meta.clone()),
         dir.clone(),
         peer_id(b"-SWWS000"),
         binder,
@@ -562,7 +562,7 @@ async fn local_swarm_downloads_from_webseed_url_list() {
     );
     assert_eq!(final_state.downloaded, meta.total_length);
 
-    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let storage = StorageIo::new(Arc::new(meta.clone()), dir.clone());
     let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
     assert_eq!(written, content);
     assert!(!storage.resume_path().exists());
@@ -614,7 +614,7 @@ async fn local_swarm_downloads_from_seed_via_tracker() {
     // 5. Spawn the seed peer accept loop (serve a single leecher).
     {
         let content_clone = content.clone();
-        let meta_clone = meta.clone();
+        let meta_clone = Arc::new(meta.clone());
         tokio::spawn(async move {
             let seed = SeedPeer {
                 content: content_clone,
@@ -638,7 +638,7 @@ async fn local_swarm_downloads_from_seed_via_tracker() {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     // No directly-supplied seed peers: discovery must come from the tracker.
     let engine = TorrentEngine::new(
-        meta.clone(),
+        Arc::new(meta.clone()),
         download_dir,
         peer_id,
         binder,
@@ -663,7 +663,7 @@ async fn local_swarm_downloads_from_seed_via_tracker() {
     assert!(final_state.tracker_ok, "tracker should have been ok");
 
     // 7. Verify the on-disk file matches the original payload.
-    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let storage = StorageIo::new(Arc::new(meta.clone()), dir.clone());
     let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
     assert_eq!(written, content, "downloaded content mismatches original");
 
@@ -692,7 +692,7 @@ async fn local_swarm_downloads_from_direct_seed_peer() {
 
     {
         let content_clone = content.clone();
-        let meta_clone = meta.clone();
+        let meta_clone = Arc::new(meta.clone());
         tokio::spawn(async move {
             let seed = SeedPeer {
                 content: content_clone,
@@ -711,7 +711,7 @@ async fn local_swarm_downloads_from_direct_seed_peer() {
     let state = Arc::new(Mutex::new(EngineState::default()));
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let engine = TorrentEngine::new(
-        meta.clone(),
+        Arc::new(meta.clone()),
         dir.clone(),
         peer_id(b"-SW0002-"),
         binder,
@@ -727,7 +727,7 @@ async fn local_swarm_downloads_from_direct_seed_peer() {
         .expect("engine error");
 
     assert!(final_state.finished);
-    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let storage = StorageIo::new(Arc::new(meta.clone()), dir.clone());
     let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
     assert_eq!(written, content);
     std::fs::remove_dir_all(&dir).ok();
@@ -768,7 +768,7 @@ async fn local_swarm_downloads_from_seed_via_udp_tracker() {
 
     {
         let content_clone = content.clone();
-        let meta_clone = meta.clone();
+        let meta_clone = Arc::new(meta.clone());
         tokio::spawn(async move {
             let seed = SeedPeer {
                 content: content_clone,
@@ -786,7 +786,7 @@ async fn local_swarm_downloads_from_seed_via_udp_tracker() {
     let state = Arc::new(Mutex::new(EngineState::default()));
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let engine = TorrentEngine::new(
-        meta.clone(),
+        Arc::new(meta.clone()),
         download_dir,
         peer_id(b"-SW0003-"),
         binder,
@@ -809,7 +809,7 @@ async fn local_swarm_downloads_from_seed_via_udp_tracker() {
     );
     assert!(final_state.tracker_ok, "udp tracker should have been ok");
 
-    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let storage = StorageIo::new(Arc::new(meta.clone()), dir.clone());
     let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
     assert_eq!(written, content, "downloaded content mismatches original");
     std::fs::remove_dir_all(&dir).ok();
@@ -836,7 +836,7 @@ async fn local_swarm_seeds_completed_download_to_leecher() {
 
     // Write the completed payload directly to a seed dir.
     let seed_dir = unique_dir("seed-source");
-    let seed_storage = Arc::new(StorageIo::new(meta.clone(), seed_dir.clone()));
+    let seed_storage = Arc::new(StorageIo::new(Arc::new(meta.clone()), seed_dir.clone()));
     seed_storage.preallocate().await.unwrap();
     let mut off = 0usize;
     let mut idx = 0usize;
@@ -874,7 +874,7 @@ async fn local_swarm_seeds_completed_download_to_leecher() {
     let (torrent_shutdown_tx, torrent_shutdown_rx) = tokio::sync::watch::channel(false);
     registry
         .register(SeedRegistration::new(
-            meta.clone(),
+            Arc::new(meta.clone()),
             seed_storage.clone(),
             None,
             seed_state.clone(),
@@ -912,7 +912,7 @@ async fn local_swarm_seeds_completed_download_to_leecher() {
     let leech_state = Arc::new(Mutex::new(EngineState::default()));
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let leech_engine = TorrentEngine::new(
-        meta.clone(),
+        Arc::new(meta.clone()),
         leech_dir.clone(),
         peer_id(b"-SW0010-"),
         binder.clone(),
@@ -942,7 +942,7 @@ async fn local_swarm_seeds_completed_download_to_leecher() {
     );
 
     // The leecher's on-disk content matches the original.
-    let leech_storage = StorageIo::new(meta.clone(), leech_dir.clone());
+    let leech_storage = StorageIo::new(Arc::new(meta.clone()), leech_dir.clone());
     let written = std::fs::read(leech_storage.file_path(0).unwrap()).unwrap();
     assert_eq!(written, content, "leecher content mismatches seed content");
 
@@ -983,7 +983,7 @@ async fn local_swarm_endgame_completes_from_near_complete_state() {
     let mut seed_peers: Vec<PeerAddr> = Vec::new();
     for tag in [b"-SD0040-", b"-SD0041-"] {
         let content_clone = content.clone();
-        let meta_clone = meta.clone();
+        let meta_clone = Arc::new(meta.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         seed_peers.push(PeerAddr::from_socket_addr(addr));
@@ -1014,7 +1014,7 @@ async fn local_swarm_endgame_completes_from_near_complete_state() {
     }
 
     // Pre-seed the first pieces on disk so the engine resumes near-complete.
-    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let storage = StorageIo::new(Arc::new(meta.clone()), dir.clone());
     storage.preallocate().await.unwrap();
     for i in 0..preseed_count {
         let (start, end) = meta.piece_byte_range(i as u64).unwrap();
@@ -1057,7 +1057,7 @@ async fn local_swarm_endgame_completes_from_near_complete_state() {
     let state = Arc::new(Mutex::new(EngineState::default()));
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let engine = TorrentEngine::new(
-        meta.clone(),
+        Arc::new(meta.clone()),
         dir.clone(),
         peer_id(b"-SW0040-"),
         binder,
@@ -1117,7 +1117,7 @@ async fn local_swarm_parallel_download_uses_multiple_seed_peers() {
         seed_peers.push(PeerAddr::from_socket_addr(addr));
 
         let content_clone = content.clone();
-        let meta_clone = meta.clone();
+        let meta_clone = Arc::new(meta.clone());
         let stats_clone = stats.clone();
         tokio::spawn(async move {
             for _ in 0..4 {
@@ -1145,7 +1145,7 @@ async fn local_swarm_parallel_download_uses_multiple_seed_peers() {
     let state = Arc::new(Mutex::new(EngineState::default()));
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let engine = TorrentEngine::new(
-        meta.clone(),
+        Arc::new(meta.clone()),
         dir.clone(),
         peer_id(b"-SWP000-"),
         binder,
@@ -1231,7 +1231,7 @@ async fn local_swarm_parallel_download_uses_multiple_seed_peers() {
         "all pieces should be served by the local swarm"
     );
 
-    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let storage = StorageIo::new(Arc::new(meta.clone()), dir.clone());
     let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
     assert_eq!(written, content, "parallel downloaded content mismatches");
     std::fs::remove_dir_all(&dir).ok();
@@ -1258,7 +1258,7 @@ async fn local_swarm_download_is_throttled_by_bandwidth_limit() {
     let seed_peer = PeerAddr::from_socket_addr(seed_addr);
     {
         let content_clone = content.clone();
-        let meta_clone = meta.clone();
+        let meta_clone = Arc::new(meta.clone());
         tokio::spawn(async move {
             let seed = SeedPeer {
                 content: content_clone,
@@ -1281,7 +1281,7 @@ async fn local_swarm_download_is_throttled_by_bandwidth_limit() {
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let limiter = RateLimiter::new(8 * 1024, 0);
     let engine = TorrentEngine::with_limiter(
-        meta.clone(),
+        Arc::new(meta.clone()),
         dir.clone(),
         peer_id(b"-SW0050-"),
         binder,
@@ -1308,7 +1308,7 @@ async fn local_swarm_download_is_throttled_by_bandwidth_limit() {
         "expected throttled download to be slow; elapsed {elapsed:?}"
     );
 
-    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let storage = StorageIo::new(Arc::new(meta.clone()), dir.clone());
     let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
     assert_eq!(written, content);
     std::fs::remove_dir_all(&dir).ok();
@@ -1336,7 +1336,7 @@ async fn local_swarm_download_is_throttled_by_per_torrent_limit() {
     let seed_peer = PeerAddr::from_socket_addr(seed_addr);
     {
         let content_clone = content.clone();
-        let meta_clone = meta.clone();
+        let meta_clone = Arc::new(meta.clone());
         tokio::spawn(async move {
             let seed = SeedPeer {
                 content: content_clone,
@@ -1359,7 +1359,7 @@ async fn local_swarm_download_is_throttled_by_per_torrent_limit() {
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let per_torrent = RateLimiter::new(8 * 1024, 0);
     let engine = TorrentEngine::with_limiter(
-        meta.clone(),
+        Arc::new(meta.clone()),
         dir.clone(),
         peer_id(b"-SW0051-"),
         binder,
@@ -1385,7 +1385,7 @@ async fn local_swarm_download_is_throttled_by_per_torrent_limit() {
         "expected per-torrent limit to throttle download; elapsed {elapsed:?}"
     );
 
-    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let storage = StorageIo::new(Arc::new(meta.clone()), dir.clone());
     let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
     assert_eq!(written, content);
     std::fs::remove_dir_all(&dir).ok();
@@ -1425,7 +1425,7 @@ async fn local_swarm_magnet_preview_fetches_metadata_without_payload_then_downlo
     let seed_peer = PeerAddr::from_socket_addr(seed_addr);
     {
         let content_clone = content.clone();
-        let meta_clone = meta.clone();
+        let meta_clone = Arc::new(meta.clone());
         let info_clone = info_bytes.clone();
         tokio::spawn(async move {
             // Accept multiple connections: metadata fetch + piece download.
@@ -1489,7 +1489,7 @@ async fn local_swarm_magnet_preview_fetches_metadata_without_payload_then_downlo
     let preview_state = Arc::new(Mutex::new(EngineState::default()));
     let (_preview_cmd_tx, preview_cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let preview_engine = TorrentEngine::with_limiter(
-        meta.clone(),
+        Arc::new(meta.clone()),
         preview_dir.clone(),
         peer_id(b"-SW009P-"),
         Arc::new(LoopbackBinder),
@@ -1528,7 +1528,7 @@ async fn local_swarm_magnet_preview_fetches_metadata_without_payload_then_downlo
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let engine = TorrentEngine::with_limiter(
         // Placeholder meta (will be replaced after metadata fetch).
-        meta.clone(),
+        Arc::new(meta.clone()),
         dir.clone(),
         peer_id(b"-SW0090-"),
         binder,
@@ -1571,7 +1571,7 @@ async fn local_swarm_magnet_preview_fetches_metadata_without_payload_then_downlo
     assert!(final_state.resolved_meta.is_some());
     assert_eq!(final_state.resolved_meta.unwrap().info_hash, info_hash);
 
-    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let storage = StorageIo::new(Arc::new(meta.clone()), dir.clone());
     let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
     assert_eq!(written, content);
     std::fs::remove_dir_all(&dir).ok();
@@ -1579,7 +1579,7 @@ async fn local_swarm_magnet_preview_fetches_metadata_without_payload_then_downlo
     /// A seed that serves both BEP 9 metadata and piece blocks.
     async fn serve_magnet_seed(
         stream: tokio::net::TcpStream,
-        meta: swarmotter_core::meta::TorrentMeta,
+        meta: std::sync::Arc<swarmotter_core::meta::TorrentMeta>,
         content: Vec<u8>,
         info_bytes: Vec<u8>,
     ) -> swarmotter_core::Result<()> {
@@ -1741,7 +1741,7 @@ async fn local_swarm_discovers_peer_via_pex() {
     let peer_b = PeerAddr::from_socket_addr(peer_b_addr);
     {
         let content_clone = content.clone();
-        let meta_clone = meta.clone();
+        let meta_clone = Arc::new(meta.clone());
         tokio::spawn(async move {
             let seed = SeedPeer {
                 content: content_clone,
@@ -1760,7 +1760,7 @@ async fn local_swarm_discovers_peer_via_pex() {
     let peer_a = PeerAddr::from_socket_addr(peer_a_addr);
     let info_hash = meta.info_hash;
     let content_a = content.clone();
-    let meta_a = meta.clone();
+    let meta_a = Arc::new(meta.clone());
     tokio::spawn(async move {
         // A seed that serves pieces and also emits a PEX update advertising B.
         if let Ok((stream, _)) = listener_a.accept().await {
@@ -1774,7 +1774,7 @@ async fn local_swarm_discovers_peer_via_pex() {
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     // Supply only peer A directly; peer B must be discovered via PEX.
     let engine = TorrentEngine::new(
-        meta.clone(),
+        Arc::new(meta.clone()),
         dir.clone(),
         peer_id(b"-SW0070-"),
         binder,
@@ -1796,7 +1796,7 @@ async fn local_swarm_discovers_peer_via_pex() {
         "pex download did not verify all pieces"
     );
 
-    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let storage = StorageIo::new(Arc::new(meta.clone()), dir.clone());
     let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
     assert_eq!(written, content);
     std::fs::remove_dir_all(&dir).ok();
@@ -1806,7 +1806,7 @@ async fn local_swarm_discovers_peer_via_pex() {
     async fn serve_pex_seed(
         stream: tokio::net::TcpStream,
         content: Vec<u8>,
-        meta: swarmotter_core::meta::TorrentMeta,
+        meta: std::sync::Arc<swarmotter_core::meta::TorrentMeta>,
         info_hash: swarmotter_core::hash::InfoHash,
         extra_peer: PeerAddr,
     ) -> swarmotter_core::Result<()> {
@@ -1933,7 +1933,7 @@ fn peer_id(prefix: &[u8; 8]) -> [u8; 20] {
 /// real download over the contained uTP transport.
 struct UtpSeedPeer {
     content: Vec<u8>,
-    meta: swarmotter_core::meta::TorrentMeta,
+    meta: std::sync::Arc<swarmotter_core::meta::TorrentMeta>,
     info_hash: swarmotter_core::hash::InfoHash,
     peer_id: [u8; 20],
 }
@@ -2063,7 +2063,7 @@ async fn local_swarm_downloads_from_seed_via_utp() {
     let seed_sock: std::sync::Arc<dyn swarmotter_core::net::ContainedUdpSocket> = seed_sock.into();
 
     let content_clone = content.clone();
-    let meta_clone = meta.clone();
+    let meta_clone = Arc::new(meta.clone());
     let seed_sock_clone = seed_sock.clone();
     tokio::spawn(async move {
         use swarmotter_core::utp::{UtpConnection, UtpHeader, UtpStream, UtpType};
@@ -2103,7 +2103,7 @@ async fn local_swarm_downloads_from_seed_via_utp() {
     // plaintext peer-wire, so disable MSE/PE explicitly; encrypted uTP is
     // covered by the required-encryption fixture below.
     let engine = TorrentEngine::new(
-        meta.clone(),
+        Arc::new(meta.clone()),
         dir.clone(),
         peer_id(b"-SWUTP00"),
         binder.clone(),
@@ -2127,7 +2127,7 @@ async fn local_swarm_downloads_from_seed_via_utp() {
         "uTP download did not verify all pieces"
     );
 
-    let storage = StorageIo::new(meta.clone(), dir.clone());
+    let storage = StorageIo::new(Arc::new(meta.clone()), dir.clone());
     let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
     assert_eq!(
         written, content,
@@ -2157,7 +2157,7 @@ async fn local_swarm_downloads_from_encrypted_seed_via_utp_when_required() {
     let seed_sock: std::sync::Arc<dyn swarmotter_core::net::ContainedUdpSocket> = seed_sock.into();
 
     let content_clone = content.clone();
-    let meta_clone = meta.clone();
+    let meta_clone = Arc::new(meta.clone());
     let seed_sock_clone = seed_sock.clone();
     tokio::spawn(async move {
         use swarmotter_core::utp::{UtpConnection, UtpHeader, UtpStream, UtpType};
@@ -2191,7 +2191,7 @@ async fn local_swarm_downloads_from_encrypted_seed_via_utp_when_required() {
     let state = Arc::new(Mutex::new(EngineState::default()));
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let engine = TorrentEngine::new(
-        meta.clone(),
+        Arc::new(meta.clone()),
         dir.clone(),
         peer_id(b"-SWEUTP-"),
         binder,
@@ -2242,7 +2242,7 @@ async fn local_swarm_utp_fail_closed_blocks_download() {
     let state = Arc::new(Mutex::new(EngineState::default()));
     let (_cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let engine = TorrentEngine::new(
-        meta.clone(),
+        Arc::new(meta.clone()),
         dir.clone(),
         peer_id(b"-SWFC000"),
         binder,
@@ -2293,7 +2293,7 @@ async fn local_swarm_active_download_reports_non_zero_health() {
     let seed_peer = PeerAddr::from_socket_addr(seed_addr);
     {
         let content_clone = content.clone();
-        let meta_clone = meta.clone();
+        let meta_clone = Arc::new(meta.clone());
         tokio::spawn(async move {
             while let Ok((stream, _)) = seed_listener.accept().await {
                 let seed = SeedPeer {
@@ -2312,7 +2312,7 @@ async fn local_swarm_active_download_reports_non_zero_health() {
     let state = Arc::new(Mutex::new(EngineState::default()));
     let (_tx, rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
     let engine = TorrentEngine::new(
-        meta.clone(),
+        Arc::new(meta.clone()),
         dir.clone(),
         peer_id(b"-SW0001-"),
         binder,
@@ -2327,7 +2327,7 @@ async fn local_swarm_active_download_reports_non_zero_health() {
     //    non-zero signal is observed before completion.
     let calc = HealthCalculator::new();
     let state_for_sample = state.clone();
-    let meta_for_sample = meta.clone();
+    let meta_for_sample = Arc::new(meta.clone());
     let sampler = tokio::spawn(async move {
         let mut best: u8 = 0;
         let mut best_bars: u8 = 0;

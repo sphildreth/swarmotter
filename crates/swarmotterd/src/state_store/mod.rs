@@ -20,6 +20,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{
@@ -70,6 +71,14 @@ const DURABLE_RETENTION: RetentionLimits = RetentionLimits {
     metric_sample_rows: MAX_METRIC_SAMPLE_ROWS,
 };
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Instrumentation for changed-record persistence: total torrent records and
+/// queue documents written by `save_changed_records` since process start.
+/// Tests and diagnostics compare deltas to prove that a progress save is
+/// proportional to actual changes rather than library size.
+pub static CHANGED_SAVE_RECORDS_WRITTEN: AtomicU64 = AtomicU64::new(0);
+pub static CHANGED_SAVE_QUEUE_WRITES: AtomicU64 = AtomicU64::new(0);
+pub static CHANGED_SAVE_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DaemonState {
@@ -390,6 +399,102 @@ pub(crate) fn save_with_original_metainfo(
         }
         StateFileKind::Sqlite => save_sqlite_generation(path, state, original_metainfo),
     }
+}
+
+/// Whether the durable state file is a SQLite generation that supports
+/// proportional changed-record saves. Legacy JSON and missing state files
+/// must first be migrated by a full save.
+pub(crate) fn supports_incremental_saves(path: &Path) -> Result<bool> {
+    Ok(classify_state_file(path)? == StateFileKind::Sqlite)
+}
+
+/// Save only torrents whose durable content changed, plus an optionally
+/// changed queue document.
+///
+/// This is the progress-sample path: a tick that changes one torrent's
+/// progress must not serialize, validate, or rewrite the other library
+/// records. Removals, imports, and paired lifecycle transactions continue to
+/// use [`save`], which stages the complete registry and deletes records the
+/// registry no longer contains; this path never deletes durable rows and a
+/// torrent absent from the changed set keeps its existing record.
+///
+/// Durability is unchanged at the commit boundary: each call is a single
+/// `IMMEDIATE` transaction with `synchronous = FULL`. A full WAL checkpoint
+/// is deliberately skipped so a save stays proportional to the changed set;
+/// WAL growth is bounded by SQLite autocheckpointing and the paired
+/// transaction paths checkpoint explicitly before capturing the state file.
+pub(crate) fn save_changed_records(
+    path: &Path,
+    torrents: &[Torrent],
+    queue: Option<&QueueState<TorrentKey>>,
+) -> Result<()> {
+    CHANGED_SAVE_CALLS.fetch_add(1, Ordering::Relaxed);
+    CHANGED_SAVE_RECORDS_WRITTEN.fetch_add(torrents.len() as u64, Ordering::Relaxed);
+    if queue.is_some() {
+        CHANGED_SAVE_QUEUE_WRITES.fetch_add(1, Ordering::Relaxed);
+    }
+    verify_existing_sqlite_state_for_migration(path, true)?;
+    let mut connection = open_sqlite(path)?;
+    migrate_schema(&mut connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| {
+            CoreError::Storage(format!("begin SQLite changed-record transaction: {error}"))
+        })?;
+    for torrent in torrents {
+        let hash = durable_torrent_key(torrent)?;
+        let current_state = torrent.state.as_str();
+        let observed_at = unix_timestamp();
+        let previous_state: Option<String> = transaction
+            .query_row(
+                "SELECT lifecycle_state FROM torrent_records WHERE info_hash = ?1",
+                params![&hash],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| {
+                CoreError::Storage(format!("read durable torrent history: {error}"))
+            })?;
+        let (torrent_json, raw_info) = encode_torrent(torrent)?;
+        transaction
+            .execute(
+                "INSERT INTO torrent_records(
+                    info_hash, name, lifecycle_state, date_added, total_length, torrent_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(info_hash) DO UPDATE SET
+                    name = excluded.name,
+                    lifecycle_state = excluded.lifecycle_state,
+                    date_added = excluded.date_added,
+                    total_length = excluded.total_length,
+                    torrent_json = excluded.torrent_json",
+                params![
+                    &hash,
+                    &torrent.meta.name,
+                    current_state,
+                    torrent.date_added.to_string(),
+                    torrent.meta.total_length.to_string(),
+                    torrent_json,
+                ],
+            )
+            .map_err(|error| CoreError::Storage(format!("write durable torrent: {error}")))?;
+        write_history(
+            &transaction,
+            &hash,
+            previous_state.as_deref(),
+            current_state,
+        )?;
+        write_canonical_info(&transaction, &hash, raw_info.as_deref())?;
+        write_health_snapshot(&transaction, &hash, torrent)?;
+        write_current_metrics(&transaction, &hash, torrent, observed_at)?;
+        write_metric_sample(&transaction, &hash, torrent, observed_at)?;
+    }
+    if let Some(queue) = queue {
+        write_queue_state(&transaction, queue)?;
+    }
+    prune_retained_rows(&transaction, DURABLE_RETENTION)?;
+    transaction.commit().map_err(|error| {
+        CoreError::Storage(format!("commit SQLite changed-record transaction: {error}"))
+    })
 }
 
 pub(crate) fn capture_file(path: &Path) -> Result<StateFileSnapshot> {
@@ -1055,7 +1160,9 @@ fn read_authoritative_torrent_batch(
             ))
         })?;
         let mut torrent = deserialize_torrent_record(record_index, &key_locator, &torrent_json)?;
-        torrent.meta.raw_info = canonical_info;
+        let mut meta = (*torrent.meta).clone();
+        meta.raw_info = canonical_info;
+        torrent.meta = Arc::new(meta);
         records.push(RebuildTorrentRecord {
             key_locator,
             torrent,
@@ -1355,7 +1462,9 @@ fn write_state_transaction(
 
 fn encode_torrent(torrent: &Torrent) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     let mut stored = torrent.clone();
-    let raw_info = stored.meta.raw_info.take();
+    let mut meta = (*stored.meta).clone();
+    let raw_info = meta.raw_info.take();
+    stored.meta = Arc::new(meta);
     let json = serde_json::to_vec(&stored)
         .map_err(|error| CoreError::Storage(format!("serialize durable torrent: {error}")))?;
     Ok((json, raw_info))
@@ -1747,7 +1856,11 @@ fn hydrate_raw_metainfo(connection: &Connection, hash: &str, torrent: &mut Torre
             CoreError::Storage(format!("read durable raw metainfo row: {error}"))
         })?;
         match representation.as_str() {
-            "canonical_info" => torrent.meta.raw_info = Some(bytes),
+            "canonical_info" => {
+                let mut meta = (*torrent.meta).clone();
+                meta.raw_info = Some(bytes);
+                torrent.meta = Arc::new(meta);
+            }
             "original_torrent" => {}
             unexpected => {
                 return Err(CoreError::Storage(format!(

@@ -10,7 +10,7 @@
 
 mod construction;
 mod containment;
-mod diagnostics;
+pub(crate) mod diagnostics;
 mod lifecycle;
 mod persistence;
 mod policy_runtime;
@@ -81,12 +81,12 @@ use swarmotter_core::udp_tracker;
 use swarmotter_core::watch;
 
 use crate::containment_gate::ContainmentGate;
-use crate::engine::{EngineCommand, EngineState, TorrentEngine};
+use crate::engine::{EngineCommand, EngineState, SharedPeerWorkerLimit, TorrentEngine};
 use crate::netbinder::ContainedBinder;
 use crate::peer_permits::{
     PeerPermitPool, PeerPermitSnapshot, PeerSessionBudget, DEFAULT_PER_TORRENT_PEER_LIMIT,
 };
-use crate::seeder::{SeedRegistration, SeedRegistry, SeederHub};
+use crate::seeder::{DownloaderServeRegistry, SeedRegistration, SeedRegistry, SeederHub};
 use storage_controls::{
     is_storage_work_cancelled, storage_root_admission_for_path, storage_work_cancelled_error,
     ExplicitRecheckOperation, StorageAdmissionController, StorageAdmissionPlan,
@@ -170,7 +170,7 @@ struct LiveTorrentTaskSnapshot {
 }
 
 struct RecoveredSeederStart {
-    meta: meta::TorrentMeta,
+    meta: std::sync::Arc<meta::TorrentMeta>,
     active_dir: String,
     complete_dir: String,
     state: Arc<Mutex<EngineState>>,
@@ -223,6 +223,22 @@ pub struct DaemonRuntime {
     log_file_path: Option<PathBuf>,
     state_path: Option<PathBuf>,
     state_write_lock: Arc<Mutex<()>>,
+    /// Per-torrent durable-content fingerprints of the last persisted
+    /// generation, used to make progress persistence proportional to actual
+    /// changes instead of rewriting the whole library. See ADR-0073.
+    durable_fingerprints: Arc<Mutex<HashMap<TorrentKey, u64>>>,
+    /// Memoized full metadata fingerprints keyed by cheap metadata identity.
+    meta_fingerprints: Arc<Mutex<HashMap<TorrentKey, (u64, u64)>>>,
+    /// Fingerprint of the durable queue document at the last save.
+    durable_queue_fingerprint: Arc<Mutex<u64>>,
+    /// Whether the durable state file is a SQLite generation that supports
+    /// changed-record saves; legacy JSON state requires full saves until a
+    /// successful migration save has run.
+    incremental_persistence_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Runtime-local count of changed-record saves performed by this
+    /// process-global counter cannot be used by tests because other tests in
+    /// the same process legitimately perform changed-record saves.
+    changed_record_saves: Arc<std::sync::atomic::AtomicU64>,
     storage_ownership_lock: Arc<Mutex<()>>,
     /// Root-scoped active-engine reservations and shared write pressure
     /// limiters. These are local-storage controls only.
@@ -242,6 +258,15 @@ pub struct DaemonRuntime {
     explicit_rechecks: Arc<Mutex<HashMap<TorrentKey, ExplicitRecheckOperation>>>,
     engine_states: Arc<RwLock<HashMap<TorrentKey, Arc<Mutex<EngineState>>>>>,
     engine_cmds: Arc<Mutex<HashMap<TorrentKey, tokio::sync::mpsc::Sender<EngineCommand>>>>,
+    /// Coalesced distribution of the configured per-torrent peer worker
+    /// limit. Scheduler ticks update this lock-free state instead of
+    /// submitting a per-engine command per tick. See ADR-0071.
+    shared_peer_limit: Arc<SharedPeerWorkerLimit>,
+    /// Active downloading torrents eligible for inbound verified-piece
+    /// serving through the shared contained listener. See ADR-0075.
+    downloader_serves: DownloaderServeRegistry,
+    /// Shutdown signals matching each registered downloader serve context.
+    downloader_serve_shutdowns: Arc<Mutex<HashMap<TorrentKey, tokio::sync::watch::Sender<bool>>>>,
     engine_handles: Arc<RwLock<HashMap<TorrentKey, JoinHandle<()>>>>,
     seeder_shutdowns: Arc<Mutex<HashMap<TorrentKey, tokio::sync::watch::Sender<bool>>>>,
     seeder_registry: SeedRegistry,
@@ -486,7 +511,7 @@ struct StorageRootAccumulator {
 
 #[derive(Debug, Clone)]
 struct EngineStartSnapshot {
-    meta: meta::TorrentMeta,
+    meta: std::sync::Arc<meta::TorrentMeta>,
     complete_dir: String,
     active_dir: String,
     download_limit: u64,
@@ -677,7 +702,7 @@ fn resolve_incomplete_dir_from_config(download_dir: &str, cfg: &Config) -> Strin
 /// active configuration. Payload paths remain rooted at `download_dir`; only
 /// metadata moves when the operator opts into `storage.resume_dir`.
 pub(super) fn storage_io_with_config(
-    meta: meta::TorrentMeta,
+    meta: impl Into<std::sync::Arc<meta::TorrentMeta>>,
     download_dir: impl Into<PathBuf>,
     cfg: &Config,
 ) -> swarmotter_core::storage::StorageIo {

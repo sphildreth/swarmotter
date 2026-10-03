@@ -329,28 +329,30 @@ async fn storage_reuses_file_handles_for_repeated_block_io() {
 
     store.write_block(0, 0, &content[..8]).await.unwrap();
     let first_handle = store
-        .file_handles
+        .writable_cache
         .lock()
         .await
+        .handles
         .get(&0)
         .unwrap()
         .file
         .clone();
-    assert_eq!(store.file_handles.lock().await.len(), 1);
+    assert_eq!(store.writable_cache.lock().await.handles.len(), 1);
 
     let clone = store.clone();
     clone.write_block(1, 0, &content[8..]).await.unwrap();
     let second_handle = clone
-        .file_handles
+        .writable_cache
         .lock()
         .await
+        .handles
         .get(&0)
         .unwrap()
         .file
         .clone();
     assert!(Arc::ptr_eq(&first_handle, &second_handle));
     assert_eq!(clone.read_block(0, 0, 8).await.unwrap(), &content[..8]);
-    assert_eq!(clone.file_handles.lock().await.len(), 1);
+    assert_eq!(clone.writable_cache.lock().await.handles.len(), 1);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -379,7 +381,7 @@ async fn read_only_recheck_does_not_retain_payload_handles() {
 
     assert_eq!(verified.count(meta.piece_count()), meta.piece_count());
     assert!(
-        store.file_handles.lock().await.is_empty(),
+        store.writable_cache.lock().await.handles.is_empty(),
         "read-only rechecks must not retain Tokio file buffers"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -405,7 +407,7 @@ async fn writable_file_handle_cache_is_bounded() {
     }
 
     assert!(
-        store.file_handles.lock().await.len() <= MAX_CACHED_WRITABLE_FILE_HANDLES,
+        store.writable_cache.lock().await.handles.len() <= MAX_CACHED_WRITABLE_FILE_HANDLES,
         "writable handle cache exceeded its fixed working-set bound"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -1174,4 +1176,154 @@ fn storage_rejects_empty_path_components() {
     };
     let store = StorageIo::new(meta, std::env::temp_dir());
     assert!(store.file_path(0).is_err());
+}
+
+// --- Safe eviction protocol and process-wide handle budget (ADR-0072) ---
+
+#[tokio::test]
+async fn eviction_beyond_64_files_preserves_every_written_byte() {
+    let file_count = MAX_CACHED_WRITABLE_FILE_HANDLES * 3;
+    let files = (0..file_count)
+        .map(|index| (vec![format!("file-{index}.bin")], 3u64))
+        .collect::<Vec<_>>();
+    let owned_contents = (0..file_count)
+        .map(|index| {
+            vec![
+                index as u8,
+                (index * 7 % 251) as u8,
+                (index * 13 % 251) as u8,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let contents = owned_contents.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let bytes = build_multi_file_torrent("eviction", &files, &contents, 3, None);
+    let meta = parse_torrent(&bytes).unwrap();
+    let dir = unique_dir("eviction-readback");
+    let store = StorageIo::new(meta.clone(), dir.clone());
+
+    // Write every piece sequentially: each write touches a new file and
+    // forces repeated LRU eviction while earlier handles leave the cache.
+    for (index, content) in contents.iter().enumerate() {
+        store.write_piece(index, content).await.unwrap();
+    }
+    // Cache must stay bounded.
+    assert!(store.writable_cache.lock().await.handles.len() <= MAX_CACHED_WRITABLE_FILE_HANDLES);
+
+    // Readback through a fresh barrier observes all writes despite eviction.
+    for (index, content) in contents.iter().enumerate() {
+        assert_eq!(store.read_piece(index).await.unwrap(), *content);
+        assert!(store.verify_piece_on_disk(index).await.unwrap());
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn parallel_writers_across_eviction_keep_verified_readback() {
+    let file_count = MAX_CACHED_WRITABLE_FILE_HANDLES * 2 + 7;
+    let files = (0..file_count)
+        .map(|index| (vec![format!("p-{index}.bin")], 5u64))
+        .collect::<Vec<_>>();
+    let owned_contents: Vec<Vec<u8>> = (0..file_count).map(|index| vec![index as u8; 5]).collect();
+    let contents: Vec<&[u8]> = owned_contents.iter().map(Vec::as_slice).collect();
+    let contents_ref = contents.clone();
+    let bytes = build_multi_file_torrent("parallel-evict", &files, &contents_ref, 5, None);
+    let meta = parse_torrent(&bytes).unwrap();
+    let dir = unique_dir("parallel-eviction");
+    let store = Arc::new(StorageIo::new(meta.clone(), dir.clone()));
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, content) in contents.iter().enumerate() {
+        let store = store.clone();
+        let content = content.to_vec();
+        tasks.spawn(async move { store.write_piece(index, &content).await });
+    }
+    while let Some(joined) = tasks.join_next().await {
+        joined
+            .expect("parallel writer task")
+            .expect("parallel writer write");
+    }
+
+    assert!(store.writable_cache.lock().await.handles.len() <= MAX_CACHED_WRITABLE_FILE_HANDLES);
+    for (index, content) in contents.iter().enumerate() {
+        assert_eq!(store.read_piece(index).await.unwrap(), *content);
+    }
+    let verified = store.recheck().await.unwrap();
+    assert_eq!(verified.count(meta.piece_count()), meta.piece_count());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn global_handle_budget_evicts_across_handle_sets() {
+    let budget = StorageHandleBudget::new(4);
+    let file_sets = 6;
+    let mut stores = Vec::new();
+    for torrent in 0..file_sets {
+        let files = (0..4)
+            .map(|index| (vec![format!("t{torrent}-f{index}.bin")], 1u64))
+            .collect::<Vec<_>>();
+        let contents: Vec<&[u8]> = vec![b"x", b"x", b"x", b"x"];
+        let bytes =
+            build_multi_file_torrent(&format!("budget-{torrent}"), &files, &contents, 1, None);
+        let meta = parse_torrent(&bytes).unwrap();
+        let dir = unique_dir(&format!("budget-{torrent}"));
+        let store = StorageIo::new(meta, dir.clone()).with_handle_budget(Some(budget.clone()));
+        stores.push((store, dir));
+    }
+
+    // Each torrent caches up to its per-torrent bound, but the process-wide
+    // budget caps total live writable handles.
+    for (store, _) in &stores {
+        for index in 0..4 {
+            store.write_piece(index, b"x").await.unwrap();
+        }
+    }
+    let live = budget.live_handles();
+    assert!(
+        live <= 6,
+        "process-wide budget exceeded: {live} live writable handles for bound 4"
+    );
+    for (store, dir) in stores {
+        for index in 0..4 {
+            assert!(store.verify_piece_on_disk(index).await.unwrap());
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+#[tokio::test]
+async fn injected_flush_failure_at_eviction_reaches_the_caller() {
+    let file_count = MAX_CACHED_WRITABLE_FILE_HANDLES + 2;
+    let files = (0..file_count)
+        .map(|index| (vec![format!("f-{index}.bin")], 1u64))
+        .collect::<Vec<_>>();
+    let owned_contents: Vec<Vec<u8>> = (0..file_count).map(|_| vec![7u8]).collect();
+    let contents: Vec<&[u8]> = owned_contents.iter().map(Vec::as_slice).collect();
+    let bytes = build_multi_file_torrent("flush-fail", &files, &contents, 1, None);
+    let meta = parse_torrent(&bytes).unwrap();
+    let dir = unique_dir("flush-failure-eviction");
+    let mut store = StorageIo::new(meta.clone(), dir.clone());
+    store.inject_flush_failure_for_test();
+
+    // Writes succeed until a write crosses the cache bound and eviction must
+    // flush an evicted handle; the injected failure must surface instead of
+    // silently discarding pending writes behind the evicted handle.
+    let mut first_error = None;
+    for index in 0..file_count {
+        if let Err(error) = store.write_piece(index, b"\x07").await {
+            first_error = Some((index, error));
+            break;
+        }
+    }
+    let (index, error) = first_error.expect("eviction flush failure should surface");
+    assert!(
+        index >= MAX_CACHED_WRITABLE_FILE_HANDLES,
+        "failure must appear at an eviction boundary, not on the first files"
+    );
+    assert!(error.to_string().contains("injected"), "{error}");
+    // Pieces written before the failure remain verifiable: no trusted claim
+    // extends past the failing boundary.
+    for earlier in 0..index {
+        assert!(store.verify_piece_on_disk(earlier).await.unwrap());
+    }
+    std::fs::remove_dir_all(dir).ok();
 }

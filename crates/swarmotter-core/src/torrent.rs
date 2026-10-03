@@ -15,6 +15,7 @@ use crate::ratio::TorrentSeeding;
 use crate::storage::PieceProgress;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// Per-torrent runtime settings.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -42,7 +43,7 @@ pub enum ContainmentRecoveryIntent {
 /// An in-memory torrent record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Torrent {
-    pub meta: TorrentMeta,
+    pub meta: Arc<TorrentMeta>,
     pub state: TorrentState,
     pub progress: PieceProgress,
     pub downloaded: u64,
@@ -113,7 +114,8 @@ pub struct Torrent {
 }
 
 impl Torrent {
-    pub fn new(meta: TorrentMeta, date_added: u64) -> Self {
+    pub fn new(meta: impl Into<Arc<TorrentMeta>>, date_added: u64) -> Self {
+        let meta = meta.into();
         // Pure v2 has a file-aligned logical piece space.  Valid complete
         // metainfo provides that layout; unresolved magnets deliberately fall
         // back to their placeholder count until metadata arrives.

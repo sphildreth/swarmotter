@@ -54,7 +54,216 @@ fn daemon_state_for_persistence(
     Ok(crate::state_store::DaemonState::new(torrents, queue))
 }
 
+/// Cheap structural identity of a torrent's immutable metadata. When this
+/// matches the last observed value, the memoized full metadata fingerprint
+/// (piece hashes, raw info bytes, BEP 52 layers) is reused instead of being
+/// re-hashed on every reconciliation tick.
+fn meta_identity_fingerprint(t: &Torrent) -> u64 {
+    let mut hash = FnvHasher::default();
+    let meta = &t.meta;
+    hash.update(meta.info_hash.as_bytes());
+    hash.update(
+        meta.identity
+            .primary_key()
+            .map(|k| k.to_locator())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hash.update(meta.name.as_bytes());
+    hash.update(&meta.piece_length.to_le_bytes());
+    hash.update(&meta.total_length.to_le_bytes());
+    hash.update(&(meta.pieces.len() as u64).to_le_bytes());
+    hash.update(&(meta.files.len() as u64).to_le_bytes());
+    for file in &meta.files {
+        hash.update(file.path.join("/").as_bytes());
+        hash.update(&file.length.to_le_bytes());
+    }
+    hash.update(&[u8::from(meta.private)]);
+    hash.update(meta.announce.as_deref().unwrap_or_default().as_bytes());
+    for tier in &meta.announce_list {
+        for tracker in tier {
+            hash.update(tracker.as_bytes());
+        }
+    }
+    hash.update(&(meta.webseeds.len() as u64).to_le_bytes());
+    for webseed in &meta.webseeds {
+        hash.update(webseed.as_bytes());
+    }
+    hash.update(meta.comment.as_deref().unwrap_or_default().as_bytes());
+    hash.update(meta.created_by.as_deref().unwrap_or_default().as_bytes());
+    hash.update(&meta.creation_date.unwrap_or(0).to_le_bytes());
+    hash.update(&[u8::from(meta.is_multi_file)]);
+    if let Some(v2) = &meta.v2 {
+        hash.update(&[1]);
+        hash.update(&(v2.piece_layers.len() as u64).to_le_bytes());
+    } else {
+        hash.update(&[0]);
+    }
+    hash.update(
+        &meta
+            .raw_info
+            .as_ref()
+            .map(Vec::len)
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
+    hash.finish()
+}
+
+/// Full fingerprint of immutable metadata: expensive inputs hashed only when
+/// the cheap identity changed.
+fn meta_full_fingerprint(t: &Torrent) -> u64 {
+    let mut hash = FnvHasher::default();
+    for piece in &t.meta.pieces {
+        hash.update(piece);
+    }
+    if let Some(raw_info) = &t.meta.raw_info {
+        hash.update(raw_info);
+    }
+    if let Some(v2) = &t.meta.v2 {
+        for layer in &v2.piece_layers {
+            hash.update(layer.pieces_root.as_bytes());
+            for piece_hash in &layer.hashes {
+                hash.update(piece_hash.as_bytes());
+            }
+        }
+    }
+    hash.finish()
+}
+
+/// Fingerprint of every durable field of a torrent record except its
+/// immutable metadata, which is covered by the memoized metadata
+/// fingerprint. A reconciliation tick must not rewrite records whose durable
+/// content did not change (ADR-0073).
+fn torrent_durable_fingerprint(t: &Torrent, meta_full: u64) -> u64 {
+    let mut hash = FnvHasher::default();
+    hash.update(&meta_full.to_le_bytes());
+    hash.update(t.state.as_str().as_bytes());
+    hash.update(t.progress.bitfield().as_bytes());
+    hash.update(&t.downloaded.to_le_bytes());
+    hash.update(&t.uploaded.to_le_bytes());
+    hash.update(&t.rate_down.to_le_bytes());
+    hash.update(&t.rate_up.to_le_bytes());
+    hash.update(&(t.active_peer_workers as u64).to_le_bytes());
+    hash.update(&(t.known_peers as u64).to_le_bytes());
+    hash.update(
+        &t.seeding
+            .ratio_limit
+            .map(|r| r.to_bits())
+            .unwrap_or(0)
+            .to_le_bytes(),
+    );
+    hash.update(&t.seeding.idle_limit.unwrap_or(0).to_le_bytes());
+    hash.update(&[u8::from(t.seeding.seed_forever)]);
+    hash.update(format!("{:?}", t.seeding_status).as_bytes());
+    for label in &t.labels {
+        hash.update(label.as_bytes());
+    }
+    hash.update(t.download_dir.as_deref().unwrap_or_default().as_bytes());
+    hash.update(&t.date_added.to_le_bytes());
+    hash.update(&t.date_completed.unwrap_or(0).to_le_bytes());
+    for file in &t.files {
+        hash.update(file.path.as_bytes());
+        hash.update(&file.length.to_le_bytes());
+        hash.update(&file.bytes_completed.to_le_bytes());
+        hash.update(format!("{:?}", file.priority).as_bytes());
+        hash.update(&[u8::from(file.wanted)]);
+    }
+    for priority in &t.priorities {
+        hash.update(format!("{:?}", priority).as_bytes());
+    }
+    for wanted in &t.wanted {
+        hash.update(&[u8::from(*wanted)]);
+    }
+    hash.update(t.error.as_deref().unwrap_or_default().as_bytes());
+    hash.update(&[t.health.score, t.health.bars]);
+    hash.update(format!("{:?}", t.health.label).as_bytes());
+    hash.update(&[
+        t.health.availability_score,
+        t.health.throughput_score,
+        t.health.peer_score,
+        t.health.stability_score,
+        t.health.discovery_score,
+    ]);
+    for reason in &t.health.reasons {
+        hash.update(reason.as_bytes());
+    }
+    hash.update(&t.download_limit.to_le_bytes());
+    hash.update(&t.upload_limit.to_le_bytes());
+    hash.update(&[u8::from(t.needs_metadata)]);
+    if let Some(magnet_hash) = &t.magnet_info_hash {
+        hash.update(magnet_hash.as_bytes());
+    }
+    hash.update(t.magnet_name.as_deref().unwrap_or_default().as_bytes());
+    for tracker in &t.magnet_trackers {
+        hash.update(tracker.as_bytes());
+    }
+    for index in &t.magnet_select_only_file_indices {
+        hash.update(&(*index as u64).to_le_bytes());
+    }
+    hash.update(&[u8::from(t.containment_recovery_intent.is_some())]);
+    hash.update(format!("{:?}", t.autopilot_mode_override).as_bytes());
+    hash.update(format!("{:?}", t.policy).as_bytes());
+    hash.finish()
+}
+
+/// FNV-1a over byte slices, used only for changed-record detection.
+#[derive(Default)]
+struct FnvHasher {
+    state: u64,
+}
+
+impl FnvHasher {
+    fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.state ^= *byte as u64;
+            self.state = self.state.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.state
+    }
+}
+
+/// Queue fingerprint used to skip rewriting the durable queue projection
+/// when reconciliation did not change queue order.
+fn queue_fingerprint(queue: &QueueState<TorrentKey>) -> u64 {
+    let mut hash = FnvHasher::default();
+    for hash_key in queue.order.iter().chain(queue.bypass.iter()) {
+        hash.update(hash_key.to_locator().as_bytes());
+    }
+    hash.update(&queue.limits.max_active_downloads.to_le_bytes());
+    hash.update(&queue.limits.max_active_seeds.to_le_bytes());
+    hash.update(&queue.limits.max_active_metadata_fetches.to_le_bytes());
+    hash.finish()
+}
+
 impl DaemonRuntime {
+    /// Re-scan every registry record and adopt the current fingerprints as
+    /// the persisted generation. Called after successful full saves.
+    async fn refresh_durable_fingerprints(&self) {
+        let mut meta_fps = self.meta_fingerprints.lock().await;
+        let mut fingerprints = self.durable_fingerprints.lock().await;
+        let reg = self.registry.lock().await;
+        meta_fps.retain(|hash, _| reg.torrents.contains_key(hash));
+        fingerprints.retain(|hash, _| reg.torrents.contains_key(hash));
+        for (hash, torrent) in &reg.torrents {
+            let meta_cheap = meta_identity_fingerprint(torrent);
+            let meta_full = match meta_fps.get(hash) {
+                Some((cheap, full)) if *cheap == meta_cheap => *full,
+                _ => {
+                    let full = meta_full_fingerprint(torrent);
+                    meta_fps.insert(*hash, (meta_cheap, full));
+                    full
+                }
+            };
+            fingerprints.insert(*hash, torrent_durable_fingerprint(torrent, meta_full));
+        }
+        let queue = self.queue.lock().await;
+        *self.durable_queue_fingerprint.lock().await = queue_fingerprint(&queue);
+    }
+
     pub async fn restore_persisted_state(&self) -> Result<usize> {
         let Some(path) = self.state_path.clone() else {
             return Ok(0);
@@ -365,6 +574,13 @@ impl DaemonRuntime {
         Ok(())
     }
 
+    /// Test diagnostics: how many changed-record saves this runtime ran.
+    #[cfg(test)]
+    pub(super) fn changed_record_save_count(&self) -> u64 {
+        self.changed_record_saves
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(super) async fn persist_state(&self) -> Result<()> {
         self.persist_state_with_original_metainfo(None).await
     }
@@ -374,6 +590,13 @@ impl DaemonRuntime {
     /// SQLite transaction. The raw document is intentionally distinct from
     /// canonical BEP 9 `info` metadata; the authenticated native export path
     /// may return only this exact representation.
+    ///
+    /// Progress reconciliation uses changed-record persistence (ADR-0073):
+    /// torrents whose durable fingerprint did not change are neither
+    /// serialized nor rewritten. Lifecycle transactions keep their full-save
+    /// semantics — removals, imports, and paired transactions stage the
+    /// complete registry so durable state can never resurrect a removed
+    /// torrent or lose a queue entry.
     async fn persist_state_with_original_metainfo(
         &self,
         original_metainfo: Option<crate::state_store::OriginalMetainfo>,
@@ -382,21 +605,144 @@ impl DaemonRuntime {
             return Ok(());
         };
         let _write_guard = self.state_write_lock.lock().await;
-        let torrents = self
-            .registry
-            .lock()
-            .await
-            .torrents
-            .values()
-            .cloned()
-            .collect();
-        let queue = self.queue.lock().await.clone();
+        if original_metainfo.is_some()
+            || !self
+                .incremental_persistence_ready
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.persist_full_state_locked(path, original_metainfo)
+                .await
+        } else {
+            self.persist_changed_state_locked(path).await
+        }
+    }
+
+    /// Full-save path. Also refreshes the fingerprint maps so subsequent
+    /// reconciliation ticks can detect actual changes only. Fingerprint
+    /// adoption happens after the save commits so a failed save is retried.
+    async fn persist_full_state_locked(
+        &self,
+        path: PathBuf,
+        original_metainfo: Option<crate::state_store::OriginalMetainfo>,
+    ) -> Result<()> {
+        let (torrents, queue, fingerprint_updates, queue_fingerprint_value) = {
+            let mut meta_fps = self.meta_fingerprints.lock().await;
+            let reg = self.registry.lock().await;
+            let mut torrents = Vec::with_capacity(reg.torrents.len());
+            let mut fingerprint_updates = Vec::with_capacity(reg.torrents.len());
+            for (hash, torrent) in &reg.torrents {
+                let meta_cheap = meta_identity_fingerprint(torrent);
+                let meta_full = match meta_fps.get(hash) {
+                    Some((cheap, full)) if *cheap == meta_cheap => *full,
+                    _ => {
+                        let full = meta_full_fingerprint(torrent);
+                        meta_fps.insert(*hash, (meta_cheap, full));
+                        full
+                    }
+                };
+                fingerprint_updates.push((*hash, torrent_durable_fingerprint(torrent, meta_full)));
+                torrents.push(torrent.clone());
+            }
+            let queue = self.queue.lock().await.clone();
+            let queue_fingerprint_value = queue_fingerprint(&queue);
+            (
+                torrents,
+                queue,
+                fingerprint_updates,
+                queue_fingerprint_value,
+            )
+        };
         let state = daemon_state_for_persistence(torrents, queue)?;
+        self.incremental_persistence_ready.store(
+            crate::state_store::supports_incremental_saves(&path).unwrap_or(false),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         tokio::task::spawn_blocking(move || {
             crate::state_store::save_with_original_metainfo(&path, &state, original_metainfo)
         })
         .await
         .map_err(|error| CoreError::Storage(format!("save daemon state task: {error}")))??;
+        {
+            let mut fingerprints = self.durable_fingerprints.lock().await;
+            fingerprints.retain(|hash, _| fingerprint_updates.iter().any(|(key, _)| key == hash));
+            for (hash, fingerprint) in fingerprint_updates {
+                fingerprints.insert(hash, fingerprint);
+            }
+        }
+        *self.durable_queue_fingerprint.lock().await = queue_fingerprint_value;
+        Ok(())
+    }
+
+    /// Changed-record save: serialize and rewrite only torrents whose durable
+    /// fingerprint changed since the last persisted generation. The registry
+    /// lock is held only for the fingerprint scan and the clones of changed
+    /// records, never across serialization or database work.
+    async fn persist_changed_state_locked(&self, path: PathBuf) -> Result<()> {
+        self.changed_record_saves
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (changed, queue, queue_changed) = {
+            let fingerprints = self.durable_fingerprints.lock().await;
+            let mut meta_fps = self.meta_fingerprints.lock().await;
+            let reg = self.registry.lock().await;
+            let mut changed = Vec::new();
+            for (hash, torrent) in &reg.torrents {
+                let meta_cheap = meta_identity_fingerprint(torrent);
+                let meta_full = match meta_fps.get(hash) {
+                    Some((cheap, full)) if *cheap == meta_cheap => *full,
+                    _ => {
+                        let full = meta_full_fingerprint(torrent);
+                        meta_fps.insert(*hash, (meta_cheap, full));
+                        full
+                    }
+                };
+                let fingerprint = torrent_durable_fingerprint(torrent, meta_full);
+                if fingerprints.get(hash).copied() != Some(fingerprint) {
+                    changed.push((*hash, fingerprint, torrent.clone()));
+                }
+            }
+            let queue = self.queue.lock().await.clone();
+            let queue_fingerprint = queue_fingerprint(&queue);
+            let queue_changed = *self.durable_queue_fingerprint.lock().await != queue_fingerprint;
+            // Validate changed records exactly like the full save does so a
+            // progress update can never persist structurally inconsistent
+            // piece progress.
+            for (_, _, torrent) in &changed {
+                validate_torrent_piece_progress(torrent, torrent_piece_count(torrent))?;
+            }
+            (changed, queue, (queue_fingerprint, queue_changed))
+        };
+        let (queue_fingerprint, queue_changed) = queue_changed;
+        if changed.is_empty() && !queue_changed {
+            return Ok(());
+        }
+        let queue_to_write = queue_changed.then_some(queue);
+        let changed_records: Vec<Torrent> = changed
+            .iter()
+            .map(|(_, _, torrent)| torrent.clone())
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            crate::state_store::save_changed_records(
+                &path,
+                &changed_records,
+                queue_to_write.as_ref(),
+            )
+        })
+        .await
+        .map_err(|error| {
+            CoreError::Storage(format!("save changed daemon state task: {error}"))
+        })??;
+        // The commit succeeded; only now adopt the new fingerprints so a
+        // failed commit is retried on the next tick instead of being
+        // permanently skipped.
+        {
+            let mut fingerprints = self.durable_fingerprints.lock().await;
+            for (hash, fingerprint, _) in &changed {
+                fingerprints.insert(*hash, *fingerprint);
+            }
+        }
+        if queue_changed {
+            *self.durable_queue_fingerprint.lock().await = queue_fingerprint;
+        }
         Ok(())
     }
 
@@ -462,6 +808,15 @@ impl DaemonRuntime {
             tokio::task::spawn_blocking(move || crate::state_store::save(&write_path, &state))
                 .await
                 .map_err(|error| CoreError::Storage(format!("save daemon state task: {error}")))?;
+        if persisted.is_ok() {
+            // Adopt the persisted generation's fingerprints so the next
+            // reconciliation tick only rewrites actual changes.
+            self.refresh_durable_fingerprints().await;
+            self.incremental_persistence_ready.store(
+                crate::state_store::supports_incremental_saves(&path).unwrap_or(false),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
         if let Err(error) = persisted {
             let rollback_path = path.clone();
             let rollback_snapshot = snapshot.clone();
@@ -1322,7 +1677,7 @@ impl DaemonRuntime {
     pub(super) async fn commit_metadata_preview_resolution(
         &self,
         hash: TorrentKey,
-        resolved: meta::TorrentMeta,
+        resolved: Arc<meta::TorrentMeta>,
     ) -> Result<()> {
         if resolved.identity.primary_key() != Some(hash) {
             return Err(CoreError::MalformedTorrent(
@@ -1440,7 +1795,7 @@ impl DaemonRuntime {
     pub(super) async fn reserve_resolved_magnet_metadata(
         &self,
         hash: TorrentKey,
-        resolved: meta::TorrentMeta,
+        resolved: Arc<meta::TorrentMeta>,
         complete_dir: String,
         active_dir: String,
         cancellation: StorageWorkCancellation,

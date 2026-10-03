@@ -267,3 +267,56 @@ mod reconcile;
 mod scheduler;
 mod trackers;
 mod watch;
+
+// --- Coalesced peer worker limit distribution (ADR-0071) ---
+
+#[tokio::test]
+async fn apply_peer_worker_limits_never_blocks_on_a_saturated_engine_channel() {
+    let root = unique_dir("peer-worker-limit-shared");
+    let config_path = root.join("swarmotter.toml");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.storage.download_dir = Some(root.display().to_string());
+    write_config_atomically(&config_path, &cfg).unwrap();
+    let mut health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    health.traffic_allowed = true;
+    let runtime = DaemonRuntime::with_paths_and_broker(
+        cfg,
+        health,
+        Some(config_path.clone()),
+        None,
+        EventBroker::default(),
+    );
+
+    // Register a fake engine channel that no receiver drains. The old
+    // per-tick command fan-out would eventually block on this channel; the
+    // shared-state distribution must never touch it.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<EngineCommand>(8);
+    for _ in 0..8 {
+        tx.send(EngineCommand::Reannounce).await.unwrap();
+    }
+    let fake_key = TorrentKey::v1(swarmotter_core::hash::InfoHash::from_bytes([0x11u8; 20]));
+    runtime.engine_cmds.lock().await.insert(fake_key, tx);
+    assert!(runtime.engine_cmds.lock().await.contains_key(&fake_key));
+
+    runtime.config.write().await.bandwidth.max_peers_per_torrent = 5;
+    for _ in 0..100 {
+        tokio::time::timeout(Duration::from_secs(1), runtime.apply_peer_worker_limits())
+            .await
+            .expect("coalesced limit application must never wait on an engine channel");
+    }
+    assert_eq!(runtime.shared_peer_limit.load_default(), 5);
+    // The fake engine channel still holds exactly its eight prefilled
+    // commands: nothing was enqueued by limit distribution.
+    let mut drained = 0;
+    while rx.try_recv().is_ok() {
+        drained += 1;
+    }
+    assert_eq!(drained, 8);
+
+    std::fs::remove_dir_all(root).ok();
+}

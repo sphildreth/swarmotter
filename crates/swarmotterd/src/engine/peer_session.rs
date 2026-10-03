@@ -114,11 +114,24 @@ impl TorrentEngine {
 
         // We are interested; ask to be unchoked.
         peer::write_message(&mut write_half, &Message::Interested).await?;
+        // Download-time uploading (ADR-0075): unchoke the peer so it can
+        // request verified pieces from this downloading torrent.
+        peer::write_message(&mut write_half, &Message::Unchoke).await?;
 
         let mut peer_bf: Option<Bitfield> = None;
         let mut peer_choking = true;
         let mut made_progress = false;
         let piece_count = self.meta.piece_count();
+        let mut inbound_serve = InboundUploadQueue::default();
+        let mut announced_pieces = {
+            let mut announced = PieceBitfield::new(piece_count);
+            for piece in 0..piece_count {
+                if have.has(piece) {
+                    announced.set(piece);
+                }
+            }
+            announced
+        };
         let mut remote_pex_id: Option<u8> = None;
         let mut no_progress_reason: Option<&'static str> = None;
 
@@ -249,11 +262,30 @@ impl TorrentEngine {
                                 .await;
                                 peer_bf = Some(bf);
                             }
+                            Message::Request {
+                                piece,
+                                offset,
+                                length,
+                            } => {
+                                inbound_serve.offer(
+                                    piece,
+                                    offset,
+                                    length,
+                                    have,
+                                    piece_count,
+                                    |index| self.piece_length(index),
+                                );
+                            }
+                            Message::Cancel {
+                                piece,
+                                offset,
+                                length,
+                            } => {
+                                inbound_serve.cancel(piece, offset, length);
+                            }
                             Message::Keepalive
                             | Message::Interested
                             | Message::NotInterested
-                            | Message::Request { .. }
-                            | Message::Cancel { .. }
                             | Message::Reject { .. }
                             | Message::HashRequest { .. }
                             | Message::Hashes { .. }
@@ -261,6 +293,17 @@ impl TorrentEngine {
                             | Message::Extended { .. }
                             | Message::Unknown { .. } => {}
                         }
+                        // Bounded serve drain: uploads never starve the
+                        // download side of this session (ADR-0075).
+                        inbound_serve
+                            .serve_bounded(
+                                &mut write_half,
+                                storage,
+                                &self.state,
+                                *peer_addr,
+                                &self.limiter,
+                            )
+                            .await?;
                     }
 
                     if received_blocks == reqs.len() {
@@ -275,7 +318,11 @@ impl TorrentEngine {
                             have.set(piece_index);
                             made_progress = true;
                             self.update_progress(have).await;
-                            self.persist_resume(storage, have).await?;
+                            // Coalesced checkpoint policy (ADR-0074): the piece
+                            // is verified and written; the resume checkpoint is
+                            // deferred until the pieces/interval policy is due.
+                            self.mark_resume_piece_verified();
+                            self.maybe_persist_resume(storage, have, false).await?;
                             // Tell the peer we have it.
                             peer::write_message(
                                 &mut write_half,
@@ -340,12 +387,26 @@ impl TorrentEngine {
                             .await;
                     }
                 }
+                Message::Request {
+                    piece,
+                    offset,
+                    length,
+                } => {
+                    inbound_serve.offer(piece, offset, length, have, piece_count, |index| {
+                        self.piece_length(index)
+                    });
+                }
+                Message::Cancel {
+                    piece,
+                    offset,
+                    length,
+                } => {
+                    inbound_serve.cancel(piece, offset, length);
+                }
                 Message::Keepalive
                 | Message::Interested
                 | Message::NotInterested
-                | Message::Request { .. }
                 | Message::Piece { .. }
-                | Message::Cancel { .. }
                 | Message::Reject { .. }
                 | Message::HashRequest { .. }
                 | Message::Hashes { .. }
@@ -385,8 +446,32 @@ impl TorrentEngine {
                     }
                 }
             }
+            // Bounded serve drain + availability updates in the serial
+            // wait-for-state phase (ADR-0075).
+            inbound_serve
+                .serve_bounded(
+                    &mut write_half,
+                    storage,
+                    &self.state,
+                    *peer_addr,
+                    &self.limiter,
+                )
+                .await?;
+            for piece in 0..piece_count {
+                if have.has(piece) && !announced_pieces.has(piece) {
+                    peer::write_message(
+                        &mut write_half,
+                        &Message::Have {
+                            piece: piece as u32,
+                        },
+                    )
+                    .await?;
+                    announced_pieces.set(piece);
+                }
+            }
         }
 
+        inbound_serve.clear();
         if made_progress {
             return Ok((true, "progressed"));
         }
@@ -461,6 +546,20 @@ pub(super) async fn record_peer_availability(
     entry.last_seen = Some(Instant::now());
 }
 
+/// Account upload bytes served to a peer on the engine state. A bidirectional
+/// session counts uploaded bytes exactly once (ADR-0075).
+pub(super) async fn record_peer_uploaded(
+    state: &Arc<Mutex<EngineState>>,
+    peer_addr: PeerAddr,
+    bytes: u64,
+) {
+    let mut s = state.lock().await;
+    s.uploaded = s.uploaded.saturating_add(bytes);
+    if let Some(peer) = s.peer_health.get_mut(&peer_addr.socket_addr()) {
+        peer.last_seen = Some(Instant::now());
+    }
+}
+
 pub(super) async fn record_peer_block(
     state: &Arc<Mutex<EngineState>>,
     peer_addr: PeerAddr,
@@ -509,6 +608,19 @@ pub(super) async fn record_peer_hash_failure(state: &Arc<Mutex<EngineState>>, pe
 pub(super) async fn record_peer_disconnect(state: &Arc<Mutex<EngineState>>) {
     let mut st = state.lock().await;
     st.peer_disconnects_recent = st.peer_disconnects_recent.saturating_add(1);
+}
+
+/// Clear failure backoff for peers that fresh discovery still reports as
+/// swarm members. Discovery evidence is the retry trigger; without it a peer
+/// whose listener was briefly unavailable (startup race, restart, churn)
+/// would stay unreachable for the whole failure window.
+pub(super) fn reset_failure_backoff_for_discovered(
+    refreshed: &[PeerAddr],
+    bad_peers: &mut HashMap<SocketAddr, Instant>,
+) {
+    for peer in refreshed {
+        bad_peers.remove(&peer.socket_addr());
+    }
 }
 
 pub(super) fn prune_peer_backoff(backoff: &mut HashMap<SocketAddr, Instant>) {
@@ -693,9 +805,18 @@ pub(super) async fn attempt_peer_wire_transport(
     write_half.flush().await?;
     let mut reader = PeerReader::new(read_half);
     let their_hs = timeout(Duration::from_secs(10), reader.read_handshake()).await??;
+    tracing::trace!(peer = %peer_addr.socket_addr(), ours = ?peer_id, theirs = ?their_hs.peer_id, "outbound handshake exchange");
     if their_hs.info_hash != info_hash {
         return Err(CoreError::Internal(
             "peer handshake info hash mismatch".into(),
+        ));
+    }
+    // Standard self-connection detection: a remote peer id equal to ours
+    // means we dialed our own listener; drop before exchanging bitfields so
+    // a daemon can never serve or download from itself.
+    if their_hs.peer_id == peer_id {
+        return Err(CoreError::Internal(
+            "self connection detected by matching peer id".into(),
         ));
     }
     let decision = peer_filter.admit_client_id(&their_hs.peer_id);

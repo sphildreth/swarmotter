@@ -236,7 +236,7 @@ async fn metadata_preview_resolution_commits_selection_before_public_state() {
     );
 
     runtime
-        .commit_metadata_preview_resolution(hash, resolved.clone())
+        .commit_metadata_preview_resolution(hash, Arc::new(resolved.clone()))
         .await
         .unwrap();
     let committed = runtime.registry.lock().await.get(&hash).cloned().unwrap();
@@ -371,7 +371,7 @@ async fn metadata_preview_rejects_out_of_range_deferred_selection_durably() {
     runtime.queue.lock().await.add(hash);
 
     let error = runtime
-        .commit_metadata_preview_resolution(hash, resolved)
+        .commit_metadata_preview_resolution(hash, std::sync::Arc::new(resolved))
         .await
         .unwrap_err();
     assert!(matches!(error, CoreError::InvalidArgument(_)));

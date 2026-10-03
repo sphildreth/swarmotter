@@ -4,6 +4,7 @@ use super::*;
 use crate::peer_permits::{PeerPermitPool, PeerSessionBudget};
 use crate::seeder::{SeedRegistration, SeedRegistry, SeederHub};
 use async_trait::async_trait;
+use std::path::Path;
 use swarmotter_core::hash::{InfoHash, PeerInfoHash, TorrentIdentity, TorrentKey, V2InfoHash};
 use swarmotter_core::meta::{
     build_multi_file_torrent, build_single_file_torrent, parse_info_dict_with_piece_layers,
@@ -1580,7 +1581,7 @@ async fn stale_fast_resume_rechecks_resume_ahead_of_payload() {
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
     let engine = TorrentEngine::new(
         meta.clone(),
-        dir.clone(),
+        dir.to_path_buf(),
         [0u8; 20],
         binder,
         state,
@@ -2250,7 +2251,10 @@ fn pure_v2_metadata_candidate_fixture() -> (TorrentMeta, TorrentIdentity) {
 async fn pure_v2_metadata_only_preview_resolves_verified_candidate_without_payload_work() {
     let (seed_meta, identity) = pure_v2_metadata_candidate_fixture();
     let seed_dir = unique_dir("pure-v2-preview-seed");
-    let seed_storage = Arc::new(StorageIo::new(seed_meta.clone(), seed_dir.clone()));
+    let seed_storage = Arc::new(StorageIo::new(
+        Arc::new(seed_meta.clone()),
+        seed_dir.clone(),
+    ));
     let piece_count = seed_meta.data_piece_count().unwrap();
     let seed_state = Arc::new(Mutex::new(EngineState {
         piece_count,
@@ -2264,7 +2268,7 @@ async fn pure_v2_metadata_only_preview_resolves_verified_candidate_without_paylo
     let (torrent_shutdown_tx, torrent_shutdown_rx) = tokio::sync::watch::channel(false);
     registry
         .register(SeedRegistration::new(
-            seed_meta.clone(),
+            Arc::new(seed_meta.clone()),
             seed_storage,
             None,
             seed_state,
@@ -2364,4 +2368,213 @@ async fn pure_v2_metadata_only_preview_resolves_verified_candidate_without_paylo
         .expect("contained pure-v2 seeding listener task failed")
         .expect("contained pure-v2 seeding listener returned an error");
     std::fs::remove_dir_all(seed_dir).ok();
+}
+
+// --- Coalesced peer worker limit distribution (ADR-0071) ---
+
+#[test]
+fn engine_without_shared_limit_keeps_explicit_worker_override() {
+    let bytes = build_single_file_torrent("limit.bin", b"generated lawful payload", 8, None, false);
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let engine = TorrentEngine::new(
+        meta,
+        PathBuf::from("/tmp"),
+        [0u8; 20],
+        Arc::new(swarmotter_core::net::binder::LoopbackBinder),
+        state,
+        rx,
+        vec![],
+        6881,
+    );
+    assert_eq!(
+        engine.current_peer_worker_limit(),
+        DEFAULT_PEER_WORKER_LIMIT
+    );
+    engine.set_peer_worker_limit(5);
+    assert_eq!(engine.current_peer_worker_limit(), 5);
+    // Zero restores the operational default (documented zero-limit semantics).
+    engine.set_peer_worker_limit(0);
+    assert_eq!(
+        engine.current_peer_worker_limit(),
+        DEFAULT_PEER_WORKER_LIMIT
+    );
+}
+
+#[test]
+fn engine_follows_shared_peer_worker_limit_without_commands() {
+    let bytes = build_single_file_torrent("limit.bin", b"generated lawful payload", 8, None, false);
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let shared = SharedPeerWorkerLimit::new();
+    let engine = TorrentEngine::new(
+        meta,
+        PathBuf::from("/tmp"),
+        [0u8; 20],
+        Arc::new(swarmotter_core::net::binder::LoopbackBinder),
+        state,
+        rx,
+        vec![],
+        6881,
+    )
+    .with_shared_peer_worker_limit(shared.clone());
+    assert_eq!(
+        engine.current_peer_worker_limit(),
+        DEFAULT_PEER_WORKER_LIMIT
+    );
+
+    // Scheduler-side replacement converges without any engine command.
+    assert!(shared.store_default(7));
+    assert_eq!(engine.current_peer_worker_limit(), 7);
+    // Repeated identical updates are no-ops and must not invalidate a
+    // per-torrent autopilot override.
+    assert!(!shared.store_default(7));
+    engine.set_peer_worker_limit(3);
+    assert_eq!(engine.current_peer_worker_limit(), 3);
+    assert!(!shared.store_default(7));
+    assert_eq!(engine.current_peer_worker_limit(), 3);
+
+    // A real configuration replacement invalidates the override and the
+    // engine converges to the new configured default.
+    assert!(shared.store_default(11));
+    assert_eq!(engine.current_peer_worker_limit(), 11);
+    assert_eq!(engine.max_peer_workers.load(Ordering::Relaxed), 0);
+}
+
+// --- Coalesced resume checkpoints (ADR-0074) ---
+
+fn checkpoint_engine_fixture(
+    dir: &Path,
+    content: &[u8],
+    piece_len: u64,
+) -> (TorrentEngine, StorageIo) {
+    let bytes = build_single_file_torrent("checkpoint.bin", content, piece_len, None, false);
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let key = TorrentKey::v1(meta.info_hash);
+    let state = Arc::new(Mutex::new(EngineState {
+        total_length: content.len() as u64,
+        piece_count: meta.piece_count(),
+        ..EngineState::default()
+    }));
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let engine = TorrentEngine::new(
+        meta.clone(),
+        dir.to_path_buf(),
+        [0u8; 20],
+        Arc::new(swarmotter_core::net::binder::LoopbackBinder),
+        state,
+        rx,
+        vec![],
+        6881,
+    )
+    .with_torrent_key(key);
+    let storage = StorageIo::new(meta, dir.to_path_buf()).with_torrent_key(key);
+    (engine, storage)
+}
+
+#[tokio::test]
+async fn resume_checkpoints_are_coalesced_below_completed_piece_count() {
+    let dir = unique_dir("checkpoint-coalesce");
+    let content: Vec<u8> = (0..200).map(|i| (i % 251) as u8).collect();
+    let (engine, storage) = checkpoint_engine_fixture(&dir, &content, 1);
+
+    // Simulate 200 verified pieces, consulting the checkpoint policy after
+    // every piece exactly like the serial download path does.
+    let mut have = swarmotter_core::storage::PieceBitfield::new(200);
+    for piece in 0..200usize {
+        have.set(piece);
+        // Keep the engine's byte counter consistent with the verified
+        // bitfield, as the real download path does.
+        engine.state.lock().await.downloaded = (piece + 1) as u64;
+        engine.mark_resume_piece_verified();
+        engine
+            .maybe_persist_resume(&storage, &have, false)
+            .await
+            .expect("coalesced checkpoint");
+    }
+    let written = engine.resume_checkpoints_written();
+    assert!(
+        written < 200 / 10,
+        "checkpoints ({written}) must be substantially below pieces (200)"
+    );
+    // The final resume file covers the last successfully checkpointed
+    // generation, and unrecorded pieces remain marked dirty for the next
+    // trigger.
+    let resume = storage
+        .load_resume(&storage.torrent_key())
+        .await
+        .unwrap()
+        .expect("resume file exists");
+    assert!(resume.piece_bitfield.count(200) >= 192);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn forced_checkpoint_covers_lifecycle_boundaries_and_resets_dirty_state() {
+    let dir = unique_dir("checkpoint-force");
+    let content: Vec<u8> = (0..8).map(|i| (i % 251) as u8).collect();
+    let (engine, storage) = checkpoint_engine_fixture(&dir, &content, 1);
+
+    let mut have = swarmotter_core::storage::PieceBitfield::new(8);
+    have.set(0);
+    engine.mark_resume_piece_verified();
+    // Below the policy threshold: deferred.
+    let due = engine.resume_checkpoint_due(false).await;
+    assert!(due.is_none(), "a single new piece must be deferred");
+    // Lifecycle boundary: forced.
+    assert!(engine.resume_checkpoint_due(true).await.is_some());
+    engine
+        .maybe_persist_resume(&storage, &have, true)
+        .await
+        .expect("forced checkpoint");
+    assert_eq!(engine.resume_checkpoints_written(), 1);
+    // Clean after the forced checkpoint.
+    engine.mark_resume_piece_verified(); // one new piece
+    assert!(engine.resume_checkpoint_due(false).await.is_none());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn pieces_verified_during_a_checkpoint_remain_dirty() {
+    tokio::time::pause();
+    let dir = unique_dir("checkpoint-race");
+    let content: Vec<u8> = (0..64).map(|i| (i % 251) as u8).collect();
+    let (engine, storage) = checkpoint_engine_fixture(&dir, &content, 1);
+    let have = swarmotter_core::storage::PieceBitfield::new(64);
+
+    for _ in 0..64 {
+        engine.mark_resume_piece_verified();
+    }
+    // The checkpoint covers the generation observed before the save; a piece
+    // verified while the checkpoint wrote advances the generation further and
+    // must not be marked clean by the completed checkpoint.
+    let observed = engine.resume_checkpoint_due(false).await.expect("due");
+    engine
+        .maybe_persist_resume(&storage, &have, false)
+        .await
+        .expect("checkpoint");
+    engine.mark_resume_piece_verified(); // completed during/after the save
+    assert_eq!(
+        engine
+            .resume_checkpointed_generation
+            .load(Ordering::Relaxed),
+        observed,
+        "checkpoint must cover only its observed generation"
+    );
+    // The post-save piece stays dirty: the generation is beyond the
+    // checkpointed one, so the next threshold or interval trigger covers it.
+    assert_ne!(
+        engine.resume_dirty_generation.load(Ordering::Relaxed),
+        engine
+            .resume_checkpointed_generation
+            .load(Ordering::Relaxed),
+        "the post-save piece must remain dirty"
+    );
+    // After the checkpoint interval elapses (mocked clock), the pending
+    // generation triggers a checkpoint even below the piece threshold.
+    tokio::time::advance(RESUME_CHECKPOINT_INTERVAL).await;
+    assert!(engine.resume_checkpoint_due(false).await.is_some());
+    std::fs::remove_dir_all(dir).ok();
 }

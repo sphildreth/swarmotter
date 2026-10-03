@@ -3,6 +3,35 @@
 use super::*;
 
 impl DaemonRuntime {
+    /// Snapshot of the live engine state for one torrent, if an engine task is
+    /// running. Diagnostics/test helper.
+    pub async fn engine_state_snapshot(&self, hash: &TorrentKey) -> Option<EngineState> {
+        let states = self.engine_states.read().await;
+        let state = states.get(hash)?;
+        let snapshot = state.lock().await.clone();
+        Some(snapshot)
+    }
+
+    /// Live engine byte counters for one torrent, falling back to the durable
+    /// registry record when no engine task is running. Used by diagnostics and
+    /// tests to observe transfer accounting without racing engine teardown.
+    pub async fn engine_uploaded_bytes(&self, hash: &TorrentKey) -> u64 {
+        let states = self.engine_states.read().await;
+        if let Some(state) = states.get(hash) {
+            let uploaded = state.lock().await.uploaded;
+            if uploaded > 0 {
+                return uploaded;
+            }
+        }
+        drop(states);
+        self.registry
+            .lock()
+            .await
+            .get(hash)
+            .map(|t| t.uploaded)
+            .unwrap_or(0)
+    }
+
     pub(super) async fn add_config_file_check(&self, checks: &mut Vec<DoctorCheck>) {
         let Some(path) = &self.config_path else {
             push_check(
@@ -570,7 +599,7 @@ pub(super) fn strip_ansi_controls(input: &str) -> String {
 }
 
 /// Generate a process-unique peer id with the SwarmOtter client prefix.
-pub(super) fn make_peer_id() -> [u8; 20] {
+pub(crate) fn make_peer_id() -> [u8; 20] {
     let mut id = [0u8; 20];
     id[..8].copy_from_slice(b"-SW0001-");
     let nanos = std::time::SystemTime::now()
@@ -601,7 +630,10 @@ pub(super) fn apply_resolved_metadata(
         Vec::new()
     };
     let initialize_files = t.needs_metadata || t.meta.files.len() != real.files.len();
-    t.meta = real.clone();
+    // Metadata is shared via `Arc` across registry, engines, and storages;
+    // the resolved metadata arrives as an owned value so wrap it once here.
+    let real = std::sync::Arc::new(real.clone());
+    t.meta = std::sync::Arc::clone(&real);
     t.needs_metadata = false;
     t.magnet_info_hash = None;
     t.magnet_identity = None;

@@ -185,9 +185,19 @@ impl TorrentEngine {
         let merged = shared.lock().await.have.clone();
         let progressed = any_progress || made_progress.load(std::sync::atomic::Ordering::Relaxed);
         if progressed {
+            let piece_count = self.meta.piece_count();
+            let newly_verified = merged
+                .count(piece_count)
+                .saturating_sub(have.count(piece_count));
+            for _ in 0..newly_verified {
+                self.mark_resume_piece_verified();
+            }
             *have = merged.clone();
             self.update_progress(&merged).await;
-            if let Err(e) = self.persist_resume(storage.as_ref(), &merged).await {
+            if let Err(e) = self
+                .maybe_persist_resume(storage.as_ref(), &merged, false)
+                .await
+            {
                 tracing::warn!(error = %e, "parallel resume persist failed");
             }
         }
@@ -452,7 +462,7 @@ impl ParallelPieceState {
 pub(super) fn spawn_parallel_peer_task(
     tasks: &mut tokio::task::JoinSet<(PeerAddr, Result<PeerSessionOutcome>)>,
     peer_addr: PeerAddr,
-    meta: TorrentMeta,
+    meta: Arc<TorrentMeta>,
     binder: Arc<dyn NetworkBinder>,
     peer_id: [u8; 20],
     shared: Arc<Mutex<ParallelPieceState>>,
@@ -700,7 +710,7 @@ where
 pub(super) async fn parallel_peer_session(
     binder: Arc<dyn NetworkBinder>,
     peer_addr: PeerAddr,
-    meta: TorrentMeta,
+    meta: Arc<TorrentMeta>,
     peer_id: [u8; 20],
     shared: Arc<Mutex<ParallelPieceState>>,
     storage: Arc<StorageIo>,
@@ -794,6 +804,11 @@ pub(super) async fn parallel_peer_session(
     )
     .await?;
     peer::write_message(&mut write_half, &Message::Interested).await?;
+    // Download-time uploading (ADR-0075): the session serves verified pieces
+    // to the remote peer over the same connection. Unchoke so the peer may
+    // request; fairness across sessions comes from the shared upload limiter
+    // and the bounded per-session request queue.
+    peer::write_message(&mut write_half, &Message::Unchoke).await?;
     write_half.flush().await.ok();
 
     let mut peer_bf: Option<Bitfield> = None;
@@ -803,6 +818,14 @@ pub(super) async fn parallel_peer_session(
     let mut remote_pex_id: Option<u8> = None;
     let mut request_window = PeerRequestWindow::new(None, Instant::now());
     let peer_socket = peer_addr.socket_addr();
+    tracing::trace!(peer = %peer_socket, "parallel session entering message loop");
+    // Bounded inbound request queue for download-time serving, plus the set
+    // of pieces this session has advertised as Have.
+    let mut inbound_serve = InboundUploadQueue::default();
+    let mut announced_pieces = {
+        let work = shared.lock().await;
+        work.have.clone()
+    };
 
     loop {
         if Instant::now() > deadline {
@@ -1052,16 +1075,61 @@ pub(super) async fn parallel_peer_session(
                             )
                             .await;
                         }
+                        Message::Request {
+                            piece,
+                            offset,
+                            length,
+                        } => {
+                            // Download-time serving (ADR-0075): only verified
+                            // pieces are offered; invalid or saturated requests
+                            // are ignored.
+                            let have_snapshot = shared.lock().await.have.clone();
+                            inbound_serve.offer(
+                                piece,
+                                offset,
+                                length,
+                                &have_snapshot,
+                                piece_count,
+                                |index| meta.piece_length_for_index_u32(index).unwrap_or(0) as u64,
+                            );
+                        }
+                        Message::Cancel {
+                            piece,
+                            offset,
+                            length,
+                        } => {
+                            inbound_serve.cancel(piece, offset, length);
+                        }
                         Message::Keepalive
                         | Message::Interested
                         | Message::NotInterested
-                        | Message::Request { .. }
-                        | Message::Cancel { .. }
                         | Message::Reject { .. }
                         | Message::HashRequest { .. }
                         | Message::Hashes { .. }
                         | Message::HashReject { .. }
                         | Message::Unknown { .. } => {}
+                    }
+                    // Bounded serve drain: uploads never starve the download
+                    // side of this session.
+                    if let Err(e) = inbound_serve
+                        .serve_bounded(&mut write_half, &storage, &state, peer_addr, &limiter)
+                        .await
+                    {
+                        no_progress_reason = "serve_upload_failed";
+                        session_error = Some(e);
+                        break;
+                    }
+                    if let Err(e) = announce_new_verified_pieces(
+                        &mut write_half,
+                        &shared,
+                        &mut announced_pieces,
+                        piece_count,
+                    )
+                    .await
+                    {
+                        no_progress_reason = "announce_verified_pieces_failed";
+                        session_error = Some(e);
+                        break;
                     }
                 }
 
@@ -1086,6 +1154,7 @@ pub(super) async fn parallel_peer_session(
 
         let msg = match timeout(Duration::from_secs(15), reader.read_message()).await {
             Ok(Ok(Some(m))) => {
+                tracing::trace!(peer = %peer_socket, msg = ?m, "parallel session state-wait message");
                 no_progress_reason = "awaiting_state_transition";
                 m
             }
@@ -1152,20 +1221,59 @@ pub(super) async fn parallel_peer_session(
                 )
                 .await;
             }
+            Message::Request {
+                piece,
+                offset,
+                length,
+            } => {
+                let have_snapshot = shared.lock().await.have.clone();
+                inbound_serve.offer(
+                    piece,
+                    offset,
+                    length,
+                    &have_snapshot,
+                    piece_count,
+                    |index| meta.piece_length_for_index_u32(index).unwrap_or(0) as u64,
+                );
+            }
+            Message::Cancel {
+                piece,
+                offset,
+                length,
+            } => {
+                inbound_serve.cancel(piece, offset, length);
+            }
             Message::Keepalive
             | Message::Interested
             | Message::NotInterested
-            | Message::Request { .. }
             | Message::Piece { .. }
-            | Message::Cancel { .. }
             | Message::Reject { .. }
             | Message::HashRequest { .. }
             | Message::Hashes { .. }
             | Message::HashReject { .. }
             | Message::Unknown { .. } => {}
         }
+        if let Err(e) = inbound_serve
+            .serve_bounded(&mut write_half, &storage, &state, peer_addr, &limiter)
+            .await
+        {
+            shared.lock().await.remove_peer(peer_socket, piece_count);
+            return Err(e);
+        }
+        if let Err(e) = announce_new_verified_pieces(
+            &mut write_half,
+            &shared,
+            &mut announced_pieces,
+            piece_count,
+        )
+        .await
+        {
+            shared.lock().await.remove_peer(peer_socket, piece_count);
+            return Err(e);
+        }
     }
 
+    inbound_serve.clear();
     shared.lock().await.remove_peer(peer_socket, piece_count);
     if no_progress_reason == "session_in_progress" {
         no_progress_reason = if no_work_available {

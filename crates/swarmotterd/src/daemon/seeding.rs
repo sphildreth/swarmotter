@@ -6,11 +6,12 @@ impl DaemonRuntime {
     pub(super) async fn start_seeder(
         &self,
         hash: TorrentKey,
-        meta: swarmotter_core::meta::TorrentMeta,
+        meta: impl Into<std::sync::Arc<swarmotter_core::meta::TorrentMeta>>,
         active_dir: String,
         complete_dir: String,
         state: Arc<Mutex<EngineState>>,
     ) -> Result<()> {
+        let meta = meta.into();
         let _data_plane_transition = self.data_plane_transition_lock.lock().await;
         self.start_seeder_while_transition_locked(hash, meta, active_dir, complete_dir, state)
             .await
@@ -19,7 +20,7 @@ impl DaemonRuntime {
     pub(super) async fn start_seeder_while_transition_locked(
         &self,
         hash: TorrentKey,
-        meta: swarmotter_core::meta::TorrentMeta,
+        meta: std::sync::Arc<swarmotter_core::meta::TorrentMeta>,
         active_dir: String,
         complete_dir: String,
         state: Arc<Mutex<EngineState>>,
@@ -79,7 +80,7 @@ impl DaemonRuntime {
             None
         } else {
             Some(Arc::new(storage_io_with_config(
-                meta.clone(),
+                Arc::clone(&meta),
                 std::path::PathBuf::from(&complete_dir),
                 &config,
             )))
@@ -108,7 +109,7 @@ impl DaemonRuntime {
         let announce_handle = self
             .spawn_seeder_announce(
                 hash,
-                meta.clone(),
+                Arc::clone(&meta),
                 peer_id,
                 listen_port,
                 state,
@@ -152,6 +153,7 @@ impl DaemonRuntime {
             self.peer_permit_pool.read().await.clone(),
         )
         .with_peer_filter(peer_filter)
+        .with_downloader_serves(self.downloader_serves.clone())
         .with_bound_addr(bound_tx);
         *self.seeder_listener_shutdown.lock().await = Some(shutdown_tx);
         let containment_gate = self.containment_gate.clone();
@@ -614,7 +616,7 @@ impl DaemonRuntime {
     pub(super) async fn spawn_seeder_announce(
         &self,
         hash: TorrentKey,
-        meta: swarmotter_core::meta::TorrentMeta,
+        meta: std::sync::Arc<swarmotter_core::meta::TorrentMeta>,
         peer_id: [u8; 20],
         listen_port: u16,
         state: Arc<Mutex<EngineState>>,

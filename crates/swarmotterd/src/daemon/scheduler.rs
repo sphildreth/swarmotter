@@ -8,13 +8,18 @@ impl DaemonRuntime {
         Self::effective_per_torrent_peer_limit(cfg.bandwidth.max_peers_per_torrent)
     }
 
+    /// Distribute the configured per-torrent peer worker limit through the
+    /// coalesced shared state (ADR-0071).
+    ///
+    /// Per-tick engine channel sends are gone: they could suspend global
+    /// queue reconciliation behind a stalled engine whose eight-slot command
+    /// channel was saturated by an unchanged value. Engines without an
+    /// autopilot override read the shared default directly; overrides are
+    /// invalidated by the shared generation bump whenever the configured
+    /// value changes.
     pub(super) async fn apply_peer_worker_limits(&self) {
         let limit = self.configured_peer_worker_limit().await;
-        let senders: Vec<tokio::sync::mpsc::Sender<EngineCommand>> =
-            self.engine_cmds.lock().await.values().cloned().collect();
-        for tx in senders {
-            let _ = tx.send(EngineCommand::UpdatePeerWorkerLimit(limit)).await;
-        }
+        self.shared_peer_limit.store_default(limit);
     }
 
     pub(super) async fn scheduler_diagnostics(
@@ -482,7 +487,17 @@ impl DaemonRuntime {
         self.engine_cmds.lock().await.remove(&hash);
         self.engine_handles.write().await.remove(&hash);
         self.engine_storage_cancellations.lock().await.remove(&hash);
+        self.teardown_downloader_serve(&hash).await;
         self.storage_admissions.release(&hash).await;
+    }
+
+    /// Remove the inbound downloader-serving registration for a torrent and
+    /// signal its serving sessions to stop (ADR-0075).
+    pub(super) async fn teardown_downloader_serve(&self, hash: &TorrentKey) {
+        if let Some(tx) = self.downloader_serve_shutdowns.lock().await.remove(hash) {
+            let _ = tx.send(true);
+        }
+        self.downloader_serves.write().await.remove(hash);
     }
 
     pub(super) async fn record_engine_containment_cancellation(
@@ -921,6 +936,13 @@ impl DaemonRuntime {
         let selfish_completion_enabled = self.selfish_completion_enabled.clone();
         let runtime_for_task = self.clone();
         let storage_work_cancellation_for_task = storage_work_cancellation.clone();
+        // The shared contained listener serves completed seeders and, since
+        // ADR-0075, the verified pieces of active downloaders. Bind it while
+        // any data-plane engine runs; an unavailable listener only disables
+        // inbound serving, never outbound transfer or containment.
+        if let Err(error) = self.ensure_seeder_listener().await {
+            tracing::warn!(%error, "shared inbound peer listener unavailable for downloader serving");
+        }
         // DHT runner for trackerless peer discovery. Gated by config and
         // containment; the engine disables DHT for private torrents.
         let dht_runner = self.shared_dht_runner(binder.clone(), peer_id).await;
@@ -967,11 +989,48 @@ impl DaemonRuntime {
             }
         };
         engine = engine
+            .with_shared_peer_worker_limit(self.shared_peer_limit.clone())
             .with_peer_worker_limit(max_peer_workers)
-            .with_peer_session_budget(peer_session_budget)
+            .with_peer_session_budget(peer_session_budget.clone())
             .with_allow_ipv6(allow_ipv6)
             .with_peer_filter(peer_filter)
             .with_pex(pex_enabled, pex_max_peers);
+        // Inbound verified-piece serving while this torrent downloads
+        // (ADR-0075). The engine registers its resolved metadata and active
+        // storage through this hook once its download loop starts; teardown
+        // paths drop the registration and signal the serve shutdown watch.
+        if !needs_metadata {
+            let (serve_shutdown_tx, serve_shutdown_rx) = tokio::sync::watch::channel(false);
+            self.downloader_serve_shutdowns
+                .lock()
+                .await
+                .insert(hash, serve_shutdown_tx);
+            let serves = self.downloader_serves.clone();
+            let serve_budget = peer_session_budget.clone();
+            engine = engine.with_downloader_serve_registration(Arc::new(
+                move |registration: crate::engine::DownloaderServeRegistration| {
+                    let serves = serves.clone();
+                    let shutdown = serve_shutdown_rx.clone();
+                    let budget = serve_budget.clone();
+                    Box::pin(async move {
+                        serves.write().await.insert(
+                            registration.torrent_key,
+                            crate::seeder::DownloaderServeContext {
+                                key: registration.torrent_key,
+                                meta: registration.meta,
+                                storage: registration.storage,
+                                state: registration.state,
+                                limiter: registration.limiter,
+                                peer_id: registration.peer_id,
+                                peer_session_budget: budget,
+                                shutdown,
+                                encryption_mode: None,
+                            },
+                        );
+                    })
+                },
+            ));
+        }
         if !tracker_host_rules.is_empty() {
             engine = engine.with_tracker_host_rules(tracker_host_rules);
         }
@@ -1087,10 +1146,19 @@ impl DaemonRuntime {
                             }
                             t.downloaded = final_state.downloaded;
                             t.uploaded = final_state.uploaded;
-                            t.progress.replace_from_bitfield(
-                                &final_state.pieces_have,
-                                final_state.piece_count,
-                            );
+                            // An engine that exits before its data plane was
+                            // initialized (containment-blocked early return,
+                            // failed storage preflight) reports a default
+                            // empty bitfield. Replacing progress with that
+                            // snapshot would corrupt the record's structural
+                            // piece space; keep the last valid progress and
+                            // let a restart/recheck establish the truth.
+                            if Self::engine_progress_matches_torrent(t, &final_state) {
+                                t.progress.replace_from_bitfield(
+                                    &final_state.pieces_have,
+                                    final_state.piece_count,
+                                );
+                            }
                             t.recompute_file_bytes_completed();
                             if final_state.finished {
                                 t.state = TorrentState::Completed;
@@ -1277,6 +1345,7 @@ impl DaemonRuntime {
         }
         // Stop the inbound peer listener / seeder too.
         self.stop_seeder(hash).await;
+        self.teardown_downloader_serve(hash).await;
         self.engine_states.write().await.remove(hash);
         self.rate_samples.write().await.remove(hash);
         self.engine_storage_cancellations.lock().await.remove(hash);
@@ -1287,6 +1356,7 @@ impl DaemonRuntime {
         self.engine_retry_after.write().await.remove(hash);
         self.cancel_engine_storage_work(hash).await;
         let explicit_recheck = self.cancel_explicit_recheck(hash).await;
+        self.teardown_downloader_serve(hash).await;
         if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
             let _ = tx.try_send(EngineCommand::Stop);
         }

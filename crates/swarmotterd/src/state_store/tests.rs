@@ -96,8 +96,13 @@ fn failed_legacy_json_migration_preserves_the_original_generation() {
     fs::write(&path, &legacy_bytes).unwrap();
 
     let mut invalid = legacy;
-    invalid.torrents[0].meta.info_hash = InfoHash::ZERO;
-    invalid.torrents[0].meta.identity = swarmotter_core::hash::TorrentIdentity::Unknown;
+    let mut meta = (*invalid.torrents[0].meta).clone();
+    meta.info_hash = InfoHash::ZERO;
+    invalid.torrents[0].meta = std::sync::Arc::new(meta);
+    invalid.torrents[0].meta = std::sync::Arc::new(swarmotter_core::meta::TorrentMeta {
+        identity: swarmotter_core::hash::TorrentIdentity::Unknown,
+        ..(*invalid.torrents[0].meta).clone()
+    });
     let error = save(&path, &invalid).unwrap_err().to_string();
     assert!(error.contains("all-zero v1 identity"), "{error}");
     assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
@@ -962,16 +967,23 @@ fn pure_v2_record_uses_a_full_durable_key_and_retains_original_metainfo() {
 fn zero_identity_sentinels_cannot_enter_durable_state() {
     let path = unique_path("zero-durable-identity");
     let mut v1_state = single_torrent_state();
-    v1_state.torrents[0].meta.info_hash = InfoHash::ZERO;
-    v1_state.torrents[0].meta.identity = swarmotter_core::hash::TorrentIdentity::Unknown;
+    {
+        let mut meta = (*v1_state.torrents[0].meta).clone();
+        meta.info_hash = InfoHash::ZERO;
+        meta.identity = swarmotter_core::hash::TorrentIdentity::Unknown;
+        v1_state.torrents[0].meta = std::sync::Arc::new(meta);
+    }
     let error = save(&path, &v1_state).unwrap_err().to_string();
     assert!(error.contains("all-zero v1 identity"), "{error}");
     assert!(!path.exists());
 
     let mut v2_state = single_torrent_state();
-    v2_state.torrents[0].meta.info_hash = InfoHash::ZERO;
-    v2_state.torrents[0].meta.identity =
-        swarmotter_core::hash::TorrentIdentity::v2(V2InfoHash::ZERO);
+    {
+        let mut meta = (*v2_state.torrents[0].meta).clone();
+        meta.info_hash = InfoHash::ZERO;
+        meta.identity = swarmotter_core::hash::TorrentIdentity::v2(V2InfoHash::ZERO);
+        v2_state.torrents[0].meta = std::sync::Arc::new(meta);
+    }
     let error = save(&path, &v2_state).unwrap_err().to_string();
     assert!(error.contains("all-zero v2 identity"), "{error}");
     assert!(!path.exists());

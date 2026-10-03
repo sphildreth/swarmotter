@@ -223,7 +223,8 @@ impl TorrentEngine {
             // its v2 file-aligned progress so a later selection change can
             // continue without accepting unverified bytes.
             self.state.lock().await.finished = true;
-            self.persist_v2_resume(storage, layout, have).await?;
+            self.maybe_persist_v2_resume(storage, layout, have, true)
+                .await?;
         }
         Ok(())
     }
@@ -415,7 +416,10 @@ impl TorrentEngine {
                     have.set(piece_index);
                     made_progress = true;
                     self.update_v2_progress(layout, have).await;
-                    self.persist_v2_resume(storage, layout, have).await?;
+                    // Coalesced checkpoint policy (ADR-0074).
+                    self.mark_resume_piece_verified();
+                    self.maybe_persist_v2_resume(storage, layout, have, false)
+                        .await?;
                     peer::write_message(
                         &mut write_half,
                         &Message::Have {
@@ -517,6 +521,23 @@ impl TorrentEngine {
         } else {
             storage.recheck_v2(layout).await
         }
+    }
+
+    /// Coalesced v2 resume checkpoint (ADR-0074): same dirty-generation
+    /// policy as the v1 path, with the file-aligned piece layout.
+    async fn maybe_persist_v2_resume(
+        &self,
+        storage: &StorageIo,
+        layout: &V2PieceLayout,
+        have: &PieceBitfield,
+        force: bool,
+    ) -> Result<()> {
+        let Some(observed) = self.resume_checkpoint_due(force).await else {
+            return Ok(());
+        };
+        self.persist_v2_resume(storage, layout, have).await?;
+        self.complete_resume_checkpoint(observed).await;
+        Ok(())
     }
 
     async fn persist_v2_resume(

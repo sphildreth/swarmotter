@@ -17,7 +17,7 @@ impl TorrentEngine {
         if let Some(magnet) = self.magnet.clone() {
             self.state.lock().await.tracker_message = Some("fetching metadata via BEP 9".into());
             let resolved = self.fetch_magnet_metadata(&magnet).await?;
-            let rebuilt = resolved.meta;
+            let rebuilt = Arc::new(resolved.meta);
             if rebuilt.identity != magnet.identity {
                 return Err(CoreError::MalformedTorrent(
                     "resolved metadata identity does not match the magnet exact topics".into(),
@@ -160,6 +160,13 @@ impl TorrentEngine {
             return Ok(self.state.lock().await.clone());
         }
 
+        // Inbound verified-piece serving for this active download
+        // (ADR-0075): the daemon routes contained inbound peer connections
+        // to this engine's verified pieces while it downloads.
+        self.register_downloader_serve(Arc::new(storage.clone()))
+            .await;
+        tracing::trace!(torrent_key = %self.torrent_key, peer_id = ?self.peer_id, "engine registered downloader serve context");
+
         // Discover peers via tracker announce (HTTP/UDP) on each tier.
         let discovery_started = Instant::now();
         let mut discovered = self.announce(AnnounceEvent::Started).await;
@@ -192,6 +199,11 @@ impl TorrentEngine {
             match self.poll_commands().await {
                 CommandOutcome::Stop => {
                     self.state.lock().await.stopped_by_command = true;
+                    // Lifecycle boundary: a stop must not lose verified
+                    // progress beyond the coalescing policy (ADR-0074).
+                    if let Err(e) = self.maybe_persist_resume(&storage, &have, true).await {
+                        tracing::warn!(error = %e, "forced resume checkpoint before stop failed");
+                    }
                     break;
                 }
                 CommandOutcome::Reannounce => {
@@ -210,6 +222,14 @@ impl TorrentEngine {
             }
             let max_concurrent = self.current_peer_worker_limit();
             self.sync_have_from_state(&mut have, piece_count).await;
+            // Bounded periodic checkpoint trigger: verified pieces written
+            // since the last checkpoint are persisted when the coalescing
+            // policy is due (ADR-0074).
+            if !self.piece_selection.complete(&have) {
+                if let Err(e) = self.maybe_persist_resume(&storage, &have, false).await {
+                    tracing::warn!(error = %e, "periodic resume checkpoint failed");
+                }
+            }
 
             if self.piece_selection.complete(&have) {
                 self.finish_selection(&storage, &have).await?;
@@ -221,6 +241,7 @@ impl TorrentEngine {
             // Periodically re-announce to refresh peers.
             if last_discovery_refresh.elapsed() > PEER_REFRESH_INTERVAL {
                 let refreshed = self.refresh_discovery_peers(false).await;
+                reset_failure_backoff_for_discovered(&refreshed, &mut bad_peers);
                 merge_unique_peers(&mut discovered, refreshed);
                 dedupe_peers(&mut discovered);
                 self.state.lock().await.peers = discovered.clone();
@@ -378,6 +399,7 @@ impl TorrentEngine {
                     });
                     self.sleep_or_stop(Duration::from_secs(2)).await;
                     let refreshed = self.refresh_discovery_peers_after(false, Some(since)).await;
+                    reset_failure_backoff_for_discovered(&refreshed, &mut bad_peers);
                     merge_unique_peers(&mut discovered, refreshed);
                     dedupe_peers(&mut discovered);
                     self.state.lock().await.peers = discovered.clone();

@@ -86,7 +86,7 @@ async fn metadata_root_admission_wait_observes_lifecycle_cancellation() {
         ))
         .unwrap();
     let hash = TorrentKey::v1(resolved.info_hash);
-    let mut torrent = Torrent::new(resolved.clone(), now());
+    let mut torrent = Torrent::new(Arc::new(resolved.clone()), now());
     torrent.state = TorrentState::DownloadingMetadata;
     torrent.needs_metadata = true;
     runtime.registry.lock().await.add(torrent).unwrap();
@@ -107,7 +107,7 @@ async fn metadata_root_admission_wait_observes_lifecycle_cancellation() {
         waiting_runtime
             .reserve_resolved_magnet_metadata(
                 hash,
-                resolved,
+                std::sync::Arc::new(resolved),
                 complete_dir,
                 active_dir,
                 waiting_cancellation,

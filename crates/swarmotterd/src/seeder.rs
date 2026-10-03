@@ -52,7 +52,7 @@ pub struct SeedRegistration {
 impl SeedRegistration {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        meta: TorrentMeta,
+        meta: impl Into<Arc<TorrentMeta>>,
         storage: Arc<StorageIo>,
         complete_storage: Option<Arc<StorageIo>>,
         state: Arc<Mutex<EngineState>>,
@@ -62,6 +62,7 @@ impl SeedRegistration {
         peer_session_budget: PeerSessionBudget,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> Self {
+        let meta = meta.into();
         let mut limiter = ShapedLimiter::from_shared_rate_limiter(limiter.into());
         if let Some(global) = global_limiter {
             limiter = limiter.with_global(global);
@@ -264,6 +265,11 @@ impl SeedRegistry {
 /// remain owned by this task and are aborted when the listener shuts down.
 pub struct SeederHub {
     registry: SeedRegistry,
+    /// Serving contexts for ACTIVE downloading torrents (ADR-0075). Inbound
+    /// connections for a torrent that is not a completed seeder can still
+    /// serve that torrent's verified pieces over the shared contained
+    /// listener while it downloads.
+    downloaders: DownloaderServeRegistry,
     binder: Arc<dyn NetworkBinder>,
     port: u16,
     encryption_mode: PeerEncryptionMode,
@@ -272,6 +278,32 @@ pub struct SeederHub {
     peer_filter: Arc<PeerFilter>,
     bound_addr: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
 }
+
+/// Serving context for one active downloading torrent. The inbound session
+/// serves only pieces verified by the engine (`state.pieces_have`) through
+/// the engine's active `StorageIo`, shaped by the torrent's live limiter.
+#[derive(Clone)]
+pub struct DownloaderServeContext {
+    pub key: TorrentKey,
+    pub meta: Arc<TorrentMeta>,
+    pub storage: Arc<StorageIo>,
+    pub state: Arc<Mutex<EngineState>>,
+    pub limiter: ShapedLimiter,
+    /// The engine's peer id; replies use it so self-dials are detected.
+    pub peer_id: [u8; 20],
+    /// The torrent's runtime peer-session budget; an inbound downloading-
+    /// torrent session holds one inbound permit across its lifetime, exactly
+    /// like a seeder session (ADR-0053).
+    pub peer_session_budget: PeerSessionBudget,
+    /// Completes when the engine ends, pauses, is removed, or loses
+    /// containment; the inbound session must stop serving promptly.
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
+    pub encryption_mode: Option<PeerEncryptionMode>,
+}
+
+/// Registry of active downloading torrents eligible for inbound serving.
+pub type DownloaderServeRegistry =
+    Arc<tokio::sync::RwLock<HashMap<TorrentKey, DownloaderServeContext>>>;
 
 impl SeederHub {
     pub fn new(
@@ -284,6 +316,7 @@ impl SeederHub {
     ) -> Self {
         Self {
             registry,
+            downloaders: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             binder,
             port,
             encryption_mode,
@@ -292,6 +325,12 @@ impl SeederHub {
             peer_filter: Arc::new(PeerFilter::default()),
             bound_addr: None,
         }
+    }
+
+    /// Attach the daemon's active-downloader serving registry (ADR-0075).
+    pub fn with_downloader_serves(mut self, downloaders: DownloaderServeRegistry) -> Self {
+        self.downloaders = downloaders;
+        self
     }
 
     /// Attach the immutable admission policy for this listener generation.
@@ -372,12 +411,14 @@ impl SeederHub {
                         continue;
                     };
                     let registry = self.registry.clone();
+                    let downloaders = self.downloaders.clone();
                     let encryption_mode = self.encryption_mode;
                     let peer_filter = self.peer_filter.clone();
                     sessions.spawn(async move {
                         if let Err(error) = serve_routed_peer(
                             stream,
                             registry,
+                            downloaders,
                             encryption_mode,
                             peer_addr,
                             peer_filter,
@@ -404,7 +445,7 @@ impl SeederHub {
 #[allow(dead_code)]
 #[cfg(test)]
 pub struct Seeder {
-    meta: TorrentMeta,
+    meta: Arc<TorrentMeta>,
     storage: Arc<StorageIo>,
     complete_storage: Option<Arc<StorageIo>>,
     state: Arc<Mutex<EngineState>>,
@@ -426,7 +467,7 @@ pub struct Seeder {
 impl Seeder {
     #[allow(clippy::too_many_arguments, dead_code)]
     pub fn new(
-        meta: TorrentMeta,
+        meta: impl Into<Arc<TorrentMeta>>,
         storage: Arc<StorageIo>,
         state: Arc<Mutex<EngineState>>,
         binder: Arc<dyn NetworkBinder>,
@@ -450,7 +491,7 @@ impl Seeder {
 
     #[allow(clippy::too_many_arguments)]
     pub fn with_limiter(
-        meta: TorrentMeta,
+        meta: impl Into<Arc<TorrentMeta>>,
         storage: Arc<StorageIo>,
         state: Arc<Mutex<EngineState>>,
         binder: Arc<dyn NetworkBinder>,
@@ -460,6 +501,7 @@ impl Seeder {
         limiter: impl Into<Arc<RateLimiter>>,
         peer_session_budget: PeerSessionBudget,
     ) -> Self {
+        let meta = meta.into();
         Self {
             meta,
             storage,
@@ -613,7 +655,7 @@ impl Seeder {
 
 #[derive(Clone)]
 struct PeerServeContext {
-    meta: TorrentMeta,
+    meta: Arc<TorrentMeta>,
     storage: Arc<StorageIo>,
     complete_storage: Option<Arc<StorageIo>>,
     state: Arc<Mutex<EngineState>>,
@@ -642,6 +684,7 @@ async fn serve_known_peer(
 async fn serve_routed_peer(
     stream: tokio::net::TcpStream,
     registry: SeedRegistry,
+    downloaders: DownloaderServeRegistry,
     listener_encryption_mode: PeerEncryptionMode,
     peer_addr: std::net::SocketAddr,
     peer_filter: Arc<PeerFilter>,
@@ -657,7 +700,17 @@ async fn serve_routed_peer(
     let (mut stream, encrypted_hash): (Box<dyn PeerDuplex>, Option<PeerInfoHash>) = if plaintext {
         (Box::new(stream), None)
     } else {
-        let hashes = registry.mse_wire_hashes().await;
+        // Active downloading torrents are equally legitimate inbound serving
+        // targets (ADR-0075); include their v1 stream keys in MSE negotiation.
+        let mut hashes = registry.mse_wire_hashes().await;
+        {
+            let downloaders = downloaders.read().await;
+            for context in downloaders.values() {
+                if let Some(v1) = context.key.as_v1() {
+                    hashes.push(PeerInfoHash::from_v1(v1));
+                }
+            }
+        }
         let (hash, encrypted) = timeout(
             Duration::from_secs(10),
             swarmotter_core::mse::accept_any(stream, &hashes),
@@ -674,12 +727,45 @@ async fn serve_routed_peer(
             "encrypted inbound peer handshake did not match its stream key".into(),
         ));
     }
-    let (key, context) = match encrypted_hash {
+    /// Where an accepted inbound peer-wire session is routed.
+    enum InboundTarget {
+        Seeder(PeerServeContext),
+        Downloader(DownloaderServeContext),
+    }
+    let target: InboundTarget = match match encrypted_hash {
         Some(hash) => registry.context_for_mse(&hash).await,
         None => registry.context_for_wire(&their_hs.info_hash).await,
-    }
-    .ok_or_else(|| CoreError::NotFound("registered inbound torrent".into()))?;
-    let encryption_mode = context.encryption_mode.unwrap_or(listener_encryption_mode);
+    } {
+        Some((_, context)) => InboundTarget::Seeder(context),
+        None => {
+            // Not a completed seeder: the torrent may be an active download
+            // eligible for verified-piece serving (ADR-0075). Match v1/hybrid
+            // downloaders by their 20-byte wire identity.
+            let matched = {
+                let downloaders = downloaders.read().await;
+                downloaders
+                    .values()
+                    .find(|context| {
+                        context
+                            .key
+                            .as_v1()
+                            .is_some_and(|v1| PeerInfoHash::from_v1(v1) == their_hs.info_hash)
+                    })
+                    .cloned()
+            };
+            InboundTarget::Downloader(
+                matched.ok_or_else(|| CoreError::NotFound("registered inbound torrent".into()))?,
+            )
+        }
+    };
+    let encryption_mode = match &target {
+        InboundTarget::Downloader(downloader) => downloader
+            .encryption_mode
+            .unwrap_or(listener_encryption_mode),
+        InboundTarget::Seeder(context) => {
+            context.encryption_mode.unwrap_or(listener_encryption_mode)
+        }
+    };
     match (plaintext, encryption_mode) {
         (true, PeerEncryptionMode::Required) => {
             return Err(CoreError::Internal(
@@ -707,10 +793,35 @@ async fn serve_routed_peer(
                 .unwrap_or_else(|| "peer rejected by admission policy".into()),
         ));
     }
-    let _torrent_peer_permit = context
-        .peer_session_budget
-        .try_acquire_torrent_inbound()
-        .ok_or_else(|| CoreError::Internal("per-torrent peer session limit reached".into()))?;
+    match target {
+        InboundTarget::Downloader(downloader) => {
+            let _torrent_peer_permit = downloader
+                .peer_session_budget
+                .try_acquire_torrent_inbound()
+                .ok_or_else(|| {
+                    CoreError::Internal("per-torrent peer session limit reached".into())
+                })?;
+            // Download-time inbound serving (ADR-0075): verified pieces only,
+            // upload side only, until the engine's shutdown watch fires.
+            serve_downloader_peer(stream, downloader, their_hs).await
+        }
+        InboundTarget::Seeder(context) => {
+            let _torrent_peer_permit = context
+                .peer_session_budget
+                .try_acquire_torrent_inbound()
+                .ok_or_else(|| {
+                    CoreError::Internal("per-torrent peer session limit reached".into())
+                })?;
+            route_to_seeder(stream, context, their_hs).await
+        }
+    }
+}
+
+async fn route_to_seeder(
+    stream: Box<dyn PeerDuplex>,
+    context: PeerServeContext,
+    their_hs: V2Handshake,
+) -> Result<()> {
     if context.meta.requires_v2_data_plane() {
         if !their_hs.supports_v2() {
             return Err(CoreError::Parse(
@@ -719,19 +830,163 @@ async fn serve_routed_peer(
         }
         serve_v2_peer(stream, context, their_hs).await
     } else {
-        let v1_hash = key.as_v1().ok_or_else(|| {
-            CoreError::Internal("v1 seeder registration has no v1 owner key".into())
-        })?;
+        let info_hash = context.meta.info_hash;
         serve_peer(
             stream,
             context,
             Handshake {
-                info_hash: v1_hash,
+                info_hash,
                 peer_id: their_hs.peer_id,
                 reserved: their_hs.reserved,
             },
         )
         .await
+    }
+}
+
+/// Serve an inbound peer for an ACTIVE downloading torrent (ADR-0075).
+///
+/// Upload side only: verified pieces are served through the engine's active
+/// storage and shaped by the torrent's limiter. The session never requests
+/// anything and never changes torrent state; it ends when the engine's serve
+/// shutdown fires (pause, stop, removal, completion handoff to the seeder
+/// registry, containment loss).
+async fn serve_downloader_peer(
+    stream: Box<dyn PeerDuplex>,
+    context: DownloaderServeContext,
+    their_hs: V2Handshake,
+) -> Result<()> {
+    let DownloaderServeContext {
+        key,
+        meta,
+        storage,
+        state,
+        limiter,
+        peer_id,
+        peer_session_budget: _,
+        mut shutdown,
+        encryption_mode: _,
+    } = context.clone();
+    if their_hs.info_hash
+        != PeerInfoHash::from_v1(key.as_v1().ok_or_else(|| {
+            CoreError::Internal("downloader serving requires a v1 wire identity".into())
+        })?)
+    {
+        return Err(CoreError::Internal(
+            "inbound downloader info hash mismatch".into(),
+        ));
+    }
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = PeerReader::new(read_half);
+    tracing::trace!(key = %key, peer_id = ?peer_id, "downloader serve session replying handshake");
+
+    // Reply with our handshake, verified bitfield, and Unchoke so the peer
+    // can request served pieces immediately.
+    peer::write_handshake(
+        &mut write_half,
+        &Handshake {
+            info_hash: meta.info_hash,
+            peer_id,
+            reserved: swarmotter_core::extensions::EXTENSION_RESERVED,
+        },
+    )
+    .await?;
+    let mut announced = {
+        let s = state.lock().await;
+        let mut bf = Bitfield::new(meta.piece_count());
+        for i in 0..meta.piece_count() {
+            if s.pieces_have.has(i) {
+                bf.set(i);
+            }
+        }
+        bf
+    };
+    peer::write_message(&mut write_half, &announced.encode_message()).await?;
+    peer::write_message(&mut write_half, &Message::Unchoke).await?;
+    write_half.flush().await.ok();
+
+    let piece_count = meta.piece_count();
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            msg = timeout(Duration::from_secs(120), reader.read_message()) => {
+                match msg {
+                    Ok(Ok(Some(message))) => match message {
+                        Message::Request { piece, offset, length } => {
+                            let p = piece as usize;
+                            let verified = {
+                                let s = state.lock().await;
+                                s.pieces_have.has(p)
+                            };
+                            if !verified || p >= piece_count {
+                                // Never expose unverified or out-of-range bytes.
+                                continue;
+                            }
+                            let length = length as usize;
+                            if length == 0 || length > 128 * 1024 {
+                                continue;
+                            }
+                            let block = match storage.read_block(p, offset as u64, length).await {
+                                Ok(block) => block,
+                                Err(error) => {
+                                    tracing::debug!(piece = p, %error, "downloader serving read failed");
+                                    continue;
+                                }
+                            };
+                            {
+                                let mut s = state.lock().await;
+                                s.uploaded = s.uploaded.saturating_add(block.len() as u64);
+                            }
+                            limiter.acquire(RateDirection::Upload, block.len() as u64).await;
+                            peer::write_message(&mut write_half, &Message::Piece { piece, offset, block }).await?;
+                            write_half.flush().await.ok();
+                        }
+                        Message::Interested => {
+                            peer::write_message(&mut write_half, &Message::Unchoke).await?;
+                        }
+                        Message::NotInterested | Message::Have { .. } | Message::Bitfield { .. } => {}
+                        Message::Choke | Message::Unchoke | Message::Keepalive
+                        | Message::Cancel { .. } | Message::Piece { .. }
+                        | Message::Reject { .. } | Message::HashRequest { .. }
+                        | Message::Hashes { .. } | Message::HashReject { .. }
+                        | Message::Extended { .. } | Message::Unknown { .. } => {}
+                    },
+                    Ok(Ok(None)) => return Ok(()),
+                    Ok(Err(_)) => return Ok(()),
+                    Err(_) => return Ok(()),
+                }
+            }
+        }
+        // Availability updates: newly verified pieces are announced with a
+        // bounded fan-out per iteration.
+        let mut sent = 0usize;
+        let newly_verified = {
+            let s = state.lock().await;
+            s.pieces_have.clone()
+        };
+        for piece in 0..piece_count {
+            if newly_verified.has(piece) && !announced.has(piece) {
+                peer::write_message(
+                    &mut write_half,
+                    &Message::Have {
+                        piece: piece as u32,
+                    },
+                )
+                .await?;
+                announced.set(piece);
+                sent += 1;
+                if sent >= 64 {
+                    break;
+                }
+            }
+        }
+        if sent > 0 {
+            write_half.flush().await.ok();
+        }
     }
 }
 
@@ -825,7 +1080,7 @@ async fn serve_v2_peer(
 #[allow(clippy::too_many_arguments)]
 async fn serve_v2_peer_session(
     stream: Box<dyn PeerDuplex>,
-    meta: TorrentMeta,
+    meta: Arc<TorrentMeta>,
     layout: V2PieceLayout,
     storage: Arc<StorageIo>,
     complete_storage: Option<Arc<StorageIo>>,
@@ -1144,7 +1399,7 @@ fn v2_hash_response(
 #[allow(clippy::too_many_arguments)]
 async fn serve_peer_session(
     stream: Box<dyn PeerDuplex>,
-    meta: TorrentMeta,
+    meta: Arc<TorrentMeta>,
     storage: Arc<StorageIo>,
     complete_storage: Option<Arc<StorageIo>>,
     state: Arc<Mutex<EngineState>>,

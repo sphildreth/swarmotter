@@ -417,7 +417,7 @@ impl DaemonRuntime {
         }
     }
 
-    fn engine_progress_matches_torrent(torrent: &Torrent, state: &EngineState) -> bool {
+    pub(super) fn engine_progress_matches_torrent(torrent: &Torrent, state: &EngineState) -> bool {
         let piece_count = torrent
             .meta
             .data_piece_count()
@@ -448,14 +448,30 @@ impl DaemonRuntime {
         let network = self.network_health.read().await.clone();
         let states = self.engine_states.read().await.clone();
         let samples = self.rate_samples.read().await.clone();
-        let torrents: Vec<Torrent> = self
-            .registry
-            .lock()
-            .await
-            .torrents
-            .values()
-            .cloned()
-            .collect();
+        // A large paused library adds bounded maintenance work: autopilot
+        // analysis covers only torrents with a running engine or an active
+        // lifecycle state. Queued/paused/error/completed records without a
+        // running engine cannot produce autopilot actions and retain their
+        // last decision until they become eligible again (ADR-0076).
+        let running_engines: HashSet<TorrentKey> =
+            self.engine_handles.read().await.keys().copied().collect();
+        let torrents: Vec<Torrent> = {
+            let reg = self.registry.lock().await;
+            reg.torrents
+                .values()
+                .filter(|torrent| {
+                    let active_state = matches!(
+                        torrent.state,
+                        TorrentState::Downloading
+                            | TorrentState::DownloadingMetadata
+                            | TorrentState::Queued
+                            | TorrentState::Seeding
+                    );
+                    active_state || running_engines.contains(&torrent.key())
+                })
+                .cloned()
+                .collect()
+        };
         let analyzer = AutopilotAnalyzer::new();
         let mut decisions = HashMap::new();
         let now = Instant::now();
@@ -481,7 +497,14 @@ impl DaemonRuntime {
             decisions.insert(hash, decision);
         }
 
-        *self.autopilot_decisions.write().await = decisions;
+        // Merge instead of replace: torrents that dropped out of the eligible
+        // set (paused, errored, or engine stopped) keep their last decision so
+        // guardrail bookkeeping and diagnostics stay stable. Removal paths and
+        // configuration replacement still clear stale entries explicitly.
+        let mut store = self.autopilot_decisions.write().await;
+        for (hash, decision) in decisions {
+            store.insert(hash, decision);
+        }
     }
 
     pub(super) async fn apply_autopilot_decision(
