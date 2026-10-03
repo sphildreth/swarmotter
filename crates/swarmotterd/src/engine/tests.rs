@@ -4,6 +4,7 @@ use super::*;
 use crate::peer_permits::{PeerPermitPool, PeerSessionBudget};
 use crate::seeder::{SeedRegistration, SeedRegistry, SeederHub};
 use async_trait::async_trait;
+use std::path::Path;
 use swarmotter_core::hash::{InfoHash, PeerInfoHash, TorrentIdentity, TorrentKey, V2InfoHash};
 use swarmotter_core::meta::{
     build_multi_file_torrent, build_single_file_torrent, parse_info_dict_with_piece_layers,
@@ -17,15 +18,16 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 fn terminal_tracker_error_requires_all_failures_and_no_successful_alternative() {
     let failed = TrackerAnnounceSnapshot {
         status: TrackerStatus::Error,
+        explicit_failure: true,
         seeders: 0,
         leechers: 0,
         downloads: 0,
-        last_error: Some("connection refused".into()),
+        last_error: Some("Requested download is not authorized".into()),
         last_message: None,
         last_announce: Some(42),
     };
     let mut state = EngineState {
-        tracker_message: Some("http://tracker.invalid/announce: connection refused".into()),
+        tracker_message: Some("Requested download is not authorized".into()),
         tracker_failures_recent: 1,
         ..Default::default()
     };
@@ -36,7 +38,45 @@ fn terminal_tracker_error_requires_all_failures_and_no_successful_alternative() 
     let error = state
         .terminal_tracker_error()
         .expect("terminal all-tracker failure should be classified");
-    assert!(error.contains("connection refused"));
+    assert!(error.contains("Requested download is not authorized"));
+    state.tracker_announces.insert(
+        "http://second.invalid/tracker".into(),
+        state.tracker_announces.values().next().unwrap().clone(),
+    );
+    assert!(state.terminal_tracker_error().is_some());
+    state
+        .tracker_announces
+        .remove("http://second.invalid/tracker");
+
+    // Recent scrape/transport failures cannot turn a retryable announce into
+    // an explicit rejection, even before alternative discovery finishes.
+    state.tracker_failures_recent = 100;
+    for message in [
+        "tracker announce timed out",
+        "connection refused",
+        "io error",
+    ] {
+        let snapshot = state.tracker_announces.values_mut().next().unwrap();
+        snapshot.explicit_failure = false;
+        snapshot.last_error = Some(message.into());
+        assert!(state.terminal_tracker_error().is_none());
+    }
+    state
+        .tracker_announces
+        .values_mut()
+        .next()
+        .unwrap()
+        .explicit_failure = true;
+
+    let mut retryable = state.tracker_announces.values().next().unwrap().clone();
+    retryable.explicit_failure = false;
+    state
+        .tracker_announces
+        .insert("http://another.invalid/tracker".into(), retryable);
+    assert!(state.terminal_tracker_error().is_none());
+    state
+        .tracker_announces
+        .remove("http://another.invalid/tracker");
 
     state.dht_discovery_ok = true;
     assert!(state.terminal_tracker_error().is_none());
@@ -52,6 +92,365 @@ fn terminal_tracker_error_requires_all_failures_and_no_successful_alternative() 
     state.peer_scheduler.eligible_peers = 0;
     state.tracker_ok = true;
     assert!(state.terminal_tracker_error().is_none());
+    state.tracker_ok = false;
+    state.tracker_last_ok = Some(Instant::now());
+    assert!(state.terminal_tracker_error().is_none());
+}
+
+struct DiscoveryFixtureBinder {
+    body: std::sync::Mutex<Vec<u8>>,
+    peer_connects: AtomicUsize,
+    udp_sends: Arc<AtomicUsize>,
+    pending_dht: bool,
+}
+
+struct DiscoveryFixtureSocket {
+    sends: Arc<AtomicUsize>,
+    pending: bool,
+}
+
+#[async_trait]
+impl ContainedUdpSocket for DiscoveryFixtureSocket {
+    async fn send_to(&self, _addr: SocketAddr, _data: &[u8]) -> Result<()> {
+        self.sends.fetch_add(1, Ordering::SeqCst);
+        if self.pending {
+            Ok(())
+        } else {
+            Err(CoreError::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            )))
+        }
+    }
+
+    async fn recv_from(&self, _buf: &mut [u8]) -> Result<(SocketAddr, usize)> {
+        std::future::pending().await
+    }
+
+    fn local_addr(&self) -> Result<SocketAddr> {
+        Ok("127.0.0.1:0".parse().unwrap())
+    }
+}
+
+#[async_trait]
+impl NetworkBinder for DiscoveryFixtureBinder {
+    async fn connect_peer(&self, _addr: SocketAddr) -> Result<tokio::net::TcpStream> {
+        self.peer_connects.fetch_add(1, Ordering::SeqCst);
+        Err(CoreError::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )))
+    }
+
+    async fn http_get(&self, url: &str) -> Result<swarmotter_core::net::HttpResponse> {
+        Ok(swarmotter_core::net::HttpResponse {
+            status: 200,
+            body: self.body.lock().unwrap().clone(),
+            final_url: url.into(),
+            content_range: None,
+        })
+    }
+
+    async fn resolve_host(&self, host: &str, port: u16) -> Result<SocketAddr> {
+        Ok(SocketAddr::new(host.parse().unwrap(), port))
+    }
+
+    async fn udp_socket(&self) -> Result<Box<dyn ContainedUdpSocket>> {
+        Ok(Box::new(DiscoveryFixtureSocket {
+            sends: self.udp_sends.clone(),
+            pending: self.pending_dht,
+        }))
+    }
+
+    async fn bind_peer_listener(&self, _port: u16) -> Result<Box<dyn PeerListener>> {
+        Err(CoreError::Internal("unused in discovery fixture".into()))
+    }
+
+    fn traffic_allowed(&self) -> bool {
+        true
+    }
+}
+
+struct DiscoveryFixture {
+    engine: TorrentEngine,
+    state: Arc<Mutex<EngineState>>,
+    commands: tokio::sync::mpsc::Sender<EngineCommand>,
+    binder: Arc<DiscoveryFixtureBinder>,
+    dir: PathBuf,
+}
+
+fn discovery_fixture(
+    body: Option<Vec<u8>>,
+    private: bool,
+    direct_peer: bool,
+    dht: bool,
+    pending_dht: bool,
+) -> DiscoveryFixture {
+    let dir = unique_dir("discovery-lifecycle");
+    let bytes = build_single_file_torrent(
+        "generated.bin",
+        b"generated local discovery lifecycle payload",
+        8,
+        body.as_ref().map(|_| "http://127.0.0.1:9/tracker"),
+        private,
+    );
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (commands, rx) = tokio::sync::mpsc::channel(8);
+    let binder = Arc::new(DiscoveryFixtureBinder {
+        body: std::sync::Mutex::new(body.unwrap_or_default()),
+        peer_connects: AtomicUsize::new(0),
+        udp_sends: Arc::new(AtomicUsize::new(0)),
+        pending_dht,
+    });
+    let peers = if direct_peer {
+        vec![PeerAddr::from_socket_addr("127.0.0.1:9".parse().unwrap())]
+    } else {
+        vec![]
+    };
+    let mut engine = TorrentEngine::new(
+        meta,
+        dir.clone(),
+        [0; 20],
+        binder.clone(),
+        state.clone(),
+        rx,
+        peers,
+        6881,
+    )
+    .with_transport(false, true)
+    .with_encryption_mode(PeerEncryptionMode::Disabled);
+    if dht {
+        engine = engine.with_dht(Arc::new(crate::dht::DhtRunner::new(
+            swarmotter_core::dht::NodeId::from_bytes([1; 20]),
+            binder.clone(),
+            vec!["127.0.0.1:9".parse().unwrap()],
+            0,
+        )));
+    }
+    DiscoveryFixture {
+        engine,
+        state,
+        commands,
+        binder,
+        dir,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn thin_successful_announce_keeps_failed_peer_swarm_alive() {
+    let fixture = discovery_fixture(
+        Some(
+            b"d8:completei101e10:incompletei0e8:intervali1800e5:peers6:\x7f\x00\x00\x01\x00\x09e"
+                .to_vec(),
+        ),
+        false,
+        false,
+        false,
+        false,
+    );
+    let task = tokio::spawn(fixture.engine.run());
+    for _ in 0..10_000 {
+        if fixture.state.lock().await.peer_scheduler.failed_peers == 1 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(fixture.binder.peer_connects.load(Ordering::SeqCst) > 0);
+    for _ in 0..8 {
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !task.is_finished(),
+        "a populated thin swarm must survive cooled-down rounds"
+    );
+    assert!(fixture
+        .state
+        .lock()
+        .await
+        .terminal_tracker_error()
+        .is_none());
+
+    // A later successful empty announce revokes the population signal; the
+    // same engine can then finish its bounded attempt and use normal retry.
+    *fixture.binder.body.lock().unwrap() =
+        b"d8:completei0e10:incompletei0e8:intervali1800e5:peers0:e".to_vec();
+    fixture
+        .commands
+        .send(EngineCommand::Reannounce)
+        .await
+        .unwrap();
+    let final_state = tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!final_state.finished);
+    assert!(final_state.terminal_tracker_error().is_none());
+    std::fs::remove_dir_all(fixture.dir).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn populated_announce_survives_empty_or_filtered_peer_lists() {
+    for (body, filter_peers) in [
+        (
+            b"d8:completei0e10:incompletei1e8:intervali1800e5:peers0:e".to_vec(),
+            false,
+        ),
+        (
+            b"d8:completei1e10:incompletei0e8:intervali1800e5:peers6:\x7f\x00\x00\x01\x00\x09e"
+                .to_vec(),
+            true,
+        ),
+    ] {
+        let mut fixture = discovery_fixture(Some(body), false, false, false, false);
+        if filter_peers {
+            let filter = PeerFilter::from_config(&swarmotter_core::peer_filter::PeerFilterConfig {
+                enabled: true,
+                rules: vec!["127.0.0.1".into()],
+                ..Default::default()
+            })
+            .unwrap();
+            fixture.engine = fixture.engine.with_peer_filter(Arc::new(filter));
+        }
+        // Record actual completed discovery before checking skipped refreshes.
+        assert!(fixture
+            .engine
+            .announce(AnnounceEvent::Started)
+            .await
+            .is_empty());
+        assert!(!fixture.engine.tracker_announce_due().await);
+        assert!(!fixture.engine.dht_lookup_due().await);
+        assert!(fixture
+            .engine
+            .refresh_discovery_peers(false)
+            .await
+            .is_empty());
+        assert!(fixture.state.lock().await.tracker_swarm_populated);
+        let task = tokio::spawn(fixture.engine.run());
+        for _ in 0..10_000 {
+            if fixture
+                .state
+                .lock()
+                .await
+                .peer_scheduler
+                .last_reason
+                .is_some()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(fixture
+            .state
+            .lock()
+            .await
+            .peer_scheduler
+            .last_reason
+            .is_some());
+        for _ in 0..8 {
+            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished());
+        assert!(fixture
+            .state
+            .lock()
+            .await
+            .terminal_tracker_error()
+            .is_none());
+        assert_eq!(fixture.binder.peer_connects.load(Ordering::SeqCst), 0);
+        fixture.commands.send(EngineCommand::Stop).await.unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(stopped.stopped_by_command);
+        std::fs::remove_dir_all(fixture.dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn successful_population_is_retained_across_retryable_announce_failure() {
+    let fixture = discovery_fixture(
+        Some(b"d8:completei100e10:incompletei0e8:intervali1800e5:peers0:e".to_vec()),
+        false,
+        false,
+        false,
+        false,
+    );
+    fixture.engine.announce(AnnounceEvent::Started).await;
+    let mut failure = TrackerAnnounceOutcome::default();
+    record_tracker_joined_result(
+        &mut failure,
+        Ok((
+            "http://127.0.0.1:9/tracker".into(),
+            Err(CoreError::Internal("tracker announce timed out".into())),
+        )),
+        now_secs(),
+    );
+    fixture
+        .engine
+        .record_tracker_announce_outcome(&failure)
+        .await;
+    let state = fixture.state.lock().await;
+    assert!(!state.tracker_ok);
+    assert!(state.tracker_swarm_populated);
+    assert!(state.tracker_last_ok.is_some());
+    assert!(
+        !state
+            .tracker_announces
+            .values()
+            .next()
+            .unwrap()
+            .explicit_failure
+    );
+    assert!(state.terminal_tracker_error().is_none());
+    std::fs::remove_dir_all(fixture.dir).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn trackerless_without_dht_exits_after_bounded_empty_discovery() {
+    let fixture = discovery_fixture(None, false, false, false, false);
+    let final_state = tokio::time::timeout(Duration::from_secs(20), fixture.engine.run())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!final_state.finished);
+    assert!(final_state.terminal_tracker_error().is_none());
+    std::fs::remove_dir_all(fixture.dir).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_peer_path_forces_dht_after_known_peers_fail_despite_cadence() {
+    let fixture = discovery_fixture(None, false, true, true, false);
+    let final_state = tokio::time::timeout(Duration::from_secs(20), fixture.engine.run())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!final_state.finished);
+    assert_eq!(
+        fixture.binder.udp_sends.load(Ordering::SeqCst),
+        2,
+        "initial lookup plus a completed lookup after peer failure, without waiting for cadence"
+    );
+    assert!(final_state.dht_last_lookup_completed.is_some());
+    assert!(final_state.terminal_tracker_error().is_none());
+    std::fs::remove_dir_all(fixture.dir).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_peer_path_waits_for_forced_dht_timeout_before_bounded_exit() {
+    let fixture = discovery_fixture(None, false, true, true, true);
+    let final_state = tokio::time::timeout(Duration::from_secs(40), fixture.engine.run())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!final_state.finished);
+    assert!(fixture.binder.udp_sends.load(Ordering::SeqCst) >= 2);
+    assert!(final_state.dht_last_lookup_completed.is_some());
+    assert!(final_state.terminal_tracker_error().is_none());
+    std::fs::remove_dir_all(fixture.dir).unwrap();
 }
 
 fn unique_dir(label: &str) -> PathBuf {
@@ -452,6 +851,7 @@ async fn magnet_tracker_activity_scrapes_the_real_magnet_info_hash() {
         url.clone(),
         TrackerAnnounceSnapshot {
             status: TrackerStatus::Ok,
+            explicit_failure: false,
             seeders: 1,
             leechers: 2,
             downloads: 0,
@@ -1181,7 +1581,7 @@ async fn stale_fast_resume_rechecks_resume_ahead_of_payload() {
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
     let engine = TorrentEngine::new(
         meta.clone(),
-        dir.clone(),
+        dir.to_path_buf(),
         [0u8; 20],
         binder,
         state,
@@ -1851,7 +2251,10 @@ fn pure_v2_metadata_candidate_fixture() -> (TorrentMeta, TorrentIdentity) {
 async fn pure_v2_metadata_only_preview_resolves_verified_candidate_without_payload_work() {
     let (seed_meta, identity) = pure_v2_metadata_candidate_fixture();
     let seed_dir = unique_dir("pure-v2-preview-seed");
-    let seed_storage = Arc::new(StorageIo::new(seed_meta.clone(), seed_dir.clone()));
+    let seed_storage = Arc::new(StorageIo::new(
+        Arc::new(seed_meta.clone()),
+        seed_dir.clone(),
+    ));
     let piece_count = seed_meta.data_piece_count().unwrap();
     let seed_state = Arc::new(Mutex::new(EngineState {
         piece_count,
@@ -1865,7 +2268,7 @@ async fn pure_v2_metadata_only_preview_resolves_verified_candidate_without_paylo
     let (torrent_shutdown_tx, torrent_shutdown_rx) = tokio::sync::watch::channel(false);
     registry
         .register(SeedRegistration::new(
-            seed_meta.clone(),
+            Arc::new(seed_meta.clone()),
             seed_storage,
             None,
             seed_state,
@@ -1965,4 +2368,213 @@ async fn pure_v2_metadata_only_preview_resolves_verified_candidate_without_paylo
         .expect("contained pure-v2 seeding listener task failed")
         .expect("contained pure-v2 seeding listener returned an error");
     std::fs::remove_dir_all(seed_dir).ok();
+}
+
+// --- Coalesced peer worker limit distribution (ADR-0071) ---
+
+#[test]
+fn engine_without_shared_limit_keeps_explicit_worker_override() {
+    let bytes = build_single_file_torrent("limit.bin", b"generated lawful payload", 8, None, false);
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let engine = TorrentEngine::new(
+        meta,
+        PathBuf::from("/tmp"),
+        [0u8; 20],
+        Arc::new(swarmotter_core::net::binder::LoopbackBinder),
+        state,
+        rx,
+        vec![],
+        6881,
+    );
+    assert_eq!(
+        engine.current_peer_worker_limit(),
+        DEFAULT_PEER_WORKER_LIMIT
+    );
+    engine.set_peer_worker_limit(5);
+    assert_eq!(engine.current_peer_worker_limit(), 5);
+    // Zero restores the operational default (documented zero-limit semantics).
+    engine.set_peer_worker_limit(0);
+    assert_eq!(
+        engine.current_peer_worker_limit(),
+        DEFAULT_PEER_WORKER_LIMIT
+    );
+}
+
+#[test]
+fn engine_follows_shared_peer_worker_limit_without_commands() {
+    let bytes = build_single_file_torrent("limit.bin", b"generated lawful payload", 8, None, false);
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let shared = SharedPeerWorkerLimit::new();
+    let engine = TorrentEngine::new(
+        meta,
+        PathBuf::from("/tmp"),
+        [0u8; 20],
+        Arc::new(swarmotter_core::net::binder::LoopbackBinder),
+        state,
+        rx,
+        vec![],
+        6881,
+    )
+    .with_shared_peer_worker_limit(shared.clone());
+    assert_eq!(
+        engine.current_peer_worker_limit(),
+        DEFAULT_PEER_WORKER_LIMIT
+    );
+
+    // Scheduler-side replacement converges without any engine command.
+    assert!(shared.store_default(7));
+    assert_eq!(engine.current_peer_worker_limit(), 7);
+    // Repeated identical updates are no-ops and must not invalidate a
+    // per-torrent autopilot override.
+    assert!(!shared.store_default(7));
+    engine.set_peer_worker_limit(3);
+    assert_eq!(engine.current_peer_worker_limit(), 3);
+    assert!(!shared.store_default(7));
+    assert_eq!(engine.current_peer_worker_limit(), 3);
+
+    // A real configuration replacement invalidates the override and the
+    // engine converges to the new configured default.
+    assert!(shared.store_default(11));
+    assert_eq!(engine.current_peer_worker_limit(), 11);
+    assert_eq!(engine.max_peer_workers.load(Ordering::Relaxed), 0);
+}
+
+// --- Coalesced resume checkpoints (ADR-0074) ---
+
+fn checkpoint_engine_fixture(
+    dir: &Path,
+    content: &[u8],
+    piece_len: u64,
+) -> (TorrentEngine, StorageIo) {
+    let bytes = build_single_file_torrent("checkpoint.bin", content, piece_len, None, false);
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let key = TorrentKey::v1(meta.info_hash);
+    let state = Arc::new(Mutex::new(EngineState {
+        total_length: content.len() as u64,
+        piece_count: meta.piece_count(),
+        ..EngineState::default()
+    }));
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let engine = TorrentEngine::new(
+        meta.clone(),
+        dir.to_path_buf(),
+        [0u8; 20],
+        Arc::new(swarmotter_core::net::binder::LoopbackBinder),
+        state,
+        rx,
+        vec![],
+        6881,
+    )
+    .with_torrent_key(key);
+    let storage = StorageIo::new(meta, dir.to_path_buf()).with_torrent_key(key);
+    (engine, storage)
+}
+
+#[tokio::test]
+async fn resume_checkpoints_are_coalesced_below_completed_piece_count() {
+    let dir = unique_dir("checkpoint-coalesce");
+    let content: Vec<u8> = (0..200).map(|i| (i % 251) as u8).collect();
+    let (engine, storage) = checkpoint_engine_fixture(&dir, &content, 1);
+
+    // Simulate 200 verified pieces, consulting the checkpoint policy after
+    // every piece exactly like the serial download path does.
+    let mut have = swarmotter_core::storage::PieceBitfield::new(200);
+    for piece in 0..200usize {
+        have.set(piece);
+        // Keep the engine's byte counter consistent with the verified
+        // bitfield, as the real download path does.
+        engine.state.lock().await.downloaded = (piece + 1) as u64;
+        engine.mark_resume_piece_verified();
+        engine
+            .maybe_persist_resume(&storage, &have, false)
+            .await
+            .expect("coalesced checkpoint");
+    }
+    let written = engine.resume_checkpoints_written();
+    assert!(
+        written < 200 / 10,
+        "checkpoints ({written}) must be substantially below pieces (200)"
+    );
+    // The final resume file covers the last successfully checkpointed
+    // generation, and unrecorded pieces remain marked dirty for the next
+    // trigger.
+    let resume = storage
+        .load_resume(&storage.torrent_key())
+        .await
+        .unwrap()
+        .expect("resume file exists");
+    assert!(resume.piece_bitfield.count(200) >= 192);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn forced_checkpoint_covers_lifecycle_boundaries_and_resets_dirty_state() {
+    let dir = unique_dir("checkpoint-force");
+    let content: Vec<u8> = (0..8).map(|i| (i % 251) as u8).collect();
+    let (engine, storage) = checkpoint_engine_fixture(&dir, &content, 1);
+
+    let mut have = swarmotter_core::storage::PieceBitfield::new(8);
+    have.set(0);
+    engine.mark_resume_piece_verified();
+    // Below the policy threshold: deferred.
+    let due = engine.resume_checkpoint_due(false).await;
+    assert!(due.is_none(), "a single new piece must be deferred");
+    // Lifecycle boundary: forced.
+    assert!(engine.resume_checkpoint_due(true).await.is_some());
+    engine
+        .maybe_persist_resume(&storage, &have, true)
+        .await
+        .expect("forced checkpoint");
+    assert_eq!(engine.resume_checkpoints_written(), 1);
+    // Clean after the forced checkpoint.
+    engine.mark_resume_piece_verified(); // one new piece
+    assert!(engine.resume_checkpoint_due(false).await.is_none());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[tokio::test]
+async fn pieces_verified_during_a_checkpoint_remain_dirty() {
+    tokio::time::pause();
+    let dir = unique_dir("checkpoint-race");
+    let content: Vec<u8> = (0..64).map(|i| (i % 251) as u8).collect();
+    let (engine, storage) = checkpoint_engine_fixture(&dir, &content, 1);
+    let have = swarmotter_core::storage::PieceBitfield::new(64);
+
+    for _ in 0..64 {
+        engine.mark_resume_piece_verified();
+    }
+    // The checkpoint covers the generation observed before the save; a piece
+    // verified while the checkpoint wrote advances the generation further and
+    // must not be marked clean by the completed checkpoint.
+    let observed = engine.resume_checkpoint_due(false).await.expect("due");
+    engine
+        .maybe_persist_resume(&storage, &have, false)
+        .await
+        .expect("checkpoint");
+    engine.mark_resume_piece_verified(); // completed during/after the save
+    assert_eq!(
+        engine
+            .resume_checkpointed_generation
+            .load(Ordering::Relaxed),
+        observed,
+        "checkpoint must cover only its observed generation"
+    );
+    // The post-save piece stays dirty: the generation is beyond the
+    // checkpointed one, so the next threshold or interval trigger covers it.
+    assert_ne!(
+        engine.resume_dirty_generation.load(Ordering::Relaxed),
+        engine
+            .resume_checkpointed_generation
+            .load(Ordering::Relaxed),
+        "the post-save piece must remain dirty"
+    );
+    // After the checkpoint interval elapses (mocked clock), the pending
+    // generation triggers a checkpoint even below the piece threshold.
+    tokio::time::advance(RESUME_CHECKPOINT_INTERVAL).await;
+    assert!(engine.resume_checkpoint_due(false).await.is_some());
+    std::fs::remove_dir_all(dir).ok();
 }

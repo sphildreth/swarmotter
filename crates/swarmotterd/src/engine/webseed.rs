@@ -95,9 +95,19 @@ impl TorrentEngine {
 
         if progressed {
             let merged = shared_have.lock().await.clone();
+            let piece_count = self.meta.piece_count();
+            let newly_verified = merged
+                .count(piece_count)
+                .saturating_sub(have.count(piece_count));
+            for _ in 0..newly_verified {
+                self.mark_resume_piece_verified();
+            }
             *have = merged.clone();
             self.update_progress(&merged).await;
-            if let Err(e) = self.persist_resume(storage.as_ref(), &merged).await {
+            if let Err(e) = self
+                .maybe_persist_resume(storage.as_ref(), &merged, false)
+                .await
+            {
                 tracing::warn!(error = %e, "webseed resume persist failed");
             }
         }
@@ -109,7 +119,7 @@ impl TorrentEngine {
 pub(super) fn spawn_webseed_piece_task(
     tasks: &mut tokio::task::JoinSet<(usize, Result<bool>)>,
     piece_index: usize,
-    meta: TorrentMeta,
+    meta: Arc<TorrentMeta>,
     binder: Arc<dyn NetworkBinder>,
     storage: Arc<StorageIo>,
     shared_have: Arc<Mutex<PieceBitfield>>,
@@ -136,7 +146,7 @@ pub(super) fn spawn_webseed_piece_task(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn download_webseed_piece(
     binder: Arc<dyn NetworkBinder>,
-    meta: TorrentMeta,
+    meta: Arc<TorrentMeta>,
     piece_index: usize,
     storage: Arc<StorageIo>,
     shared_have: Arc<Mutex<PieceBitfield>>,

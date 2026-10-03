@@ -1225,3 +1225,268 @@ async fn concurrent_config_replacements_leave_runtime_and_disk_consistent() {
         .ends_with(".tmp")));
     std::fs::remove_dir_all(root).ok();
 }
+
+// --- Proportional changed-record persistence (ADR-0073) ---
+
+fn bulk_registry_torrent(label: &str, index: usize) -> Torrent {
+    let payload = format!("generated lawful library payload {label} {index}");
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        &format!("{label}-{index}.bin"),
+        payload.as_bytes(),
+        64,
+        None,
+        false,
+    );
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    Torrent::new(meta, now())
+}
+
+#[tokio::test]
+async fn progress_persistence_rewrites_only_changed_records() {
+    use crate::state_store::CHANGED_SAVE_RECORDS_WRITTEN;
+
+    let root = unique_dir("incremental-persistence");
+    let state_path = root.join("state.sqlite");
+    let cfg = Config::default();
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        cfg.clone(),
+        health.clone(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+
+    // First save: legacy/absent state must take the full migration path.
+    // This runtime-local counter isolates the assertion from other tests in
+    // the same process that legitimately perform changed-record saves.
+    runtime.persist_state().await.unwrap();
+    assert_eq!(
+        runtime.changed_record_save_count(),
+        0,
+        "full saves are not changed-record saves"
+    );
+
+    // Build a library of paused records plus one record with engine progress.
+    let mut active_hash = None;
+    for index in 0..300 {
+        let torrent = bulk_registry_torrent("library", index);
+        let hash = torrent.key();
+        let mut torrent = torrent;
+        torrent.state = TorrentState::Paused;
+        if index == 0 {
+            torrent.state = TorrentState::Downloading;
+            torrent.downloaded = 4096;
+            torrent.uploaded = 512;
+            active_hash = Some(hash);
+        }
+        runtime.registry.lock().await.add(torrent).unwrap();
+        runtime.queue.lock().await.add(hash);
+    }
+    let active_hash = active_hash.unwrap();
+
+    // Prime the fingerprint generation with a full save.
+    runtime.persist_state().await.unwrap();
+
+    // Simulate one engine progress sample: exactly one record must be
+    // serialized and rewritten.
+    {
+        let mut reg = runtime.registry.lock().await;
+        let torrent = reg.get_mut(&active_hash).unwrap();
+        torrent.downloaded += 65536;
+        torrent.uploaded += 1024;
+    }
+    let before = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    runtime.persist_state().await.unwrap();
+    let after = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        after - before,
+        1,
+        "a one-torrent progress change must rewrite exactly one record"
+    );
+
+    // Growing the inactive library must not increase writes for a fixed
+    // active set.
+    for index in 300..1_300 {
+        let torrent = bulk_registry_torrent("library", index);
+        let hash = torrent.key();
+        let mut torrent = torrent;
+        torrent.state = TorrentState::Paused;
+        runtime.registry.lock().await.add(torrent).unwrap();
+        runtime.queue.lock().await.add(hash);
+    }
+    // Newly registered records are written exactly once (their first
+    // durable generation), then never again while unchanged.
+    let before = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    runtime.persist_state().await.unwrap();
+    let after = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        after - before,
+        1_000,
+        "newly registered library records are written once"
+    );
+    let before = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    runtime.persist_state().await.unwrap();
+    let after = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        after - before,
+        0,
+        "an unchanged 10k inactive library must not be rewritten on a no-op save"
+    );
+
+    // One further active change still rewrites exactly one record despite the
+    // larger library.
+    {
+        let mut reg = runtime.registry.lock().await;
+        let torrent = reg.get_mut(&active_hash).unwrap();
+        torrent.downloaded += 65536;
+    }
+    let before = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    runtime.persist_state().await.unwrap();
+    let after = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        after - before,
+        1,
+        "changed-record saves stay proportional to changes as the library grows"
+    );
+
+    // Durable state remains loadable and coherent after incremental saves.
+    // Assert against the durable record itself so the restored runtime's
+    // engine tasks (which legitimately re-derive live counters after their
+    // first discovery pass) cannot race these assertions.
+    let connection = rusqlite::Connection::open(&state_path).unwrap();
+    let json: Vec<u8> = connection
+        .query_row(
+            "SELECT torrent_json FROM torrent_records WHERE info_hash = ?1",
+            rusqlite::params![active_hash.to_locator()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+    let durable: Torrent = serde_json::from_slice(&json).unwrap();
+    assert_eq!(durable.downloaded, 4096 + 65536 + 65536);
+    assert_eq!(durable.state, TorrentState::Downloading);
+    let count: i64 = rusqlite::Connection::open(&state_path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM torrent_records", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 1_300);
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn changed_fingerprints_preserve_metadata_labels_and_queue_boundaries() {
+    let root = unique_dir("changed-fingerprint-boundaries");
+    let state_path = root.join("state.sqlite");
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        Config::default(),
+        disabled_health(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let first_bytes = swarmotter_core::meta::build_single_file_torrent(
+        "fingerprint-first.bin",
+        b"generated first payload",
+        8,
+        None,
+        false,
+    );
+    let second_bytes = swarmotter_core::meta::build_single_file_torrent(
+        "fingerprint-second.bin",
+        b"generated second payload",
+        8,
+        None,
+        false,
+    );
+    let first = runtime
+        .add_torrent_file_with_options(first_bytes, AddTorrentOptions::new(None, true))
+        .await
+        .unwrap();
+    let second = runtime
+        .add_torrent_file_with_options(second_bytes, AddTorrentOptions::new(None, true))
+        .await
+        .unwrap();
+    runtime
+        .set_labels(&first, vec!["a".into(), "bc".into()])
+        .await
+        .unwrap();
+    runtime.persist_state_full().await.unwrap();
+
+    runtime
+        .set_labels(&first, vec!["ab".into(), "c".into()])
+        .await
+        .unwrap();
+    let tracker = "https://tracker.example.invalid/announce".to_string();
+    runtime.add_tracker(&first, tracker.clone()).await.unwrap();
+
+    {
+        let mut queue = runtime.queue.lock().await;
+        queue.order = vec![first];
+        queue.bypass = vec![second];
+    }
+    runtime.persist_state_full().await.unwrap();
+    {
+        let mut queue = runtime.queue.lock().await;
+        queue.order = vec![first, second];
+        queue.bypass.clear();
+    }
+    runtime.persist_state().await.unwrap();
+    drop(runtime);
+
+    let stored = crate::state_store::load(&state_path).unwrap().unwrap();
+    let torrent = stored
+        .torrents
+        .iter()
+        .find(|torrent| torrent.key() == first)
+        .unwrap();
+    assert_eq!(torrent.labels, vec!["ab", "c"]);
+    assert_eq!(torrent.meta.announce.as_deref(), Some(tracker.as_str()));
+    assert_eq!(stored.queue.order, vec![first, second]);
+    assert!(stored.queue.bypass.is_empty());
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn removal_after_incremental_saves_deletes_the_durable_record() {
+    let root = unique_dir("incremental-removal");
+    let state_path = root.join("state.sqlite");
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        Config::default(),
+        disabled_health(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "removed-after-incremental.bin",
+        b"generated removal payload",
+        8,
+        None,
+        false,
+    );
+    let hash = runtime
+        .add_torrent_file_with_options(bytes, AddTorrentOptions::new(None, true))
+        .await
+        .unwrap();
+    runtime
+        .set_labels(&hash, vec!["changed".into()])
+        .await
+        .unwrap();
+    runtime.remove_torrent(&hash, false).await.unwrap();
+
+    let stored = crate::state_store::load(&state_path).unwrap().unwrap();
+    assert!(stored.torrents.is_empty());
+    assert!(!stored.queue.order.contains(&hash));
+    drop(runtime);
+    std::fs::remove_dir_all(root).ok();
+}

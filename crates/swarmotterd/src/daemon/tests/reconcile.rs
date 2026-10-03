@@ -245,7 +245,7 @@ async fn reconcile_applies_resolved_magnet_metadata_while_engine_runs() {
             pieces_have,
             piece_count: real_meta.piece_count(),
             total_length: real_meta.total_length,
-            resolved_meta: Some(real_meta.clone()),
+            resolved_meta: Some(Arc::new(real_meta.clone())),
             ..Default::default()
         })),
     );

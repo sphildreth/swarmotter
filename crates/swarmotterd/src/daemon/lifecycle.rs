@@ -499,6 +499,10 @@ impl DaemonOps for DaemonRuntime {
             if let Some(torrent) = reg.get_mut(hash) {
                 torrent.containment_recovery_intent = None;
                 torrent.policy.preview_until_started = false;
+                if torrent.state == TorrentState::TrackerError {
+                    torrent.state = TorrentState::Queued;
+                    torrent.error = None;
+                }
             } else {
                 return Err(CoreError::NotFound("torrent".into()));
             }
@@ -758,7 +762,7 @@ impl DaemonOps for DaemonRuntime {
         if let Some(current) = self.registry.lock().await.get_mut(hash) {
             current.download_dir = Some(path);
         }
-        let persist_result = self.persist_state().await;
+        let persist_result = self.persist_state_full().await;
         let result = if let Err(persist_error) = persist_result {
             match moved_storage
                 .move_to_with_partial_file_suffix(source_path, payload_partial_file_suffix)
@@ -806,7 +810,7 @@ impl DaemonOps for DaemonRuntime {
         if file_index >= torrent.meta.files.len() {
             return Err(CoreError::NotFound("torrent file".into()));
         }
-        let mut renamed_meta = torrent.meta.clone();
+        let mut renamed_meta = (*torrent.meta).clone();
         renamed_meta.files[file_index].path = components;
         let cfg = self.config.read().await.clone();
         let (complete_dir, active_dir) = Self::policy_storage_paths_with_config(&cfg, &torrent);
@@ -868,10 +872,10 @@ impl DaemonOps for DaemonRuntime {
             }
         };
         if let Some(torrent) = self.registry.lock().await.get_mut(hash) {
-            torrent.meta = renamed_meta;
+            torrent.meta = std::sync::Arc::new(renamed_meta);
             torrent.files[file_index].path = new_path;
         }
-        let result = if let Err(persist_error) = self.persist_state().await {
+        let result = if let Err(persist_error) = self.persist_state_full().await {
             match rollback_payload_rename(&old_path, &new_file_path, disk_outcome).await {
                 Ok(()) => {
                     if let Some(current) = self.registry.lock().await.get_mut(hash) {
@@ -1229,10 +1233,17 @@ impl DaemonOps for DaemonRuntime {
         let hash = &canonical_hash;
         let result = match self.registry.lock().await.get_mut(hash) {
             Some(t) => {
+                // Torrent metadata is shared via `Arc` across registry,
+                // engines, and storages; rebuild the shared value for this
+                // rare tracker-list edit instead of mutating in place.
                 if t.meta.announce.is_none() {
-                    t.meta.announce = Some(url);
+                    let mut meta = (*t.meta).clone();
+                    meta.announce = Some(url);
+                    t.meta = std::sync::Arc::new(meta);
                 } else {
-                    t.meta.announce_list.push(vec![url]);
+                    let mut meta = (*t.meta).clone();
+                    meta.announce_list.push(vec![url]);
+                    t.meta = std::sync::Arc::new(meta);
                 }
                 Ok(())
             }
@@ -1247,13 +1258,15 @@ impl DaemonOps for DaemonRuntime {
         let hash = &canonical_hash;
         let result = match self.registry.lock().await.get_mut(hash) {
             Some(t) => {
-                if t.meta.announce.as_deref() == Some(&url) {
-                    t.meta.announce = None;
+                let mut meta = (*t.meta).clone();
+                if meta.announce.as_deref() == Some(&url) {
+                    meta.announce = None;
                 }
-                t.meta.announce_list.retain_mut(|tier| {
+                meta.announce_list.retain_mut(|tier| {
                     tier.retain(|u| u != &url);
                     !tier.is_empty()
                 });
+                t.meta = std::sync::Arc::new(meta);
                 Ok(())
             }
             None => Err(CoreError::NotFound("torrent".into())),
@@ -1272,10 +1285,11 @@ impl DaemonOps for DaemonRuntime {
         let hash = &canonical_hash;
         let result = match self.registry.lock().await.get_mut(hash) {
             Some(t) => {
-                if t.meta.announce.as_deref() == Some(&old_url) {
-                    t.meta.announce = Some(new_url);
+                let mut meta = (*t.meta).clone();
+                if meta.announce.as_deref() == Some(&old_url) {
+                    meta.announce = Some(new_url);
                 } else {
-                    for tier in t.meta.announce_list.iter_mut() {
+                    for tier in meta.announce_list.iter_mut() {
                         for u in tier.iter_mut() {
                             if *u == old_url {
                                 *u = new_url.clone();
@@ -1283,6 +1297,7 @@ impl DaemonOps for DaemonRuntime {
                         }
                     }
                 }
+                t.meta = std::sync::Arc::new(meta);
                 Ok(())
             }
             None => Err(CoreError::NotFound("torrent".into())),
@@ -1835,7 +1850,7 @@ impl DaemonOps for DaemonRuntime {
         }
 
         self.clear_download_runtime_state().await;
-        self.persist_state().await?;
+        self.persist_state_full().await?;
 
         tracing::warn!(
             torrents_removed = torrents.len(),

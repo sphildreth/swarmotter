@@ -6,11 +6,12 @@ impl DaemonRuntime {
     pub(super) async fn start_seeder(
         &self,
         hash: TorrentKey,
-        meta: swarmotter_core::meta::TorrentMeta,
+        meta: impl Into<std::sync::Arc<swarmotter_core::meta::TorrentMeta>>,
         active_dir: String,
         complete_dir: String,
         state: Arc<Mutex<EngineState>>,
     ) -> Result<()> {
+        let meta = meta.into();
         let _data_plane_transition = self.data_plane_transition_lock.lock().await;
         self.start_seeder_while_transition_locked(hash, meta, active_dir, complete_dir, state)
             .await
@@ -19,7 +20,7 @@ impl DaemonRuntime {
     pub(super) async fn start_seeder_while_transition_locked(
         &self,
         hash: TorrentKey,
-        meta: swarmotter_core::meta::TorrentMeta,
+        meta: std::sync::Arc<swarmotter_core::meta::TorrentMeta>,
         active_dir: String,
         complete_dir: String,
         state: Arc<Mutex<EngineState>>,
@@ -79,7 +80,7 @@ impl DaemonRuntime {
             None
         } else {
             Some(Arc::new(storage_io_with_config(
-                meta.clone(),
+                Arc::clone(&meta),
                 std::path::PathBuf::from(&complete_dir),
                 &config,
             )))
@@ -108,7 +109,7 @@ impl DaemonRuntime {
         let announce_handle = self
             .spawn_seeder_announce(
                 hash,
-                meta.clone(),
+                Arc::clone(&meta),
                 peer_id,
                 listen_port,
                 state,
@@ -152,6 +153,7 @@ impl DaemonRuntime {
             self.peer_permit_pool.read().await.clone(),
         )
         .with_peer_filter(peer_filter)
+        .with_downloader_serves(self.downloader_serves.clone())
         .with_bound_addr(bound_tx);
         *self.seeder_listener_shutdown.lock().await = Some(shutdown_tx);
         let containment_gate = self.containment_gate.clone();
@@ -168,7 +170,10 @@ impl DaemonRuntime {
             }
         }));
         match tokio::time::timeout(Duration::from_secs(5), bound_rx).await {
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(addr)) => {
+                *self.seeder_listener_addr.lock().await = Some(addr);
+                Ok(())
+            }
             Ok(Err(_)) => {
                 drop(handle_slot);
                 self.stop_seeder_listener(true).await;
@@ -187,6 +192,7 @@ impl DaemonRuntime {
     }
 
     pub(super) async fn stop_seeder_listener(&self, force: bool) {
+        *self.seeder_listener_addr.lock().await = None;
         if let Some(shutdown) = self.seeder_listener_shutdown.lock().await.take() {
             let _ = shutdown.send(true);
         }
@@ -614,7 +620,7 @@ impl DaemonRuntime {
     pub(super) async fn spawn_seeder_announce(
         &self,
         hash: TorrentKey,
-        meta: swarmotter_core::meta::TorrentMeta,
+        meta: std::sync::Arc<swarmotter_core::meta::TorrentMeta>,
         peer_id: [u8; 20],
         listen_port: u16,
         state: Arc<Mutex<EngineState>>,
@@ -704,7 +710,7 @@ impl DaemonRuntime {
         if let Some(handle) = handle {
             let _ = handle.await;
         }
-        if self.seeder_registry.is_empty().await {
+        if self.seeder_registry.is_empty().await && self.downloader_serves.read().await.is_empty() {
             self.stop_seeder_listener(false).await;
         }
         if let Some(torrent) = self.registry.lock().await.get_mut(hash) {
@@ -781,6 +787,7 @@ impl DaemonRuntime {
                             true,
                             crate::engine::TrackerAnnounceSnapshot {
                                 status: TrackerStatus::Ok,
+                                explicit_failure: false,
                                 seeders: response.seeders,
                                 leechers: response.leechers,
                                 downloads: 0,
@@ -805,6 +812,7 @@ impl DaemonRuntime {
                             false,
                             crate::engine::TrackerAnnounceSnapshot {
                                 status: TrackerStatus::Error,
+                                explicit_failure: true,
                                 seeders: response.seeders,
                                 leechers: response.leechers,
                                 downloads: 0,
@@ -827,6 +835,7 @@ impl DaemonRuntime {
                             false,
                             crate::engine::TrackerAnnounceSnapshot {
                                 status: TrackerStatus::Error,
+                                explicit_failure: false,
                                 seeders: 0,
                                 leechers: 0,
                                 downloads: 0,
@@ -847,6 +856,7 @@ impl DaemonRuntime {
                             false,
                             crate::engine::TrackerAnnounceSnapshot {
                                 status: TrackerStatus::Error,
+                                explicit_failure: false,
                                 seeders: 0,
                                 leechers: 0,
                                 downloads: 0,
@@ -899,7 +909,7 @@ impl DaemonRuntime {
             handle.abort();
             let _ = handle.await;
         }
-        if self.seeder_registry.is_empty().await {
+        if self.seeder_registry.is_empty().await && self.downloader_serves.read().await.is_empty() {
             self.stop_seeder_listener(true).await;
         }
         if let Some(torrent) = self.registry.lock().await.get_mut(hash) {

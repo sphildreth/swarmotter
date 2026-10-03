@@ -405,8 +405,13 @@ async fn spawn_failing_tracker() -> (String, Arc<AtomicUsize>) {
                 let _ =
                     tokio::time::timeout(Duration::from_secs(2), stream.read(&mut request)).await;
                 observed.fetch_add(1, Ordering::Relaxed);
-                let response = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                let _ = stream.write_all(response).await;
+                let body = b"d14:failure reason36:Requested download is not authorizede";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(body).await;
                 let _ = stream.flush().await;
             });
         }
@@ -416,88 +421,118 @@ async fn spawn_failing_tracker() -> (String, Arc<AtomicUsize>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn terminal_tracker_failure_sets_tracker_error_and_reannounce_retries() {
-    let (tracker_url, tracker_requests) = spawn_failing_tracker().await;
-    let content = b"generated tracker-error reachability payload";
-    let torrent_bytes =
-        build_single_file_torrent("tracker-error.bin", content, 8, Some(&tracker_url), false);
-    let hash = TorrentKey::v1(parse_torrent(&torrent_bytes).unwrap().info_hash);
-    let download_dir = unique_dir("tracker-error");
+    for private in [false, true] {
+        let (tracker_url, tracker_requests) = spawn_failing_tracker().await;
+        let content = b"generated tracker-error reachability payload";
+        let torrent_bytes =
+            build_single_file_torrent("tracker-error.bin", content, 8, Some(&tracker_url), private);
+        let hash = TorrentKey::v1(parse_torrent(&torrent_bytes).unwrap().info_hash);
+        let download_dir = unique_dir("tracker-error");
 
-    let mut config = Config::default();
-    config.network.mode = NetworkContainmentMode::Disabled;
-    config.dht.enabled = false;
-    config.torrent.listen_port = 0;
-    config.torrent.encryption_mode = swarmotter_core::config::PeerEncryptionMode::Disabled;
-    config.storage.download_dir = Some(download_dir.display().to_string());
-    config.storage.incomplete_dir = Some(download_dir.display().to_string());
-    let health = NetworkHealth::blocked(
-        NetworkContainmentMode::Disabled,
-        NetworkContainmentStatus::Disabled,
-        "disabled",
-    );
-    let runtime = Arc::new(DaemonRuntime::new(config.clone(), health));
-    runtime
-        .add_torrent_file(torrent_bytes, Some(download_dir.display().to_string()))
-        .await
-        .unwrap();
+        let mut config = Config::default();
+        config.network.mode = NetworkContainmentMode::Disabled;
+        config.dht.enabled = private;
+        config.dht.bootstrap_nodes.clear();
+        config.dht.port = 0;
+        config.torrent.listen_port = 0;
+        config.torrent.encryption_mode = swarmotter_core::config::PeerEncryptionMode::Disabled;
+        config.storage.download_dir = Some(download_dir.display().to_string());
+        config.storage.incomplete_dir = Some(download_dir.display().to_string());
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = Arc::new(DaemonRuntime::new(config.clone(), health));
+        runtime
+            .add_torrent_file(torrent_bytes, Some(download_dir.display().to_string()))
+            .await
+            .unwrap();
 
-    let mut failed = None;
-    for _ in 0..200 {
-        let summary = runtime.get_torrent(&hash).await.unwrap();
-        if summary.state == TorrentState::TrackerError {
-            failed = Some(summary);
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let failed = match failed {
-        Some(summary) => summary,
-        None => {
+        let mut failed = None;
+        for _ in 0..200 {
             let summary = runtime.get_torrent(&hash).await.unwrap();
-            let diagnostics = runtime.torrent_stats(&hash).await;
-            runtime.shutdown().await.unwrap();
-            panic!(
+            if summary.state == TorrentState::TrackerError {
+                failed = Some(summary);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let failed = match failed {
+            Some(summary) => summary,
+            None => {
+                let summary = runtime.get_torrent(&hash).await.unwrap();
+                let diagnostics = runtime.torrent_stats(&hash).await;
+                runtime.shutdown().await.unwrap();
+                panic!(
                 "terminal tracker failure did not reach tracker_error: summary={summary:?}, diagnostics={diagnostics:?}, requests={}",
                 tracker_requests.load(Ordering::Relaxed)
             );
+            }
+        };
+        assert!(
+            failed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Requested download is not authorized")),
+            "tracker_error must retain the last tracker failure: {:?}",
+            failed.error
+        );
+        assert!(tracker_requests.load(Ordering::Relaxed) >= 1);
+
+        let response = swarmotter_api::app_router(app_state(runtime.clone(), config))
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/torrents/{}", hash.to_locator()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["data"]["state"], "tracker_error");
+        assert!(value["data"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("Requested download is not authorized")));
+
+        runtime.reannounce(&hash).await.unwrap();
+        let retried = runtime.get_torrent(&hash).await.unwrap();
+        assert_ne!(retried.state, TorrentState::TrackerError);
+        assert!(retried.error.is_none());
+
+        for action in ["resume", "start_now"] {
+            let failed_again = tokio::time::timeout(Duration::from_secs(25), async {
+                loop {
+                    let summary = runtime.get_torrent(&hash).await.unwrap();
+                    if summary.state == TorrentState::TrackerError {
+                        break summary;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(failed_again
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Requested download is not authorized"));
+            if action == "resume" {
+                runtime.resume(&hash).await.unwrap();
+            } else {
+                runtime.start_now(&hash).await.unwrap();
+            }
+            let retried = runtime.get_torrent(&hash).await.unwrap();
+            assert_ne!(retried.state, TorrentState::TrackerError);
+            assert!(retried.error.is_none());
         }
-    };
-    assert!(
-        failed
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("503")),
-        "tracker_error must retain the last tracker failure: {:?}",
-        failed.error
-    );
-    assert!(tracker_requests.load(Ordering::Relaxed) >= 1);
-
-    let response = swarmotter_api::app_router(app_state(runtime.clone(), config))
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/v1/torrents/{}", hash.to_locator()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .unwrap();
-    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(value["data"]["state"], "tracker_error");
-    assert!(value["data"]["error"]
-        .as_str()
-        .is_some_and(|error| error.contains("503")));
-
-    runtime.reannounce(&hash).await.unwrap();
-    let retried = runtime.get_torrent(&hash).await.unwrap();
-    assert_ne!(retried.state, TorrentState::TrackerError);
-    assert!(retried.error.is_none());
-
-    runtime.shutdown().await.unwrap();
-    std::fs::remove_dir_all(download_dir).ok();
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(download_dir).ok();
+    }
 }
 
 struct ActiveSessionGuard(Arc<AtomicUsize>);

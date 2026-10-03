@@ -7,6 +7,41 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [2.2.0] - [2026-10-03]
+
+### Added
+
+- **Upload while downloading:** two incomplete daemons in one swarm can now
+  exchange verified pieces without a seeder. The shared contained peer
+  listener serves verified-piece ranges for active downloads (ADR-0075),
+  outbound peer sessions upload while downloading, verified-piece Have
+  messages fan out promptly, and discovery-evidence failures reset candidate
+  backoff. A new two-daemon integration test completes a real torrent through
+  peer-to-peer exchange alone.
+
+### Changed
+
+- **Shared torrent metadata memory:** the registry, engines, storages, and
+  seeder contexts share parsed torrent metadata via `Arc<TorrentMeta>`
+  instead of deep-cloning it per component, cutting per-torrent memory and
+  clone traffic during engine starts and scheduler operations. Tracker-list
+  edits, file renames, and magnet metadata resolution rebuild the shared
+  value; durable state round-trips unchanged.
+- **Bounded maintenance work:** autopilot decision refreshes analyze only
+  torrents with a running engine or an active lifecycle state, so a large
+  paused library no longer clones and re-analyzes every record each tick.
+
+### Fixed
+
+- **Discovery-aware download recovery:** thin successful announces reporting
+  swarm population keep the engine alive while peers fail or cool down. The
+  no-peer path gives enabled DHT a completed lookup despite cadence suppression;
+  genuinely empty engines retain a bounded exit. Announce timeouts, connection,
+  and I/O failures use the existing retry queue. `tracker_error` requires
+  explicit rejection from every attempted tracker with no successful announce
+  or usable alternative;
+  Reannounce, Resume, and Start Now still clear the retained error (ADR-0070).
+
 ## [2.1.0] - [2026-10-02]
 
 ### Added

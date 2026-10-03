@@ -173,15 +173,34 @@ feature completion and acceptance criteria, not by time estimates.
 - Per-torrent health serialization: `TorrentSummary` and the torrent detail
   endpoint both include a `health` object with score, bars, label, and
   per-component sub-scores.
-- Terminal tracker failure reachability: a real contained HTTP tracker failure
-  must drive the daemon to `tracker_error`, retain its last failure in the
-  native summary, and allow manual reannounce/resume to clear and retry. A
-  successful tracker response or usable DHT, PEX, direct-peer, or webseed
-  signal must prevent this terminal classification. The production-path
-  evidence is
-  `terminal_tracker_failure_sets_tracker_error_and_reannounce_retries`; the
-  classifier matrix is
+- Tracker lifecycle recovery (ADR-0070): generated local fixtures must prove
+  that every attempted tracker returning an explicit protocol rejection, with
+  DHT disabled or a private torrent and no usable alternative, reaches
+  `tracker_error`, retains the rejection in the native summary/API, and clears
+  it on Reannounce, Resume, and Start Now. Production evidence:
+  `terminal_tracker_failure_sets_tracker_error_and_reannounce_retries`.
+  `udp_connect_rejection_retains_explicit_failure_reason` also verifies that
+  BEP 15 connect rejections retain their complete protocol failure reason.
+  Classifier evidence:
   `terminal_tracker_error_requires_all_failures_and_no_successful_alternative`.
+- Transient announce failures must remain retryable even before DHT completes;
+  the real daemon must place the exhausted attempt in its incomplete-engine
+  retry queue. Evidence:
+  `tracker_announce_timeout_waits_for_dht_then_queues_for_retry`.
+- Thin successful announces reporting swarm population must survive cooled-down
+  no-peer rounds without `tracker_error`. A later successful empty announce
+  permits bounded recovery. Evidence:
+  `thin_successful_announce_keeps_failed_peer_swarm_alive`;
+  `populated_announce_survives_empty_or_filtered_peer_lists` covers empty and
+  filtered lists, including leecher-only population, and
+  `successful_population_is_retained_across_retryable_announce_failure` covers
+  population retained across transport errors.
+- Empty-swarm discovery must force a DHT lookup after known peers become
+  unusable despite cadence suppression, and await completion including timeout.
+  Evidence: `no_peer_path_forces_dht_after_known_peers_fail_despite_cadence` and
+  `no_peer_path_waits_for_forced_dht_timeout_before_bounded_exit`.
+  Skipped refreshes supply no new evidence. Trackerless/DHT-disabled engines
+  must still exit: `trackerless_without_dht_exits_after_bounded_empty_discovery`.
 
 ### Watch-folder stability and atomicity acceptance matrix
 

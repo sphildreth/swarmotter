@@ -305,11 +305,15 @@ not accept restart-required fields.
 ## Per-torrent seeding contract
 
 - Native list/detail summaries expose nullable `error`. A bounded engine run
-  that exhausts every attempted configured tracker with no usable DHT, PEX,
-  direct-peer, or webseed source transitions to `tracker_error` and retains the
-  last tracker failure there. Reannounce, Resume, or Start Now clears the error
-  and retries; a successful tracker or alternative source prevents the
-  terminal classification.
+  transitions to `tracker_error` only when every attempted tracker explicitly
+  rejects the announce, no announce succeeded during that run, and no usable
+  DHT, PEX, direct-peer, or webseed signal exists. The last rejection is retained
+  in `error`; Reannounce, Resume, or Start Now clears it and retries. Announce
+  timeouts, connection, and I/O failures use the incomplete-engine retry queue.
+  A thin successful announce reporting any seeders or leechers prevents
+  empty-swarm give-up, regardless of peer filtering/failure/cooldown. Enabled
+  DHT must finish a lookup after known peers become unusable before an empty
+  engine can exit; skipped refreshes do not establish emptiness (ADR-0070).
 - Native list and detail summaries expose the persisted `seeding` object,
   `seeding_status`, ratio/uploaded counters, and resolved
   `effective_ratio_limit` / `effective_idle_limit`.

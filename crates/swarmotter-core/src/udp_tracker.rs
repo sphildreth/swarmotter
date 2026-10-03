@@ -98,7 +98,12 @@ async fn run_one_transaction(
 ) -> Result<AnnounceResponse> {
     let connect_txn = random_txn_id();
     let connect = encode_connect(connect_txn);
-    let buf = send_recv(socket, addr, &connect, ACTION_CONNECT, connect_txn, 16).await?;
+    let buf = send_recv(socket, addr, &connect, ACTION_CONNECT, connect_txn, 2048).await?;
+    // Preserve a BEP 15 rejection at either stage as a protocol failure. A
+    // transport error remains Err and can be retried by the engine instead.
+    if buf.starts_with(&ACTION_ERROR.to_be_bytes()) {
+        return decode_announce(&buf, connect_txn);
+    }
     let conn_id = decode_connect(&buf, connect_txn)?;
 
     let announce_txn = random_txn_id();
@@ -589,6 +594,35 @@ mod tests {
         assert_eq!(resp.peers[0].ip.to_string(), "127.0.0.1");
         assert_eq!(resp.peers[0].port, u16::from_be_bytes([0xC8, 0xE5]));
         tracker_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_connect_rejection_retains_explicit_failure_reason() {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let rejection = "Requested download is not authorized";
+        let server = tokio::spawn(async move {
+            let mut request = [0; 2048];
+            let (_, peer) = socket.recv_from(&mut request).await.unwrap();
+            assert_eq!(&request[8..12], &ACTION_CONNECT.to_be_bytes());
+            let mut response = ACTION_ERROR.to_be_bytes().to_vec();
+            response.extend_from_slice(&request[12..16]);
+            response.extend_from_slice(rejection.as_bytes());
+            socket.send_to(&response, peer).await.unwrap();
+        });
+        let mut request = req();
+        request.tracker_url = format!("udp://{address}/announce");
+        let binder = crate::net::binder::LoopbackBinder;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            udp_announce_with_iters(&binder, &request, 2),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.failure_reason.as_deref(), Some(rejection));
+        assert!(response.peers.is_empty());
+        server.await.unwrap();
     }
 
     /// Fail-closed UDP tracker: a blocking binder refuses to create the UDP

@@ -73,6 +73,103 @@ async fn unfinished_engine_exit_requeues_and_releases_active_slot() {
     assert_eq!(runtime.desired_download_hashes().await, vec![second_hash]);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tracker_announce_timeout_waits_for_dht_then_queues_for_retry() {
+    let tracker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    // This path has no derived scrape endpoint; only announce is under test.
+    let tracker_url = format!("http://{}/tracker", tracker.local_addr().unwrap());
+    let tracker_task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = tracker.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut first_byte = [0; 1];
+                stream.read_exact(&mut first_byte).await.unwrap();
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    let silent_dht = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dir = unique_dir("tracker-timeout-retry");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.torrent.listen_port = 0;
+    cfg.dht.port = 0;
+    cfg.dht.bootstrap_nodes = vec![silent_dht.local_addr().unwrap().to_string()];
+    cfg.storage.download_dir = Some(dir.display().to_string());
+    cfg.storage.incomplete_dir = Some(dir.display().to_string());
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::new(cfg, health);
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "timeout.bin",
+        b"generated local tracker timeout payload",
+        8,
+        Some(&tracker_url),
+        false,
+    );
+    let hash = runtime
+        .add_torrent_file(bytes, Some(dir.display().to_string()))
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let state = runtime.engine_states.read().await.get(&hash).cloned();
+            if let Some(state) = state {
+                let state = state.lock().await;
+                if state.dht_last_lookup.is_some() && state.dht_last_lookup_completed.is_none() {
+                    let snapshot = state.tracker_announces.get(&tracker_url).unwrap();
+                    assert!(snapshot
+                        .last_error
+                        .as_deref()
+                        .unwrap()
+                        .contains("timed out"));
+                    assert!(!snapshot.explicit_failure);
+                    assert!(state.terminal_tracker_error().is_none());
+                    drop(state);
+                    assert_ne!(
+                        runtime.get_torrent(&hash).await.unwrap().state,
+                        TorrentState::TrackerError
+                    );
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            let summary = runtime.get_torrent(&hash).await.unwrap();
+            assert_ne!(summary.state, TorrentState::TrackerError);
+            if summary.state == TorrentState::Queued
+                && runtime.engine_retry_after.read().await.contains_key(&hash)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(runtime
+        .engine_retry_after
+        .read()
+        .await
+        .get(&hash)
+        .is_some_and(|at| *at > Instant::now()));
+    assert_eq!(runtime.queue.lock().await.position(&hash), Some(1));
+    runtime.shutdown().await.unwrap();
+    tracker_task.abort();
+    drop(silent_dht);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn stale_active_without_engine_is_requeued_and_releases_active_slot() {
     let mut cfg = Config::default();

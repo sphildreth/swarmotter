@@ -37,16 +37,276 @@ use crate::v2::V2PieceLayout;
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+static HANDLE_USE_TICK: AtomicU64 = AtomicU64::new(0);
+
 // Tokio retains an internal read/write buffer of up to 2 MiB in every
 // `tokio::fs::File`. Keep only a bounded working set of writable handles and
 // never cache read-only handles, so a recheck of a large multi-file torrent
 // cannot retain one such buffer per payload file.
 const MAX_CACHED_WRITABLE_FILE_HANDLES: usize = 64;
 
+/// Process-wide (or per-storage-root) bound on live writable payload file
+/// handles. Each cached or in-flight writable handle occupies one slot; the
+/// slot is released when the underlying file object is dropped. When the
+/// bound is saturated, insertion first evicts the calling handle set's own
+/// least-recently-used entries and then asks other registered handle sets to
+/// evict, so an idle torrent's full cache cannot starve active writers.
+///
+/// This complements the per-torrent working-set limit: a daemon transferring
+/// hundreds of torrents would otherwise accumulate up to
+/// `per_torrent_limit * active_torrents` descriptors and Tokio buffers.
+///
+/// The bound covers writable payload handles. Read-only verification and
+/// seeding handles remain deliberately short-lived and uncached.
+/// See ADR-0072.
+pub struct StorageHandleBudget {
+    max_writable_handles: usize,
+    live: AtomicU64,
+    released: tokio::sync::Notify,
+    /// Registered handle sets (one per torrent storage cache). Registered
+    /// through weak references so dropping a `StorageIo` never keeps a cache
+    /// alive; entries are pruned when found dead.
+    registered: Mutex<Vec<std::sync::Weak<WritableHandleCacheCore>>>,
+}
+
+impl StorageHandleBudget {
+    pub fn new(max_writable_handles: usize) -> Arc<Self> {
+        Arc::new(Self {
+            max_writable_handles: max_writable_handles.max(1),
+            live: AtomicU64::new(0),
+            released: tokio::sync::Notify::new(),
+            registered: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Number of writable payload handles currently held across the process.
+    pub fn live_handles(&self) -> u64 {
+        self.live.load(Ordering::Relaxed)
+    }
+
+    /// The configured bound, for diagnostics.
+    pub fn max_handles(&self) -> usize {
+        self.max_writable_handles
+    }
+
+    async fn register(&self, cache: &Arc<WritableHandleCacheCore>) {
+        let mut registered = self.registered.lock().await;
+        registered.retain(|entry| entry.strong_count() > 0);
+        let already = registered.iter().any(|entry| {
+            entry
+                .upgrade()
+                .is_some_and(|strong| Arc::ptr_eq(&strong, cache))
+        });
+        if !already {
+            registered.push(Arc::downgrade(cache));
+        }
+    }
+
+    async fn acquire(&self) {
+        loop {
+            let live = self.live.fetch_add(1, Ordering::AcqRel);
+            if live < self.max_writable_handles as u64 {
+                return;
+            }
+            self.live.fetch_sub(1, Ordering::AcqRel);
+            // Ask other registered handle sets to release an LRU entry, then
+            // wait for either a release notification or a bounded retry tick.
+            let registered: Vec<Arc<WritableHandleCacheCore>> = {
+                let mut entries = self.registered.lock().await;
+                entries.retain(|entry| entry.strong_count() > 0);
+                entries.iter().filter_map(|w| w.upgrade()).collect()
+            };
+            for cache in &registered {
+                let _ = cache.evict_one_lru().await;
+                let live = self.live.fetch_add(1, Ordering::AcqRel);
+                if live < self.max_writable_handles as u64 {
+                    return;
+                }
+                self.live.fetch_sub(1, Ordering::AcqRel);
+            }
+            let notified = self.released.notified();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(25), notified).await;
+        }
+    }
+
+    fn release(&self) {
+        self.live.fetch_sub(1, Ordering::AcqRel);
+        self.released.notify_waiters();
+    }
+}
+
+/// A writable payload file that accounts itself against the shared handle
+/// budget for as long as the file object exists.
+struct BudgetedWritableFile {
+    file: fs::File,
+    budget: Option<Arc<StorageHandleBudget>>,
+}
+
+impl std::ops::Deref for BudgetedWritableFile {
+    type Target = fs::File;
+
+    fn deref(&self) -> &fs::File {
+        &self.file
+    }
+}
+
+impl std::ops::DerefMut for BudgetedWritableFile {
+    fn deref_mut(&mut self) -> &mut fs::File {
+        &mut self.file
+    }
+}
+
+impl Drop for BudgetedWritableFile {
+    fn drop(&mut self) {
+        if let Some(budget) = self.budget.take() {
+            budget.release();
+        }
+    }
+}
+
+/// One torrent's bounded writable-handle working set plus handles retired
+/// from that set while an active writer still held a reference.
+///
+/// A handle must never silently disappear from every flush boundary: writes
+/// issued through a handle evicted from the primary cache are still observed
+/// by read/verification/move barriers through the retired set until the last
+/// operation using that handle completes.
+#[derive(Default)]
+struct WritableHandleCache {
+    handles: HashMap<usize, CachedFileHandle>,
+    retired: HashMap<usize, Vec<RetiredWritableHandle>>,
+}
+
+struct RetiredWritableHandle {
+    file: Arc<Mutex<BudgetedWritableFile>>,
+    flush_pending: bool,
+}
+
+/// Shared core for budget registration: one instance per distinct torrent
+/// storage cache, shared by every `StorageIo` clone of that torrent.
+struct WritableHandleCacheCore {
+    cache: Arc<Mutex<WritableHandleCache>>,
+}
+
+impl WritableHandleCacheCore {
+    /// Evict one least-recently-used writable handle. Returns the number of
+    /// descriptors released. The evicted handle is flushed first so pending
+    /// buffered writes complete and any pending failure surfaces here.
+    async fn evict_one_lru(&self) -> usize {
+        Self::prune_released_retired(&self.cache).await;
+        let candidate = {
+            let cache = self.cache.lock().await;
+            cache
+                .handles
+                .iter()
+                .filter(|(_, handle)| handle.writable)
+                .min_by_key(|(_, handle)| handle.last_used)
+                .map(|(index, _)| *index)
+        };
+        let Some(index) = candidate else {
+            return 0;
+        };
+        let Some(handle) = (async {
+            let mut cache = self.cache.lock().await;
+            let candidate = cache
+                .handles
+                .iter()
+                .filter(|(_, handle)| handle.writable)
+                .min_by_key(|(_, handle)| handle.last_used)
+                .map(|(index, _)| *index)?;
+            cache.handles.remove(&candidate)
+        })
+        .await
+        else {
+            return 0;
+        };
+        let flush = {
+            let mut file = handle.file.lock().await;
+            file.flush().await.map_err(CoreError::from)
+        };
+        // Cross-torrent eviction cannot surface an error to a caller of
+        // another torrent; a flush failure here leaves the handle cached and
+        // the owning torrent's own next barrier propagates it.
+        let flush = flush
+            .inspect_err(|_| {
+                tracing::warn!("writable payload handle flush failed during budget-driven eviction")
+            })
+            .is_ok();
+        if !flush {
+            let mut cache = self.cache.lock().await;
+            if let std::collections::hash_map::Entry::Vacant(entry) = cache.handles.entry(index) {
+                entry.insert(handle);
+            } else {
+                cache
+                    .retired
+                    .entry(index)
+                    .or_default()
+                    .push(RetiredWritableHandle {
+                        file: handle.file,
+                        flush_pending: true,
+                    });
+            }
+            return 0;
+        }
+        match Self::retire_or_release(&self.cache, index, handle).await {
+            RetiredOrReleased::Released => 1,
+            RetiredOrReleased::Retired => 0,
+        }
+    }
+
+    /// Flush a removed handle and move it to the retired set when an active
+    /// operation still holds a reference. Returns `Released` when the
+    /// descriptor was dropped, `Retired` when it remains observable through
+    /// the retired set until the last active operation finishes.
+    async fn retire_or_release(
+        cache: &Arc<Mutex<WritableHandleCache>>,
+        index: usize,
+        handle: CachedFileHandle,
+    ) -> RetiredOrReleased {
+        if Arc::strong_count(&handle.file) > 1 {
+            // An active operation still writes through this handle. Keep it
+            // reachable from every flush barrier until that operation ends.
+            cache
+                .lock()
+                .await
+                .retired
+                .entry(index)
+                .or_default()
+                .push(RetiredWritableHandle {
+                    file: handle.file,
+                    flush_pending: false,
+                });
+            return RetiredOrReleased::Retired;
+        }
+        drop(handle);
+        RetiredOrReleased::Released
+    }
+
+    async fn prune_released_retired(cache: &Arc<Mutex<WritableHandleCache>>) {
+        let mut cache = cache.lock().await;
+        for retired in cache.retired.values_mut() {
+            retired.retain(|handle| handle.flush_pending || Arc::strong_count(&handle.file) > 1);
+        }
+        cache.retired.retain(|_, retired| !retired.is_empty());
+    }
+}
+
+enum RetiredOrReleased {
+    Retired,
+    Released,
+}
+
+#[derive(Clone)]
+struct CachedFileHandle {
+    file: Arc<Mutex<BudgetedWritableFile>>,
+    writable: bool,
+    last_used: u64,
+}
+
 /// Per-torrent storage handle performing real disk I/O.
 #[derive(Clone)]
 pub struct StorageIo {
-    meta: TorrentMeta,
+    meta: Arc<TorrentMeta>,
     /// The canonical daemon/durable identity used for fast-resume and path
     /// ownership. This deliberately remains distinct from `meta.info_hash`,
     /// which is zero for pure-v2 metainfo.
@@ -63,7 +323,12 @@ pub struct StorageIo {
     /// Bounded cache of writable handles. Read-only verification/seeding
     /// handles are deliberately short-lived because Tokio retains its I/O
     /// buffer for as long as the handle remains alive.
-    file_handles: Arc<Mutex<HashMap<usize, CachedFileHandle>>>,
+    writable_cache: Arc<Mutex<WritableHandleCache>>,
+    /// Registered once with [`StorageHandleBudget`] so global saturation can
+    /// evict this torrent's least-recently-used entries.
+    cache_core: Arc<WritableHandleCacheCore>,
+    /// Optional process/root-wide writable-handle budget. See ADR-0072.
+    handle_budget: Option<Arc<StorageHandleBudget>>,
     resume_write_lock: Arc<Mutex<()>>,
     /// Optional shared sustained payload-write limiter. The daemon gives every
     /// active torrent on one configured storage root the same limiter, so this
@@ -74,12 +339,10 @@ pub struct StorageIo {
     /// Optional process-local accounting shared by storage handles on one
     /// daemon root. It is observational and never changes I/O semantics.
     metrics: Option<StorageIoMetrics>,
-}
-
-#[derive(Clone)]
-struct CachedFileHandle {
-    file: Arc<Mutex<fs::File>>,
-    writable: bool,
+    /// Test-only injected flush failure exercised at handle eviction.
+    /// Production builds never set this.
+    #[cfg(test)]
+    test_flush_failure: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,23 +412,39 @@ impl StoragePathOwnership {
 }
 
 impl StorageIo {
-    pub fn new(meta: TorrentMeta, download_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(meta: impl Into<Arc<TorrentMeta>>, download_dir: impl Into<PathBuf>) -> Self {
+        let meta = meta.into();
         let torrent_key = meta
             .identity
             .primary_key()
             .unwrap_or_else(|| TorrentKey::v1(meta.info_hash));
+        let writable_cache: Arc<Mutex<WritableHandleCache>> =
+            Arc::new(Mutex::new(WritableHandleCache::default()));
         Self {
             meta,
             torrent_key,
             download_dir: download_dir.into(),
             partial_file_suffix: None,
             resume_dir: None,
-            file_handles: Arc::new(Mutex::new(HashMap::new())),
+            writable_cache: writable_cache.clone(),
+            cache_core: Arc::new(WritableHandleCacheCore {
+                cache: writable_cache,
+            }),
+            handle_budget: None,
             resume_write_lock: Arc::new(Mutex::new(())),
             write_limiter: None,
             cow_strategy: CowStrategy::Conservative,
             metrics: None,
+            #[cfg(test)]
+            test_flush_failure: None,
         }
+    }
+
+    /// Test-only hook: inject a flush failure the next time a writable handle
+    /// is evicted. Production builds never include this.
+    #[cfg(test)]
+    pub(crate) fn inject_flush_failure_for_test(&mut self) {
+        self.test_flush_failure = Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
     }
 
     /// Relocate durable fast-resume metadata without changing payload paths.
@@ -187,6 +466,15 @@ impl StorageIo {
     /// The full canonical durable key used by this handle.
     pub fn torrent_key(&self) -> TorrentKey {
         self.torrent_key
+    }
+
+    /// Attach a process/root-wide writable-handle budget. When set, every
+    /// cached or in-flight writable payload handle counts against the shared
+    /// bound and saturation evicts least-recently-used entries across all
+    /// registered torrent handle sets. See ADR-0072.
+    pub fn with_handle_budget(mut self, budget: Option<Arc<StorageHandleBudget>>) -> Self {
+        self.handle_budget = budget;
+        self
     }
 
     /// Select an active-only payload filename suffix, such as `.part`.
@@ -797,47 +1085,181 @@ impl StorageIo {
         &self,
         index: usize,
         create_if_missing: bool,
-    ) -> Result<Arc<Mutex<fs::File>>> {
-        if let Some(handle) = self.file_handles.lock().await.get(&index).cloned() {
+    ) -> Result<Arc<Mutex<BudgetedWritableFile>>> {
+        if let Some(handle) = self
+            .writable_cache
+            .lock()
+            .await
+            .handles
+            .get(&index)
+            .cloned()
+        {
             if handle.writable || !create_if_missing {
                 return Ok(handle.file);
             }
         }
 
+        if create_if_missing {
+            // A writable handle for this index may have been evicted while an
+            // active writer still used it. Opening a second independent file
+            // object for the same path would let the writer's pending writes
+            // race a reader on the new handle, so wait for the retired handle
+            // to be released before opening a replacement.
+            loop {
+                let (pending_flush, still_active) = {
+                    let mut cache = self.writable_cache.lock().await;
+                    let Some(retired) = cache.retired.get_mut(&index) else {
+                        break;
+                    };
+                    retired.retain(|handle| {
+                        handle.flush_pending || Arc::strong_count(&handle.file) > 1
+                    });
+                    if retired.is_empty() {
+                        cache.retired.remove(&index);
+                        break;
+                    }
+                    let pending_flush = retired
+                        .iter()
+                        .find(|handle| handle.flush_pending)
+                        .map(|handle| handle.file.clone());
+                    let still_active = retired
+                        .iter()
+                        .any(|handle| Arc::strong_count(&handle.file) > 1);
+                    (pending_flush, still_active)
+                };
+                if let Some(file) = pending_flush {
+                    file.lock().await.flush().await.map_err(CoreError::from)?;
+                    let mut cache = self.writable_cache.lock().await;
+                    if let Some(retired) = cache.retired.get_mut(&index) {
+                        if let Some(handle) = retired
+                            .iter_mut()
+                            .find(|handle| Arc::ptr_eq(&handle.file, &file))
+                        {
+                            handle.flush_pending = false;
+                        }
+                    }
+                    continue;
+                }
+                if still_active {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+        }
+
         let path = self.file_path(index)?;
+        if create_if_missing {
+            if let Some(budget) = &self.handle_budget {
+                budget.register(&self.cache_core).await;
+                budget.acquire().await;
+            }
+        }
         let file = if create_if_missing {
-            self.open_writable_payload_file(&path).await?
+            let file = match self.open_writable_payload_file(&path).await {
+                Ok(file) => file,
+                Err(error) => {
+                    if let Some(budget) = &self.handle_budget {
+                        budget.release();
+                    }
+                    return Err(error);
+                }
+            };
+            BudgetedWritableFile {
+                file,
+                budget: self.handle_budget.clone(),
+            }
         } else {
-            fs::OpenOptions::new()
+            // Read-only handles stay unaccounted and uncached: they are used
+            // by one operation and dropped. Tokio keeps its internal buffer
+            // in the File object after the read, so caching them makes
+            // resident memory grow by up to 2 MiB for every file traversed by
+            // a recheck.
+            let file = fs::OpenOptions::new()
                 .read(true)
                 .truncate(false)
                 .open(&path)
                 .await
-                .map_err(CoreError::from)?
+                .map_err(CoreError::from)?;
+            BudgetedWritableFile { file, budget: None }
         };
         let file = CachedFileHandle {
             file: Arc::new(Mutex::new(file)),
             writable: create_if_missing,
+            last_used: HANDLE_USE_TICK.fetch_add(1, Ordering::Relaxed),
         };
 
-        // A read-only handle is used by one operation and then dropped. Tokio
-        // keeps its internal buffer in the File object after the read, so
-        // inserting these handles into the long-lived cache makes resident
-        // memory grow by up to 2 MiB for every file traversed by a recheck.
         if !create_if_missing {
             return Ok(file.file);
         }
 
-        let mut handles = self.file_handles.lock().await;
-        // Another writer may have populated the cache while this file was
-        // being opened. Preserve one shared seek/write lock for that index.
-        if let Some(existing) = handles.get(&index).filter(|handle| handle.writable) {
-            return Ok(existing.file.clone());
+        let insert = {
+            let mut cache = self.writable_cache.lock().await;
+            // Another writer may have populated the cache while this file was
+            // being opened. Preserve one shared seek/write lock for that
+            // index. This duplicate handle's budget slot is released when the
+            // uninserted guard is dropped below.
+            if let Some(existing) = cache.handles.get(&index).filter(|handle| handle.writable) {
+                return Ok(existing.file.clone());
+            }
+            // Evict least-recently-used writable handles one at a time until
+            // there is room. Eviction flushes each candidate first so pending
+            // buffered writes complete and any pending failure reaches the
+            // caller instead of vanishing with the evicted handle. Handles
+            // still referenced by an active writer move to the retired set,
+            // where read/verification/move barriers continue to observe them
+            // until their last reference drops.
+            let mut evicted = Vec::new();
+            while cache.handles.len() >= MAX_CACHED_WRITABLE_FILE_HANDLES {
+                let Some(evict_index) = cache
+                    .handles
+                    .iter()
+                    .filter(|(candidate, _)| **candidate != index)
+                    .min_by_key(|(_, handle)| handle.last_used)
+                    .map(|(index, _)| *index)
+                else {
+                    break;
+                };
+                if let Some(handle) = cache.handles.remove(&evict_index) {
+                    evicted.push((evict_index, handle));
+                }
+            }
+            cache.handles.insert(index, file.clone());
+            evicted
+        };
+        for (evict_index, evicted) in insert {
+            // Observe write completion and propagate failures before the
+            // evicted handle leaves every flush boundary.
+            let flush_result = {
+                let mut file = evicted.file.lock().await;
+                file.flush().await.map_err(CoreError::from)
+            };
+            #[cfg(test)]
+            let flush_result = match (&self.test_flush_failure, &flush_result) {
+                (Some(flag), Ok(())) if flag.load(Ordering::Relaxed) => Err(CoreError::Storage(
+                    "injected writable handle flush failure at eviction".into(),
+                )),
+                _ => flush_result,
+            };
+            if let Err(error) = flush_result {
+                let mut cache = self.writable_cache.lock().await;
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    cache.handles.entry(evict_index)
+                {
+                    entry.insert(evicted);
+                } else {
+                    cache
+                        .retired
+                        .entry(evict_index)
+                        .or_default()
+                        .push(RetiredWritableHandle {
+                            file: evicted.file,
+                            flush_pending: true,
+                        });
+                }
+                return Err(error);
+            }
+            WritableHandleCacheCore::retire_or_release(&self.writable_cache, evict_index, evicted)
+                .await;
         }
-        if handles.len() >= MAX_CACHED_WRITABLE_FILE_HANDLES {
-            handles.clear();
-        }
-        handles.insert(index, file.clone());
         Ok(file.file)
     }
 
@@ -913,42 +1335,122 @@ impl StorageIo {
         Ok(out)
     }
 
+    /// Collect the cached plus retired writable handles for the requested
+    /// file indices. Retired handles keep serving writes from an operation
+    /// that survived eviction; every flush boundary must observe them.
+    async fn collect_writable_handles_for(
+        &self,
+        indices: &[usize],
+    ) -> Vec<Arc<Mutex<BudgetedWritableFile>>> {
+        let mut out = Vec::new();
+        {
+            let cache = self.writable_cache.lock().await;
+            for index in indices {
+                if let Some(handle) = cache.handles.get(index).filter(|h| h.writable) {
+                    out.push(handle.file.clone());
+                }
+                if let Some(retired) = cache.retired.get(index) {
+                    out.extend(
+                        retired
+                            .iter()
+                            .filter(|h| h.flush_pending || Arc::strong_count(&h.file) > 1)
+                            .map(|h| h.file.clone()),
+                    );
+                }
+            }
+        }
+        out
+    }
+
     async fn flush_writable_file_slices(&self, slices: &[FileSliceRange]) -> Result<()> {
-        let handles = {
-            let handles = self.file_handles.lock().await;
-            slices
-                .iter()
-                .filter_map(|slice| {
-                    handles
-                        .get(&slice.file_index)
-                        .filter(|handle| handle.writable)
-                        .map(|handle| handle.file.clone())
-                })
-                .collect::<Vec<_>>()
-        };
+        let indices: Vec<usize> = slices.iter().map(|slice| slice.file_index).collect();
+        let handles = self.collect_writable_handles_for(&indices).await;
         for file in handles {
             file.lock().await.flush().await.map_err(CoreError::from)?;
         }
+        self.mark_retired_flushed(Some(&indices)).await;
+        self.prune_retired_handles().await;
         Ok(())
     }
 
+    /// Flush every writable handle this storage cache knows about, including
+    /// handles retired during eviction but still held by active writers.
     async fn flush_all_writable_handles(&self) -> Result<()> {
         let handles = {
-            let handles = self.file_handles.lock().await;
-            handles
+            let cache = self.writable_cache.lock().await;
+            let mut out: Vec<Arc<Mutex<BudgetedWritableFile>>> = cache
+                .handles
                 .values()
                 .filter(|handle| handle.writable)
                 .map(|handle| handle.file.clone())
-                .collect::<Vec<_>>()
+                .collect();
+            for retired in cache.retired.values() {
+                out.extend(
+                    retired
+                        .iter()
+                        .filter(|handle| {
+                            handle.flush_pending || Arc::strong_count(&handle.file) > 1
+                        })
+                        .map(|handle| handle.file.clone()),
+                );
+            }
+            out
         };
         for file in handles {
             file.lock().await.flush().await.map_err(CoreError::from)?;
         }
+        self.mark_retired_flushed(None).await;
+        self.prune_retired_handles().await;
         Ok(())
     }
 
+    async fn mark_retired_flushed(&self, indices: Option<&[usize]>) {
+        let mut cache = self.writable_cache.lock().await;
+        for (index, retired) in &mut cache.retired {
+            if indices.is_none_or(|indices| indices.contains(index)) {
+                for handle in retired {
+                    handle.flush_pending = false;
+                }
+            }
+        }
+    }
+
+    /// Drop retired handles whose last active reference has gone. Their
+    /// buffered writes already completed through the flush above.
+    async fn prune_retired_handles(&self) {
+        let mut cache = self.writable_cache.lock().await;
+        for retired in cache.retired.values_mut() {
+            retired.retain(|handle| handle.flush_pending || Arc::strong_count(&handle.file) > 1);
+        }
+        cache.retired.retain(|_, retired| !retired.is_empty());
+    }
+
+    /// Wait until every retired handle has been released by its active
+    /// operation, flushing along the way. Move and removal barriers use this
+    /// so a still-running writer cannot keep writing through an evicted
+    /// handle after the barrier completes.
+    async fn drain_retired_handles(&self) -> Result<()> {
+        loop {
+            self.flush_all_writable_handles().await?;
+            let busy = {
+                let cache = self.writable_cache.lock().await;
+                cache
+                    .retired
+                    .values()
+                    .flatten()
+                    .any(|handle| handle.flush_pending || Arc::strong_count(&handle.file) > 1)
+            };
+            if !busy {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
     async fn clear_file_handles(&self) {
-        self.file_handles.lock().await.clear();
+        let mut cache = self.writable_cache.lock().await;
+        cache.handles.clear();
+        cache.retired.clear();
     }
 
     /// Verify a piece by reading it from disk and comparing its SHA-1 to the
@@ -1209,7 +1711,7 @@ impl StorageIo {
         destination_dir: impl Into<PathBuf>,
         partial_file_suffix: Option<String>,
     ) -> Result<Self> {
-        let destination = Self::new(self.meta.clone(), destination_dir)
+        let destination = Self::new(Arc::clone(&self.meta), destination_dir)
             .with_torrent_key(self.torrent_key)
             .with_resume_dir(self.resume_dir.clone())
             .with_partial_file_suffix(partial_file_suffix)
@@ -1222,6 +1724,7 @@ impl StorageIo {
             return Ok(destination);
         }
         self.flush_all_writable_handles().await?;
+        self.drain_retired_handles().await?;
         self.clear_file_handles().await;
         let plan = self.build_move_plan(&destination).await?;
         self.remove_resume().await?;
@@ -1239,7 +1742,7 @@ impl StorageIo {
     /// fast-resume file because only payload names change. Completion calls
     /// this path when complete and incomplete roots are identical.
     pub async fn finalize_partial_file_suffix(&self) -> Result<Self> {
-        let destination = Self::new(self.meta.clone(), self.download_dir.clone())
+        let destination = Self::new(Arc::clone(&self.meta), self.download_dir.clone())
             .with_torrent_key(self.torrent_key)
             .with_resume_dir(self.resume_dir.clone())
             .with_cow_strategy(self.cow_strategy)
@@ -1252,6 +1755,7 @@ impl StorageIo {
 
     async fn rewrite_partial_file_suffix(&self, destination: Self) -> Result<Self> {
         self.flush_all_writable_handles().await?;
+        self.drain_retired_handles().await?;
         self.clear_file_handles().await;
         let plan = self.build_move_plan(&destination).await?;
         execute_move_plan(&plan, &destination.download_dir).await?;
@@ -1328,6 +1832,7 @@ impl StorageIo {
     /// Remove all torrent data files and the resume file.
     pub async fn remove_all(&self) -> Result<()> {
         self.flush_all_writable_handles().await?;
+        self.drain_retired_handles().await?;
         self.clear_file_handles().await;
         let mut failures = Vec::new();
         for i in 0..self.meta.files.len() {

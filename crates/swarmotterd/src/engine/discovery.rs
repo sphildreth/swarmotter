@@ -20,15 +20,41 @@ impl TorrentEngine {
     }
 
     pub(super) async fn refresh_discovery_peers(&self, force: bool) -> Vec<PeerAddr> {
+        self.refresh_discovery_peers_after(force, None).await
+    }
+
+    /// Give DHT one completed lookup after candidates become unusable, even
+    /// when ordinary refresh cadence would skip it. Tracker intervals remain
+    /// authoritative; their last real announce is retained as evidence.
+    pub(super) async fn refresh_discovery_peers_after(
+        &self,
+        force: bool,
+        unusable_since: Option<Instant>,
+    ) -> Vec<PeerAddr> {
         let mut refreshed = Vec::new();
         if force || self.tracker_announce_due().await {
             refreshed = self.announce(AnnounceEvent::Empty).await;
         }
-        if force || self.dht_lookup_due().await {
+        let dht_pending = if let Some(since) = unusable_since {
+            self.dht_enabled()
+                && self
+                    .state
+                    .lock()
+                    .await
+                    .dht_last_lookup_completed
+                    .is_none_or(|last| last < since)
+        } else {
+            false
+        };
+        if force || dht_pending || self.dht_lookup_due().await {
             merge_unique_peers(&mut refreshed, self.discover_dht_peers().await);
         }
         dedupe_peers(&mut refreshed);
         refreshed
+    }
+
+    pub(super) fn dht_enabled(&self) -> bool {
+        !self.meta.is_private() && self.dht.is_some()
     }
 
     pub(super) async fn tracker_announce_due(&self) -> bool {
@@ -52,7 +78,7 @@ impl TorrentEngine {
     }
 
     pub(super) async fn dht_lookup_due(&self) -> bool {
-        if self.meta.is_private() || self.dht.is_none() {
+        if !self.dht_enabled() {
             return false;
         }
         self.state
@@ -69,12 +95,14 @@ impl TorrentEngine {
         let Some(dht) = &self.dht else {
             return Vec::new();
         };
-        self.state.lock().await.dht_last_lookup = Some(Instant::now());
+        let started = Instant::now();
+        self.state.lock().await.dht_last_lookup = Some(started);
         let result = tokio::time::timeout(
             DHT_DISCOVERY_TIMEOUT,
             dht.get_peers_with_stats(self.discovery_wire_hash(), DHT_DISCOVERY_ROUNDS),
         )
         .await;
+        self.state.lock().await.dht_last_lookup_completed = Some(started);
         match result {
             Ok(Ok(lookup)) => {
                 let peers = self.filter_allowed_peers(lookup.peers);
@@ -193,6 +221,7 @@ impl TorrentEngine {
                 url.clone(),
                 TrackerAnnounceSnapshot {
                     status: TrackerStatus::Updating,
+                    explicit_failure: false,
                     seeders: 0,
                     leechers: 0,
                     downloads: 0,
@@ -248,6 +277,10 @@ impl TorrentEngine {
             s.tracker_announces.insert(url.clone(), result.clone());
         }
         if outcome.ok {
+            s.tracker_swarm_populated = outcome.tracker_results.values().any(|snapshot| {
+                snapshot.status == TrackerStatus::Ok
+                    && (snapshot.seeders > 0 || snapshot.leechers > 0)
+            });
             s.tracker_last_ok = Some(Instant::now());
             if outcome.failures == 0 {
                 s.tracker_failures_recent = 0;
@@ -494,6 +527,7 @@ pub(super) fn record_tracker_joined_result(
                     url,
                     TrackerAnnounceSnapshot {
                         status: TrackerStatus::Error,
+                        explicit_failure: true,
                         seeders: resp.seeders,
                         leechers: resp.leechers,
                         downloads: 0,
@@ -532,6 +566,7 @@ pub(super) fn record_tracker_joined_result(
                 url,
                 TrackerAnnounceSnapshot {
                     status: TrackerStatus::Ok,
+                    explicit_failure: false,
                     seeders: resp.seeders,
                     leechers: resp.leechers,
                     downloads: 0,
@@ -553,6 +588,7 @@ pub(super) fn record_tracker_joined_result(
                 url,
                 TrackerAnnounceSnapshot {
                     status: TrackerStatus::Error,
+                    explicit_failure: false,
                     seeders: 0,
                     leechers: 0,
                     downloads: 0,

@@ -102,9 +102,16 @@ impl TorrentEngine {
         let progressed = any_progress || made_progress.load(std::sync::atomic::Ordering::Relaxed);
         let _still_endgame = is_endgame(self.piece_selection.remaining(&merged));
         if progressed {
+            let piece_count = self.meta.piece_count();
+            let newly_verified = merged
+                .count(piece_count)
+                .saturating_sub(have.count(piece_count));
+            for _ in 0..newly_verified {
+                self.mark_resume_piece_verified();
+            }
             *have = merged.clone();
             self.update_progress(&merged).await;
-            if let Err(e) = self.persist_resume(&storage, &merged).await {
+            if let Err(e) = self.maybe_persist_resume(&storage, &merged, false).await {
                 tracing::warn!(error = %e, "endgame resume persist failed");
             }
         }
@@ -158,7 +165,7 @@ impl<T> Drop for AbortOnDropHandle<T> {
 pub(super) async fn endgame_peer_session(
     binder: Arc<dyn NetworkBinder>,
     peer_addr: PeerAddr,
-    meta: TorrentMeta,
+    meta: Arc<TorrentMeta>,
     selection: PieceSelection,
     peer_id: [u8; 20],
     shared_have: Arc<Mutex<PieceBitfield>>,
