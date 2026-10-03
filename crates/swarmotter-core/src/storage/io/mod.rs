@@ -234,8 +234,8 @@ impl WritableHandleCacheCore {
             .is_ok();
         if !flush {
             let mut cache = self.cache.lock().await;
-            if !cache.handles.contains_key(&index) {
-                cache.handles.insert(index, handle);
+            if let std::collections::hash_map::Entry::Vacant(entry) = cache.handles.entry(index) {
+                entry.insert(handle);
             } else {
                 cache
                     .retired
@@ -1241,8 +1241,10 @@ impl StorageIo {
             };
             if let Err(error) = flush_result {
                 let mut cache = self.writable_cache.lock().await;
-                if !cache.handles.contains_key(&evict_index) {
-                    cache.handles.insert(evict_index, evicted);
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    cache.handles.entry(evict_index)
+                {
+                    entry.insert(evicted);
                 } else {
                     cache
                         .retired

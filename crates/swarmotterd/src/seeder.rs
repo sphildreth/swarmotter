@@ -882,7 +882,6 @@ async fn serve_downloader_peer(
         peer_id,
         peer_session_budget: _,
         mut shutdown,
-        encryption_mode: _,
         ..
     } = context.clone();
     let expected_wire_hash = meta
