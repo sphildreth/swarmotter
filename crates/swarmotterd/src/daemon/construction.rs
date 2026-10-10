@@ -140,6 +140,7 @@ impl DaemonRuntime {
             seeder_shutdowns: Arc::new(Mutex::new(HashMap::new())),
             seeder_registry: SeedRegistry::default(),
             seeder_lifecycle_lock: Arc::new(Mutex::new(())),
+            seeder_listener_addr: Arc::new(Mutex::new(None)),
             seeder_listener_shutdown: Arc::new(Mutex::new(None)),
             seeder_listener_handle: Arc::new(Mutex::new(None)),
             seeder_handles: Arc::new(Mutex::new(HashMap::new())),

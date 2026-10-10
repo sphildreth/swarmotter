@@ -471,6 +471,7 @@ pub struct TorrentEngine {
     /// daemon for the configured active storage root.
     storage_write_limiter: Option<RateLimiter>,
     storage_metrics: Option<StorageIoMetrics>,
+    storage_handle_budget: Option<Arc<swarmotter_core::storage::StorageHandleBudget>>,
     /// Per-torrent autopilot override for the peer worker limit. `0` means no
     /// override is active and the engine follows [`Self::shared_peer_limit`].
     max_peer_workers: Arc<AtomicUsize>,
@@ -692,6 +693,7 @@ impl TorrentEngine {
             minimum_free_space_percent: 0,
             storage_write_limiter: None,
             storage_metrics: None,
+            storage_handle_budget: None,
             max_peer_workers: Arc::new(AtomicUsize::new(0)),
             peer_worker_override_generation: Arc::new(AtomicU64::new(0)),
             shared_peer_limit: None,
@@ -799,6 +801,14 @@ impl TorrentEngine {
     /// Attach shared actual-I/O accounting for the active storage root.
     pub fn with_storage_metrics(mut self, metrics: Option<StorageIoMetrics>) -> Self {
         self.storage_metrics = metrics;
+        self
+    }
+
+    pub fn with_storage_handle_budget(
+        mut self,
+        budget: Option<Arc<swarmotter_core::storage::StorageHandleBudget>>,
+    ) -> Self {
+        self.storage_handle_budget = budget;
         self
     }
 

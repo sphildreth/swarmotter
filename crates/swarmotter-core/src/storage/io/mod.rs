@@ -174,7 +174,12 @@ impl Drop for BudgetedWritableFile {
 #[derive(Default)]
 struct WritableHandleCache {
     handles: HashMap<usize, CachedFileHandle>,
-    retired: HashMap<usize, Vec<Arc<Mutex<BudgetedWritableFile>>>>,
+    retired: HashMap<usize, Vec<RetiredWritableHandle>>,
+}
+
+struct RetiredWritableHandle {
+    file: Arc<Mutex<BudgetedWritableFile>>,
+    flush_pending: bool,
 }
 
 /// Shared core for budget registration: one instance per distinct torrent
@@ -188,6 +193,7 @@ impl WritableHandleCacheCore {
     /// descriptors released. The evicted handle is flushed first so pending
     /// buffered writes complete and any pending failure surfaces here.
     async fn evict_one_lru(&self) -> usize {
+        Self::prune_released_retired(&self.cache).await;
         let candidate = {
             let cache = self.cache.lock().await;
             cache
@@ -226,8 +232,24 @@ impl WritableHandleCacheCore {
                 tracing::warn!("writable payload handle flush failed during budget-driven eviction")
             })
             .is_ok();
+        if !flush {
+            let mut cache = self.cache.lock().await;
+            if let std::collections::hash_map::Entry::Vacant(entry) = cache.handles.entry(index) {
+                entry.insert(handle);
+            } else {
+                cache
+                    .retired
+                    .entry(index)
+                    .or_default()
+                    .push(RetiredWritableHandle {
+                        file: handle.file,
+                        flush_pending: true,
+                    });
+            }
+            return 0;
+        }
         match Self::retire_or_release(&self.cache, index, handle).await {
-            RetiredOrReleased::Released => usize::from(flush),
+            RetiredOrReleased::Released => 1,
             RetiredOrReleased::Retired => 0,
         }
     }
@@ -250,11 +272,22 @@ impl WritableHandleCacheCore {
                 .retired
                 .entry(index)
                 .or_default()
-                .push(handle.file);
+                .push(RetiredWritableHandle {
+                    file: handle.file,
+                    flush_pending: false,
+                });
             return RetiredOrReleased::Retired;
         }
         drop(handle);
         RetiredOrReleased::Released
+    }
+
+    async fn prune_released_retired(cache: &Arc<Mutex<WritableHandleCache>>) {
+        let mut cache = cache.lock().await;
+        for retired in cache.retired.values_mut() {
+            retired.retain(|handle| handle.flush_pending || Arc::strong_count(&handle.file) > 1);
+        }
+        cache.retired.retain(|_, retired| !retired.is_empty());
     }
 }
 
@@ -1073,18 +1106,40 @@ impl StorageIo {
             // race a reader on the new handle, so wait for the retired handle
             // to be released before opening a replacement.
             loop {
-                let still_active = {
+                let (pending_flush, still_active) = {
                     let mut cache = self.writable_cache.lock().await;
                     let Some(retired) = cache.retired.get_mut(&index) else {
                         break;
                     };
-                    retired.retain(|handle| Arc::strong_count(handle) > 1);
+                    retired.retain(|handle| {
+                        handle.flush_pending || Arc::strong_count(&handle.file) > 1
+                    });
                     if retired.is_empty() {
                         cache.retired.remove(&index);
                         break;
                     }
-                    true
+                    let pending_flush = retired
+                        .iter()
+                        .find(|handle| handle.flush_pending)
+                        .map(|handle| handle.file.clone());
+                    let still_active = retired
+                        .iter()
+                        .any(|handle| Arc::strong_count(&handle.file) > 1);
+                    (pending_flush, still_active)
                 };
+                if let Some(file) = pending_flush {
+                    file.lock().await.flush().await.map_err(CoreError::from)?;
+                    let mut cache = self.writable_cache.lock().await;
+                    if let Some(retired) = cache.retired.get_mut(&index) {
+                        if let Some(handle) = retired
+                            .iter_mut()
+                            .find(|handle| Arc::ptr_eq(&handle.file, &file))
+                        {
+                            handle.flush_pending = false;
+                        }
+                    }
+                    continue;
+                }
                 if still_active {
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                 }
@@ -1099,7 +1154,15 @@ impl StorageIo {
             }
         }
         let file = if create_if_missing {
-            let file = self.open_writable_payload_file(&path).await?;
+            let file = match self.open_writable_payload_file(&path).await {
+                Ok(file) => file,
+                Err(error) => {
+                    if let Some(budget) = &self.handle_budget {
+                        budget.release();
+                    }
+                    return Err(error);
+                }
+            };
             BudgetedWritableFile {
                 file,
                 budget: self.handle_budget.clone(),
@@ -1177,14 +1240,20 @@ impl StorageIo {
                 _ => flush_result,
             };
             if let Err(error) = flush_result {
-                if Arc::strong_count(&evicted.file) > 1 {
-                    self.writable_cache
-                        .lock()
-                        .await
+                let mut cache = self.writable_cache.lock().await;
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    cache.handles.entry(evict_index)
+                {
+                    entry.insert(evicted);
+                } else {
+                    cache
                         .retired
                         .entry(evict_index)
                         .or_default()
-                        .push(evicted.file);
+                        .push(RetiredWritableHandle {
+                            file: evicted.file,
+                            flush_pending: true,
+                        });
                 }
                 return Err(error);
             }
@@ -1281,7 +1350,12 @@ impl StorageIo {
                     out.push(handle.file.clone());
                 }
                 if let Some(retired) = cache.retired.get(index) {
-                    out.extend(retired.iter().filter(|h| Arc::strong_count(h) > 1).cloned());
+                    out.extend(
+                        retired
+                            .iter()
+                            .filter(|h| h.flush_pending || Arc::strong_count(&h.file) > 1)
+                            .map(|h| h.file.clone()),
+                    );
                 }
             }
         }
@@ -1294,6 +1368,7 @@ impl StorageIo {
         for file in handles {
             file.lock().await.flush().await.map_err(CoreError::from)?;
         }
+        self.mark_retired_flushed(Some(&indices)).await;
         self.prune_retired_handles().await;
         Ok(())
     }
@@ -1313,8 +1388,10 @@ impl StorageIo {
                 out.extend(
                     retired
                         .iter()
-                        .filter(|handle| Arc::strong_count(handle) > 1)
-                        .cloned(),
+                        .filter(|handle| {
+                            handle.flush_pending || Arc::strong_count(&handle.file) > 1
+                        })
+                        .map(|handle| handle.file.clone()),
                 );
             }
             out
@@ -1322,8 +1399,20 @@ impl StorageIo {
         for file in handles {
             file.lock().await.flush().await.map_err(CoreError::from)?;
         }
+        self.mark_retired_flushed(None).await;
         self.prune_retired_handles().await;
         Ok(())
+    }
+
+    async fn mark_retired_flushed(&self, indices: Option<&[usize]>) {
+        let mut cache = self.writable_cache.lock().await;
+        for (index, retired) in &mut cache.retired {
+            if indices.is_none_or(|indices| indices.contains(index)) {
+                for handle in retired {
+                    handle.flush_pending = false;
+                }
+            }
+        }
     }
 
     /// Drop retired handles whose last active reference has gone. Their
@@ -1331,7 +1420,7 @@ impl StorageIo {
     async fn prune_retired_handles(&self) {
         let mut cache = self.writable_cache.lock().await;
         for retired in cache.retired.values_mut() {
-            retired.retain(|handle| Arc::strong_count(handle) > 1);
+            retired.retain(|handle| handle.flush_pending || Arc::strong_count(&handle.file) > 1);
         }
         cache.retired.retain(|_, retired| !retired.is_empty());
     }
@@ -1349,7 +1438,7 @@ impl StorageIo {
                     .retired
                     .values()
                     .flatten()
-                    .any(|handle| Arc::strong_count(handle) > 1)
+                    .any(|handle| handle.flush_pending || Arc::strong_count(&handle.file) > 1)
             };
             if !busy {
                 return Ok(());

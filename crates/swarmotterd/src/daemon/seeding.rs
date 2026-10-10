@@ -170,7 +170,10 @@ impl DaemonRuntime {
             }
         }));
         match tokio::time::timeout(Duration::from_secs(5), bound_rx).await {
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(addr)) => {
+                *self.seeder_listener_addr.lock().await = Some(addr);
+                Ok(())
+            }
             Ok(Err(_)) => {
                 drop(handle_slot);
                 self.stop_seeder_listener(true).await;
@@ -189,6 +192,7 @@ impl DaemonRuntime {
     }
 
     pub(super) async fn stop_seeder_listener(&self, force: bool) {
+        *self.seeder_listener_addr.lock().await = None;
         if let Some(shutdown) = self.seeder_listener_shutdown.lock().await.take() {
             let _ = shutdown.send(true);
         }
@@ -707,7 +711,7 @@ impl DaemonRuntime {
         if let Some(handle) = handle {
             Self::join_stopping_task(handle).await;
         }
-        if self.seeder_registry.is_empty().await {
+        if self.seeder_registry.is_empty().await && self.downloader_serves.read().await.is_empty() {
             self.stop_seeder_listener(false).await;
         }
         if let Some(torrent) = self.registry.lock().await.get_mut(hash) {
@@ -906,7 +910,7 @@ impl DaemonRuntime {
             handle.abort();
             let _ = handle.await;
         }
-        if self.seeder_registry.is_empty().await {
+        if self.seeder_registry.is_empty().await && self.downloader_serves.read().await.is_empty() {
             self.stop_seeder_listener(true).await;
         }
         if let Some(torrent) = self.registry.lock().await.get_mut(hash) {

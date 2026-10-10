@@ -706,8 +706,13 @@ async fn serve_routed_peer(
         {
             let downloaders = downloaders.read().await;
             for context in downloaders.values() {
-                if let Some(v1) = context.key.as_v1() {
-                    hashes.push(PeerInfoHash::from_v1(v1));
+                if let Some(wire_hash) = context
+                    .meta
+                    .identity
+                    .v1_peer_info_hash()
+                    .or_else(|| context.meta.identity.v2_peer_info_hash())
+                {
+                    hashes.push(wire_hash);
                 }
             }
         }
@@ -741,20 +746,31 @@ async fn serve_routed_peer(
             // Not a completed seeder: the torrent may be an active download
             // eligible for verified-piece serving (ADR-0075). Match v1/hybrid
             // downloaders by their 20-byte wire identity.
-            let matched = {
+            let mut matched = {
                 let downloaders = downloaders.read().await;
                 downloaders
                     .values()
-                    .find(|context| {
+                    .filter(|context| {
                         context
-                            .key
-                            .as_v1()
-                            .is_some_and(|v1| PeerInfoHash::from_v1(v1) == their_hs.info_hash)
+                            .meta
+                            .identity
+                            .v1_peer_info_hash()
+                            .or_else(|| context.meta.identity.v2_peer_info_hash())
+                            == Some(their_hs.info_hash)
                     })
+                    .take(2)
                     .cloned()
+                    .collect::<Vec<_>>()
             };
+            if matched.len() > 1 {
+                return Err(CoreError::DuplicateTorrent(
+                    "ambiguous 20-byte inbound downloader identity".into(),
+                ));
+            }
             InboundTarget::Downloader(
-                matched.ok_or_else(|| CoreError::NotFound("registered inbound torrent".into()))?,
+                matched
+                    .pop()
+                    .ok_or_else(|| CoreError::NotFound("registered inbound torrent".into()))?,
             )
         }
     };
@@ -856,8 +872,9 @@ async fn serve_downloader_peer(
     context: DownloaderServeContext,
     their_hs: V2Handshake,
 ) -> Result<()> {
+    let context = context.clone();
+    let key = context.key;
     let DownloaderServeContext {
-        key,
         meta,
         storage,
         state,
@@ -865,16 +882,20 @@ async fn serve_downloader_peer(
         peer_id,
         peer_session_budget: _,
         mut shutdown,
-        encryption_mode: _,
+        ..
     } = context.clone();
-    if their_hs.info_hash
-        != PeerInfoHash::from_v1(key.as_v1().ok_or_else(|| {
-            CoreError::Internal("downloader serving requires a v1 wire identity".into())
-        })?)
-    {
+    let expected_wire_hash = meta
+        .identity
+        .v1_peer_info_hash()
+        .or_else(|| meta.identity.v2_peer_info_hash())
+        .ok_or_else(|| CoreError::Internal("downloader serving lacks a wire identity".into()))?;
+    if their_hs.info_hash != expected_wire_hash {
         return Err(CoreError::Internal(
             "inbound downloader info hash mismatch".into(),
         ));
+    }
+    if meta.requires_v2_data_plane() {
+        return serve_downloader_v2_peer(stream, context, their_hs).await;
     }
     let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = PeerReader::new(read_half);
@@ -906,6 +927,10 @@ async fn serve_downloader_peer(
     write_half.flush().await.ok();
 
     let piece_count = meta.piece_count();
+    let mut availability_tick = tokio::time::interval(Duration::from_secs(1));
+    availability_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut read_message = Box::pin(reader.read_message());
+    let mut idle_timeout = Box::pin(tokio::time::sleep(Duration::from_secs(120)));
     loop {
         tokio::select! {
             _ = shutdown.changed() => {
@@ -913,9 +938,13 @@ async fn serve_downloader_peer(
                     return Ok(());
                 }
             }
-            msg = timeout(Duration::from_secs(120), reader.read_message()) => {
+            _ = availability_tick.tick() => {}
+            _ = &mut idle_timeout => return Ok(()),
+            msg = &mut read_message => {
+                drop(read_message);
+                read_message = Box::pin(reader.read_message());
                 match msg {
-                    Ok(Ok(Some(message))) => match message {
+                    Ok(Some(message)) => match message {
                         Message::Request { piece, offset, length } => {
                             let p = piece as usize;
                             let verified = {
@@ -924,25 +953,28 @@ async fn serve_downloader_peer(
                             };
                             if !verified || p >= piece_count {
                                 // Never expose unverified or out-of-range bytes.
+                                idle_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(120));
                                 continue;
                             }
                             let length = length as usize;
                             if length == 0 || length > 128 * 1024 {
+                                idle_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(120));
                                 continue;
                             }
                             let block = match storage.read_block(p, offset as u64, length).await {
                                 Ok(block) => block,
                                 Err(error) => {
                                     tracing::debug!(piece = p, %error, "downloader serving read failed");
+                                    idle_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(120));
                                     continue;
                                 }
                             };
-                            {
-                                let mut s = state.lock().await;
-                                s.uploaded = s.uploaded.saturating_add(block.len() as u64);
-                            }
                             limiter.acquire(RateDirection::Upload, block.len() as u64).await;
                             peer::write_message(&mut write_half, &Message::Piece { piece, offset, block }).await?;
+                            {
+                                let mut s = state.lock().await;
+                                s.uploaded = s.uploaded.saturating_add(length as u64);
+                            }
                             write_half.flush().await.ok();
                         }
                         Message::Interested => {
@@ -955,10 +987,9 @@ async fn serve_downloader_peer(
                         | Message::Hashes { .. } | Message::HashReject { .. }
                         | Message::Extended { .. } | Message::Unknown { .. } => {}
                     },
-                    Ok(Ok(None)) => return Ok(()),
-                    Ok(Err(_)) => return Ok(()),
-                    Err(_) => return Ok(()),
+                    Ok(None) | Err(_) => return Ok(()),
                 }
+                idle_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(120));
             }
         }
         // Availability updates: newly verified pieces are announced with a
@@ -986,6 +1017,155 @@ async fn serve_downloader_peer(
         }
         if sent > 0 {
             write_half.flush().await.ok();
+        }
+    }
+}
+
+async fn serve_downloader_v2_peer(
+    stream: Box<dyn PeerDuplex>,
+    context: DownloaderServeContext,
+    their_hs: V2Handshake,
+) -> Result<()> {
+    let DownloaderServeContext {
+        meta,
+        storage,
+        state,
+        limiter,
+        peer_id,
+        mut shutdown,
+        ..
+    } = context;
+    let wire_hash = meta
+        .identity
+        .v2_peer_info_hash()
+        .ok_or_else(|| CoreError::Internal("pure-v2 downloader lacks a v2 identity".into()))?;
+    if their_hs.info_hash != wire_hash || !their_hs.supports_v2() {
+        return Err(CoreError::Internal(
+            "inbound pure-v2 downloader handshake mismatch".into(),
+        ));
+    }
+    let layout = meta.v2_piece_layout()?;
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut reader = PeerReader::new(read_half);
+    peer::write_v2_handshake(
+        &mut write_half,
+        &V2Handshake {
+            info_hash: wire_hash,
+            peer_id,
+            reserved: peer::with_v2_support(swarmotter_core::extensions::EXTENSION_RESERVED),
+        },
+    )
+    .await?;
+    let mut announced = {
+        let state = state.lock().await;
+        let mut bitfield = Bitfield::new(layout.piece_count());
+        for index in 0..layout.piece_count() {
+            if state.pieces_have.has(index) {
+                bitfield.set(index);
+            }
+        }
+        bitfield
+    };
+    peer::write_message(&mut write_half, &announced.encode_message()).await?;
+    write_half.flush().await.map_err(CoreError::from)?;
+
+    let mut choking = true;
+    let mut availability_tick = tokio::time::interval(Duration::from_secs(1));
+    availability_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut read_message = Box::pin(reader.read_message());
+    let mut idle_timeout = Box::pin(tokio::time::sleep(Duration::from_secs(120)));
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = availability_tick.tick() => {}
+            _ = &mut idle_timeout => return Ok(()),
+            message = &mut read_message => {
+                drop(read_message);
+                read_message = Box::pin(reader.read_message());
+                match message {
+                    Ok(Some(Message::Interested)) => {
+                        peer::write_message(&mut write_half, &Message::Unchoke).await?;
+                        write_half.flush().await.map_err(CoreError::from)?;
+                        choking = false;
+                    }
+                    Ok(Some(Message::Request { piece, offset, length })) => {
+                        let piece_index = piece as usize;
+                        let Some(mapping) = layout.piece(piece_index) else {
+                            peer::write_message(&mut write_half, &Message::Reject { piece, offset, length }).await?;
+                            idle_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(120));
+                            continue;
+                        };
+                        let end = u64::from(offset).checked_add(u64::from(length));
+                        let valid = !choking
+                            && length > 0
+                            && length <= peer::BLOCK_SIZE
+                            && end.is_some_and(|end| end <= mapping.length)
+                            && state.lock().await.pieces_have.has(piece_index);
+                        if !valid {
+                            peer::write_message(&mut write_half, &Message::Reject { piece, offset, length }).await?;
+                            idle_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(120));
+                            continue;
+                        }
+                        let block = match storage.read_v2_block(
+                            &layout,
+                            piece_index,
+                            u64::from(offset),
+                            length as usize,
+                        ).await {
+                            Ok(block) => block,
+                            Err(error) => {
+                                tracing::debug!(piece = piece_index, %error, "v2 downloader serving read failed");
+                                peer::write_message(&mut write_half, &Message::Reject { piece, offset, length }).await?;
+                                idle_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(120));
+                                continue;
+                            }
+                        };
+                        let uploaded_bytes = block.len() as u64;
+                        limiter.acquire(RateDirection::Upload, uploaded_bytes).await;
+                        peer::write_message(
+                            &mut write_half,
+                            &Message::Piece { piece, offset, block },
+                        ).await?;
+                        let mut state = state.lock().await;
+                        state.uploaded = state.uploaded.saturating_add(uploaded_bytes);
+                        drop(state);
+                        write_half.flush().await.map_err(CoreError::from)?;
+                    }
+                    Ok(Some(Message::NotInterested)) => choking = true,
+                    Ok(Some(Message::Have { .. } | Message::Bitfield { .. } | Message::Choke
+                        | Message::Unchoke | Message::Keepalive | Message::Cancel { .. }
+                        | Message::Piece { .. } | Message::Reject { .. } | Message::HashRequest { .. }
+                        | Message::Hashes { .. } | Message::HashReject { .. }
+                        | Message::Extended { .. } | Message::Unknown { .. })) => {}
+                    Ok(None) | Err(_) => return Ok(()),
+                }
+                idle_timeout.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(120));
+            }
+        }
+        let newly_verified = state.lock().await.pieces_have.clone();
+        let mut sent = 0usize;
+        for piece in 0..layout.piece_count() {
+            if newly_verified.has(piece) && !announced.has(piece) {
+                peer::write_message(
+                    &mut write_half,
+                    &Message::Have {
+                        piece: piece as u32,
+                    },
+                )
+                .await?;
+                announced.set(piece);
+                sent += 1;
+                if sent >= 64 {
+                    break;
+                }
+            }
+        }
+        if sent > 0 {
+            write_half.flush().await.map_err(CoreError::from)?;
         }
     }
 }
@@ -1998,6 +2178,132 @@ mod tests {
         drop(reader);
         drop(write);
         let _ = torrent_shutdown_tx.send(true);
+        let _ = hub_shutdown_tx.send(true);
+        task.await.unwrap().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn active_pure_v2_downloader_serves_verified_pieces_and_announces_new_ones() {
+        let content = vec![0x6d; (2 * V2_BLOCK_LENGTH) as usize];
+        let meta = Arc::new(pure_v2_meta("v2-active-download.bin", &content));
+        let layout = meta.v2_piece_layout().unwrap();
+        let wire_hash = meta.identity.v2_peer_info_hash().unwrap();
+        let key = meta.identity.primary_key().unwrap();
+        let dir = unique_dir("v2-active-download");
+        let storage = Arc::new(StorageIo::new(meta.clone(), dir.clone()).with_torrent_key(key));
+        let first_piece = layout.piece(0).unwrap();
+        let first_end = usize::try_from(first_piece.length).unwrap();
+        storage
+            .write_v2_piece(&layout, 0, &content[..first_end])
+            .await
+            .unwrap();
+        let mut have = PieceBitfield::new(layout.piece_count());
+        have.set(0);
+        let state = Arc::new(Mutex::new(EngineState {
+            piece_count: layout.piece_count(),
+            total_length: meta.total_length,
+            pieces_have: have,
+            ..EngineState::default()
+        }));
+        let global_peer_permits = PeerPermitPool::unlimited();
+        let peer_session_budget =
+            PeerSessionBudget::new(global_peer_permits.clone(), PeerPermitPool::unlimited());
+        let (serve_shutdown_tx, serve_shutdown_rx) = tokio::sync::watch::channel(false);
+        let downloaders = Arc::new(tokio::sync::RwLock::new(HashMap::from([(
+            key,
+            DownloaderServeContext {
+                key,
+                meta: meta.clone(),
+                storage,
+                state: state.clone(),
+                limiter: ShapedLimiter::from_shared_rate_limiter(
+                    Arc::new(RateLimiter::unlimited()),
+                ),
+                peer_id: peer_id(b"-V2DLSV-"),
+                peer_session_budget,
+                shutdown: serve_shutdown_rx,
+                encryption_mode: Some(PeerEncryptionMode::Required),
+            },
+        )])));
+        let registry = SeedRegistry::default();
+        let (hub_shutdown_tx, hub_shutdown_rx) = tokio::sync::watch::channel(false);
+        let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+        let hub = SeederHub::new(
+            registry,
+            Arc::new(LoopbackBinder),
+            0,
+            PeerEncryptionMode::Disabled,
+            hub_shutdown_rx,
+            global_peer_permits,
+        )
+        .with_downloader_serves(downloaders)
+        .with_bound_addr(bound_tx);
+        let task = tokio::spawn(hub.run());
+        let address = bound_rx.await.unwrap();
+
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let stream = swarmotter_core::mse::connect(stream, wire_hash)
+            .await
+            .unwrap();
+        let (read, mut write) = tokio::io::split(stream);
+        peer::write_v2_handshake(
+            &mut write,
+            &V2Handshake {
+                info_hash: wire_hash,
+                peer_id: peer_id(b"-V2DLCL-"),
+                reserved: peer::with_v2_support(swarmotter_core::extensions::EXTENSION_RESERVED),
+            },
+        )
+        .await
+        .unwrap();
+        let mut reader = PeerReader::new(read);
+        let response = reader.read_v2_handshake().await.unwrap();
+        assert_eq!(response.info_hash, wire_hash);
+        assert!(response.supports_v2());
+        assert!(matches!(
+            reader.read_message().await.unwrap(),
+            Some(Message::Bitfield { bits }) if bits == [0b1000_0000]
+        ));
+        peer::write_message(&mut write, &Message::Interested)
+            .await
+            .unwrap();
+        assert!(matches!(
+            reader.read_message().await.unwrap(),
+            Some(Message::Unchoke)
+        ));
+        peer::write_message(
+            &mut write,
+            &Message::Request {
+                piece: 0,
+                offset: 0,
+                length: 1024,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            reader.read_message().await.unwrap(),
+            Some(Message::Piece { piece: 0, block, .. }) if block == content[..1024]
+        ));
+        assert_eq!(state.lock().await.uploaded, 1024);
+        state.lock().await.pieces_have.set(1);
+        let have = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    reader.read_message().await.unwrap(),
+                    Some(Message::Have { piece: 1 })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(have.is_ok(), "newly verified v2 piece was not announced");
+
+        drop(reader);
+        drop(write);
+        let _ = serve_shutdown_tx.send(true);
         let _ = hub_shutdown_tx.send(true);
         task.await.unwrap().unwrap();
         std::fs::remove_dir_all(dir).ok();

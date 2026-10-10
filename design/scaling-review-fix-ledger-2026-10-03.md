@@ -23,7 +23,7 @@ Tracking ledger for the concurrent-download review findings. Status values:
 | W3 | Persistence proportionality | `persist_state_with_original_metainfo` deep-clones + rewrites every torrent per save | fixed | Fingerprint-based changed-record saves; full saves for lifecycle ops; fingerprints adopted only after commit | `progress_persistence_rewrites_only_changed_records`; also fixed a pre-existing race where an engine exiting before initialization corrupted registry progress |
 | W4 | Resume checkpoints | per-piece `persist_resume` in serial path | fixed | Dirty-generation coalescing (64 pieces or 5 s), forced at lifecycle boundaries, v1+v2 | `resume_checkpoints_are_coalesced_below_completed_piece_count`, `forced_checkpoint_covers_lifecycle_boundaries_and_resets_dirty_state`, `pieces_verified_during_a_checkpoint_remain_dirty` |
 | W5 | Upload during download | inbound `Request` discarded while downloading | fixed | Inbound serving registry + `serve_downloader_peer` on the shared listener; outbound sessions serve via `InboundUploadQueue`; Have fan-out; discovery-evidence backoff reset; self-dial detection | `two_daemon_verified_exchange` (two real daemons complete without a seed) |
-| W6 | Maintenance interference | autopilot clones full registry per tick | in-progress | Active-set-only autopilot inputs | bounded-library test |
+| W6 | Maintenance interference | autopilot clones full registry per tick | fixed | Active-set-only autopilot inputs | bounded-library test |
 | W7 | Memory / hot path | deep meta clones, assembler copies, piece scans | fixed | `Arc<TorrentMeta>` shared across registry, engines, storages, and seeder contexts; `Into<Arc<TorrentMeta>>` constructors; metadata edits rebuild the shared value | `cargo test --workspace` (291 daemon unit tests incl. durable-state round-trips) |
 | W8 | Production harness | no real-daemon scale harness | in-progress | Daemon harness profiles | machine-readable results |
 
@@ -49,7 +49,7 @@ Implementation:
 
 Evidence: `crates/swarmotterd/tests/two_daemon_verified_exchange.rs` — two
 real `DaemonRuntime` instances (distinct state dirs, ports, and peer ids) plus
-a local tracker complete a 64-piece torrent by exchanging verified pieces in
+a local tracker complete a 16-piece torrent by exchanging verified pieces in
 both directions with no seeder; both bitfields reach full coverage and the
 payload bytes match the original content. Stable across repeated runs.
 

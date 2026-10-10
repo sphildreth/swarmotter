@@ -40,7 +40,7 @@ fn unique_dir(label: &str) -> PathBuf {
 /// peer list containing BOTH swarm members.
 async fn run_two_peer_tracker(
     listener: tokio::net::TcpListener,
-    peers: Vec<PeerAddr>,
+    peers: std::sync::Arc<tokio::sync::RwLock<Vec<PeerAddr>>>,
 ) -> std::io::Result<()> {
     loop {
         let (mut stream, _) = listener.accept().await?;
@@ -49,6 +49,13 @@ async fn run_two_peer_tracker(
             let mut buf = vec![0u8; 4096];
             let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
             let mut encoded_peers = Vec::new();
+            let peers = loop {
+                let peers = peers.read().await.clone();
+                if !peers.is_empty() {
+                    break peers;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
             for peer in &peers {
                 if let std::net::IpAddr::V4(v4) = peer.ip {
                     encoded_peers.extend_from_slice(&v4.octets());
@@ -122,33 +129,13 @@ async fn two_incomplete_daemons_exchange_verified_pieces_without_a_seed() {
 
     let tracker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tracker_port = tracker.local_addr().unwrap().port();
-    // Listener ports are reserved before the daemons configure them.
-    let port_a = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
-    let port_b = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().port()
-    };
-
     let dir_a = unique_dir("peer-a");
     let dir_b = unique_dir("peer-b");
 
-    // The tracker learns the daemon listener ports in advance; both daemon
-    // listeners are bound lazily by the shared peer listener task.
-    let tracker_peers = vec![
-        PeerAddr {
-            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            port: port_a,
-        },
-        PeerAddr {
-            ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            port: port_b,
-        },
-    ];
+    let tracker_peers = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let tracker_peers_for_task = tracker_peers.clone();
     tokio::spawn(async move {
-        let _ = run_two_peer_tracker(tracker, tracker_peers).await;
+        let _ = run_two_peer_tracker(tracker, tracker_peers_for_task).await;
     });
 
     let torrent_bytes = build_single_file_torrent(
@@ -166,7 +153,7 @@ async fn two_incomplete_daemons_exchange_verified_pieces_without_a_seed() {
     prewrite_pieces(&torrent_bytes, &dir_b, &payload, 8..16).await;
 
     let runtime_a = DaemonRuntime::with_paths_broker_and_state(
-        daemon_config(&dir_a, port_a),
+        daemon_config(&dir_a, 0),
         daemon_health(),
         None,
         None,
@@ -174,7 +161,7 @@ async fn two_incomplete_daemons_exchange_verified_pieces_without_a_seed() {
         EventBroker::default(),
     );
     let runtime_b = DaemonRuntime::with_paths_broker_and_state(
-        daemon_config(&dir_b, port_b),
+        daemon_config(&dir_b, 0),
         daemon_health(),
         None,
         None,
@@ -197,6 +184,18 @@ async fn two_incomplete_daemons_exchange_verified_pieces_without_a_seed() {
 
     runtime_a.start_now(&hash_a).await.unwrap();
     runtime_b.start_now(&hash_b).await.unwrap();
+    let addr_a = runtime_a.seeder_listener_addr().await.unwrap();
+    let addr_b = runtime_b.seeder_listener_addr().await.unwrap();
+    *tracker_peers.write().await = vec![
+        PeerAddr {
+            ip: addr_a.ip(),
+            port: addr_a.port(),
+        },
+        PeerAddr {
+            ip: addr_b.ip(),
+            port: addr_b.port(),
+        },
+    ];
 
     // Both daemons must reach full completion by exchanging their verified
     // halves; neither has a complete seed.

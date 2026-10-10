@@ -2,6 +2,12 @@
 
 use super::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PersistenceMode {
+    ChangedRecords,
+    Full,
+}
+
 fn torrent_piece_count(torrent: &Torrent) -> usize {
     torrent
         .meta
@@ -62,36 +68,42 @@ fn meta_identity_fingerprint(t: &Torrent) -> u64 {
     let mut hash = FnvHasher::default();
     let meta = &t.meta;
     hash.update(meta.info_hash.as_bytes());
-    hash.update(
-        meta.identity
-            .primary_key()
-            .map(|k| k.to_locator())
-            .unwrap_or_default()
-            .as_bytes(),
-    );
-    hash.update(meta.name.as_bytes());
+    if let Some(key) = meta.identity.primary_key() {
+        hash.update(&[1]);
+        hash.update_field(key.to_locator().as_bytes());
+    } else {
+        hash.update(&[0]);
+    }
+    hash.update_field(meta.name.as_bytes());
     hash.update(&meta.piece_length.to_le_bytes());
     hash.update(&meta.total_length.to_le_bytes());
     hash.update(&(meta.pieces.len() as u64).to_le_bytes());
     hash.update(&(meta.files.len() as u64).to_le_bytes());
     for file in &meta.files {
-        hash.update(file.path.join("/").as_bytes());
+        hash.update_field(file.path.join("/").as_bytes());
         hash.update(&file.length.to_le_bytes());
     }
     hash.update(&[u8::from(meta.private)]);
-    hash.update(meta.announce.as_deref().unwrap_or_default().as_bytes());
+    hash.update_optional_field(meta.announce.as_deref().map(str::as_bytes));
+    hash.update_len(meta.announce_list.len());
     for tier in &meta.announce_list {
+        hash.update_len(tier.len());
         for tracker in tier {
-            hash.update(tracker.as_bytes());
+            hash.update_field(tracker.as_bytes());
         }
     }
     hash.update(&(meta.webseeds.len() as u64).to_le_bytes());
     for webseed in &meta.webseeds {
-        hash.update(webseed.as_bytes());
+        hash.update_field(webseed.as_bytes());
     }
-    hash.update(meta.comment.as_deref().unwrap_or_default().as_bytes());
-    hash.update(meta.created_by.as_deref().unwrap_or_default().as_bytes());
-    hash.update(&meta.creation_date.unwrap_or(0).to_le_bytes());
+    hash.update_optional_field(meta.comment.as_deref().map(str::as_bytes));
+    hash.update_optional_field(meta.created_by.as_deref().map(str::as_bytes));
+    if let Some(creation_date) = meta.creation_date {
+        hash.update(&[1]);
+        hash.update(&creation_date.to_le_bytes());
+    } else {
+        hash.update(&[0]);
+    }
     hash.update(&[u8::from(meta.is_multi_file)]);
     if let Some(v2) = &meta.v2 {
         hash.update(&[1]);
@@ -135,10 +147,11 @@ fn meta_full_fingerprint(t: &Torrent) -> u64 {
 /// immutable metadata, which is covered by the memoized metadata
 /// fingerprint. A reconciliation tick must not rewrite records whose durable
 /// content did not change (ADR-0073).
-fn torrent_durable_fingerprint(t: &Torrent, meta_full: u64) -> u64 {
+fn torrent_durable_fingerprint(t: &Torrent, meta_structural: u64, meta_full: u64) -> u64 {
     let mut hash = FnvHasher::default();
+    hash.update(&meta_structural.to_le_bytes());
     hash.update(&meta_full.to_le_bytes());
-    hash.update(t.state.as_str().as_bytes());
+    hash.update_field(t.state.as_str().as_bytes());
     hash.update(t.progress.bitfield().as_bytes());
     hash.update(&t.downloaded.to_le_bytes());
     hash.update(&t.uploaded.to_le_bytes());
@@ -146,38 +159,51 @@ fn torrent_durable_fingerprint(t: &Torrent, meta_full: u64) -> u64 {
     hash.update(&t.rate_up.to_le_bytes());
     hash.update(&(t.active_peer_workers as u64).to_le_bytes());
     hash.update(&(t.known_peers as u64).to_le_bytes());
-    hash.update(
-        &t.seeding
-            .ratio_limit
-            .map(|r| r.to_bits())
-            .unwrap_or(0)
-            .to_le_bytes(),
-    );
-    hash.update(&t.seeding.idle_limit.unwrap_or(0).to_le_bytes());
-    hash.update(&[u8::from(t.seeding.seed_forever)]);
-    hash.update(format!("{:?}", t.seeding_status).as_bytes());
-    for label in &t.labels {
-        hash.update(label.as_bytes());
+    if let Some(ratio) = t.seeding.ratio_limit {
+        hash.update(&[1]);
+        hash.update(&ratio.to_bits().to_le_bytes());
+    } else {
+        hash.update(&[0]);
     }
-    hash.update(t.download_dir.as_deref().unwrap_or_default().as_bytes());
+    if let Some(idle_limit) = t.seeding.idle_limit {
+        hash.update(&[1]);
+        hash.update(&idle_limit.to_le_bytes());
+    } else {
+        hash.update(&[0]);
+    }
+    hash.update(&[u8::from(t.seeding.seed_forever)]);
+    hash.update_field(format!("{:?}", t.seeding_status).as_bytes());
+    hash.update_len(t.labels.len());
+    for label in &t.labels {
+        hash.update_field(label.as_bytes());
+    }
+    hash.update_optional_field(t.download_dir.as_deref().map(str::as_bytes));
     hash.update(&t.date_added.to_le_bytes());
-    hash.update(&t.date_completed.unwrap_or(0).to_le_bytes());
+    if let Some(date_completed) = t.date_completed {
+        hash.update(&[1]);
+        hash.update(&date_completed.to_le_bytes());
+    } else {
+        hash.update(&[0]);
+    }
+    hash.update_len(t.files.len());
     for file in &t.files {
-        hash.update(file.path.as_bytes());
+        hash.update_field(file.path.as_bytes());
         hash.update(&file.length.to_le_bytes());
         hash.update(&file.bytes_completed.to_le_bytes());
-        hash.update(format!("{:?}", file.priority).as_bytes());
+        hash.update_field(format!("{:?}", file.priority).as_bytes());
         hash.update(&[u8::from(file.wanted)]);
     }
+    hash.update_len(t.priorities.len());
     for priority in &t.priorities {
-        hash.update(format!("{:?}", priority).as_bytes());
+        hash.update_field(format!("{:?}", priority).as_bytes());
     }
+    hash.update_len(t.wanted.len());
     for wanted in &t.wanted {
         hash.update(&[u8::from(*wanted)]);
     }
-    hash.update(t.error.as_deref().unwrap_or_default().as_bytes());
+    hash.update_optional_field(t.error.as_deref().map(str::as_bytes));
     hash.update(&[t.health.score, t.health.bars]);
-    hash.update(format!("{:?}", t.health.label).as_bytes());
+    hash.update_field(format!("{:?}", t.health.label).as_bytes());
     hash.update(&[
         t.health.availability_score,
         t.health.throughput_score,
@@ -185,25 +211,31 @@ fn torrent_durable_fingerprint(t: &Torrent, meta_full: u64) -> u64 {
         t.health.stability_score,
         t.health.discovery_score,
     ]);
+    hash.update_len(t.health.reasons.len());
     for reason in &t.health.reasons {
-        hash.update(reason.as_bytes());
+        hash.update_field(reason.as_bytes());
     }
     hash.update(&t.download_limit.to_le_bytes());
     hash.update(&t.upload_limit.to_le_bytes());
     hash.update(&[u8::from(t.needs_metadata)]);
     if let Some(magnet_hash) = &t.magnet_info_hash {
-        hash.update(magnet_hash.as_bytes());
+        hash.update(&[1]);
+        hash.update_field(magnet_hash.as_bytes());
+    } else {
+        hash.update(&[0]);
     }
-    hash.update(t.magnet_name.as_deref().unwrap_or_default().as_bytes());
+    hash.update_optional_field(t.magnet_name.as_deref().map(str::as_bytes));
+    hash.update_len(t.magnet_trackers.len());
     for tracker in &t.magnet_trackers {
-        hash.update(tracker.as_bytes());
+        hash.update_field(tracker.as_bytes());
     }
+    hash.update_len(t.magnet_select_only_file_indices.len());
     for index in &t.magnet_select_only_file_indices {
         hash.update(&(*index as u64).to_le_bytes());
     }
     hash.update(&[u8::from(t.containment_recovery_intent.is_some())]);
-    hash.update(format!("{:?}", t.autopilot_mode_override).as_bytes());
-    hash.update(format!("{:?}", t.policy).as_bytes());
+    hash.update_field(format!("{:?}", t.autopilot_mode_override).as_bytes());
+    hash.update_field(format!("{:?}", t.policy).as_bytes());
     hash.finish()
 }
 
@@ -221,6 +253,25 @@ impl FnvHasher {
         }
     }
 
+    fn update_len(&mut self, len: usize) {
+        self.update(&(len as u64).to_le_bytes());
+    }
+
+    fn update_field(&mut self, bytes: &[u8]) {
+        self.update_len(bytes.len());
+        self.update(bytes);
+    }
+
+    fn update_optional_field(&mut self, bytes: Option<&[u8]>) {
+        match bytes {
+            Some(bytes) => {
+                self.update(&[1]);
+                self.update_field(bytes);
+            }
+            None => self.update(&[0]),
+        }
+    }
+
     fn finish(&self) -> u64 {
         self.state
     }
@@ -230,8 +281,13 @@ impl FnvHasher {
 /// when reconciliation did not change queue order.
 fn queue_fingerprint(queue: &QueueState<TorrentKey>) -> u64 {
     let mut hash = FnvHasher::default();
-    for hash_key in queue.order.iter().chain(queue.bypass.iter()) {
-        hash.update(hash_key.to_locator().as_bytes());
+    hash.update_len(queue.order.len());
+    for hash_key in &queue.order {
+        hash.update_field(hash_key.to_locator().as_bytes());
+    }
+    hash.update_len(queue.bypass.len());
+    for hash_key in &queue.bypass {
+        hash.update_field(hash_key.to_locator().as_bytes());
     }
     hash.update(&queue.limits.max_active_downloads.to_le_bytes());
     hash.update(&queue.limits.max_active_seeds.to_le_bytes());
@@ -248,10 +304,13 @@ impl DaemonRuntime {
         meta_fps.clear();
         fingerprints.clear();
         for torrent in &state.torrents {
-            let cheap = meta_identity_fingerprint(torrent);
-            let full = meta_full_fingerprint(torrent);
-            meta_fps.insert(torrent.key(), (cheap, full));
-            fingerprints.insert(torrent.key(), torrent_durable_fingerprint(torrent, full));
+            let meta_cheap = meta_identity_fingerprint(torrent);
+            let meta_full = meta_full_fingerprint(torrent);
+            meta_fps.insert(torrent.key(), (meta_cheap, meta_full));
+            fingerprints.insert(
+                torrent.key(),
+                torrent_durable_fingerprint(torrent, meta_cheap, meta_full),
+            );
         }
         *self.durable_queue_fingerprint.lock().await = queue_fingerprint(&state.queue);
     }
@@ -574,7 +633,13 @@ impl DaemonRuntime {
     }
 
     pub(super) async fn persist_state(&self) -> Result<()> {
-        self.persist_state_with_original_metainfo(None).await
+        self.persist_state_with_mode(None, PersistenceMode::ChangedRecords)
+            .await
+    }
+
+    pub(super) async fn persist_state_full(&self) -> Result<()> {
+        self.persist_state_with_mode(None, PersistenceMode::Full)
+            .await
     }
 
     /// Persist the registry/queue generation and, for a freshly accepted
@@ -589,9 +654,10 @@ impl DaemonRuntime {
     /// semantics — removals, imports, and paired transactions stage the
     /// complete registry so durable state can never resurrect a removed
     /// torrent or lose a queue entry.
-    async fn persist_state_with_original_metainfo(
+    async fn persist_state_with_mode(
         &self,
         original_metainfo: Option<crate::state_store::OriginalMetainfo>,
+        mode: PersistenceMode,
     ) -> Result<()> {
         let Some(path) = self.state_path.clone() else {
             return Ok(());
@@ -599,7 +665,8 @@ impl DaemonRuntime {
         let mut timer = crate::persistence_metrics::SaveTimer::new();
         let _write_guard = self.state_write_lock.lock().await;
         timer.locked();
-        let result = if original_metainfo.is_some()
+        let result = if mode == PersistenceMode::Full
+            || original_metainfo.is_some()
             || !self
                 .incremental_persistence_ready
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -637,7 +704,10 @@ impl DaemonRuntime {
                         full
                     }
                 };
-                fingerprint_updates.push((*hash, torrent_durable_fingerprint(torrent, meta_full)));
+                fingerprint_updates.push((
+                    *hash,
+                    torrent_durable_fingerprint(torrent, meta_cheap, meta_full),
+                ));
                 torrents.push(torrent.clone());
             }
             let queue = self.queue.lock().await.clone();
@@ -694,7 +764,7 @@ impl DaemonRuntime {
                         full
                     }
                 };
-                let fingerprint = torrent_durable_fingerprint(torrent, meta_full);
+                let fingerprint = torrent_durable_fingerprint(torrent, meta_cheap, meta_full);
                 if fingerprints.get(hash).copied() != Some(fingerprint) {
                     changed.push((*hash, fingerprint, torrent.clone()));
                 }
@@ -1076,9 +1146,10 @@ impl DaemonRuntime {
                 "injected shared torrent-add persistence failure".into(),
             ))
         } else {
-            self.persist_state_with_original_metainfo(
+            self.persist_state_with_mode(
                 original_metainfo
                     .map(|bytes| crate::state_store::OriginalMetainfo::new(hash, bytes)),
+                PersistenceMode::Full,
             )
             .await
         };
@@ -1211,7 +1282,7 @@ impl DaemonRuntime {
                 peer_permit_pools.remove(hash);
             }
         }
-        self.persist_state().await?;
+        self.persist_state_full().await?;
         self.reconcile_queue().await;
         let removed_hashes = targets
             .into_iter()

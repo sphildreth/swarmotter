@@ -105,6 +105,7 @@ const AUTOPILOT_STATE_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
 const MAGNET_METADATA_NO_PEERS_RETRY_DELAY: Duration = Duration::from_secs(60);
 const MAGNET_METADATA_NO_PEERS_RETRY_MESSAGE: &str =
     "magnet metadata fetch: no peers discovered; will retry";
+const DAEMON_WRITABLE_HANDLE_BUDGET: usize = 256;
 const STALE_ACTIVE_RECOVERY_MESSAGE: &str =
     "active torrent had no running engine; queued for lifecycle recovery";
 const STALE_INACTIVE_ENGINE_RECOVERY_MESSAGE: &str =
@@ -274,6 +275,7 @@ pub struct DaemonRuntime {
     seeder_registry: SeedRegistry,
     /// Serializes the live registry with coarse/fine lifecycle transitions.
     seeder_lifecycle_lock: Arc<Mutex<()>>,
+    seeder_listener_addr: Arc<Mutex<Option<std::net::SocketAddr>>>,
     seeder_listener_shutdown: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
     seeder_listener_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Per-torrent tracker announce sidecars. The TCP listener itself is
@@ -376,6 +378,11 @@ impl DaemonRuntime {
     #[allow(dead_code)]
     pub fn containment_gate(&self) -> &ContainmentGate {
         &self.containment_gate
+    }
+
+    /// The bound address of the shared inbound peer listener, when active.
+    pub async fn seeder_listener_addr(&self) -> Option<std::net::SocketAddr> {
+        *self.seeder_listener_addr.lock().await
     }
 
     /// Send a runtime health report (used by tests to inject bind-failure
@@ -711,7 +718,18 @@ pub(super) fn storage_io_with_config(
     cfg: &Config,
 ) -> swarmotter_core::storage::StorageIo {
     swarmotter_core::storage::StorageIo::new(meta, download_dir)
+        .with_handle_budget(Some(daemon_storage_handle_budget()))
         .with_resume_dir(cfg.storage.resume_dir.as_ref().map(PathBuf::from))
+}
+
+pub(super) fn daemon_storage_handle_budget() -> Arc<swarmotter_core::storage::StorageHandleBudget> {
+    static BUDGET: std::sync::OnceLock<Arc<swarmotter_core::storage::StorageHandleBudget>> =
+        std::sync::OnceLock::new();
+    BUDGET
+        .get_or_init(|| {
+            swarmotter_core::storage::StorageHandleBudget::new(DAEMON_WRITABLE_HANDLE_BUDGET)
+        })
+        .clone()
 }
 
 /// Resolve the local storage-root control that owns a torrent's active write
