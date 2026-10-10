@@ -313,6 +313,28 @@ In strict interface mode, hostname trackers and DHT bootstrap hostnames need
 constrained DNS. On Linux, SwarmOtter accepts systemd-resolved link DNS for the
 required interface, for example DNS servers shown by `resolvectl dns br0`.
 
+## Web UI stalls while Docker reports healthy
+
+Older container health checks call `/health`, which reports network containment
+health. It does not verify that torrent lists, statistics, or persistence are
+making progress. A responsive health route can coexist with stalled torrent
+operations.
+
+Check an authenticated torrent-list request with a bounded timeout:
+
+```bash
+curl --max-time 5 --fail --silent --show-error \
+  -H "Authorization: Bearer ${SWARMOTTER_API_TOKEN}" \
+  http://127.0.0.1:9091/api/v1/torrents
+```
+
+If `/health` succeeds but this request times out, inspect daemon logs and the
+last state-file update along with CPU, memory, and disk usage. Builds before
+the ADR-0077 fix can deadlock when queue planning overlaps persistence: each
+operation holds a lock the other needs. Updating to a build with the
+registry-before-queue lock ordering fixes that cycle. Restarting clears an
+existing deadlock but does not prevent recurrence in an affected build.
+
 ## Performance with large libraries (1,000+ torrents)
 
 When managing large torrent libraries, monitor these indicators:
@@ -381,3 +403,16 @@ If performance degrades with large libraries:
 3. Set a global `max_peers` cap to bound total connection count.
 4. Ensure file descriptor limits are sufficient (65,536+ for 1,000 torrents).
 5. Enable `autopilot.mode = "act"` for automatic stalled-torrent mitigation.
+
+Current images use `/live` to check worker progress and registry/queue access.
+A sustained stall causes a nonzero process exit so `restart: unless-stopped`
+can recover it; Docker's unhealthy status alone does not restart a container.
+Normal VPN loss remains a separate network-health condition. Inspect the
+authenticated doctor report for `logging_delivery` and `persistence_performance`.
+Counters are process-local: compare deltas across repeated samples. Snapshot
+time includes fingerprint scanning/cloning and lock acquisition; SQLite time
+and serialized bytes currently cover changed-record saves.
+
+Application logs retain the active file and five numbered archives. Docker logs
+are capped separately. Check both the download filesystem and state filesystem
+for free space; download reserves do not protect a separate SQLite volume.

@@ -428,6 +428,7 @@ pub(crate) fn save_changed_records(
     torrents: &[Torrent],
     queue: Option<&QueueState<TorrentKey>>,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
     CHANGED_SAVE_CALLS.fetch_add(1, Ordering::Relaxed);
     CHANGED_SAVE_RECORDS_WRITTEN.fetch_add(torrents.len() as u64, Ordering::Relaxed);
     if queue.is_some() {
@@ -456,6 +457,8 @@ pub(crate) fn save_changed_records(
                 CoreError::Storage(format!("read durable torrent history: {error}"))
             })?;
         let (torrent_json, raw_info) = encode_torrent(torrent)?;
+        crate::persistence_metrics::SERIALIZED_BYTES
+            .fetch_add(torrent_json.len() as u64, Ordering::Relaxed);
         transaction
             .execute(
                 "INSERT INTO torrent_records(
@@ -492,9 +495,14 @@ pub(crate) fn save_changed_records(
         write_queue_state(&transaction, queue)?;
     }
     prune_retained_rows(&transaction, DURABLE_RETENTION)?;
-    transaction.commit().map_err(|error| {
+    let result = transaction.commit().map_err(|error| {
         CoreError::Storage(format!("commit SQLite changed-record transaction: {error}"))
-    })
+    });
+    crate::persistence_metrics::WRITE_US.fetch_add(
+        crate::persistence_metrics::micros(started),
+        Ordering::Relaxed,
+    );
+    result
 }
 
 pub(crate) fn capture_file(path: &Path) -> Result<StateFileSnapshot> {
@@ -1610,7 +1618,8 @@ fn write_canonical_info(
              VALUES (?1, 'canonical_info', ?2, ?3)
              ON CONFLICT(info_hash, representation) DO UPDATE SET
                 metainfo = excluded.metainfo,
-                stored_at = excluded.stored_at",
+                stored_at = excluded.stored_at
+             WHERE torrent_metainfo.metainfo != excluded.metainfo",
             params![hash, raw_info, unix_timestamp()],
         )
         .map_err(|error| CoreError::Storage(format!("write durable canonical info: {error}")))?;

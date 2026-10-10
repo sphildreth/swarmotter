@@ -3,6 +3,95 @@
 use super::*;
 
 #[tokio::test]
+async fn full_persistence_and_queue_planning_remain_responsive() {
+    persistence_and_queue_planning_remain_responsive(false).await;
+}
+
+#[tokio::test]
+async fn incremental_persistence_and_queue_planning_remain_responsive() {
+    persistence_and_queue_planning_remain_responsive(true).await;
+}
+
+async fn persistence_and_queue_planning_remain_responsive(incremental: bool) {
+    let root = unique_dir("persistence-queue-lock-order");
+    let state_path = root.join("state.sqlite");
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        Config::default(),
+        health,
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "lock-order.bin",
+        b"generated local payload",
+        8,
+        None,
+        false,
+    );
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let hash = TorrentKey::v1(meta.info_hash);
+    runtime
+        .registry
+        .lock()
+        .await
+        .add(Torrent::new(meta, 1))
+        .unwrap();
+    runtime.queue.lock().await.add(hash);
+    if incremental {
+        // The first save creates SQLite; the next detects the existing
+        // database and enables changed-record persistence.
+        runtime.persist_state().await.unwrap();
+        runtime.persist_state().await.unwrap();
+    }
+    assert_eq!(
+        runtime
+            .incremental_persistence_ready
+            .load(Ordering::Relaxed),
+        incremental
+    );
+    runtime
+        .registry
+        .lock()
+        .await
+        .get_mut(&hash)
+        .unwrap()
+        .uploaded = 17;
+
+    // Enqueue persistence first at the registry, then poll the scheduler.
+    // The old scheduler held the queue while waiting here. Once persistence
+    // acquired the registry, each operation waited forever for the other.
+    // Explicit polling makes the interleaving deterministic without sleeps.
+    let registry_guard = runtime.registry.lock().await;
+    let mut save = Box::pin(runtime.persist_state());
+    assert!(futures_util::poll!(&mut save).is_pending());
+    let mut plan = Box::pin(runtime.desired_download_hashes());
+    assert!(futures_util::poll!(&mut plan).is_pending());
+    drop(registry_guard);
+
+    let (saved, planned, torrents, stats) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(save, plan, runtime.list_torrents(), runtime.global_stats())
+    })
+    .await
+    .expect("persistence, queue planning, and control-plane reads must not deadlock");
+    saved.unwrap();
+    assert_eq!(planned, vec![hash]);
+    assert_eq!(torrents.len(), 1);
+    assert_eq!(stats.torrent_count, 1);
+    let persisted = crate::state_store::load(&state_path).unwrap().unwrap();
+    assert_eq!(persisted.torrents.len(), 1);
+    assert_eq!(persisted.torrents[0].uploaded, 17);
+    assert_eq!(persisted.queue.position(&hash), Some(1));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn durable_state_restores_torrents_settings_and_queue() {
     let root = unique_dir("durable-state");
     let state_path = root.join("state.json");
@@ -1378,6 +1467,216 @@ async fn progress_persistence_rewrites_only_changed_records() {
     assert_eq!(count, 1_300);
 
     std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
+async fn full_command_channel_does_not_hold_global_map() {
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::new(Config::default(), health);
+    let hash = TorrentKey::v1(InfoHash::from_bytes([0x11; 20]));
+    let other = TorrentKey::v1(InfoHash::from_bytes([0x22; 20]));
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    tx.try_send(EngineCommand::Reannounce).unwrap();
+    runtime.engine_cmds.lock().await.insert(hash, tx);
+    let (other_tx, mut other_rx) = tokio::sync::mpsc::channel(1);
+    runtime.engine_cmds.lock().await.insert(other, other_tx);
+    let (finished, completion) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        let _finished = finished;
+        std::future::pending::<()>().await;
+    });
+    runtime.engine_handles.write().await.insert(hash, handle);
+    let mut stopping = Box::pin(runtime.stop_engine(&hash));
+    assert!(futures_util::poll!(&mut stopping).is_pending());
+    assert!(runtime.engine_cmds.try_lock().is_ok());
+    assert!(tokio::time::timeout(
+        Duration::from_millis(100),
+        runtime.send_engine_command(other, EngineCommand::Reannounce)
+    )
+    .await
+    .unwrap());
+    assert!(other_rx.recv().await.is_some());
+    tokio::time::timeout(Duration::from_secs(7), &mut stopping)
+        .await
+        .unwrap();
+    drop(stopping);
+    assert!(
+        completion.await.is_err(),
+        "cancelled engine must drop its completion sender"
+    );
+    assert!(runtime.engine_cmds.try_lock().is_ok());
+}
+
+#[tokio::test]
+async fn rollback_save_adopts_only_committed_snapshot_fingerprint() {
+    let root = unique_dir("review-fingerprint-race");
+    let state_path = root.join("state.sqlite");
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        Config::default(),
+        health,
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "review.bin",
+        b"local payload",
+        8,
+        None,
+        false,
+    );
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let hash = TorrentKey::v1(meta.info_hash);
+    runtime
+        .registry
+        .lock()
+        .await
+        .add(Torrent::new(meta, 1))
+        .unwrap();
+    runtime.queue.lock().await.add(hash);
+    runtime.persist_state().await.unwrap();
+    runtime.persist_state().await.unwrap();
+    runtime
+        .registry
+        .lock()
+        .await
+        .get_mut(&hash)
+        .unwrap()
+        .uploaded = 1;
+    // Delay post-save fingerprint adoption until the on-disk snapshot is visible.
+    let fingerprint_guard = runtime.meta_fingerprints.lock().await;
+    let saving = runtime.clone();
+    let save = tokio::spawn(async move { saving.persist_state_with_file_rollback().await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let uploaded = {
+                let connection = rusqlite::Connection::open_with_flags(
+                    &state_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .unwrap();
+                let bytes: Vec<u8> = connection
+                    .query_row("SELECT torrent_json FROM torrent_records", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["uploaded"]
+                    .as_u64()
+                    .unwrap()
+            };
+            if uploaded == 1 {
+                break;
+            }
+            assert!(
+                !save.is_finished(),
+                "save unexpectedly ended before writing the snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    runtime
+        .registry
+        .lock()
+        .await
+        .get_mut(&hash)
+        .unwrap()
+        .uploaded = 2;
+    drop(fingerprint_guard);
+    save.await.unwrap().unwrap();
+    runtime.persist_state().await.unwrap();
+    let disk = crate::state_store::load(&state_path)
+        .unwrap()
+        .unwrap()
+        .torrents[0]
+        .uploaded;
+    assert_eq!(disk, 2);
+    assert_eq!(
+        runtime.registry.lock().await.get(&hash).unwrap().uploaded,
+        2
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+/// Reproducible local profile; no network or external content. Run alone with
+/// --ignored --nocapture --test-threads=1 to compare commits on the same host.
+#[tokio::test]
+#[ignore = "generated large-metadata persistence profile"]
+async fn persistence_large_metadata_profile() {
+    let root = unique_dir("persistence-profile");
+    let path = root.join("state.sqlite");
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        Config::default(),
+        NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            NetworkContainmentStatus::Disabled,
+            "profile",
+        ),
+        None,
+        None,
+        Some(path.clone()),
+        EventBroker::default(),
+    );
+    let mut active = Vec::new();
+    for index in 0..308 {
+        let mut torrent = if index < 8 {
+            let bytes = swarmotter_core::meta::build_single_file_torrent(
+                &format!("generated-{index}.bin"),
+                &vec![0x42; 4 * 1024 * 1024],
+                64,
+                None,
+                false,
+            );
+            Torrent::new(swarmotter_core::meta::parse_torrent(&bytes).unwrap(), now())
+        } else {
+            bulk_registry_torrent("profile", index)
+        };
+        torrent.state = TorrentState::Paused;
+        let hash = torrent.key();
+        if index < 8 {
+            active.push(hash);
+        }
+        runtime.registry.lock().await.add(torrent).unwrap();
+        runtime.queue.lock().await.add(hash);
+    }
+    runtime.persist_state().await.unwrap();
+    runtime.persist_state().await.unwrap();
+    let started = Instant::now();
+    for _ in 0..5 {
+        runtime.persist_state().await.unwrap();
+    }
+    println!("idle_five_ms={}", started.elapsed().as_millis());
+    let started = Instant::now();
+    for sample in 1..=5 {
+        for hash in &active {
+            runtime
+                .registry
+                .lock()
+                .await
+                .get_mut(hash)
+                .unwrap()
+                .uploaded = sample;
+        }
+        runtime.persist_state().await.unwrap();
+    }
+    println!(
+        "eight_active_five_ms={} sqlite_bytes={}",
+        started.elapsed().as_millis(),
+        std::fs::metadata(&path).unwrap().len()
+    );
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]

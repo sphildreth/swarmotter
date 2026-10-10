@@ -181,3 +181,8 @@ namespace/link operations, and the daemon receives only `CAP_NET_RAW` for
 
 Keep this document aligned with `architecture.md`, `configuration.md`, and the
 accepted containment ADRs whenever the binding or DNS policy changes.
+
+Process shutdown irreversibly closes the containment gate before cleanup.
+Concurrent network-health recovery cannot re-enable a stopping process. The
+application liveness watchdog is separate from VPN health: path loss continues
+to use normal fail-closed recovery, without treating it as a daemon crash.

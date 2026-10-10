@@ -27,6 +27,7 @@ use tokio::sync::Notify;
 #[derive(Debug)]
 pub struct ContainmentGate {
     allowed: AtomicBool,
+    stopped: AtomicBool,
     generation: AtomicU64,
     status: std::sync::Mutex<Option<NetworkContainmentStatus>>,
     detail: std::sync::Mutex<String>,
@@ -37,6 +38,7 @@ impl ContainmentGate {
     pub fn new(traffic_allowed: bool) -> Arc<Self> {
         Arc::new(Self {
             allowed: AtomicBool::new(traffic_allowed),
+            stopped: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             status: std::sync::Mutex::new(None),
             detail: std::sync::Mutex::new(String::new()),
@@ -44,8 +46,20 @@ impl ContainmentGate {
         })
     }
 
+    /// Irreversibly deny traffic for process shutdown, including racing recovery.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.block(
+            NetworkContainmentStatus::BlockedFailClosed,
+            "daemon stopping",
+        );
+    }
+
     /// Permit traffic and advance generation only on blocked-to-allowed.
     pub fn allow(&self) {
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
         let was_allowed = self.allowed.swap(true, Ordering::SeqCst);
         if !was_allowed {
             self.generation.fetch_add(1, Ordering::SeqCst);
@@ -79,7 +93,7 @@ impl ContainmentGate {
 
     /// Return `CoreError::NetworkBlocked` when denied.
     pub fn enforce(&self) -> Result<()> {
-        if self.allowed.load(Ordering::SeqCst) {
+        if self.traffic_allowed() {
             Ok(())
         } else {
             let detail = self
@@ -107,7 +121,7 @@ impl ContainmentGate {
 
     /// Whether traffic is currently permitted (synchronous snapshot).
     pub fn traffic_allowed(&self) -> bool {
-        self.allowed.load(Ordering::SeqCst)
+        !self.stopped.load(Ordering::SeqCst) && self.allowed.load(Ordering::SeqCst)
     }
 
     /// Current blocked status, if any.

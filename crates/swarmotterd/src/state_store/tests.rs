@@ -1020,3 +1020,27 @@ fn durable_piece_hash_lengths_are_checked_with_record_and_piece_context() {
         remove_state(&path);
     }
 }
+
+#[test]
+fn progress_save_does_not_rewrite_unchanged_canonical_metadata() {
+    let path = unique_path("immutable-canonical-info");
+    let mut state = single_torrent_state();
+    save(&path, &state).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_metadata_rewrite BEFORE UPDATE ON torrent_metainfo
+        BEGIN SELECT RAISE(FAIL, 'unchanged metadata rewritten'); END;",
+        )
+        .unwrap();
+    state.torrents[0].uploaded = 17;
+    save_changed_records(&path, &state.torrents, None).unwrap();
+    let stored = load(&path).unwrap().unwrap();
+    assert_eq!(stored.torrents[0].uploaded, 17);
+    assert_eq!(
+        stored.torrents[0].meta.raw_info,
+        state.torrents[0].meta.raw_info
+    );
+    drop(connection);
+    remove_state(&path);
+}

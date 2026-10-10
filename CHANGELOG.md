@@ -7,6 +7,47 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [2.3.0] - [2026-10-10]
+
+### Added
+
+- **Application liveness and recovery:** public `/live` checks essential worker
+  progress and registry/queue responsiveness independently of VPN availability.
+  Background workers are supervised; worker failure or sustained stalls trigger
+  fail-closed shutdown and nonzero exit for service recovery (ADR-0078).
+- **Operational diagnostics:** authenticated doctor checks report logging drops
+  and write errors, plus persistence save counts, failures, timings, and
+  serialized bytes. A generated large-metadata persistence profile supports
+  repeatable measurement without external torrents.
+
+### Changed
+
+- **Bounded logging:** stderr and optional file output use a bounded background
+  writer. Application logs rotate at 10 MiB with five archives; Docker Compose
+  limits each service to three 10 MiB log files (ADR-0078).
+- **Deployment safeguards:** Docker health checks use `/live`, Compose grants a
+  45-second stop grace period, and example configurations reserve 1 GiB and 1%
+  free download space. Existing explicit reserve settings remain supported.
+- **Persistence work:** changed-record saves avoid a redundant clone and skip
+  rewriting unchanged canonical metadata.
+
+### Fixed
+
+- **Daemon responsiveness:** queue planning acquires registry and queue locks
+  in the same order as persistence, preventing a deadlock that stalled torrent
+  lists, statistics, and state saves while network health remained responsive.
+  Regression tests cover full and incremental persistence (ADR-0077).
+- **Engine command stalls:** engine shutdown releases the shared command map
+  before waiting. Automatic commands enqueue without blocking, explicit
+  reannounce reports unavailable command queues, and engine/seeder shutdown
+  cancels tasks that exceed the graceful join deadline.
+- **Shutdown completion:** SSE and WebSocket clients close when shutdown begins.
+  Cleanup checkpoints state with bounded HTTP drain, process shutdown, and
+  runtime teardown; concurrent recovery cannot reopen terminal containment.
+- **Persistence snapshot race:** rollback saves adopt fingerprints from the
+  committed snapshot so concurrent progress updates remain eligible for the
+  next incremental save.
+
 ## [2.2.0] - [2026-10-03]
 
 ### Added

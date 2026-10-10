@@ -220,6 +220,12 @@ succeeded; downloaded count uses scrape when available.
    subscribers.
 6. The handler returns the standard `{ success, data, error }` envelope.
 
+Operations holding both the torrent registry and queue locks acquire the
+registry first (ADR-0077). Queue planning and persistence use this shared order
+to avoid blocking each other indefinitely. Separate accesses release their
+guards before acquiring the other lock; persistence releases both before
+serialization and database writes.
+
 ## Durable torrent add and watch ingestion
 
 API file, magnet, and watch-folder additions converge on one daemon transaction
@@ -328,3 +334,14 @@ recovery intent.
 - Avoid `unwrap`/`expect` in production paths where a meaningful error exists.
 - Keep modules small and focused.
 - Minimal, Apache-2.0-compatible dependencies (see ADR-0009).
+
+## Supervision and shutdown
+
+ADR-0078 defines essential worker supervision, completed-work heartbeats, an
+independent process watchdog, and terminal containment during shutdown. `/live`
+checks application progress independently of VPN state. Worker failures and
+sustained stalls cause bounded cleanup and nonzero exit for service recovery.
+Event clients close before HTTP drain; current worker transactions finish before
+torrent shutdown and checkpointing. Logging uses bounded background delivery.
+Persistence doctor counters report cumulative lock wait, snapshot/scan, SQLite
+write, total/maximum operation latency, errors, and serialized record bytes.

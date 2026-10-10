@@ -22,7 +22,7 @@ use axum::{
 use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use std::{convert::Infallible, sync::Arc, time::Duration};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tokio_stream::StreamExt as _;
 
@@ -55,6 +55,7 @@ impl Event {
 #[derive(Clone)]
 pub struct EventBroker {
     tx: broadcast::Sender<PublishedEvent>,
+    stopping: watch::Sender<bool>,
 }
 
 /// Serialized event frame shared by all subscribers.
@@ -68,7 +69,17 @@ pub struct PublishedEvent {
 impl EventBroker {
     pub fn new(capacity: usize) -> Self {
         let (tx, _rx) = broadcast::channel(capacity);
-        Self { tx }
+        let (stopping, _) = watch::channel(false);
+        Self { tx, stopping }
+    }
+
+    pub fn shutdown(&self) {
+        self.stopping.send_replace(true);
+    }
+
+    pub async fn closed(&self) {
+        let mut rx = self.stopping.subscribe();
+        let _ = rx.wait_for(|stopping| *stopping).await;
     }
 
     pub fn publish(&self, event: Event) {
@@ -125,8 +136,12 @@ pub async fn ws_handler(
         async move {
             let mut stream = broker.subscribe();
             let mut ping = tokio::time::interval(Duration::from_secs(30));
+            let delivery = async {
             loop {
                 tokio::select! {
+                    incoming = socket.recv() => {
+                        if matches!(incoming, None | Some(Err(_)) | Some(Ok(Message::Close(_)))) { break; }
+                    }
                     _ = ping.tick() => {
                         if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
                             break;
@@ -155,6 +170,11 @@ pub async fn ws_handler(
                     }
                 }
             }
+            };
+            tokio::select! {
+                _ = broker.closed() => {},
+                _ = delivery => {},
+            }
         }
     })
 }
@@ -163,7 +183,8 @@ fn make_event_stream(
     broker: EventBroker,
     info_hash: Option<String>,
 ) -> impl Stream<Item = Result<axum::response::sse::Event, Infallible>> {
-    broker.subscribe().filter_map(move |res| match res {
+    let shutdown = broker.clone();
+    let stream = broker.subscribe().filter_map(move |res| match res {
         Ok(event) => {
             if let Some(want) = &info_hash {
                 if event.info_hash.as_deref() != Some(want) {
@@ -180,7 +201,8 @@ fn make_event_stream(
                 .event("events_dropped")
                 .data(lagged_event_json(skipped))))
         }
-    })
+    });
+    futures_util::StreamExt::take_until(stream, async move { shutdown.closed().await })
 }
 
 fn lagged_event_json(skipped: u64) -> String {
@@ -297,5 +319,22 @@ mod tests {
         let bad = serde_json::Value::String("ok".into());
         // The above serializes fine; we exercise the public API path.
         b.publish(Event::new("daemon_health_changed", bad));
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    #[tokio::test]
+    async fn shutdown_ends_existing_and_new_sse_subscriptions() {
+        let broker = EventBroker::default();
+        let stream = make_event_stream(broker.clone(), None);
+        tokio::pin!(stream);
+        assert!(futures_util::poll!(Box::pin(stream.next())).is_pending());
+        broker.shutdown();
+        assert!(stream.next().await.is_none());
+        let late = make_event_stream(broker, None);
+        tokio::pin!(late);
+        assert!(late.next().await.is_none());
     }
 }

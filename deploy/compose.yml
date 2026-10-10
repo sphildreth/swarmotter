@@ -16,6 +16,11 @@ services:
       - "${SWARMOTTER_WEB_PORT:-9091}:9091"
     volumes:
       - "${GLUETUN_STATE_DIR:-/srv/swarmotter/gluetun}:/gluetun"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
   swarmotter:
@@ -29,6 +34,7 @@ services:
     # namespace. Do not remove this shared-namespace boundary or attach a
     # fallback bridge while using that config.
     network_mode: "service:vpn"
+    stop_grace_period: 45s
     environment:
       SWARMOTTER_API__REQUIRE_AUTH: ${SWARMOTTER_API_REQUIRE_AUTH:-true}
       SWARMOTTER_API__AUTH_TOKEN: ${SWARMOTTER_API_TOKEN:-}
@@ -43,4 +49,9 @@ services:
       nofile:
         soft: 65536
         hard: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped

@@ -128,6 +128,7 @@ pub fn app_router_with_body_limit(state: SharedState, max_request_body_bytes: us
     Router::new()
         // Public health route that neither mutates nor reveals torrent data.
         .route("/health", get(handlers::health::root_health))
+        .route("/live", get(handlers::health::live))
         .merge(controls)
         .with_state(state)
 }

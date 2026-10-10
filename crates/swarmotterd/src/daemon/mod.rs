@@ -13,6 +13,8 @@ mod containment;
 pub(crate) mod diagnostics;
 mod lifecycle;
 mod persistence;
+mod reliability;
+pub use reliability::Watchdog;
 mod policy_runtime;
 mod port_mapping;
 mod port_test;
@@ -334,10 +336,12 @@ pub struct DaemonRuntime {
     engine_retry_after: Arc<RwLock<HashMap<TorrentKey, Instant>>>,
     autopilot_decisions: Arc<RwLock<HashMap<TorrentKey, AutopilotDecision>>>,
     autopilot_last_action: Arc<RwLock<HashMap<TorrentKey, Instant>>>,
+    // When holding both guards, acquire registry before queue (ADR-0077).
     queue: Arc<Mutex<QueueState<TorrentKey>>>,
     dht_runner: Arc<Mutex<Option<Arc<crate::dht::DhtRunner>>>>,
     queue_reconcile: Arc<Mutex<QueueReconcileState>>,
     event_broker: EventBroker,
+    reliability: Arc<reliability::Reliability>,
     /// Process-wide containment gate shared by every data-plane component.
     /// See ADR-0051.
     pub(crate) containment_gate: Arc<ContainmentGate>,
