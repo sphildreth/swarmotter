@@ -125,6 +125,8 @@ impl DaemonRuntime {
             durable_queue_fingerprint: Arc::new(Mutex::new(0)),
             incremental_persistence_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             changed_record_saves: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            changed_records_written: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             storage_ownership_lock: Arc::new(Mutex::new(())),
             storage_admissions: StorageAdmissionController::default(),
             storage_metrics: StorageMetricRegistry::default(),

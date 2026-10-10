@@ -74,8 +74,8 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Instrumentation for changed-record persistence: total torrent records and
 /// queue documents written by `save_changed_records` since process start.
-/// Tests and diagnostics compare deltas to prove that a progress save is
-/// proportional to actual changes rather than library size.
+/// These process-wide diagnostics include all runtimes; tests must use
+/// runtime-local counters when asserting exact per-save deltas.
 pub static CHANGED_SAVE_RECORDS_WRITTEN: AtomicU64 = AtomicU64::new(0);
 pub static CHANGED_SAVE_QUEUE_WRITES: AtomicU64 = AtomicU64::new(0);
 pub static CHANGED_SAVE_CALLS: AtomicU64 = AtomicU64::new(0);

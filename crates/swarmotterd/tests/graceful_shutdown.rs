@@ -53,7 +53,7 @@ resume_dir = "{0}/resume"
             ])
             .env_remove("SWARMOTTER_CONFIG")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
     );
@@ -85,7 +85,7 @@ resume_dir = "{0}/resume"
     let start = Instant::now();
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
-            assert!(status.success());
+            assert!(status.success(), "daemon exited with {status}");
             break;
         }
         assert!(

@@ -1332,8 +1332,6 @@ fn bulk_registry_torrent(label: &str, index: usize) -> Torrent {
 
 #[tokio::test]
 async fn progress_persistence_rewrites_only_changed_records() {
-    use crate::state_store::CHANGED_SAVE_RECORDS_WRITTEN;
-
     let root = unique_dir("incremental-persistence");
     let state_path = root.join("state.sqlite");
     let cfg = Config::default();
@@ -1382,6 +1380,26 @@ async fn progress_persistence_rewrites_only_changed_records() {
     // Prime the fingerprint generation with a full save.
     runtime.persist_state().await.unwrap();
 
+    // A second runtime deterministically exercises the cross-runtime writes
+    // that parallel tests can interleave with the measurement below.
+    let other_runtime = DaemonRuntime::with_paths_broker_and_state(
+        cfg,
+        health,
+        None,
+        None,
+        Some(root.join("other.sqlite")),
+        EventBroker::default(),
+    );
+    other_runtime.persist_state().await.unwrap();
+    // Detect the newly created SQLite generation before incremental saves.
+    other_runtime.persist_state().await.unwrap();
+    other_runtime
+        .registry
+        .lock()
+        .await
+        .add(bulk_registry_torrent("other", 0))
+        .unwrap();
+
     // Simulate one engine progress sample: exactly one record must be
     // serialized and rewritten.
     {
@@ -1390,9 +1408,11 @@ async fn progress_persistence_rewrites_only_changed_records() {
         torrent.downloaded += 65536;
         torrent.uploaded += 1024;
     }
-    let before = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
-    runtime.persist_state().await.unwrap();
-    let after = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    let before = runtime.changed_records_written_count();
+    other_runtime.persist_state().await.unwrap();
+    assert_eq!(other_runtime.changed_records_written_count(), 1);
+    runtime.clone().persist_state().await.unwrap();
+    let after = runtime.changed_records_written_count();
     assert_eq!(
         after - before,
         1,
@@ -1411,21 +1431,21 @@ async fn progress_persistence_rewrites_only_changed_records() {
     }
     // Newly registered records are written exactly once (their first
     // durable generation), then never again while unchanged.
-    let before = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    let before = runtime.changed_records_written_count();
     runtime.persist_state().await.unwrap();
-    let after = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    let after = runtime.changed_records_written_count();
     assert_eq!(
         after - before,
         1_000,
         "newly registered library records are written once"
     );
-    let before = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    let before = runtime.changed_records_written_count();
     runtime.persist_state().await.unwrap();
-    let after = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    let after = runtime.changed_records_written_count();
     assert_eq!(
         after - before,
         0,
-        "an unchanged 10k inactive library must not be rewritten on a no-op save"
+        "an unchanged inactive library must not be rewritten on a no-op save"
     );
 
     // One further active change still rewrites exactly one record despite the
@@ -1435,9 +1455,9 @@ async fn progress_persistence_rewrites_only_changed_records() {
         let torrent = reg.get_mut(&active_hash).unwrap();
         torrent.downloaded += 65536;
     }
-    let before = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    let before = runtime.changed_records_written_count();
     runtime.persist_state().await.unwrap();
-    let after = CHANGED_SAVE_RECORDS_WRITTEN.load(std::sync::atomic::Ordering::Relaxed);
+    let after = runtime.changed_records_written_count();
     assert_eq!(
         after - before,
         1,

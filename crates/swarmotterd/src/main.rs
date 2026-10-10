@@ -156,6 +156,9 @@ async fn run() -> Result<()> {
         qbittorrent: swarmotter_api::state::QbittorrentCompatState::default(),
     });
 
+    // Register handlers before serving requests: a client can send SIGTERM
+    // as soon as the API responds, before a lazily polled future runs.
+    let shutdown_signal = shutdown_signal()?;
     let bind = api_bind;
 
     tracing::info!(%bind, "swarmotterd starting; API + Web UI on control plane");
@@ -200,7 +203,7 @@ async fn run() -> Result<()> {
     });
     let mut server_done = false;
     let failure = tokio::select! {
-        _ = shutdown_signal() => None,
+        result = shutdown_signal => result.err().map(|error| format!("shutdown signal failed: {error}")),
         ended = workers.join_next() => Some(format!("essential worker stopped: {ended:?}")),
         result = runtime.supervise_progress() => Some(format!("progress supervisor stopped: {result:?}")),
         result = &mut server => {
@@ -313,24 +316,23 @@ fn resolve_state_file(explicit: Option<PathBuf>, config: &Config) -> PathBuf {
         .unwrap_or_else(default_state_file)
 }
 
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl-C handler");
-    };
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>>> {
     #[cfg(unix)]
-    let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install terminate handler")
-            .recv()
-            .await;
-    };
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = terminate.recv() => {},
+            }
+            Ok(())
+        })
+    }
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+    {
+        Ok(tokio::signal::ctrl_c())
     }
 }
 

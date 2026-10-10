@@ -33,6 +33,10 @@ date or duration estimates.
 
 ### Fixed
 
+- **Parallel persistence tests:** record-write assertions use runtime-local
+  counters so saves from other tests cannot cause spurious CI or release
+  validation failures. A regression check covers interleaved runtime saves.
+
 - **Daemon responsiveness:** queue planning acquires registry and queue locks
   in the same order as persistence, preventing a deadlock that stalled torrent
   lists, statistics, and state saves while network health remained responsive.
@@ -44,6 +48,8 @@ date or duration estimates.
 - **Shutdown completion:** SSE and WebSocket clients close when shutdown begins.
   Cleanup checkpoints state with bounded HTTP drain, process shutdown, and
   runtime teardown; concurrent recovery cannot reopen terminal containment.
+  Unix signal handlers register before the API starts accepting requests so
+  an immediate SIGTERM follows the graceful shutdown path.
 - **Persistence snapshot race:** rollback saves adopt fingerprints from the
   committed snapshot so concurrent progress updates remain eligible for the
   next incremental save.

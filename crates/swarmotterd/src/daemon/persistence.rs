@@ -632,6 +632,13 @@ impl DaemonRuntime {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Test diagnostics scoped to this runtime, including its clones.
+    #[cfg(test)]
+    pub(super) fn changed_records_written_count(&self) -> u64 {
+        self.changed_records_written
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub(super) async fn persist_state(&self) -> Result<()> {
         self.persist_state_with_mode(None, PersistenceMode::ChangedRecords)
             .await
@@ -801,6 +808,9 @@ impl DaemonRuntime {
         .map_err(|error| {
             CoreError::Storage(format!("save changed daemon state task: {error}"))
         })??;
+        #[cfg(test)]
+        self.changed_records_written
+            .fetch_add(updates.len() as u64, std::sync::atomic::Ordering::Relaxed);
         // The commit succeeded; only now adopt the new fingerprints so a
         // failed commit is retried on the next tick instead of being
         // permanently skipped.

@@ -238,10 +238,13 @@ pub struct DaemonRuntime {
     /// changed-record saves; legacy JSON state requires full saves until a
     /// successful migration save has run.
     incremental_persistence_ready: Arc<std::sync::atomic::AtomicBool>,
-    /// Runtime-local count of changed-record saves performed by this
+    /// Runtime-local count of changed-record saves. A
     /// process-global counter cannot be used by tests because other tests in
     /// the same process legitimately perform changed-record saves.
     changed_record_saves: Arc<std::sync::atomic::AtomicU64>,
+    /// Test-local count of records successfully committed by changed-record saves.
+    #[cfg(test)]
+    changed_records_written: Arc<std::sync::atomic::AtomicU64>,
     storage_ownership_lock: Arc<Mutex<()>>,
     /// Root-scoped active-engine reservations and shared write pressure
     /// limiters. These are local-storage controls only.
