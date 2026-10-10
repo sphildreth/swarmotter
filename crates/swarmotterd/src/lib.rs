@@ -11,6 +11,7 @@ pub mod logging;
 pub mod metadata;
 pub mod netbinder;
 pub mod peer_permits;
+pub mod persistence_metrics;
 pub mod runtime;
 pub mod seeder;
 pub mod state_store;

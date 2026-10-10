@@ -176,6 +176,7 @@ impl DaemonRuntime {
             dht_runner: Arc::new(Mutex::new(None)),
             queue_reconcile: Arc::new(Mutex::new(QueueReconcileState::default())),
             event_broker,
+            reliability: Arc::new(reliability::Reliability::default()),
             containment_gate,
             interface_probe,
             health_report_tx,

@@ -232,3 +232,20 @@ When configuration behavior changes:
    reference.
 4. Update this document only when the configuration model or compatibility
    contract changes.
+
+## Reliability safeguards
+
+File logging rotates at 10 MiB and retains five numbered archives. Stderr and
+file writes run off the async executor, with a 1024-record queue and 64 KiB
+maximum record. Overload drops whole records; authenticated doctor diagnostics
+report cumulative delivery drops and I/O failures. Settings are fixed process
+limits in this release. Docker Compose also limits each service's logs to three
+10 MiB files and grants a 45-second stop grace period.
+
+Example storage configurations reserve 1073741824 bytes and 1% free space. Both
+existing storage reserve checks apply; explicit zero remains supported for
+compatibility. Set reserves for the actual download volume, and independently
+monitor free space on the state/config volume.
+
+The `/live` route reports application liveness; `/health` retains network-health
+semantics. See ADR-0078 for watchdog and bounded shutdown behavior.

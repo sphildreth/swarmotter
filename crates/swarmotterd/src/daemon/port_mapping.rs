@@ -155,14 +155,24 @@ impl DaemonRuntime {
     /// settings or containment transition.
     pub async fn port_mapping_loop(self: Arc<Self>) {
         let mut delay = Duration::ZERO;
-        loop {
-            if !delay.is_zero() {
+        while !self.is_stopping() {
+            let deadline = tokio::time::Instant::now() + delay;
+            loop {
+                self.heartbeat(3);
+                if self.is_stopping() {
+                    return;
+                }
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
                 tokio::select! {
-                    _ = tokio::time::sleep(delay) => {},
-                    _ = self.port_mapping.wake.notified() => {},
+                    _ = tokio::time::sleep(remaining.min(Duration::from_secs(1))) => {},
+                    _ = self.port_mapping.wake.notified() => { break; },
                 }
             }
             delay = self.port_mapping_tick_inner(false).await;
+            self.heartbeat(3);
         }
     }
 

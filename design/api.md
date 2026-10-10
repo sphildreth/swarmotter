@@ -367,3 +367,12 @@ When API behavior changes:
    architecture changes.
 4. Treat `/api/v1` compatibility as release-facing behavior; see
    `VERSIONING_GUIDE.md`.
+
+### Application liveness
+
+`GET /live` is public and returns HTTP 200 when essential workers and registry/
+queue access are responsive, or 503 while stalled or stopping. Its empty body
+contains no torrent data. VPN unavailability alone does not fail liveness.
+`GET /health` retains its existing network containment response. SSE and
+WebSocket subscriptions close when daemon shutdown begins. Authenticated doctor
+checks include logging delivery counters and persistence performance counters.

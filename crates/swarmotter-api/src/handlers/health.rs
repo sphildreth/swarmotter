@@ -52,3 +52,12 @@ pub async fn version(State(state): State<SharedState>) -> Response {
 use envelope as _;
 #[allow(unused_imports)]
 use ok_empty_response as _;
+
+/// No torrent details or authentication requirements; VPN loss is not a crash.
+pub async fn live(State(state): State<SharedState>) -> axum::http::StatusCode {
+    if state.daemon.application_live().await {
+        axum::http::StatusCode::OK
+    } else {
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    }
+}

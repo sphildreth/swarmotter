@@ -8,80 +8,198 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    mpsc,
+};
+use std::time::Duration;
 
 use swarmotter_core::config::LoggingConfig;
 use swarmotter_core::error::{CoreError, Result};
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
 
-#[derive(Clone)]
-struct LogWriter {
-    file: Option<Arc<Mutex<File>>>,
+const MAX_RECORD: usize = 64 * 1024;
+const MAX_FILE: u64 = 10 * 1024 * 1024;
+const ARCHIVES: usize = 5;
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+static WRITE_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+pub fn counters() -> (u64, u64) {
+    (
+        DROPPED.load(Ordering::Relaxed),
+        WRITE_ERRORS.load(Ordering::Relaxed),
+    )
 }
 
+enum Record {
+    Line(Vec<u8>),
+    Flush(mpsc::SyncSender<()>),
+}
+#[derive(Clone)]
+struct LogWriter {
+    sender: mpsc::SyncSender<Record>,
+}
 struct LogWriterGuard {
-    stderr: io::Stderr,
-    file: Option<Arc<Mutex<File>>>,
+    sender: mpsc::SyncSender<Record>,
+    bytes: Vec<u8>,
+    oversized: bool,
 }
 
 impl<'a> MakeWriter<'a> for LogWriter {
     type Writer = LogWriterGuard;
-
     fn make_writer(&'a self) -> Self::Writer {
         LogWriterGuard {
-            stderr: io::stderr(),
-            file: self.file.clone(),
+            sender: self.sender.clone(),
+            bytes: Vec::new(),
+            oversized: false,
         }
     }
 }
-
 impl Write for LogWriterGuard {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.stderr.write_all(buf)?;
-        if let Some(file) = &self.file {
-            file.lock()
-                .map_err(|_| io::Error::other("log file lock poisoned"))?
-                .write_all(buf)?;
+        if self.bytes.len().saturating_add(buf.len()) <= MAX_RECORD && !self.oversized {
+            self.bytes.extend_from_slice(buf);
+        } else {
+            self.oversized = true;
+            self.bytes.clear();
         }
         Ok(buf.len())
     }
-
     fn flush(&mut self) -> io::Result<()> {
-        self.stderr.flush()?;
-        if let Some(file) = &self.file {
-            file.lock()
-                .map_err(|_| io::Error::other("log file lock poisoned"))?
-                .flush()?;
-        }
         Ok(())
     }
 }
+impl Drop for LogWriterGuard {
+    fn drop(&mut self) {
+        if self.oversized
+            || self
+                .sender
+                .try_send(Record::Line(std::mem::take(&mut self.bytes)))
+                .is_err()
+        {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
-/// Initialize daemon logging and return the file path when file logging is on.
-pub fn init(config: &LoggingConfig) -> Result<Option<PathBuf>> {
-    let log_path = if config.file {
-        let path = config
+struct RotatingFile {
+    path: PathBuf,
+    file: Option<File>,
+    size: u64,
+    limit: u64,
+}
+impl RotatingFile {
+    fn write_record(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.size.saturating_add(bytes.len() as u64) > self.limit {
+            self.file.take();
+            for index in (1..=ARCHIVES).rev() {
+                let from = if index == 1 {
+                    self.path.clone()
+                } else {
+                    archive_path(&self.path, index - 1)
+                };
+                let to = archive_path(&self.path, index);
+                match std::fs::rename(from, to) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            self.size = 0;
+        }
+        if self.file.is_none() {
+            self.file = Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)?,
+            );
+        }
+        if let Some(file) = &mut self.file {
+            file.write_all(bytes)?;
+        }
+        self.size += bytes.len() as u64;
+        Ok(())
+    }
+}
+fn archive_path(path: &Path, index: usize) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{index}"));
+    PathBuf::from(name)
+}
+
+/// Retain through shutdown. Flush is bounded even if stderr or disk has stalled.
+pub struct LoggingGuard {
+    pub path: Option<PathBuf>,
+    sender: mpsc::SyncSender<Record>,
+}
+impl LoggingGuard {
+    pub fn flush(&self) {
+        let (tx, rx) = mpsc::sync_channel(1);
+        if self.sender.try_send(Record::Flush(tx)).is_ok() {
+            let _ = rx.recv_timeout(Duration::from_secs(1));
+        }
+    }
+}
+impl Drop for LoggingGuard {
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+/// A bounded worker owns both output sinks; callers never wait for I/O.
+pub fn init(config: &LoggingConfig) -> Result<LoggingGuard> {
+    let path = config.file.then(|| {
+        config
             .file_path
             .as_deref()
             .map(expand_tilde)
-            .unwrap_or_else(default_log_path);
-        Some(prepare_log_file(&path).map(|file| (path, file))?)
+            .unwrap_or_else(default_log_path)
+    });
+    let mut file = if let Some(path) = &path {
+        let file = prepare_log_file(path)?;
+        let size = file.metadata()?.len();
+        Some(RotatingFile {
+            path: path.clone(),
+            file: Some(file),
+            size,
+            limit: MAX_FILE,
+        })
     } else {
         None
     };
-
-    let log_file = match &log_path {
-        Some((_, file)) => Some(Arc::new(Mutex::new(
-            file.try_clone().map_err(CoreError::from)?,
-        ))),
-        None => None,
-    };
-    let writer = LogWriter { file: log_file };
     let filter = EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(config.level.as_str()))
         .map_err(|e| CoreError::InvalidConfig(format!("logging.level: {e}")))?;
-
+    let (sender, receiver) = mpsc::sync_channel(1024);
+    std::thread::Builder::new()
+        .name("swarmotter-logs".into())
+        .spawn(move || {
+            let mut stderr = io::stderr();
+            while let Ok(record) = receiver.recv() {
+                match record {
+                    Record::Line(bytes) => {
+                        if stderr.write_all(&bytes).is_err() {
+                            WRITE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if let Some(file) = &mut file {
+                            if file.write_record(&bytes).is_err() {
+                                WRITE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                    Record::Flush(done) => {
+                        let _ = stderr.flush();
+                        let _ = done.send(());
+                    }
+                }
+            }
+        })
+        .map_err(CoreError::from)?;
+    let writer = LogWriter {
+        sender: sender.clone(),
+    };
     if config.json {
         tracing_subscriber::fmt()
             .json()
@@ -98,8 +216,7 @@ pub fn init(config: &LoggingConfig) -> Result<Option<PathBuf>> {
             .try_init()
             .map_err(|e| CoreError::Internal(format!("failed to initialize logging: {e}")))?;
     }
-
-    Ok(log_path.map(|(path, _)| path))
+    Ok(LoggingGuard { path, sender })
 }
 
 fn prepare_log_file(path: &Path) -> Result<File> {
@@ -151,6 +268,49 @@ mod tests {
     fn expands_home_prefix() {
         if let Some(home) = std::env::var_os("HOME") {
             assert_eq!(expand_tilde("~/x"), PathBuf::from(home).join("x"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod reliability_tests {
+    use super::*;
+    #[test]
+    fn slow_sink_cannot_block_producer_and_oversized_records_are_bounded() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        sender.try_send(Record::Line(vec![])).unwrap();
+        let writer = LogWriter { sender };
+        let mut record = writer.make_writer();
+        record.write_all(&vec![0; MAX_RECORD + 1]).unwrap();
+        assert!(record.bytes.is_empty());
+        assert!(record.oversized);
+        drop(record);
+        drop(writer.make_writer()); // Full channel must return immediately.
+    }
+    #[test]
+    fn rotation_bounds_archives_and_keeps_newest_records() {
+        let path =
+            std::env::temp_dir().join(format!("swarmotter-rotation-{}.log", std::process::id()));
+        let file = prepare_log_file(&path).unwrap();
+        let mut writer = RotatingFile {
+            path: path.clone(),
+            file: Some(file),
+            size: 0,
+            limit: 4,
+        };
+        for i in 0..12 {
+            writer.write_record(format!("{i:03}\n").as_bytes()).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "011\n");
+        assert_eq!(
+            std::fs::read_to_string(archive_path(&path, 5)).unwrap(),
+            "006\n"
+        );
+        assert!(!archive_path(&path, 6).exists());
+        drop(writer);
+        std::fs::remove_file(&path).unwrap();
+        for i in 1..=5 {
+            std::fs::remove_file(archive_path(&path, i)).unwrap();
         }
     }
 }

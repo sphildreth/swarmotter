@@ -71,9 +71,13 @@ impl DaemonRuntime {
     /// states between active and `network_blocked` as the path appears or
     /// disappears. Stop running engines when the path becomes unavailable.
     pub async fn network_health_loop(self: Arc<Self>) {
-        loop {
+        while !self.is_stopping() {
             tokio::time::sleep(Duration::from_secs(5)).await;
+            if self.is_stopping() {
+                break;
+            }
             self.network_health_tick().await;
+            self.heartbeat(1);
         }
     }
 
@@ -433,10 +437,14 @@ impl DaemonRuntime {
     /// telemetry. In `act` mode this applies only bounded daemon/engine
     /// commands that use existing contained data-plane paths.
     pub async fn autopilot_loop(self: Arc<Self>) {
-        loop {
+        while !self.is_stopping() {
             tokio::time::sleep(AUTOPILOT_INTERVAL).await;
+            if self.is_stopping() {
+                break;
+            }
             self.reconcile_queue().await;
             self.refresh_autopilot_decisions(true).await;
+            self.heartbeat(2);
         }
     }
 
@@ -571,7 +579,7 @@ impl DaemonRuntime {
         let Some(tx) = tx else {
             return false;
         };
-        tx.send(command).await.is_ok()
+        tx.try_send(command).is_ok()
     }
 
     pub(super) async fn apply_autopilot_peer_worker_limit(

@@ -240,28 +240,20 @@ fn queue_fingerprint(queue: &QueueState<TorrentKey>) -> u64 {
 }
 
 impl DaemonRuntime {
-    /// Re-scan every registry record and adopt the current fingerprints as
-    /// the persisted generation. Called after successful full saves.
-    async fn refresh_durable_fingerprints(&self) {
+    /// Adopt only the generation actually committed, never live values that
+    /// might have changed while the disk write was in progress.
+    async fn adopt_durable_snapshot(&self, state: &crate::state_store::DaemonState) {
         let mut meta_fps = self.meta_fingerprints.lock().await;
         let mut fingerprints = self.durable_fingerprints.lock().await;
-        let reg = self.registry.lock().await;
-        meta_fps.retain(|hash, _| reg.torrents.contains_key(hash));
-        fingerprints.retain(|hash, _| reg.torrents.contains_key(hash));
-        for (hash, torrent) in &reg.torrents {
-            let meta_cheap = meta_identity_fingerprint(torrent);
-            let meta_full = match meta_fps.get(hash) {
-                Some((cheap, full)) if *cheap == meta_cheap => *full,
-                _ => {
-                    let full = meta_full_fingerprint(torrent);
-                    meta_fps.insert(*hash, (meta_cheap, full));
-                    full
-                }
-            };
-            fingerprints.insert(*hash, torrent_durable_fingerprint(torrent, meta_full));
+        meta_fps.clear();
+        fingerprints.clear();
+        for torrent in &state.torrents {
+            let cheap = meta_identity_fingerprint(torrent);
+            let full = meta_full_fingerprint(torrent);
+            meta_fps.insert(torrent.key(), (cheap, full));
+            fingerprints.insert(torrent.key(), torrent_durable_fingerprint(torrent, full));
         }
-        let queue = self.queue.lock().await;
-        *self.durable_queue_fingerprint.lock().await = queue_fingerprint(&queue);
+        *self.durable_queue_fingerprint.lock().await = queue_fingerprint(&state.queue);
     }
 
     pub async fn restore_persisted_state(&self) -> Result<usize> {
@@ -604,8 +596,10 @@ impl DaemonRuntime {
         let Some(path) = self.state_path.clone() else {
             return Ok(());
         };
+        let mut timer = crate::persistence_metrics::SaveTimer::new();
         let _write_guard = self.state_write_lock.lock().await;
-        if original_metainfo.is_some()
+        timer.locked();
+        let result = if original_metainfo.is_some()
             || !self
                 .incremental_persistence_ready
                 .load(std::sync::atomic::Ordering::Relaxed)
@@ -614,7 +608,9 @@ impl DaemonRuntime {
                 .await
         } else {
             self.persist_changed_state_locked(path).await
-        }
+        };
+        timer.finish(result.is_ok());
+        result
     }
 
     /// Full-save path. Also refreshes the fingerprint maps so subsequent
@@ -625,6 +621,7 @@ impl DaemonRuntime {
         path: PathBuf,
         original_metainfo: Option<crate::state_store::OriginalMetainfo>,
     ) -> Result<()> {
+        let scan_started = Instant::now();
         let (torrents, queue, fingerprint_updates, queue_fingerprint_value) = {
             let mut meta_fps = self.meta_fingerprints.lock().await;
             let reg = self.registry.lock().await;
@@ -652,6 +649,7 @@ impl DaemonRuntime {
                 queue_fingerprint_value,
             )
         };
+        crate::persistence_metrics::scanned(scan_started);
         let state = daemon_state_for_persistence(torrents, queue)?;
         self.incremental_persistence_ready.store(
             crate::state_store::supports_incremental_saves(&path).unwrap_or(false),
@@ -680,6 +678,7 @@ impl DaemonRuntime {
     async fn persist_changed_state_locked(&self, path: PathBuf) -> Result<()> {
         self.changed_record_saves
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let scan_started = Instant::now();
         let (changed, queue, queue_changed) = {
             let fingerprints = self.durable_fingerprints.lock().await;
             let mut meta_fps = self.meta_fingerprints.lock().await;
@@ -711,15 +710,16 @@ impl DaemonRuntime {
             }
             (changed, queue, (queue_fingerprint, queue_changed))
         };
+        crate::persistence_metrics::scanned(scan_started);
         let (queue_fingerprint, queue_changed) = queue_changed;
         if changed.is_empty() && !queue_changed {
             return Ok(());
         }
         let queue_to_write = queue_changed.then_some(queue);
-        let changed_records: Vec<Torrent> = changed
-            .iter()
-            .map(|(_, _, torrent)| torrent.clone())
-            .collect();
+        let (updates, changed_records): (Vec<_>, Vec<_>) = changed
+            .into_iter()
+            .map(|(hash, fingerprint, torrent)| ((hash, fingerprint), torrent))
+            .unzip();
         tokio::task::spawn_blocking(move || {
             crate::state_store::save_changed_records(
                 &path,
@@ -736,7 +736,7 @@ impl DaemonRuntime {
         // permanently skipped.
         {
             let mut fingerprints = self.durable_fingerprints.lock().await;
-            for (hash, fingerprint, _) in &changed {
+            for (hash, fingerprint) in &updates {
                 fingerprints.insert(*hash, *fingerprint);
             }
         }
@@ -804,14 +804,14 @@ impl DaemonRuntime {
         let queue = self.queue.lock().await.clone();
         let state = daemon_state_for_persistence(torrents, queue)?;
         let write_path = path.clone();
-        let persisted =
-            tokio::task::spawn_blocking(move || crate::state_store::save(&write_path, &state))
-                .await
-                .map_err(|error| CoreError::Storage(format!("save daemon state task: {error}")))?;
-        if persisted.is_ok() {
-            // Adopt the persisted generation's fingerprints so the next
-            // reconciliation tick only rewrites actual changes.
-            self.refresh_durable_fingerprints().await;
+        let persisted = tokio::task::spawn_blocking(move || {
+            crate::state_store::save(&write_path, &state)?;
+            Ok::<_, CoreError>(state)
+        })
+        .await
+        .map_err(|error| CoreError::Storage(format!("save daemon state task: {error}")))?;
+        if let Ok(saved_state) = &persisted {
+            self.adopt_durable_snapshot(saved_state).await;
             self.incremental_persistence_ready.store(
                 crate::state_store::supports_incremental_saves(&path).unwrap_or(false),
                 std::sync::atomic::Ordering::Relaxed,

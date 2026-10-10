@@ -192,11 +192,12 @@ impl DaemonRuntime {
         if let Some(shutdown) = self.seeder_listener_shutdown.lock().await.take() {
             let _ = shutdown.send(true);
         }
-        if let Some(handle) = self.seeder_listener_handle.lock().await.take() {
+        let handle = self.seeder_listener_handle.lock().await.take();
+        if let Some(handle) = handle {
             if force {
                 handle.abort();
             }
-            let _ = handle.await;
+            Self::join_stopping_task(handle).await;
         }
     }
 
@@ -704,7 +705,7 @@ impl DaemonRuntime {
         self.seeder_registry.unregister(hash).await;
         let handle = self.seeder_handles.lock().await.remove(hash);
         if let Some(handle) = handle {
-            let _ = handle.await;
+            Self::join_stopping_task(handle).await;
         }
         if self.seeder_registry.is_empty().await {
             self.stop_seeder_listener(false).await;

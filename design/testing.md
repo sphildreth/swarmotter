@@ -31,6 +31,13 @@ feature completion and acceptance criteria, not by time estimates.
 - Piece selection.
 - Piece verification.
 - Queue behavior.
+- Registry/queue lock ordering (ADR-0077): deterministically overlap queue
+  planning with full and incremental persistence; verify both operations and
+  torrent-list/statistics reads finish and the saved state retains the updated
+  counters and queue membership. Covered by
+  `full_persistence_and_queue_planning_remain_responsive` and
+  `incremental_persistence_and_queue_planning_remain_responsive` in the daemon
+  persistence tests.
 - Ratio/seeding behavior.
 - Bandwidth limit logic.
 - Config validation.
@@ -442,3 +449,12 @@ The release-wide mapping from requirements to production paths, acceptance
 tests, and documents is maintained in
 [v1-traceability.md](v1-traceability.md). Keep both documents aligned when a
 test contract changes.
+
+Reliability regression tests fill an engine command channel while sending to
+another torrent, mutate progress between a rollback save and fingerprint
+adoption, exercise blocked registry/queue liveness, and ensure terminal
+containment cannot reopen. A real-binary SIGTERM test keeps SSE and WebSocket
+clients open and verifies successful exit plus a valid SQLite checkpoint.
+Logging tests cover bounded records, queue saturation, and archive retention.
+Run the generated storage profile alone with `cargo test -p swarmotterd --lib
+persistence_large_metadata_profile -- --ignored --nocapture --test-threads=1`.

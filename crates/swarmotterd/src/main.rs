@@ -42,8 +42,18 @@ struct Args {
     rebuild_state_projections: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    // Aborted engine tasks may have already submitted blocking I/O. Never let
+    // Tokio's destructor turn a completed process shutdown into an endless wait.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    result
+}
+
+async fn run() -> Result<()> {
     let args = Args::parse();
 
     // Offline projection rebuild is intentionally independent of daemon
@@ -81,7 +91,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let log_file = logging::init(&config.logging)?;
+    let log_guard = logging::init(&config.logging)?;
+    let log_file = log_guard.path.clone();
     if let Some(path) = &log_file {
         tracing::info!(path = %path.display(), "daemon file logging enabled");
     }
@@ -158,49 +169,90 @@ async fn main() -> Result<()> {
             .into_make_service(),
     );
 
-    // Spawn watch-folder scanner. It reads the live daemon config each pass,
-    // so watch folders added through settings start working without restart.
-    {
-        let rt = runtime.clone();
-        tokio::spawn(async move {
-            rt.watch_loop().await;
-        });
+    let watchdog = runtime.start_watchdog()?;
+    let mut workers = tokio::task::JoinSet::new();
+    let rt = runtime.clone();
+    workers.spawn(async move {
+        rt.watch_loop().await;
+        "watch"
+    });
+    let rt = runtime.clone();
+    workers.spawn(async move {
+        rt.network_health_loop().await;
+        "network"
+    });
+    let rt = runtime.clone();
+    workers.spawn(async move {
+        rt.port_mapping_loop().await;
+        "port mapping"
+    });
+    let rt = runtime.clone();
+    workers.spawn(async move {
+        rt.autopilot_loop().await;
+        "autopilot"
+    });
+
+    let broker = state.broker.clone();
+    let mut server = tokio::spawn(async move {
+        serve
+            .with_graceful_shutdown(async move { broker.closed().await })
+            .await
+    });
+    let mut server_done = false;
+    let failure = tokio::select! {
+        _ = shutdown_signal() => None,
+        ended = workers.join_next() => Some(format!("essential worker stopped: {ended:?}")),
+        result = runtime.supervise_progress() => Some(format!("progress supervisor stopped: {result:?}")),
+        result = &mut server => {
+            server_done = true;
+            Some(format!("HTTP server stopped unexpectedly: {result:?}"))
+        }
+    };
+    runtime.begin_shutdown();
+    if let Some(reason) = &failure {
+        tracing::error!(%reason, "daemon recovery shutdown");
     }
 
-    // Spawn the network containment health monitor so fail-closed state
-    // transitions are detected while the daemon is running.
-    {
-        let rt = runtime.clone();
-        tokio::spawn(async move {
-            rt.network_health_loop().await;
-        });
+    // Finish current background transactions rather than cancelling them in
+    // the middle of a storage mutation. The process watchdog is the final
+    // bound if either a transaction or the final checkpoint cannot finish.
+    let cleanup = async {
+        while let Some(result) = workers.join_next().await {
+            if let Err(error) = result {
+                tracing::error!(%error, "worker failed during shutdown");
+            }
+        }
+        runtime.shutdown().await?;
+        if !server_done {
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut server)
+                .await
+                .map_err(|_| {
+                    swarmotter_core::error::CoreError::Internal("HTTP drain timed out".into())
+                })?
+                .map_err(|e| {
+                    swarmotter_core::error::CoreError::Internal(format!("HTTP task: {e}"))
+                })?
+                .map_err(swarmotter_core::error::CoreError::from)?;
+        }
+        Ok::<_, swarmotter_core::error::CoreError>(())
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(30), cleanup).await {
+        Ok(Ok(())) => {}
+        result => {
+            tracing::error!(
+                ?result,
+                "shutdown incomplete; last committed state retained"
+            );
+            // A cancelled spawn_blocking operation can still run; do not
+            // return into a runtime destructor that waits without a bound.
+            log_guard.flush();
+            std::process::exit(1);
+        }
     }
-
-    // Router mapping is opt-in and every discovery/renewal request is issued
-    // through the same contained data-plane binder as peer traffic.
-    {
-        let rt = runtime.clone();
-        tokio::spawn(async move {
-            rt.port_mapping_loop().await;
-        });
+    watchdog.disarm();
+    if let Some(reason) = failure {
+        return Err(swarmotter_core::error::CoreError::Internal(reason));
     }
-
-    // Spawn the adaptive swarm autopilot. Observe mode only records decisions;
-    // act mode applies bounded engine/queue commands from contained telemetry.
-    {
-        let rt = runtime.clone();
-        tokio::spawn(async move {
-            rt.autopilot_loop().await;
-        });
-    }
-
-    // Graceful shutdown on Ctrl-C.
-    serve
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| swarmotter_core::error::CoreError::Internal(format!("server error: {e}")))?;
-
-    runtime.shutdown().await?;
     tracing::info!("swarmotterd stopped");
     Ok(())
 }

@@ -6,8 +6,11 @@ impl DaemonRuntime {
     /// Watch-folder scan loop: periodically scans configured folders and imports
     /// newly-stabilized `.torrent` files.
     pub async fn watch_loop(self: Arc<Self>) {
-        loop {
+        while !self.is_stopping() {
             tokio::time::sleep(Duration::from_secs(10)).await;
+            if self.is_stopping() {
+                break;
+            }
             if let Err(error) = self.scan_watch_folders().await {
                 tracing::warn!(
                     error = %error,
@@ -15,6 +18,7 @@ impl DaemonRuntime {
                     "automatic watch-folder scan incomplete; observations retained for retry"
                 );
             }
+            self.heartbeat(0);
         }
     }
 

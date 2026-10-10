@@ -2,7 +2,27 @@
 
 use super::*;
 
+// A cancelled API request must not detach a task removed from the map.
+struct StoppingTask(tokio::task::JoinHandle<()>);
+impl Drop for StoppingTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl DaemonRuntime {
+    pub(super) async fn join_stopping_task(handle: tokio::task::JoinHandle<()>) {
+        let mut handle = StoppingTask(handle);
+        if tokio::time::timeout(Duration::from_secs(5), &mut handle.0)
+            .await
+            .is_err()
+        {
+            tracing::warn!("task stop deadline reached; cancelling task");
+            handle.0.abort();
+            let _ = (&mut handle.0).await;
+        }
+    }
+
     pub(super) async fn configured_peer_worker_limit(&self) -> usize {
         let cfg = self.config.read().await;
         Self::effective_per_torrent_peer_limit(cfg.bandwidth.max_peers_per_torrent)
@@ -190,9 +210,11 @@ impl DaemonRuntime {
         let retry_after = self.engine_retry_after.read().await.clone();
         let mut storage_plan =
             StorageAdmissionPlan::from_records(self.storage_admissions.records().await);
+        // Match persistence's registry -> queue order. Holding the queue
+        // while waiting for the registry can deadlock a concurrent save.
+        let reg = self.registry.lock().await;
         let mut queue = self.queue.lock().await;
         queue.limits = cfg.queue.clone();
-        let reg = self.registry.lock().await;
         let now = Instant::now();
         let stale_queue_entries = queue
             .order
@@ -1333,12 +1355,31 @@ impl DaemonRuntime {
         self.engine_retry_after.write().await.remove(hash);
         self.cancel_engine_storage_work(hash).await;
         let explicit_recheck = self.cancel_explicit_recheck(hash).await;
-        if let Some(tx) = self.engine_cmds.lock().await.remove(hash) {
-            let _ = tx.send(EngineCommand::Stop).await;
-        }
-        let handle = self.engine_handles.write().await.remove(hash);
-        if let Some(handle) = handle {
-            let _ = handle.await;
+        // Never hold the process-wide map while sending to one engine.
+        let tx = self.engine_cmds.lock().await.remove(hash);
+        let mut handle = self
+            .engine_handles
+            .write()
+            .await
+            .remove(hash)
+            .map(StoppingTask);
+        let graceful = async {
+            if let Some(tx) = tx {
+                let _ = tx.send(EngineCommand::Stop).await;
+            }
+            if let Some(handle) = handle.as_mut() {
+                let _ = (&mut handle.0).await;
+            }
+        };
+        if tokio::time::timeout(Duration::from_secs(5), graceful)
+            .await
+            .is_err()
+        {
+            tracing::warn!(%hash, "engine stop deadline reached; cancelling task");
+            if let Some(mut handle) = handle {
+                handle.0.abort();
+                let _ = (&mut handle.0).await;
+            }
         }
         if let Some(recheck) = explicit_recheck {
             recheck.wait_finished().await;

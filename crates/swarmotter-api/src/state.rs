@@ -330,6 +330,11 @@ pub trait DaemonOps: Send + Sync + 'static {
     /// Reset all download state, configured storage contents, and daemon logs.
     async fn reset_downloads(&self) -> Result<ResetResult>;
 
+    /// Control-plane and essential worker liveness, independent of VPN status.
+    async fn application_live(&self) -> bool {
+        true
+    }
+
     /// Network containment health.
     async fn network_health(&self) -> NetworkHealth;
     /// Last known opt-in listen-port reachability result. This is

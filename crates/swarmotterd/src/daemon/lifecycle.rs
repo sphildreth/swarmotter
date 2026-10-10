@@ -677,8 +677,11 @@ impl DaemonOps for DaemonRuntime {
         // restart the engine which announces on start.
         let tx = self.engine_cmds.lock().await.get(hash).cloned();
         if let Some(tx) = tx {
-            let _ = tx.send(EngineCommand::Reannounce).await;
-            Ok(())
+            tx.try_send(EngineCommand::Reannounce).map_err(|error| {
+                CoreError::Internal(format!(
+                    "engine command unavailable; retry reannounce: {error}"
+                ))
+            })
         } else {
             self.resume(hash).await
         }
@@ -1874,6 +1877,10 @@ impl DaemonOps for DaemonRuntime {
         })
     }
 
+    async fn application_live(&self) -> bool {
+        DaemonRuntime::application_live(self).await
+    }
+
     async fn network_health(&self) -> NetworkHealth {
         self.network_health.read().await.clone()
     }
@@ -2191,6 +2198,27 @@ impl DaemonOps for DaemonRuntime {
         );
         self.add_config_file_check(&mut checks).await;
         self.add_log_file_check(&mut checks).await;
+        let (dropped, errors) = crate::logging::counters();
+        checks.push(DoctorCheck {
+            id: "logging_delivery".into(),
+            label: "Logging delivery".into(),
+            level: if dropped == 0 && errors == 0 {
+                DiagnosticLevel::Ok
+            } else {
+                DiagnosticLevel::Warning
+            },
+            detail: format!(
+                "dropped_records={dropped} write_errors={errors}; bounded queue and rotating files"
+            ),
+            remediation: None,
+        });
+        checks.push(DoctorCheck {
+            id: "persistence_performance".into(),
+            label: "Persistence performance".into(),
+            level: DiagnosticLevel::Ok,
+            detail: crate::persistence_metrics::summary(),
+            remediation: None,
+        });
         self.add_storage_checks(&cfg, &mut checks).await;
         self.add_watch_checks(&cfg, &mut checks).await;
         self.add_torrent_runtime_check(&mut checks).await;
