@@ -33,6 +33,9 @@ date or duration estimates.
 
 ### Fixed
 
+- **Release checksum verification:** exclude `SHA256SUMS` itself when hashing
+  release assets so the published manifest passes `sha256sum --check`.
+
 - **Parallel persistence tests:** record-write assertions use runtime-local
   counters so saves from other tests cannot cause spurious CI or release
   validation failures. A regression check covers interleaved runtime saves.
