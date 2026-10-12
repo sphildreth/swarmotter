@@ -7,7 +7,15 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
-## [Unreleased]
+## [2.3.1] - [2026-10-12]
+
+### Fixed
+
+- **UDP tracker discovery:** send the BEP 15 protocol identifier in connect
+  requests. The incorrect identifier caused compliant trackers to discard the
+  handshake, leaving UDP-only torrents waiting for tracker timeouts before DHT
+  discovery. Regression checks validate the specified wire bytes and the local
+  tracker fixture's handshake.
 
 ### Changed
 

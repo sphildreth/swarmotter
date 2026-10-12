@@ -301,6 +301,12 @@ counts fall back to retained scrape data.
 
 Common causes:
 
+- Builds with the incorrect BEP 15 UDP connect identifier cannot contact
+  compliant UDP trackers. If all UDP announces time out while tracker probes
+  through the same contained path succeed, update to a build with the UDP
+  tracker protocol identifier fix. Automatic queue-slot release can repeatedly
+  interrupt discovery before the engine reaches DHT; use
+  `autopilot.mode = "observe"` while diagnosing this condition.
 - The torrent has no live seeders.
 - The tracker hostnames cannot resolve under strict DNS containment.
 - UDP tracker traffic is blocked by the network path.

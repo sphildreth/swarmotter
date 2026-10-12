@@ -25,7 +25,7 @@ use crate::peer::PeerAddr;
 use crate::tracker::{AnnounceEvent, AnnounceRequest, AnnounceResponse};
 
 /// BEP 15 connect request magic constant.
-const CONNECT_MAGIC: u64 = 0x4172_7101_9800;
+const CONNECT_MAGIC: u64 = 0x0417_2710_1980;
 pub const ACTION_CONNECT: u32 = 0;
 pub const ACTION_ANNOUNCE: u32 = 1;
 #[allow(dead_code)]
@@ -361,18 +361,18 @@ mod tests {
     }
 
     #[test]
-    fn encode_connect_is_16_bytes() {
+    fn encode_connect_matches_bep15_wire_format() {
         let enc = encode_connect(42);
-        assert_eq!(enc.len(), 16);
+        // BEP 15's protocol ID must be checked independently of the encoder
+        // constant; a tracker silently discards an incorrect ID.
         assert_eq!(
-            u64::from_be_bytes(enc[0..8].try_into().unwrap()),
-            CONNECT_MAGIC
+            enc,
+            [
+                0x00, 0x00, 0x04, 0x17, 0x27, 0x10, 0x19, 0x80, // protocol ID
+                0x00, 0x00, 0x00, 0x00, // connect action
+                0x00, 0x00, 0x00, 0x2a, // transaction ID
+            ]
         );
-        assert_eq!(
-            u32::from_be_bytes(enc[8..12].try_into().unwrap()),
-            ACTION_CONNECT
-        );
-        assert_eq!(u32::from_be_bytes(enc[12..16].try_into().unwrap()), 42);
     }
 
     #[test]
@@ -552,7 +552,9 @@ mod tests {
         let tracker_task = tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             // Connect request.
-            let (_n, peer) = tracker_sock.recv_from(&mut buf).await.unwrap();
+            let (n, peer) = tracker_sock.recv_from(&mut buf).await.unwrap();
+            assert_eq!(n, 16);
+            assert_eq!(&buf[..8], &[0x00, 0x00, 0x04, 0x17, 0x27, 0x10, 0x19, 0x80]);
             let action = u32::from_be_bytes(buf[8..12].try_into().unwrap());
             assert_eq!(action, ACTION_CONNECT);
             let txn = u32::from_be_bytes(buf[12..16].try_into().unwrap());
