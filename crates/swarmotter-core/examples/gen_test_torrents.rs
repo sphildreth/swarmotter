@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// gen_test_torrents: build N small lawful .torrent files and write each
+// gen_test_torrents: build N small .torrent files and write each
 // payload to disk, so two swarmotterd instances (seeder + leecher) can
 // exercise the BitTorrent protocol locally without contacting any public
-// tracker or webseed. All content is generated and non-copyrighted.
+// tracker or webseed. All payloads are generated locally.
 //
 // Usage: cargo run --release --example gen_test_torrents -- \
 //   [count] [piece_length] [pieces_per_file] [out_dir] [tracker_url] [private]

@@ -12,8 +12,7 @@ specific source IP, network namespace, or configured NIC, silent fallback to
 the default route would leak torrent traffic outside the intended path.
 
 SwarmOtter's network safety depends on torrent traffic never escaping the
-configured path. This is a routing-correctness and operational-safety concern,
-not a piracy-evasion feature.
+configured path. This is a routing-correctness and operational-safety concern.
 
 ## Decision
 

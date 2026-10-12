@@ -7,7 +7,7 @@ Accepted
 ## Context
 
 Global defaults and independent per-torrent controls make it difficult for an
-operator to manage several classes of lawful distribution. The daemon already
+operator to manage several classes of distribution. The daemon already
 has labels, watch-folder defaults, per-torrent bandwidth, queue, and seeding
 settings, but had no coherent inherited policy model or a way to explain an
 effective value.

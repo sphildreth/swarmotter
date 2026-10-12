@@ -7,7 +7,7 @@ Accepted
 ## Context
 
 SwarmOtter is a long-lived project with non-negotiable rules around release
-model, network containment, lawful use, and dependency hygiene. Without a
+model, network containment, project stance, and dependency hygiene. Without a
 durable record of significant decisions, future contributors and coding agents
 risk re-litigating settled choices or silently violating project rules.
 

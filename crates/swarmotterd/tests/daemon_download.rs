@@ -1119,7 +1119,7 @@ async fn daemon_remove_delete_data_preserves_storage_root_directories() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_add_downloads_to_completion_via_engine() {
-    // Generate a legal payload.
+    // Generate a payload.
     let mut content = Vec::with_capacity(32 * 1024 + 7);
     for i in 0..32 * 1024 + 7 {
         content.push((i % 251) as u8);
@@ -1222,7 +1222,7 @@ async fn daemon_add_downloads_to_completion_via_engine() {
 /// `remove_torrent(delete_data = false)` driven automatically on completion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn daemon_selfish_mode_removes_completed_torrent_and_preserves_data() {
-    // Generate a legal payload.
+    // Generate a payload.
     let mut content = Vec::with_capacity(32 * 1024 + 7);
     for i in 0..32 * 1024 + 7 {
         content.push((i % 251) as u8);

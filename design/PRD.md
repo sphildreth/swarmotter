@@ -4,7 +4,7 @@
 
 The goal is to build **SwarmOtter**, a high-performance, production-usable BitTorrent daemon in Rust that can replace a Transmission-style deployment while keeping the project identity distinct from Transmission and other existing BitTorrent clients.
 
-SwarmOtter prioritizes correctness, performance, operational safety, API completeness, lawful-use positioning, and reliable torrent behavior over visual polish. The Web UI should be complete and usable, but it does not need to be fancy, animated, or visually elaborate. Function matters more than form.
+SwarmOtter prioritizes correctness, performance, operational safety, API completeness, and reliable torrent behavior over visual polish. The Web UI should be complete and usable, but it does not need to be fancy, animated, or visually elaborate. Function matters more than form.
 
 SwarmOtter consists of:
 
@@ -18,7 +18,7 @@ SwarmOtter consists of:
 
 The project name is **SwarmOtter**.
 
-SwarmOtter should be described as a performance-first, VPN-aware, FOSS BitTorrent daemon for lawful torrents, open-source distribution, self-hosted automation, and strict network containment.
+SwarmOtter should be described as a performance-first, VPN-aware, FOSS BitTorrent daemon for torrent management, self-hosted automation, and strict network containment.
 
 SwarmOtter is not a fork or rebrand of Transmission. It may be described as Transmission-style because it provides a daemon, API, and practical Web UI for managing torrents, but its branding, code, documentation, API design, and project identity should remain distinct.
 
@@ -143,129 +143,55 @@ The UI should emphasize:
 The UI should avoid unnecessary complexity such as animations, large component frameworks, heavy theming systems, or design work that does not improve operational control.
 
 
-## Legal, Licensing, and GitHub Repository Documentation
+## Licensing and Repository Documentation
 
-SwarmOtter is intended to be a lawful, general-purpose FOSS BitTorrent client. BitTorrent protocol support is a legitimate technical capability, but the project must be documented and presented carefully because some users misuse torrent software for copyright infringement.
+SwarmOtter is a general-purpose BitTorrent client intended for legal torrenting.
+Users choose their content and are responsible for their use. The application
+does not police those choices. See ADR-0079 and `design/legal.md`.
 
-This section defines repository and documentation requirements. It is not legal advice and does not replace review by qualified legal counsel where needed.
-
-### Legal Positioning
-
-SwarmOtter must be positioned as a tool for lawful downloading, sharing, and seeding of content that users have the right to access and distribute.
-
-Appropriate documented use cases include:
-
-- Linux distribution ISO downloads.
-- Open-source project release distribution.
-- Public-domain media.
-- Open datasets.
-- Internal company or homelab file distribution where the user has rights to the content.
-- User-generated torrents for test fixtures and local swarm testing.
-
-The project documentation must not position SwarmOtter as a piracy tool or as a way to obtain unauthorized copyrighted material.
-
-### Lawful-Use Statement
-
-The README and project documentation must include a clear lawful-use statement similar to the following:
-
-```markdown
-## Lawful Use
-
-SwarmOtter is a general-purpose BitTorrent client intended for lawful downloading, sharing, and seeding of content that users have the right to access and distribute.
-
-Examples of appropriate use include downloading and seeding Linux distributions, open-source project releases, public-domain media, open datasets, and other legally distributed files.
-
-SwarmOtter does not include, endorse, host, index, or provide access to copyrighted material that is distributed without authorization. Users are responsible for ensuring that their use of SwarmOtter complies with applicable laws and the rights of content owners.
-```
+Contributions and feature proposals are evaluated for functionality,
+correctness, security, maintenance, and license compatibility. Presumed user
+intent and content categories are not acceptance gates.
 
 ### Repository Documentation Requirements
 
-The public GitHub repository must include the following documentation before `v1.0.0` release:
+The public repository includes:
 
-- `README.md` with project overview, lawful-use statement, feature list, and safe examples.
-- `LICENSE` containing the selected FOSS license.
-- `NOTICE.md` when required by the selected license or dependencies.
-- `THIRD_PARTY_LICENSES.md` or a generated dependency license report.
+- `README.md` with project overview, feature list, examples, and a brief
+  user-responsibility notice.
+- `LICENSE` containing the Apache License, Version 2.0.
+- `NOTICE.md` when required by the license or dependencies.
+- `THIRD_PARTY_LICENSES.md` recording dependency licenses.
 - `SECURITY.md` explaining how to report security issues.
 - `CONTRIBUTING.md` explaining contribution expectations and license terms.
-- `CODE_OF_CONDUCT.md` if the project will accept public community contributions.
-- `docs/lawful-use.md` explaining intended legal use cases and prohibited project use patterns.
-- `docs/legal.md` summarizing project legal posture, disclaimers, and user responsibility.
-- `docs/legal.md` stating that the project does not host or link to unauthorized copyrighted content.
-- `docs/network-containment.md` documenting VPN/NIC containment as routing control, privacy-preserving network design, and fail-closed safety, not as piracy evasion.
+- `CODE_OF_CONDUCT.md` for community participation.
+- `docs/legal.md` with the consolidated use and license notice.
+- `docs/network-containment.md` documenting configured routing and fail-closed
+  behavior.
 
-### Prohibited Project Content
+### Examples and Test Data
 
-The repository must not include:
+Prefer generated local torrents and local swarm fixtures for automated tests
+so they are reproducible and independent of third-party content and services.
+Examples and comments explain the behavior being demonstrated.
 
-- Links to unauthorized copyrighted content.
-- Magnet links for unauthorized copyrighted content.
-- `.torrent` files for unauthorized copyrighted content.
-- Default pirate indexers.
-- Built-in torrent search providers aimed at infringing content.
-- Default tracker lists associated with infringing content.
-- Example screenshots showing copyrighted movies, shows, commercial games, music albums, ROM collections, or cracked software.
-- Documentation that explains how to find pirated content.
-- Documentation that frames VPN/NIC binding as a way to hide piracy or evade copyright enforcement.
+### Network Containment Documentation
 
-### Safe Examples and Test Data
-
-Examples, tests, screenshots, and sample data must use clearly lawful sources.
-
-Acceptable examples include:
-
-- Generated local test torrents.
-- Public-domain files.
-- Open datasets.
-- Linux distribution torrent examples.
-- Project-owned sample files created specifically for SwarmOtter testing.
-
-When possible, automated tests should prefer generated local torrents and local swarm fixtures so the test suite does not depend on third-party content availability.
-
-### VPN/NIC Documentation Wording
-
-VPN/NIC containment is a valid SwarmOtter feature and a core differentiator. It must be documented as a network safety and routing-control feature.
-
-Preferred wording:
-
-- Strict network containment.
-- Fail-closed torrent data plane.
-- Predictable routing.
-- Privacy-preserving network design.
-- Homelab/container network isolation.
-- Compliance with local network policy.
-
-Avoid wording such as:
-
-- Hide piracy from an ISP.
-- Evade law enforcement.
-- Avoid copyright enforcement.
-- Download copyrighted content safely.
-- Bypass takedowns or monitoring.
+Document which traffic is contained, how the configured path is enforced, and
+what happens when that path fails. These technical guarantees apply regardless
+of content or user intent.
 
 ### Licensing Requirements
 
-The project must choose a clear FOSS license before public `v1.0.0` release.
+SwarmOtter uses Apache-2.0 (ADR-0007). Dependency licenses must be reviewed for
+compatibility with the license and distribution model. The project stance does
+not add license terms; warranty and liability provisions are in `LICENSE`.
 
-Recommended license options include:
+### Branding
 
-- Apache-2.0.
-- MIT.
-- Dual MIT/Apache-2.0.
-
-Before release, dependency licenses must be reviewed for compatibility with the selected license and expected distribution model.
-
-### Branding and Trademark Notes
-
-The SwarmOtter name, logo, mascot, and badge artwork should have a clear repository note describing whether the artwork is licensed under the same license as the code or reserved under separate brand/trademark rules.
-
-If logo and brand assets are not intended to be freely reused in modified downstream products, this must be stated clearly in `docs/legal.md` or a dedicated branding policy.
-
-### Content and Abuse Reporting
-
-The repository must provide a clear way for users, contributors, or rights holders to report concerns about project content, documentation, examples, or misuse of official project infrastructure.
-
-The project should make clear that it does not control third-party use of the software, but it does control official SwarmOtter repositories, documentation, examples, issue templates, discussions, release artifacts, and project-hosted assets.
+Document any separate license or usage terms for name, logo, mascot, and badge
+artwork in `docs/legal.md` or a dedicated branding document if such terms are
+adopted.
 
 ## Non-Negotiable v1.0.0 Release Blockers
 
@@ -297,10 +223,8 @@ SwarmOtter is not ready for `v1.0.0` until all of the following are complete:
 - Logs and operational diagnostics.
 - Automated tests for core engine, API, storage, and network containment behavior.
 - FOSS license selected and included in the repository.
-- Lawful-use statement included in the README and documentation.
-- Legal/project documentation completed for GitHub publication.
+- User-responsibility notice and project documentation completed for GitHub publication.
 - Dependency license review completed.
-- No unauthorized copyrighted sample content, torrent files, magnet links, pirate indexers, or infringing examples are included.
 
 ## System Architecture
 
@@ -1039,9 +963,7 @@ swarmotter/
 │   ├── configuration.md
 │   ├── api.md
 │   ├── vpn-network-containment.md
-│   ├── lawful-use.md
 │   ├── legal.md
-│   ├── content-policy.md
 │   └── deployment.md
 └── src/
     ├── main.rs
@@ -1301,9 +1223,8 @@ Deployment documentation must include:
 - API/Web UI exposure guidance.
 - Example config file.
 - Example systemd service.
-- Lawful-use documentation.
+- Use and license notice.
 - License and dependency-license documentation.
-- Content policy documentation.
 - Brand/logo usage documentation.
 
 ## Development Workstreams
@@ -1416,19 +1337,13 @@ The following workstreams describe dependency order and feature grouping. They a
 - Logs/errors.
 
 
-### Workstream: Legal and Repository Documentation
+### Workstream: Licensing and Repository Documentation
 
-- Select FOSS license.
-- Add `LICENSE`.
-- Add lawful-use statement to `README.md`.
-- Add `docs/lawful-use.md`.
-- Add `docs/legal.md`.
-- Add legal/content-policy guidance to `docs/legal.md`.
-- Add dependency license report.
-- Add security reporting instructions.
-- Add contribution guidelines.
-- Confirm no infringing examples, links, magnets, torrent files, screenshots, or default indexers are included.
-- Confirm VPN/NIC documentation is framed around routing, privacy, network containment, and fail-closed safety.
+- Include Apache-2.0 in `LICENSE`.
+- Maintain the brief user-responsibility notice in `README.md` and `docs/legal.md`.
+- Maintain the dependency license report.
+- Maintain security reporting instructions and contribution guidelines.
+- Document VPN/NIC routing, network containment, and fail-closed behavior.
 
 ### Workstream: Hardening and Release Completion
 
@@ -1476,9 +1391,6 @@ The project is ready for `v1.0.0` only when every item below is complete:
 - Network containment tests pass.
 - Project is consistently named SwarmOtter across repository, docs, config examples, service files, and release artifacts.
 - FOSS license is selected and included.
-- README contains lawful-use statement.
-- Legal documentation is complete.
-- Content policy documentation is complete.
+- User-responsibility and license documentation is complete.
 - Dependency license review is complete.
-- No unauthorized copyrighted sample content, magnets, torrent files, screenshots, or default pirate indexers are included.
 - VPN/NIC documentation is framed around routing control, privacy-preserving network design, network containment, and fail-closed safety.

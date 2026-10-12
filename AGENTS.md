@@ -6,10 +6,10 @@ before making changes. Human contributors should follow the same rules.
 ## Project summary
 
 SwarmOtter is a performance-first Rust BitTorrent daemon with a practical Web
-UI, a complete API, and fail-closed VPN/NIC traffic containment. It is intended
-for lawful torrent use cases such as Linux distributions, open-source project
-releases, public-domain media, open datasets, and other legally distributed
-files.
+UI, a complete API, and fail-closed VPN/NIC traffic containment. It is a
+general-purpose client intended for legal torrenting. Users choose their
+content and are responsible for their use; SwarmOtter does not police those
+choices.
 
 The first release, `v1.0.0`, required every capability in
 `design/requirements.md` to be implemented, tested, documented, and usable —
@@ -28,7 +28,7 @@ do not regress, weaken, or downgrade any of them to "future enhancements".
    was implemented, tested, documented, and usable (see the project summary).
    All of these capabilities — DHT, PEX, UDP trackers, watch folders, browser
    magnet handling, file prioritization, queueing, bandwidth controls, fast
-   resume, VPN/NIC containment, and legal documentation — are shipped and must
+   resume, and VPN/NIC containment — are shipped and must
    remain so. Do not create wording that implies they are optional future
    enhancements, and do not remove or degrade them.
 
@@ -37,23 +37,17 @@ do not regress, weaken, or downgrade any of them to "future enhancements".
    criteria only. Do not add time estimates to documentation, comments,
    commits, issues, or PRs.
 
-3. **Lawful use only.** Do not implement piracy-oriented features. Do not add
-   pirate indexers, infringing-content search, bundled copyrighted torrents,
-   infringing magnet links, or examples/screenshots based on copyrighted
-   movies, shows, music, games, ROMs, or cracked software. See
-   `design/content-policy.md` and `design/lawful-use.md`.
-
-4. **Strict network containment.** All torrent-related traffic must go through
+3. **Strict network containment.** All torrent-related traffic must go through
    the configured network path and must fail closed if that path is
    unavailable. Never let torrent traffic silently fall back to the default
    route. See `design/vpn-network-containment.md`.
 
-5. **Function over form.** The Web UI must be complete and usable, but visual
+4. **Function over form.** The Web UI must be complete and usable, but visual
    polish, animations, and heavy UI frameworks are non-goals unless they
    materially improve operations. The API and daemon are the primary product
    surfaces.
 
-6. **Engine changes follow the design.** The torrent data-plane engine is
+5. **Engine changes follow the design.** The torrent data-plane engine is
    implemented; it is not to be rebuilt ad hoc or extended outside the design
    and acceptance criteria in `design/requirements.md`,
    `design/architecture.md`, and the relevant ADRs (peer wire protocol,
@@ -86,19 +80,15 @@ When in doubt, create the ADR.
 ADR format and lifecycle are documented in `design/adr/README.md`. Use the next
 sequential four-digit number, kebab-case title, and fill out every section.
 
-## Legal and lawful-use rules
+## Neutral project stance
 
-- SwarmOtter is a neutral, general-purpose BitTorrent client.
-- Do not include piracy-oriented examples, indexers, trackers, magnets,
-  `.torrent` files, screenshots, or documentation.
-- Do not use wording such as "download free movies", "avoid copyright
-  enforcement", "hide piracy", "bypass ISP monitoring", or "pirate safely".
-- VPN/NIC containment must be described as routing correctness,
-  privacy-preserving network design, operational safety, container networking,
-  and fail-closed behavior — never as piracy evasion.
-- Users are responsible for ensuring their use complies with applicable laws
-  and the rights of content owners. The project does not provide legal advice.
-- See `design/lawful-use.md`, `design/content-policy.md`, and `design/legal.md`.
+- Describe capabilities and operational behavior in plain, factual language.
+- Review contributions for functionality, correctness, security, maintenance,
+  and license compatibility. Do not use presumed user intent or content
+  categories as acceptance gates.
+- Keep user responsibility separate from technical safeguards such as network
+  containment, authentication, and storage safety.
+- See `design/legal.md` and ADR-0079 for the project stance.
 
 ## Network containment rules
 
@@ -187,8 +177,8 @@ sequential four-digit number, kebab-case title, and fill out every section.
 - Update `design/vpn-network-containment.md` when containment behavior,
   covered traffic, or fail-closed conditions change.
 - Update `design/testing.md` when test strategy or required test areas change.
-- Update legal docs (`design/lawful-use.md`, `design/content-policy.md`,
-  `design/legal.md`) when lawful-use posture or content policy changes.
+- Update `design/legal.md` and `docs/legal.md` when the project stance or
+  licensing documentation changes.
 
 ## When to create an ADR
 

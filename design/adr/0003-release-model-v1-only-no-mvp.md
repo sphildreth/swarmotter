@@ -24,7 +24,7 @@ tested, documented, and usable.
 
 DHT, PEX, UDP trackers, watch folders, browser magnet handling, file
 prioritization, queueing, bandwidth controls, fast resume, VPN/NIC
-containment, and legal documentation are all part of `v1.0.0` scope and must
+containment, and license documentation are all part of `v1.0.0` scope and must
 not be described as optional future enhancements.
 
 Progress is tracked by completed capabilities and acceptance criteria, not by

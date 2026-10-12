@@ -397,18 +397,17 @@ UDP socket (see ADR-0020).
       covered by local fixtures; a uTP fail-closed test proves the
       `BlockedBinder` blocks uTP swarm downloads; an
       active-download health test samples the live engine state during a
-      generated lawful local download and asserts the per-torrent health
+      generated local download and asserts the per-torrent health
       reports a non-zero score with at least one bar.
 
-### Legal / Repository
+### License / Repository
 
 - [x] FOSS license selected (Apache-2.0, ADR-0007)
 - [x] LICENSE present
-- [x] README lawful-use statement
-- [x] `design/lawful-use.md`, `design/content-policy.md`, `design/legal.md`
+- [x] User-responsibility notice in README and `docs/legal.md` (ADR-0079)
+- [x] Project stance and license documentation in `design/legal.md`
 - [x] SECURITY.md, CONTRIBUTING.md, CODE_OF_CONDUCT.md
 - [x] Dependency license review / THIRD_PARTY_LICENSES.md current
-- [x] No infringing examples/magnets/torrents/indexers
 - [x] VPN/NIC docs framed as routing/safety/containment
 
 ## Blockers

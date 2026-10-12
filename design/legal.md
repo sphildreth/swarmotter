@@ -1,47 +1,22 @@
-# Legal Posture
+# Project Stance and License
 
-This document summarizes SwarmOtter's plain-language legal posture. It is
-project policy and documentation, **not legal advice**. It does not replace
-review by qualified legal counsel where needed.
+SwarmOtter is a general-purpose BitTorrent client intended for legal torrenting.
+Users choose their content and are responsible for their use of the software.
+SwarmOtter does not police those choices.
 
-For user-facing legal and content policy guidance, see `../docs/legal.md`.
+Contributions and feature proposals are evaluated for functionality, correctness,
+security, maintenance, and license compatibility. Presumed user intent and
+content categories are not acceptance gates. Generated local torrents remain
+preferred test fixtures because they make tests reproducible and independent
+of third-party services.
 
-## Project posture
+Network containment, authentication, path validation, and other technical
+safeguards remain requirements regardless of content or user intent.
 
-- SwarmOtter is a neutral, general-purpose BitTorrent client.
-- BitTorrent is a protocol and has substantial lawful uses.
-- The project does not provide content.
-- The project does not index content.
-- The project does not encourage infringement.
-- Users are responsible for ensuring their use complies with applicable laws
-  and the rights of content owners.
+Source code remains licensed under Apache-2.0 (see `LICENSE` and ADR-0007).
+The license contains the warranty disclaimer and limitation of liability;
+this project stance does not add license terms.
+Dependency license review and supply-chain auditing remain required.
 
-## License versus policy
-
-SwarmOtter source code is licensed under the Apache License, Version 2.0 (see
-`LICENSE` and ADR-0007).
-
-Legal restrictions must **not** be added to the FOSS license itself. Adding
-extra restrictions to a permissive license would defeat its purpose and create
-incompatibility. Lawful-use expectations belong in documentation and project
-policy, not in the license text.
-
-Lawful-use expectations are documented in:
-
-- `design/lawful-use.md`
-- `design/content-policy.md`
-- This document.
-- `../docs/lawful-use.md`
-- `../docs/legal.md`
-
-## Branding and trademark
-
-The SwarmOtter name, logo, mascot, and badge artwork may be subject to separate
-brand/trademark rules distinct from the code license. If logo and brand assets
-are not intended to be freely reused in modified downstream products, that must
-be stated clearly here or in a dedicated branding policy.
-
-## No legal advice
-
-SwarmOtter documentation does not provide legal advice. Where specific legal
-questions arise, users and contributors should consult qualified legal counsel.
+See [ADR-0079](adr/0079-neutral-project-stance-and-user-responsibility.md) for the
+decision and [the user guide](../docs/legal.md) for the published notice.

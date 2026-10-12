@@ -9,5 +9,4 @@
 - [Web UI](web-ui.md)
 - [Deployment](deployment.md)
 - [Troubleshooting](troubleshooting.md)
-- [Lawful Use](lawful-use.md)
-- [Legal and Content Policy](legal.md)
+- [Use and License](legal.md)

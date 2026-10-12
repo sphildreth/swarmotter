@@ -4,7 +4,7 @@
 //! complete seed complete a download by exchanging verified payload through
 //! the contained peer wire paths (ADR-0075).
 //!
-//! Lawful generated payload only: every byte is generated locally and no
+//! Generated local payload: every byte is generated locally and no
 //! public tracker or third-party content is contacted.
 
 use std::path::{Path, PathBuf};
@@ -123,7 +123,7 @@ async fn prewrite_pieces(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_incomplete_daemons_exchange_verified_pieces_without_a_seed() {
-    // Generated lawful payload: 16 pieces of 16 bytes.
+    // Generated payload: 16 pieces of 16 bytes.
     let payload: Vec<u8> = (0..256usize).map(|i| (i * 37 % 251) as u8).collect();
     let piece_len = 16u64;
 

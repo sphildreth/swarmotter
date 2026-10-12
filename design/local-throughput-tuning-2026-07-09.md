@@ -6,8 +6,8 @@ inputs shared.
 
 ## Setup
 
-- **10 lawful test torrents** generated from a 1 MiB synthetic payload per
-  file (synthetic, non-copyrighted). 64 pieces × 16 KiB each.
+- **10 test torrents** generated from a 1 MiB synthetic payload per
+  file (synthetic). 64 pieces × 16 KiB each.
 - **In-process seed peers** in a per-torrent pool, each bound to a
   loopback `TcpListener` (no public network).
 - **In-process engines** using the project's real `TorrentEngine`,

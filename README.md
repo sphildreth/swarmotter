@@ -41,13 +41,6 @@ SwarmOtter is a performance-first Rust BitTorrent daemon built for Linux/server 
 - **Operationally correct** — predictable behavior, safe recovery, and clear diagnostics
 - **Containment-native** — VPN/NIC fail-closed traffic containment is a core requirement
 
-## What SwarmOtter Is Not
-
-SwarmOtter is not a torrent indexer, search engine, or piracy assistant. It's designed for lawful content distribution and does not include:
-- Bundled torrent indexes
-- Infringing magnet links
-- Copyrighted media examples
-
 ## Features
 
 SwarmOtter provides a comprehensive set of BitTorrent features:
@@ -90,22 +83,13 @@ Containment is strict by default - omitting `[network]` requires a valid path fo
 
 See [`docs/network-containment.md`](docs/network-containment.md) for detailed information.
 
-## Lawful Use
+## Use and Responsibility
 
-SwarmOtter is designed for lawful downloading, sharing, and seeding of content that users have the right to access and distribute. It supports:
+SwarmOtter is a general-purpose BitTorrent client intended for legal torrenting.
+Users choose the content they download and share and are responsible for their
+use of the software. SwarmOtter does not police those choices.
 
-- Linux distributions
-- Open-source project releases
-- Public-domain media
-- Open datasets
-- User-owned files
-- Organization-approved distribution workflows
-
-Users are responsible for ensuring their use complies with applicable laws and the rights of content owners. This is project policy and documentation, not legal advice.
-
-For more information on lawful use, see:
-- [`docs/lawful-use.md`](docs/lawful-use.md)
-- [`docs/legal.md`](docs/legal.md)
+See [Use and License](docs/legal.md) for the notice and license references.
 
 ## Getting Started
 
@@ -188,8 +172,6 @@ swarmotter/
 │   ├── vpn-network-containment.md
 │   ├── deployment.md
 │   ├── testing.md
-│   ├── lawful-use.md
-│   ├── content-policy.md
 │   ├── legal.md
 │   └── adr/                   # Architecture decision records
 ├── config/                    # Example configuration files
@@ -235,8 +217,7 @@ User-facing documentation:
 - [Web UI](docs/web-ui.md)
 - [Deployment](docs/deployment.md)
 - [Troubleshooting](docs/troubleshooting.md)
-- [Lawful use](docs/lawful-use.md)
-- [Legal and content policy](docs/legal.md)
+- [Use and license](docs/legal.md)
 
 The guide is built with mdBook from `docs/` (`book.toml`) and published to
 GitHub Pages.
@@ -256,7 +237,6 @@ Contributions are welcome! To contribute:
 - Read [`AGENTS.md`](AGENTS.md) for coding-agent and contributor governance
 - Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for workflow and conventions
 - Create or update an ADR in [`design/adr/`](design/adr/) for decisions with lasting architectural, legal, dependency, or containment impact
-- Follow the project's lawful use guidelines; see [`docs/legal.md`](docs/legal.md)
 - Run `cargo fmt`, `cargo check`, `cargo test`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `cargo deny check` before submitting work
 
 ## License

@@ -37,7 +37,7 @@ fn pure_v2_single_file_fixture() -> Vec<u8> {
 fn hybrid_v1_compatible_fixture() -> Vec<u8> {
     let mut torrent = Vec::new();
     torrent.extend_from_slice(b"d4:infod9:file treed10:hybrid.bind0:d6:lengthi1e11:pieces root32:");
-    // SHA-256 of the lawful generated single-byte payload `x`.
+    // SHA-256 of the generated single-byte payload `x`.
     torrent.extend_from_slice(&[
         0x2d, 0x71, 0x16, 0x42, 0xb7, 0x26, 0xb0, 0x44, 0x01, 0x62, 0x7c, 0xa9, 0xfb, 0xac, 0x32,
         0xf5, 0xc8, 0x53, 0x0f, 0xb1, 0x90, 0x3c, 0xc4, 0xdb, 0x02, 0x25, 0x87, 0x17, 0x92, 0x1a,
@@ -46,7 +46,7 @@ fn hybrid_v1_compatible_fixture() -> Vec<u8> {
     torrent.extend_from_slice(
         b"eee6:lengthi1e12:meta versioni2e4:name10:hybrid.bin12:piece lengthi16384e6:pieces20:",
     );
-    // SHA-1 of the same lawful generated single-byte payload `x`.
+    // SHA-1 of the same generated single-byte payload `x`.
     torrent.extend_from_slice(&[
         0x11, 0xf6, 0xad, 0x8e, 0xc5, 0x2a, 0x29, 0x84, 0xab, 0xaa, 0xfd, 0x7c, 0x3b, 0x51, 0x65,
         0x03, 0x78, 0x5c, 0x20, 0x72,

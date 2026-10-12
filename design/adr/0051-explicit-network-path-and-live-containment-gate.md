@@ -118,7 +118,7 @@ probe, failed repair, successful replacement, and the generic denial status.
 
 The Linux CI harness builds as the normal runner user and creates two
 PID-qualified namespaces connected only by a veth, with no default route. It
-generates a lawful payload/torrent and runs a local compact HTTP tracker plus a
+generates a test payload/torrent and runs a local compact HTTP tracker plus a
 throttled TCP BitTorrent seed. After real tracker discovery and partial verified
 peer-wire progress, deleting the daemon veth must yield `interface_missing`, a
 `network_blocked` torrent, stable bytes, empty data-plane scheduler diagnostics,
@@ -143,7 +143,7 @@ performs the version bump.
 
 - Supersedes earlier text permitting an omitted network table to select
   disabled containment.
-- [ADR-0005](0005-strict-network-containment-fail-closed.md)
+- [ADR-0005](0005-strict-vpn-nic-network-containment.md)
 - [ADR-0012](0012-network-binder-centralized-containment.md)
 - [ADR-0047](0047-transactional-live-data-plane-reconfiguration.md)
 - `design/vpn-network-containment.md`

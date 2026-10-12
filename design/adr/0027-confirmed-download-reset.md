@@ -11,7 +11,7 @@ daemon instance to a clean download state. Manually removing every torrent,
 payload file, incomplete file, and log file is error-prone, especially while
 download and seeding tasks may still be running.
 
-The operation is destructive. It can remove lawful user payload data and should
+The operation is destructive. It can remove user payload data and should
 not be exposed as an accidental one-click action.
 
 ## Decision

@@ -3,10 +3,8 @@
 This document defines SwarmOtter's network containment requirements. It is a
 core `v1.0.0` requirement (see ADR-0005 and `requirements.md`).
 
-This feature is documented as routing correctness, privacy-preserving network
-design, operational safety, container networking, and fail-closed behavior. It
-is **not** a piracy-evasion feature. See `content-policy.md` for prohibited
-wording.
+Containment keeps torrent traffic on the configured network path and blocks
+traffic when that path is unavailable.
 
 ## Requirement
 
@@ -171,7 +169,7 @@ local multicast/gateway traffic; it is not a torrent-data fallback.
 The CI acceptance harness
 `scripts/test-network-containment-transition.sh` creates PID-qualified daemon
 and peer namespaces joined only by a veth pair, gives neither namespace a
-default route, generates a lawful payload/torrent, and runs a local compact
+default route, generates a test payload/torrent, and runs a local compact
 HTTP tracker plus throttled TCP BitTorrent seed. Cargo, the fixture, API clients,
 and daemon all run with the normal CI identity. Only `sudo ip` performs
 namespace/link operations, and the daemon receives only `CAP_NET_RAW` for

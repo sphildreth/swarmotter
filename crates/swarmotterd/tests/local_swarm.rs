@@ -14,7 +14,7 @@
 //! - the engine reports a finished download.
 //!
 //! All traffic stays on loopback via `LoopbackBinder` (the contained network
-//! path). No third-party or copyrighted content is used. See
+//! path). No third-party content is used. See
 //! `design/testing.md` and ADR-0015 (local swarm testing).
 
 #![allow(clippy::field_reassign_with_default)]
@@ -508,7 +508,7 @@ fn parse_range_header(req: &str) -> Option<(usize, usize)> {
     Some((start.parse().ok()?, end.parse().ok()?))
 }
 
-/// Webseed download: a legal generated payload is served by a local HTTP range
+/// Webseed download: a generated payload is served by a local HTTP range
 /// server advertised through BEP 19 `url-list`. No tracker or peer is needed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_swarm_downloads_from_webseed_url_list() {
@@ -571,12 +571,12 @@ async fn local_swarm_downloads_from_webseed_url_list() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// Full end-to-end: a legal generated payload is torrented, a local seed peer
+/// Full end-to-end: a generated payload is torrented, a local seed peer
 /// serves it, a local tracker announces the seed, and the SwarmOtter engine
 /// downloads and verifies every piece.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_swarm_downloads_from_seed_via_tracker() {
-    // 1. Generate a legal test payload (deterministic, non-copyrighted).
+    // 1. Generate a test payload (deterministic).
     let mut content = Vec::with_capacity(64 * 1024 + 13);
     for i in 0..64 * 1024 + 13 {
         content.push((i % 251) as u8);
@@ -1085,7 +1085,7 @@ async fn local_swarm_endgame_completes_from_near_complete_state() {
 }
 
 /// Normal-mode swarm parallelism: a trackerless, private torrent with
-/// generated legal payload data is downloaded from several direct loopback
+/// generated payload data is downloaded from several direct loopback
 /// seed peers. The synthetic seeds delay each block just enough that a
 /// single-peer architecture would be observable: the engine must run several
 /// active peer workers and accept useful pieces from multiple local peers
@@ -1399,7 +1399,7 @@ fn pick_port() -> u16 {
 /// BEP 9 magnet end-to-end: a metadata-only preview first resolves a magnet
 /// through a direct contained peer without payload work; a normal run then
 /// announces to trackers, retries after an incompatible metadata peer,
-/// discovers a seed peer, verifies the `info` dict, and downloads the lawful
+/// discovers a seed peer, verifies the `info` dict, and downloads the
 /// generated content.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_swarm_magnet_preview_fetches_metadata_without_payload_then_downloads() {
@@ -2276,7 +2276,7 @@ async fn local_swarm_active_download_reports_non_zero_health() {
     use swarmotter_core::models::network::NetworkHealth;
     use swarmotter_core::models::torrent::TorrentState;
 
-    // 1. Generated lawful payload.
+    // 1. Generated payload.
     let mut content = Vec::with_capacity(8 * 1024);
     for i in 0..8 * 1024 {
         content.push((i % 251) as u8);

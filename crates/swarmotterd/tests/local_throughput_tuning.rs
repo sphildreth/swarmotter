@@ -246,7 +246,7 @@ fn mib_per_sec(bytes: u64, elapsed: Duration) -> f64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn throughput_tuning_baseline_vs_tuned() {
-    // ---------- 1. Build 10 lawful, generated test torrents ----------
+    // ---------- 1. Build 10 generated test torrents ----------
     let torrents: Vec<TestTorrent> = (0..TORRENT_COUNT)
         .map(|i| build_test_torrent(format!("tuning-{i:02}.bin"), i as u8))
         .collect();

@@ -16,8 +16,6 @@ Before requesting review, confirm the following:
 - [ ] Network containment behavior considered. **Does this affect network
   containment?** If yes, torrent traffic must remain constrained and
   fail-closed behavior must not be weakened.
-- [ ] Legal/lawful-use posture considered. **Does this affect legal/lawful-use
-  posture?** No piracy-oriented features, indexers, or infringing examples.
 - [ ] New dependencies reviewed. **Does this introduce new dependencies?** If
   yes, they were reviewed for license compatibility (Apache-2.0), maintenance
   quality, security posture, complexity impact, and network containment

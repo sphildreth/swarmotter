@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Superseded by [ADR-0079](0079-neutral-project-stance-and-user-responsibility.md).
+
+The following records the former policy and is retained for historical context.
 
 ## Context
 
@@ -46,8 +48,7 @@ use complies with applicable laws; the project does not provide legal advice.
 
 ## Related Documents
 
+- [ADR-0079](0079-neutral-project-stance-and-user-responsibility.md)
 - `AGENTS.md`
-- `design/lawful-use.md`
-- `design/content-policy.md`
 - `design/legal.md`
 - `design/adr/0007-apache-2-license.md`

@@ -17,7 +17,7 @@ feature completion and acceptance criteria, not by time estimates.
 
 - Magnet parsing, including v1 `btih`, v2 `btmh`, hybrid exact topics, and
   conflicting-topic rejection.
-- Torrent parsing, including generated lawful v1, v2, and hybrid fixtures.
+- Torrent parsing, including generated v1, v2, and hybrid fixtures.
 - Explicit v1 SHA-1 and v2 SHA-256 identity handling. A pure-v2 add must
   retain its full 64-character key through registry, queue, storage, API, and
   SQLite state without aliasing a v1 value; a hybrid must retain both validated
@@ -339,7 +339,7 @@ transition.
 - Privileged Linux namespace transition (ADR-0051):
   `scripts/test-network-containment-transition.sh` creates two temporary
   PID-qualified namespaces joined by a veth pair with no default route. It
-  generates lawful payload/metainfo, runs a compact HTTP tracker and throttled
+  generates payload/metainfo, runs a compact HTTP tracker and throttled
   TCP BitTorrent seed, registers the raw torrent through the real API, proves
   partial tracker-discovered peer-wire traffic, deletes the daemon veth, and
   requires `interface_missing`, `network_blocked`, stable partial bytes, empty
@@ -398,7 +398,7 @@ transition.
   the payload with `required` mode and no TCP/plaintext fallback.
 - Recheck after completion: covered via `StorageIo::recheck`
 - Per-torrent health during active download: an actively-downloading
-  generated lawful local payload reports a non-zero health score and at
+  generated local payload reports a non-zero health score and at
   least one bar, computed from the live engine state.
 - Peer-session budgets (ADR-0053): generated stalling swarms sample live
   diagnostics while five torrents share a global cap, while one torrent has a
@@ -420,7 +420,7 @@ transition.
 - Daemon lifecycle tests cover 1,000- and 10,000-record stale-active recovery,
   metadata retry backoff, desired active cap enforcement, and bulk removal.
 - API integration tests cover 1,000-torrent rapid add, bulk add, and
-  query/filter/group behavior with generated lawful magnets.
+  query/filter/group behavior with generated magnets.
 - Ignored opt-in scale tests cover larger synthetic flows:
   `ignored_thousand_mixed_state_torrents_keep_scheduler_bounds` validates a
   1,200-record daemon library across queued, checking, downloading metadata,
@@ -428,7 +428,7 @@ transition.
   scheduler request/grant bounds.
   `ignored_scale_harness_add_query_retry_remove_reset_2000_torrents` validates
   a 2,000-torrent API add/query/recheck/reannounce/remove/reset flow using
-  generated lawful torrent files.
+  generated torrent files.
 
 Run ignored scale tests explicitly when validating large-library behavior:
 
@@ -439,9 +439,8 @@ cargo test -p swarmotter-api --test scale_harness -- --ignored
 
 ## Test data
 
-Tests must use clearly lawful sources (generated local torrents, public-domain
-files, open datasets, Linux distribution examples, project-owned sample files).
-See `content-policy.md`.
+Prefer generated local torrents and local swarm fixtures so tests are
+reproducible and do not depend on third-party content or service availability.
 
 ## Traceability
 

@@ -14,10 +14,6 @@ Key points:
 - **No time estimates.** Do not include calendar, sprint, week, month, or
   duration estimates in issues, PRs, commits, or documentation. Track work by
   completed capabilities and acceptance criteria.
-- **Lawful use only.** Do not add piracy-oriented features, indexers,
-  infringing-content search, bundled copyrighted torrents, infringing magnets,
-  or examples/screenshots based on copyrighted movies, shows, music, games,
-  ROMs, or cracked software. See `design/content-policy.md`.
 - **Strict network containment.** All torrent-related traffic must go through
   the configured network path and must fail closed. See
   `design/vpn-network-containment.md`.
@@ -80,8 +76,8 @@ traffic containment. Record significant additions in
 `THIRD_PARTY_LICENSES.md` and create an ADR when the dependency is
 significant.
 
-## Piracy-oriented contributions are not accepted
+## Contribution review
 
-Contributions that add piracy-oriented features, infringing-content search,
-bundled copyrighted torrents, infringing magnet links, or documentation
-encouraging copyright infringement will be rejected.
+Contributions are reviewed for functionality, correctness, security,
+maintenance, and license compatibility. Presumed user intent and content
+categories are not acceptance gates. See [the project stance](design/legal.md).

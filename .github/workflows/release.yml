@@ -118,7 +118,7 @@ jobs:
           cp LICENSE README.md CHANGELOG.md THIRD_PARTY_LICENSES.md "${stage}/"
           cp config/swarmotter.toml.example config/swarmotter.container.toml.example "${stage}/config/"
           cp deploy/.env.example deploy/compose.yml deploy/gluetun.env.example deploy/swarmotterd.service "${stage}/deploy/"
-          cp docs/SUMMARY.md docs/api.md docs/configuration.md docs/deployment.md docs/getting-started.md docs/index.md docs/lawful-use.md docs/legal.md docs/network-containment.md docs/troubleshooting.md docs/web-ui.md "${stage}/docs/"
+          cp docs/SUMMARY.md docs/api.md docs/configuration.md docs/deployment.md docs/getting-started.md docs/index.md docs/legal.md docs/network-containment.md docs/troubleshooting.md docs/web-ui.md "${stage}/docs/"
           cp -R docs/assets "${stage}/docs/assets"
 
           tar -C dist -czf "dist/packages/${root}.tar.gz" "${root}"

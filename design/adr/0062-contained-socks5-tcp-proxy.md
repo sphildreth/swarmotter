@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Some lawful-distribution and restricted-network deployments need an explicit
+Some distribution and restricted-network deployments need an explicit
 SOCKS5 egress proxy for torrent TCP and HTTP traffic. A proxy must not weaken
 SwarmOtter's configured VPN/NIC/network-namespace containment, leak target DNS
 through an unrelated resolver, or create a direct retry path when the proxy is

@@ -931,7 +931,7 @@ mod tests {
         out.push(b'e');
     }
 
-    /// Generate a small lawful BEP 52 `info` dictionary with three logical
+    /// Generate a small BEP 52 `info` dictionary with three logical
     /// pieces. The non-power-of-two layer count exercises padded hash-layer
     /// retrieval rather than merely the easy two-piece case.
     fn v2_bep9_fixture(

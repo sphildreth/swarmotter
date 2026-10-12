@@ -7,6 +7,17 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [Unreleased]
+
+### Changed
+
+- Clarified SwarmOtter's neutral stance: it is intended for legal torrenting,
+  while users choose their content and are responsible for their use. Removed
+  project-specific content restrictions and lawful-use gates from contributor
+  rules, issue/PR templates, release criteria, and planning documentation.
+  Consolidated the use and license notice and recorded ADR-0079, superseding
+  ADR-0008. Technical safeguards and license requirements remain in place.
+
 ## [2.3.0] - [2026-10-10]
 
 ### Added

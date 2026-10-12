@@ -40,7 +40,6 @@ The following areas are security-relevant:
 
 ## Network Containment Failures
 
-SwarmOtter's network containment is a safety feature, not a piracy-evasion
-feature. It is documented as routing correctness, privacy-preserving network
-design, operational safety, container networking, and fail-closed behavior.
+SwarmOtter's network containment keeps torrent traffic on the configured path
+and blocks it when that path is unavailable.
 Any change that weakens fail-closed behavior is a security regression.

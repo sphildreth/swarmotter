@@ -13,26 +13,9 @@ feature status is based on this repository's `README.md`,
 project-owned documentation, and project repositories listed in
 [Sources](#sources).
 
-SwarmOtter is not a torrent indexer, search engine, piracy assistant, or
-content-discovery tool. Features involving feeds or automation are framed for
-lawful, user-configured distribution workflows only.
-
-## Why the policy exclusions are a feature, not a gap
-
-Several cells in this matrix show `❌ Policy` for built-in search, bundled
-indexers, and content-discovery integrations. This is a deliberate product
-posture, not a missing feature. Many institutional, educational,
-public-sector, enterprise-adjacent, and family-shared-server deployments
-cannot adopt a client that ships search plugins, default indexers, or
-content-discovery surfaces, regardless of how those features are framed.
-By refusing to ship those surfaces, SwarmOtter fits a deployment niche
-that mainstream clients cannot occupy: the daemon is safe to hand to
-non-technical operators and to run in policy-restricted environments
-without per-deployment content scrubbing. The lawful-use and content-
-policy posture is therefore a market-differentiating feature, not a
-limitation, and it is one of the project's primary competitive moats.
-See `design/lawful-use.md` and `design/content-policy.md` for the
-authoritative scope.
+SwarmOtter currently has no built-in search, indexer, or content-discovery
+integration. These are absent capabilities, not permanent policy exclusions.
+Future proposals follow the normal design and acceptance process (ADR-0079).
 
 ## Table stakes vs. differentiators
 
@@ -51,7 +34,7 @@ This comparison distinguishes between two classes of features:
 - **Differentiators**: features where SwarmOtter offers something no
   mainstream client provides, or offers it in a meaningfully better way.
   Examples include fail-closed VPN/NIC containment, the adaptive autopilot,
-  the explainability API, and the lawful-use posture. These are the
+  the explainability API, and operational diagnostics. These are the
   reasons a user would choose SwarmOtter over an established client.
 
 The Roadmap Gap Map records the remaining product gaps and differentiator
@@ -84,18 +67,17 @@ candidates.
 | Partial | Supported with meaningful limitations, narrower scope, or less direct UI/API coverage. |
 | Plugin | Available through an official or common plugin/extension path. |
 | ❌ | Not provided by the checked project sources. |
-| ❌ Policy | Intentionally excluded by SwarmOtter policy. |
 | Roadmap P1/P2/P3 | Not completed in SwarmOtter and tracked in `design/BACKLOG.md` at that priority. |
 
 ## Project Positioning
 
 | Project | Best Fit | Main Surfaces | Notable Strengths | Important Trade-Offs |
 | --- | --- | --- | --- | --- |
-| SwarmOtter | Linux/server and homelab torrent daemon with strong operational controls | Daemon, REST API, WebSocket/SSE events, Web UI, bounded qBittorrent and Transmission automation adapters | Fail-closed VPN/NIC containment, API-first design, doctor/health checks, performance diagnostics, lawful-use posture | No desktop-native UI; no built-in search/indexer by policy; some ecosystem and shared-server features are roadmap items |
+| SwarmOtter | Linux/server and homelab torrent daemon with strong operational controls | Daemon, REST API, WebSocket/SSE events, Web UI, bounded qBittorrent and Transmission automation adapters | Fail-closed VPN/NIC containment, API-first design, doctor/health checks, performance diagnostics | No desktop-native UI; no built-in search/indexer; some ecosystem and shared-server features are roadmap items |
 | Transmission | Simple, lightweight desktop/server torrenting | Native desktop UIs, daemon, Web UI, `transmission-remote`, Transmission RPC | Low resource use, mature native UIs, straightforward remote control | Smaller feature surface than qBittorrent/BiglyBT; limited policy/profile model |
 | qBittorrent | Full-featured desktop and Web UI client | Qt desktop UI, Web UI, WebUI API | Broad core feature coverage, RSS, search plugins, categories/tags, sequential download, bandwidth scheduler | Desktop-first architecture; no SwarmOtter-style fail-closed data-plane containment |
 | Deluge | Daemon/client model with plugin-friendly operation | Daemon, GTK UI, Web UI, Console UI, Deluge RPC/Web API | Thin-client architecture, libtorrent core, plugins, multiple official UIs | Feature depth often depends on plugins; no SwarmOtter-style containment model |
-| BiglyBT | Feature-rich desktop client with extensive plugins | Desktop UI, plugins, remote-control plugins | Tags/categories, swarm merging, WebTorrent, I2P helper, rich plugin ecosystem | Large desktop application footprint; broad content-discovery/social features do not match SwarmOtter policy |
+| BiglyBT | Feature-rich desktop client with extensive plugins | Desktop UI, plugins, remote-control plugins | Tags/categories, swarm merging, WebTorrent, I2P helper, rich plugin ecosystem | Large desktop application footprint |
 | aria2 | Scriptable multi-protocol downloader | CLI, JSON-RPC, XML-RPC | Lightweight multi-source HTTP/FTP/SFTP/BitTorrent/Metalink downloader | Not a full library-management torrent client or integrated Web UI |
 | rTorrent + ruTorrent | Terminal/server deployments and seedbox-style operations | ncurses TUI, XMLRPC, ruTorrent Web UI | Lean terminal operation, remote-control ecosystem, ruTorrent plugins | More manual setup; Web UI is a separate front end; no SwarmOtter-style containment model |
 
@@ -139,8 +121,8 @@ candidates.
 | Capability | SwarmOtter | Transmission | qBittorrent | Deluge | BiglyBT | aria2 | rTorrent + ruTorrent |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Watch folders | ✅ | ✅ | ✅ | Plugin | ✅ | ❌ | ✅ |
-| RSS feed automation | Roadmap P1 for user-configured lawful feeds | ❌ | ✅ | Plugin | ✅ + Plugin | ❌ | Plugin/scripts |
-| Built-in search/indexer | ❌ Policy | ❌ | ✅ | ❌ | ✅ | ❌ | Plugin |
+| RSS feed automation | Roadmap P1 for user-configured feeds | ❌ | ✅ | Plugin | ✅ + Plugin | ❌ | Plugin/scripts |
+| Built-in search/indexer | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | Plugin |
 | Sequential download/streaming | Roadmap P2 | Partial | ✅ | Partial | ✅ | Partial | Partial |
 | Torrent creation | Roadmap P1 | ✅ | ✅ | Plugin | ✅ | ❌ | Plugin/scripts |
 | Superseeding/initial seeding | Roadmap P1 | Partial | ✅ | ✅ | ✅ | ❌ | ✅ |
@@ -188,7 +170,7 @@ priority list. It deliberately removes completed work rather than retaining a
 checked-off history. This comparison records current support in the tables
 above; consult the Feature Map for the ordered remaining opportunities.
 
-The next P1 work is lawful v1/v2/hybrid torrent creation; source-metadata
+The next P1 work is v1/v2/hybrid torrent creation; source-metadata
 display, deterministic magnet generation, and Web UI/batch exact-metainfo
 portability; cleanup safety; an API-backed CLI; API discovery; and tracker/peer
 operations. Shared-server routing and multi-user features remain conditional,

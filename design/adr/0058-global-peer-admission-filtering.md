@@ -50,8 +50,7 @@ local operator action rather than an unbounded remote-fetch subsystem.
 - Rules are global rather than per-profile, per-tracker, or per-user. Those
   scopes would need separate security, privacy, and containment decisions.
 - Filtering is an admission decision, not a routing, anonymity, or content
-  classification feature. It does not weaken lawful-use restrictions or the
-  configured network path.
+  classification feature. It does not weaken the configured network path.
 
 ## Related Documents
 

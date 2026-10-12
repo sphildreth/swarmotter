@@ -12,8 +12,8 @@ completed items here as checked-off backlog rows.
 
 This is a product backlog, not a release-scope or release-status document.
 Items are prioritized product opportunities that can be selected only when
-their dependencies, acceptance criteria, lawful-use posture, and network
-containment requirements are satisfied.
+their dependencies, acceptance criteria, and network containment requirements
+are satisfied.
 
 ## Priority Key
 
@@ -41,7 +41,7 @@ conditional feature does not advance merely because its technical prerequisites
 are available.
 
 The completed compatibility, policy-intake, and durable-library foundations
-now make lawful distribution creation, portability, cleanup, and operational
+now make distribution creation, portability, cleanup, and operational
 interfaces the highest-value work. The remaining map favors capabilities that
 build directly on those foundations before introducing shared-server scope or
 new external integrations.
@@ -50,7 +50,7 @@ new external integrations.
 
 | Priority | Sequence | Feature | User Value | Source Signals |
 | --- | --- | --- | --- | --- |
-| P1 | 1 | Torrent creation for lawful distribution | Create v1, v2, and hybrid torrents using the completed shared metadata model | BiglyBT, aria2, Transmission [#5794](https://github.com/transmission/transmission/issues/5794) |
+| P1 | 1 | Torrent creation for distribution | Create v1, v2, and hybrid torrents using the completed shared metadata model | BiglyBT, aria2, Transmission [#5794](https://github.com/transmission/transmission/issues/5794) |
 | P1 | 2 | Library provenance and portability | Surface stored source metadata, generate deterministic magnets, and complete UI/batch exact-metainfo portability | qBittorrent, Transmission, Deluge, and BiglyBT torrent detail/export workflows |
 | P1 | 3 | File cleanup, trash, and retention safety | Remove unwanted data safely without accidental loss | qBittorrent and Transmission cleanup requests |
 | P1 | 4 | Scriptable CLI (`swarmotterctl`) | Provide API-backed SSH and automation workflows with stable JSON output | `transmission-remote`, rTorrent, aria2 |
@@ -66,15 +66,15 @@ new external integrations.
 | P1 (conditional) | 14 | Multi-user / multi-tenant support | Add tenant isolation and quotas only after durable state and network-path strategy are established | Flood, rTorrent/ruTorrent, qBittorrent request [#3327](https://github.com/qbittorrent/qBittorrent/issues/3327) |
 | P1 (conditional) | 15 | Operator audit log | Audit privileged lifecycle actions after the authorization and durable-state foundations exist | Compliance-oriented server operations |
 | P2 | 1 | Safe automation hooks | Offer bounded, observable, allowlisted event actions after the operator surface is mature | Transmission and qBittorrent automation requests |
-| P2 | 2 | User-configured lawful RSS feeds | Support user-supplied lawful distribution feeds without bundled discovery | Deluge and rTorrent RSS workflows |
-| P2 | 3 | Superseeding / initial seeding (BEP 16) | Improve first distribution efficiency for lawful releases | BEP 16, qBittorrent, BiglyBT |
-| P2 | 4 | Seed prioritization (low-seed first) | Prefer work that improves lawful swarm availability | qBittorrent and Transmission discussions |
+| P2 | 2 | User-configured RSS feeds | Support user-supplied distribution feeds without bundled discovery | Deluge and rTorrent RSS workflows |
+| P2 | 3 | Superseeding / initial seeding (BEP 16) | Improve first distribution efficiency for releases | BEP 16, qBittorrent, BiglyBT |
+| P2 | 4 | Seed prioritization (low-seed first) | Prefer work that improves swarm availability | qBittorrent and Transmission discussions |
 | P2 | 5 | Container and sandbox hardening | Complete read-only-rootfs validation, image verification guidance, and optional orchestration artifacts beyond the existing non-root multi-architecture image and Compose support | Container operator practice |
 | P2 | 6 | Synthetic availability and SLO-style summaries | Add an opt-in contained data-plane synthetic check after baseline health semantics | Cloud-native operations conventions |
 | P2 | 7 | Filesystem snapshot integration | Add opt-in rollback hooks for supported local snapshot systems | Btrfs, ZFS, Snapper workflows |
 | P2 | 8 | Client-identity fingerprinting and rollups | Summarize peer client composition for operations visibility | qBittorrent and BiglyBT peer views |
 | P2 | 9 | HTTP / HTTPS proxy support | Evaluate constrained proxy support where SOCKS5 is unavailable | qBittorrent and aria2 proxy support |
-| P2 | 10 | Seedbox pre-seed warm-up | Pre-read and verify a lawful release before announce | BiglyBT-related warm-up concepts |
+| P2 | 10 | Seedbox pre-seed warm-up | Pre-read and verify a release before announce | BiglyBT-related warm-up concepts |
 | P2 | 11 | Disk cache / I/O buffer configuration | Tune storage behavior for specialized deployments | qBittorrent, Deluge, Transmission |
 | P2 | 12 | Sequential download / streaming / file preview | Add explicitly opt-in ordered fetching and local preview behavior | qBittorrent, aria2, WebTorrent, Deluge |
 | P2 | 13 | Protocol compatibility follow-ons | Track protocol gaps beyond the completed BEP 52 foundation | qBittorrent and Transmission protocol requests |
@@ -84,7 +84,7 @@ new external integrations.
 | P2 | 17 | Backup / restore and bulk import/export | Support large-library migration and recovery | qBittorrent, Deluge, Flood |
 | P2 | 18 | Thin client / remote session architecture | Consider a streaming client protocol beyond API and CLI operation | Deluge, qBittorrent, Flood |
 | P2 | 19 | OpenTelemetry observability | Export traces and metrics for cloud-native deployments | OpenTelemetry |
-| P2 | 20 | Cloud / object-storage-backed storage root | Evaluate institutional lawful-distribution storage integrations | rclone and institutional distribution patterns |
+| P2 | 20 | Cloud / object-storage-backed storage root | Evaluate institutional distribution storage integrations | rclone and institutional distribution patterns |
 | P2 | 21 | Local GeoIP / ASN peer rollups | Provide on-device peer-distribution summaries | Local GeoIP databases |
 | P2 | 22 | Responsive / mobile-friendly Web UI | Improve small-viewport operation | qBittorrent and Transmission Web UIs |
 | P3 | 1 | Trust and provenance signals for torrents and trackers | Research interoperable, secure provenance semantics before committing to signed-torrent claims | Signed-release workflows; no common signed-torrent standard |
@@ -300,7 +300,6 @@ SwarmOtter feature shape:
 - Surface running hook state and recent hook results in the API/UI.
 - Require per-hook working directory, environment allowlist, timeout, and
   output capture.
-- Never bundle content-specific automations or piracy-oriented workflows.
 - Add notification transports: webhook, ntfy, Apprise, and email — to extend
   automation with user-preferred delivery channels without requiring per-hook
   scripting.
@@ -314,7 +313,7 @@ SwarmOtter feature shape:
 **Priority: P1, sequence 1.** The completed BEP 52 v2/hybrid foundation
 supplies one shared identity and metadata model.
 
-Problem: lawful distributors who create `.torrent` files from their own content
+Problem: distributors who create `.torrent` files from their own content
 currently need external tooling. SwarmOtter could create and immediately seed
 torrents as part of a distribution workflow.
 
@@ -326,7 +325,7 @@ Requested elsewhere:
 
 SwarmOtter feature shape:
 
-- Create `.torrent` from local lawful content via API and UI.
+- Create `.torrent` from local content via API and UI.
 - Support piece hashing with configurable piece size; tracker tier configuration;
   optional webseed `url-list`; private flag; v1/v2/hybrid (BEP 52) format.
 - Immediate seed of created content.
@@ -342,7 +341,7 @@ Acceptance direction:
 
 **Priority: P2, sequence 3.**
 
-Problem: first-time distributors of new lawful releases want efficient initial
+Problem: first-time distributors of new releases want efficient initial
 seeding where pieces are distributed evenly without requiring complete download
 from any single peer.
 
@@ -377,8 +376,7 @@ Requested elsewhere:
 - qBittorrent [#9063](https://github.com/qbittorrent/qBittorrent/issues/9063)
   requests seed-priority-based seeding.
 - Transmission users have discussed seed-count-aware seeding policies.
-- Aligns with SwarmOtter's lawful-distribution mission: keeping lawful swarms
-  healthy.
+- Improves swarm availability and distribution efficiency.
 
 SwarmOtter feature shape:
 
@@ -423,39 +421,36 @@ Acceptance direction:
 
 - Specs must be accurate and versioned alongside the API.
 - Compatibility surface specs must document parity gaps explicitly.
-- No indexer, search, or content-discovery endpoints are documented.
+- Specs describe the implemented endpoints and identify unsupported operations.
 
-### User-Configured Lawful RSS Feeds
+### User-Configured RSS Feeds
 
 **Priority: P2, sequence 2.**
 
-Problem: lawful distributors and self-hosting operators use RSS to distribute
-updates to lawful content (Linux ISOs, open-source releases, public-domain
-media, legal datasets). These workflows require a local RSS ingestion surface
+Problem: distributors and self-hosting operators use RSS to distribute
+updates to content (Linux ISOs, open-source releases, public-domain
+media, datasets). These workflows require a local RSS ingestion surface
 separate from bundled discovery tools.
 
 Requested elsewhere:
 
-- Deluge ships an RSS plugin for lawful feed ingestion.
+- Deluge ships an RSS plugin for feed ingestion.
 - rTorrent supports RSS intake via external scripts and plugins.
 - Self-hosting communities use RSS feeds from Linux distributions, open-source
-  projects, and legal media archives.
+  projects, and media archives.
 
 SwarmOtter feature shape:
 
-- Support user-configured RSS feed URLs as a lawful-distribution intake channel.
+- Support user-configured RSS feed URLs as a distribution intake channel.
 - Feed items are matched against user-defined include/exclude patterns.
 - Matched items flow into the standard add workflow (metadata-first preview,
   profile assignment, file exclusion rules).
-- Users are responsible for feed selection; no bundled infringing or
-  piracy-oriented feeds are included.
+- Feed URLs and matching rules are configured by the operator.
 
 Acceptance direction:
 
-- Only user-supplied feeds are supported; no bundled indexers, search plugins,
-  or content-discovery integrations.
-- Feed ingestion falls within project scope as defined in `design/content-policy.md`
-  and `design/lawful-use.md`; no bundled infringing feeds are included.
+- Feed ingestion uses operator-supplied URLs and the existing contained network
+  layer for feed fetches and torrent intake.
 - Implementing this requires an ADR (new feature surface + project scope decision).
 
 ### Native Cross-Seed & Hardlink-Aware Storage
@@ -476,7 +471,7 @@ Requested elsewhere:
 
 SwarmOtter feature shape:
 
-- Match existing on-disk data to new lawful torrents by piece layout and piece
+- Match existing on-disk data to new torrents by piece layout and piece
   size.
 - Link instead of re-download where the filesystem supports it.
 - Integrate with shipped storage-root resource controls and the future
@@ -495,11 +490,11 @@ interoperable signature format, threat model, and operator semantics before
 SwarmOtter can promise provenance verification. There is no common signed-
 `.torrent` standard to adopt as a simple feature.
 
-Problem: lawful distributors and operators managing legitimate content need
-to know whether a torrent or a tracker host is one they can rely on. Mainstream
+Problem: distributors and operators need to know whether a torrent or a
+tracker host is one they can rely on. Mainstream
 clients treat every `.torrent` and every tracker host as equally trusted. For
 institutional, educational, public-sector, and enterprise-adjacent deployments
-this is a real gap and a real differentiator for a lawful-use daemon.
+provenance information would help operators assess the source of their data.
 
 Requested elsewhere:
 
@@ -705,7 +700,7 @@ Acceptance direction:
 
 **Priority: P2, sequence 8.**
 
-Problem: operators running legal swarms (Linux ISOs, open-source releases,
+Problem: operators running swarms (Linux ISOs, open-source releases,
 public archives) want to know what other clients are connecting to their
 seeders so they can prioritize compatibility fixes and understand their
 contribution to the broader ecosystem. Most clients display a peer-client
@@ -862,7 +857,7 @@ Acceptance direction:
 
 **Priority: P2, sequence 10.**
 
-Problem: when a lawful release is newly created and seeded, the first
+Problem: when a release is newly created and seeded, the first
 peers to connect find a seeder that has not yet read or hashed its pieces,
 so the first serving round is slow and the swarm's initial health looks
 poor. Pre-reading and pre-hashing all pieces *before* the torrent is
@@ -875,7 +870,7 @@ Requested elsewhere:
 - BiglyBT has related pre-seed and swarm-warmup concepts.
 - Superseeding / initial seeding (P2) benefits from a warm
   seeder because piece distribution is the bottleneck.
-- Legal distributors of Linux ISOs, open-source releases, and datasets
+- Distributors of Linux ISOs, open-source releases, and datasets
   care about first-hour swarm health.
 
 SwarmOtter feature shape:
@@ -944,7 +939,7 @@ Problem: `.torrent` files contain metadata fields beyond the piece table and
 file list: `comment`, `created by`, `creation date`, and `encoding`. Every
 mainstream torrent client displays these fields in a properties or info panel.
 SwarmOtter's parser already retains these fields, but the native API and Web UI
-do not surface them as a coherent library record. For lawful distributors
+do not surface them as a coherent library record. For distributors
 verifying provenance of downloaded content, and
 for operators inspecting torrent origin, this is baseline expected
 functionality.
@@ -1075,7 +1070,7 @@ torrent client presents to trackers and peers. Every mainstream client
 offers some form of anonymous mode that hides or randomizes the client
 identification (User-Agent header for trackers, peer ID prefix for peer
 connections). SwarmOtter uses a fixed peer ID prefix and User-Agent string.
-For lawful-use operators who simply want to reduce their operational
+For operators who simply want to reduce their operational
 footprint, this is expected privacy-preserving functionality.
 
 Requested elsewhere:
@@ -1105,8 +1100,6 @@ SwarmOtter feature shape:
 
 Acceptance direction:
 
-- Anonymous mode is framed as privacy-preserving operation, not as evasion
-  of copyright enforcement or lawful-use policy.
 - Anonymous mode never weakens network containment; it only changes
   wire-level identification strings.
 - The randomized peer ID is generated once per daemon session and reused
@@ -1195,7 +1188,7 @@ Requested elsewhere:
 SwarmOtter feature shape:
 
 - Track BEP support gaps in a protocol compatibility matrix.
-- Prioritize changes that improve lawful public swarms and do not compromise
+- Prioritize changes that improve public swarms and do not compromise
   containment.
 - Add local-swarm fixtures before enabling new protocol behavior by default.
 - Keep new proposals separate from the completed v1/v2/hybrid identity model so a
@@ -1413,15 +1406,14 @@ Acceptance direction:
 
 **Priority: P2, sequence 20.**
 
-Problem: institutional lawful distributors (datasets, public archives,
+Problem: institutional distributors (datasets, public archives,
 open-source release mirrors) increasingly keep their publishable content
 in object storage (S3, S3-compatible, WebDAV) rather than on a local disk.
 No mainstream torrent client treats object storage as a first-class
 torrent storage root, so these operators must mount the bucket and
 accept the limitations of a POSIX-over-object layer. A native
-object-storage-backed storage root fits SwarmOtter's lawful-distribution
-mission and complements shipped storage-root controls, the future
-filesystem-aware storage strategy, and torrent creation (P1).
+object-storage-backed storage root complements shipped storage-root controls,
+the future filesystem-aware storage strategy, and torrent creation (P1).
 
 Requested elsewhere:
 
@@ -1437,7 +1429,7 @@ SwarmOtter feature shape:
 - Add an optional object-storage-backed storage root type for S3,
   S3-compatible, and WebDAV targets.
 - Support both seeding-from-existing-object-data and
-  download-to-object-storage workflows for lawful distribution.
+  download-to-object-storage workflows for distribution.
 - Reuse the existing piece-hash verification path; an object-storage root is
   treated like any other storage root by the resource-control and future
   filesystem-aware storage layers.
@@ -1457,12 +1449,12 @@ Acceptance direction:
 
 **Priority: P2, sequence 21.**
 
-Problem: operators running legal swarms (Linux ISOs, open-source
+Problem: operators running swarms (Linux ISOs, open-source
 releases, public archives) want to understand the geographic and ASN
 distribution of the peers connecting to their seeders, both for
 distribution planning and for abuse detection. Today they get a per-peer
 IP string at most. Complementing the client-identity fingerprinting
-rollup (P2), an on-device GeoIP/ASN rollup gives legal-swarm
+rollup (P2), an on-device GeoIP/ASN rollup gives swarm
 operators a view no mainstream client provides, with no third-party
 lookup.
 
@@ -1472,7 +1464,7 @@ Requested elsewhere:
   geographic or ASN view.
 - Self-hosting operators ask for swarm composition visibility beyond the
   client string.
-- Legal distributors want to know whether their release is reaching the
+- Distributors want to know whether their release is reaching the
   regions they expect.
 
 SwarmOtter feature shape:
@@ -1541,7 +1533,7 @@ Acceptance direction:
 **Priority: P3, sequence 2.**
 
 Problem: plugin systems create integration value but also create security,
-support, and lawful-use risk.
+support, and maintenance risk.
 
 Requested elsewhere:
 
@@ -1553,14 +1545,12 @@ SwarmOtter research direction:
 
 - Do not implement arbitrary plugins without a separate ADR and threat model.
 - If pursued, prefer narrow, declarative extensions over arbitrary code.
-- Any extension surface must prohibit bundled infringing indexes, infringing
-  magnets, or content-discovery integrations that violate project policy.
 
 ### Alternate Privacy-Preserving Transports
 
 **Priority: P3, sequence 3.**
 
-Problem: alternate transports may help some lawful deployments, but they can
+Problem: alternate transports may help some deployments, but they can
 materially change containment, dependencies, user expectations, and project
 messaging.
 
@@ -1578,8 +1568,6 @@ SwarmOtter research direction:
 - Treat alternate transports as a separate data-plane architecture decision.
 - Require strict containment, explicit routing semantics, and local test
   fixtures before implementation.
-- Do not frame this work as evasion of copyright enforcement or other unlawful
-  activity.
 
 ### Swarm Merging (BiglyBT-style)
 
@@ -1604,7 +1592,6 @@ SwarmOtter research direction:
 - Assess containment implications: merging must not bypass network containment
   for peer traffic.
 - Requires design and containment review before acceptance.
-- No piracy-oriented content matching is permitted.
 
 ### Terminal UI / Console Interface
 
@@ -1662,9 +1649,8 @@ SwarmOtter research direction:
   posture: tooling, source string extraction, and contribution rules.
 - Define the localization scope: Web UI strings, API error messages,
   documentation, and which of those are localized first.
-- Decide how localization interacts with lawful-use policy: error
-  messages and docs remain authoritative in English; translations are
-  best-effort with an explicit "untranslated" fallback.
+- Define translation fallback behavior: error messages and docs remain
+  authoritative in English, with an explicit fallback for untranslated text.
 - Do not localize log messages; structured logs use stable English codes
   for automation compatibility.
 
@@ -1675,7 +1661,7 @@ Acceptance direction:
 - Source strings are extracted at build time and missing strings fail
   the build for in-scope locales.
 - Implementing this requires an ADR (introduces a new contributor
-  surface and a content policy decision).
+  surface and translation workflow).
 
 ### Version-Aware Contextual Documentation
 
@@ -1713,15 +1699,10 @@ Acceptance direction:
 - Contextual help is generated from or linked to the same versioned docs
   source; no parallel content.
 
-## Excluded From This Backlog
+## Additional Feature Proposals
 
-The investigated issue trackers include requests around built-in search, search
-plugins, bundled indexers, and broad content discovery. Those requests are
-intentionally excluded from this backlog because SwarmOtter is not a torrent
-indexer or piracy-assistant project.
-
-Bundled indexers, search plugins, and content-discovery integrations that serve
-piracy use cases are excluded permanently. User-configured lawful RSS feed
-ingestion is not excluded (see User-Configured Lawful RSS Feeds, P2). Any future
-RSS or discovery-adjacent capability must first pass the lawful-use and content
-policy requirements in `design/content-policy.md` and `design/lawful-use.md`.
+Built-in search, search plugins, bundled indexers, and content-discovery
+integrations are not implemented or prioritized in this backlog. They are not
+permanently excluded by content policy. Future proposals use the same design,
+security, maintenance, and containment criteria as other features (ADR-0079).
+User-configured RSS ingestion remains a separate candidate above.

@@ -28,8 +28,7 @@ metadata declares `license = "Apache-2.0"`, and new Rust source files include
   `CONTRIBUTING.md`.
 - Dependencies must be reviewed for Apache-2.0 compatibility, tracked in
   `THIRD_PARTY_LICENSES.md`.
-- Legal restrictions beyond the FOSS license belong in documentation and
-  project policy, not in the license itself (see ADR-0008).
+- The neutral project stance adds no license restrictions (see ADR-0079).
 
 ## Related Documents
 

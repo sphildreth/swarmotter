@@ -7,8 +7,8 @@ Accepted
 ## Context
 
 SwarmOtter must verify real download behavior without depending on
-third-party, copyrighted, or questionable content (`design/testing.md`,
-`design/content-policy.md`). Required test areas include local swarm tests:
+third-party content or services (`design/testing.md`). Required test areas
+include local swarm tests:
 tracker-based peer discovery, download completion, seeding, and recheck.
 These need a repeatable, offline harness driven entirely by generated test
 data.
@@ -38,8 +38,7 @@ same code path the daemon uses in production.
 
 ## Consequences
 
-- Local swarm tests run offline and deterministically, satisfying the lawful
-  test-data requirement.
+- Local swarm tests run offline and deterministically with generated fixtures.
 - The harness validates both tracker-based and direct-peer discovery paths.
 - Adding DHT/PEX/uTP testing later means adding a fixture to this harness, not
   touching third-party content.
@@ -51,5 +50,5 @@ same code path the daemon uses in production.
 - `crates/swarmotterd/tests/local_swarm.rs`
 - `crates/swarmotterd/tests/daemon_download.rs`
 - `design/testing.md`
-- ADR-0008 (lawful use and no piracy-oriented features)
+- [ADR-0079: Neutral Project Stance and User Responsibility](0079-neutral-project-stance-and-user-responsibility.md)
 - ADR-0013 (peer protocol)

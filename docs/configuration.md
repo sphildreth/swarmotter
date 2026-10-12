@@ -488,7 +488,7 @@ host_rules = [
 # Case-insensitive * and ? patterns against slash-separated torrent paths.
 excluded_file_patterns = ["*.nfo", "samples/*"]
 # Safe relative path below both selected storage roots.
-organization_subdirectory = "lawful/linux"
+organization_subdirectory = "releases/linux"
 # Optional independent staging directory below the incomplete root.
 incomplete_subdirectory = "review"
 # Put single-file torrents below a directory named after the torrent.

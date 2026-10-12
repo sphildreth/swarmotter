@@ -22,13 +22,7 @@ relates to v1.0.0 scope. -->
 
 <!-- How do we know this is complete? -->
 
-## Lawful-use and scope note
-
-SwarmOtter is a lawful general-purpose BitTorrent client. Piracy-oriented
-features, indexers, search for infringing content, bundled copyrighted
-torrents, infringing magnet links, or examples/screenshots based on
-copyrighted movies, shows, music, games, ROMs, or cracked software are **not
-accepted**. See `design/content-policy.md`.
+## Scope note
 
 SwarmOtter does not use an MVP model; required v1.0.0 features are not optional
 future enhancements. Progress is tracked by completed capabilities and

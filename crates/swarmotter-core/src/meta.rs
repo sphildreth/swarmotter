@@ -1776,7 +1776,7 @@ mod tests {
             .collect()
     }
 
-    /// Build a canonical local BEP 52 fixture. The payload is lawful generated
+    /// Build a canonical local BEP 52 fixture. The payload is generated
     /// test data; no external metainfo or network source is used.
     fn build_v2_single_file_torrent(
         name: &str,

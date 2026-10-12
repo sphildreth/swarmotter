@@ -11,7 +11,7 @@ tested, documented, and usable.
 
 DHT, PEX, UDP trackers, watch folders, browser magnet handling, file
 prioritization, queueing, bandwidth controls, fast resume, VPN/NIC
-containment, and legal documentation are all part of `v1.0.0` scope. They are
+containment, and license documentation are all part of `v1.0.0` scope. They are
 not optional future enhancements.
 
 Progress is tracked by completed capabilities and acceptance criteria, not by
@@ -126,8 +126,8 @@ for `v1.0.0` only when every item in the `v1.0.0` completion checklist (see
   operational controls; WebSocket/SSE updates work.
 - Configuration and deployment are documented; automated, storage, network
   containment, and local swarm tests pass.
-- License, legal, content-policy, and dependency-license documentation are
-  complete, with no infringing examples or default pirate indexers included.
+- License and dependency-license documentation are complete, with a concise
+  user-responsibility notice (see ADR-0079).
 
 ## Detailed plan
 

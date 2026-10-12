@@ -245,7 +245,7 @@ scripts/test-network-containment-transition.sh \
 ```
 
 The harness uses no external network or default route. It creates two
-PID-qualified namespaces, generates a lawful payload and torrent, and runs a
+PID-qualified namespaces, generates a test payload and torrent, and runs a
 compact HTTP tracker plus throttled TCP BitTorrent seed in the peer namespace.
 The raw torrent is registered through the real API and must show partial
 tracker-discovered peer-wire progress. The harness then deletes the daemon veth

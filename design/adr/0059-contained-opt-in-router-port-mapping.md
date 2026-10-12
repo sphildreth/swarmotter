@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-An inbound peer listener is more useful when a lawful distributor can make its
+An inbound peer listener is more useful when a distributor can make its
 configured TCP listen port reachable through a local NAT gateway. Router port
 mapping protocols require multicast discovery, UDP requests, and HTTP SOAP
 requests to devices outside the daemon's control. Creating those sockets or
