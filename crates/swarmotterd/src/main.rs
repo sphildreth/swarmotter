@@ -138,7 +138,6 @@ async fn run() -> Result<()> {
         Some(state_file.clone()),
         broker.clone(),
     ));
-    runtime.restore_persisted_state().await?;
 
     let state = Arc::new(AppState {
         daemon: runtime.clone(),
@@ -159,7 +158,11 @@ async fn run() -> Result<()> {
     // Register handlers before serving requests: a client can send SIGTERM
     // as soon as the API responds, before a lazily polled future runs.
     let shutdown_signal = shutdown_signal()?;
+    tokio::pin!(shutdown_signal);
     let bind = api_bind;
+    let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = ready.clone();
+    let restoring = runtime.clone();
 
     tracing::info!(%bind, "swarmotterd starting; API + Web UI on control plane");
 
@@ -169,10 +172,38 @@ async fn run() -> Result<()> {
             .map_err(swarmotter_core::error::CoreError::from)?,
         swarmotter_api::routes::app_router_with_body_limit(state.clone(), max_request_body_bytes)
             .merge(swarmotter_web::web_router())
+            .layer(axum::middleware::from_fn(move |request, next| {
+                guard_restoring_library(gate.clone(), restoring.clone(), request, next)
+            }))
             .into_make_service(),
     );
 
+    let broker = state.broker.clone();
+    let mut server = tokio::spawn(async move {
+        serve
+            .with_graceful_shutdown(async move { broker.closed().await })
+            .await
+    });
     let watchdog = runtime.start_watchdog()?;
+    tokio::select! {
+        result = runtime.restore_persisted_state() => {
+            if let Err(error) = result {
+                runtime.begin_shutdown();
+                server.abort();
+                return Err(error);
+            }
+        }
+        result = &mut shutdown_signal => {
+            runtime.begin_shutdown();
+            server.abort();
+            return Ok(result?);
+        }
+        result = &mut server => {
+            runtime.begin_shutdown();
+            return Err(swarmotter_core::error::CoreError::Internal(format!("HTTP stopped during restore: {result:?}")));
+        }
+    }
+    runtime.finish_restore_supervision();
     let mut workers = tokio::task::JoinSet::new();
     let rt = runtime.clone();
     workers.spawn(async move {
@@ -195,12 +226,7 @@ async fn run() -> Result<()> {
         "autopilot"
     });
 
-    let broker = state.broker.clone();
-    let mut server = tokio::spawn(async move {
-        serve
-            .with_graceful_shutdown(async move { broker.closed().await })
-            .await
-    });
+    ready.store(true, std::sync::atomic::Ordering::Release);
     let mut server_done = false;
     let failure = tokio::select! {
         result = shutdown_signal => result.err().map(|error| format!("shutdown signal failed: {error}")),
@@ -314,6 +340,33 @@ fn resolve_state_file(explicit: Option<PathBuf>, config: &Config) -> PathBuf {
                 .map(|directory| directory.join("state.json"))
         })
         .unwrap_or_else(default_state_file)
+}
+
+async fn guard_restoring_library(
+    ready: Arc<std::sync::atomic::AtomicBool>,
+    runtime: Arc<daemon::DaemonRuntime>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{Method, StatusCode};
+    use axum::response::IntoResponse;
+
+    if ready.load(std::sync::atomic::Ordering::Acquire) {
+        return next.run(request).await;
+    }
+    if request.uri().path() == "/live" && request.method() == Method::GET {
+        return if runtime.restore_live() {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        .into_response();
+    }
+    let (checked, total, pieces_checked) = runtime.restore_verification_progress();
+    (StatusCode::SERVICE_UNAVAILABLE, [("retry-after","2")], axum::Json(serde_json::json!({
+        "success":false,"data":{"status":"restoring","checked":checked,"total":total,"pieces_checked":pieces_checked},
+        "error":{"message":"Library restoration in progress"}
+    }))).into_response()
 }
 
 fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>>> {

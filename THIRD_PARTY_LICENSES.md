@@ -34,13 +34,12 @@ foundational dependency stack rationale.
 | tracing-subscriber | 0.3 | MIT | Log output formatting |
 | axum | 0.7 | MIT | Async HTTP API framework (control plane only) |
 | tower | 0.5 | MIT | Tower service/middleware for axum |
-| tower-http | 0.6 | MIT | HTTP middleware (static fs, trace, cors) |
 | hyper | 1 | MIT | HTTP server under axum and HTTP/1 client codec over binder-provided contained streams; its client connector/pool is not used |
 | hyper-util | 0.1 | MIT | Tokio I/O adapter for Hyper over an already-connected contained TCP/TLS stream; no connector is enabled or used |
 | http-body-util | 0.1 | MIT | Empty GET request bodies and framed decoded-body streaming for the bounded contained HTTP client |
 | sha1 | 0.10 | BSD-3-Clause | Info-hash and piece-hash computation (pure Rust) |
 | sha2 | 0.10 | MIT/Apache-2.0 | SHA-256 computation for BEP 52 v2 and hybrid torrent identity and piece-layer validation (pure Rust) |
-| rusqlite | 0.37 | MIT | Maintained Rust bindings for the local SQLite durable-state store; it creates no network traffic |
+| rusqlite | 0.41 | MIT | Maintained Rust bindings for the local SQLite durable-state store; it creates no network traffic |
 | SQLite (bundled by `libsqlite3-sys`) | 3.x | Public Domain | Embedded local durable-state engine, bundled so supported deployments do not depend on a host SQLite package |
 | hex | 0.4 | MIT/Apache-2.0 | Hex encoding/decoding |
 | url | 2 | MIT/Apache-2.0 | Magnet link and tracker URL parsing |
@@ -89,7 +88,7 @@ operating-system packages in a specific artifact.
 None of the direct dependencies above create torrent data-plane network
 traffic on their own. All torrent-related sockets (peers, trackers, DHT, PEX,
 webseeds, magnet metadata) are created through SwarmOtter's central network
-containment layer. `axum`/`tower-http` use Hyper on the control plane. The data
+containment layer. `axum` uses Hyper on the control plane. The data
 plane uses only Hyper's HTTP/1 codec and `hyper-util` Tokio adapter over a stream
 already resolved and connected by `NetworkBinder`; no Hyper connector,
 resolver, pool, or general client is enabled. The vendored Tabulator browser

@@ -111,21 +111,73 @@ async fn prewrite_pieces(
 ) {
     let meta = parse_torrent(torrent_bytes).unwrap();
     let storage = StorageIo::new(meta.clone(), download_dir.to_path_buf());
+    let layout = meta
+        .requires_v2_data_plane()
+        .then(|| meta.v2_piece_layout().unwrap());
     for piece in pieces {
         let start = piece * meta.piece_length as usize;
         let end = (start + meta.piece_length as usize).min(payload.len());
-        storage
-            .write_piece(piece, &payload[start..end])
-            .await
-            .unwrap();
+        if let Some(layout) = &layout {
+            storage
+                .write_v2_piece(layout, piece, &payload[start..end])
+                .await
+                .unwrap();
+        } else {
+            storage
+                .write_piece(piece, &payload[start..end])
+                .await
+                .unwrap();
+        }
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_incomplete_daemons_exchange_verified_pieces_without_a_seed() {
-    // Generated payload: 16 pieces of 16 bytes.
-    let payload: Vec<u8> = (0..256usize).map(|i| (i * 37 % 251) as u8).collect();
-    let piece_len = 16u64;
+    exchange(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pure_v2_two_daemons_exchange_and_restore_verified_pieces() {
+    exchange(true).await;
+}
+
+fn pure_v2_metainfo(payload: &[u8], piece_len: u64, tracker: &str) -> Vec<u8> {
+    let name = "verified-exchange.bin";
+    let root = swarmotter_core::v2::v2_file_root(payload).unwrap();
+    let mut data = format!(
+        "d8:announce{}:{}4:infod9:file treed{}:{}d0:d6:lengthi{}e11:pieces root32:",
+        tracker.len(),
+        tracker,
+        name.len(),
+        name,
+        payload.len()
+    )
+    .into_bytes();
+    data.extend(root.as_bytes());
+    data.extend(
+        format!(
+            "eee12:meta versioni2e4:name{}:{}12:piece lengthi{}ee12:piece layersd32:",
+            name.len(),
+            name,
+            piece_len
+        )
+        .as_bytes(),
+    );
+    data.extend(root.as_bytes());
+    let chunks = payload.chunks(piece_len as usize);
+    data.extend(format!("{}:", chunks.len() * 32).as_bytes());
+    for chunk in chunks {
+        data.extend(swarmotter_core::v2::v2_leaf_hash(chunk).as_bytes());
+    }
+    data.extend(b"ee");
+    data
+}
+
+async fn exchange(pure_v2: bool) {
+    let piece_len = if pure_v2 { 16384 } else { 16 };
+    let payload: Vec<u8> = (0..16 * piece_len as usize)
+        .map(|i| (i * 37 % 251) as u8)
+        .collect();
 
     let tracker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let tracker_port = tracker.local_addr().unwrap().port();
@@ -138,14 +190,22 @@ async fn two_incomplete_daemons_exchange_verified_pieces_without_a_seed() {
         let _ = run_two_peer_tracker(tracker, tracker_peers_for_task).await;
     });
 
-    let torrent_bytes = build_single_file_torrent(
-        "verified-exchange.bin",
-        &payload,
-        piece_len,
-        Some(&format!("http://127.0.0.1:{tracker_port}/announce")),
-        false,
-    );
-    let piece_count = parse_torrent(&torrent_bytes).unwrap().piece_count();
+    let url = format!("http://127.0.0.1:{tracker_port}/announce");
+    let torrent_bytes = if pure_v2 {
+        pure_v2_metainfo(&payload, piece_len, &url)
+    } else {
+        build_single_file_torrent(
+            "verified-exchange.bin",
+            &payload,
+            piece_len,
+            Some(&url),
+            false,
+        )
+    };
+    let piece_count = parse_torrent(&torrent_bytes)
+        .unwrap()
+        .data_piece_count()
+        .unwrap();
     assert_eq!(piece_count, 16);
 
     // Complementary halves: A verifies pieces 0..8, B verifies 8..16.
@@ -229,9 +289,38 @@ async fn two_incomplete_daemons_exchange_verified_pieces_without_a_seed() {
     let uploaded_a = runtime_a.engine_uploaded_bytes(&hash_a).await;
     let uploaded_b = runtime_b.engine_uploaded_bytes(&hash_b).await;
     println!("uploaded: a={uploaded_a} b={uploaded_b}");
-    assert!(uploaded_a >= 128, "a must have uploaded its half");
-    assert!(uploaded_b >= 128, "b must have uploaded its half");
+    assert!(
+        uploaded_a >= payload.len() as u64 / 2,
+        "a must have uploaded its half"
+    );
+    assert!(
+        uploaded_b >= payload.len() as u64 / 2,
+        "b must have uploaded its half"
+    );
 
+    runtime_a.shutdown().await.unwrap();
+    runtime_b.shutdown().await.unwrap();
+    if pure_v2 {
+        let restored = DaemonRuntime::with_paths_broker_and_state(
+            daemon_config(&dir_a, 0),
+            daemon_health(),
+            None,
+            None,
+            Some(dir_a.join("state.sqlite")),
+            EventBroker::default(),
+        );
+        restored.restore_persisted_state().await.unwrap();
+        assert_eq!(restored.get_torrent(&hash_a).await.unwrap().pieces_have, 16);
+        let mut damaged = payload.clone();
+        damaged[0] ^= 0xff;
+        std::fs::write(dir_a.join("verified-exchange.bin"), damaged).unwrap();
+        restored.recheck(&hash_a).await.unwrap();
+        assert_eq!(restored.get_torrent(&hash_a).await.unwrap().pieces_have, 15);
+        std::fs::remove_file(dir_a.join("verified-exchange.bin")).unwrap();
+        restored.recheck(&hash_a).await.unwrap();
+        assert_eq!(restored.get_torrent(&hash_a).await.unwrap().pieces_have, 0);
+        restored.shutdown().await.unwrap();
+    }
     std::fs::remove_dir_all(dir_a).ok();
     std::fs::remove_dir_all(dir_b).ok();
 }

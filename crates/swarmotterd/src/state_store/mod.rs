@@ -281,6 +281,7 @@ pub fn rebuild_projections(path: &Path) -> Result<ProjectionRebuildReport> {
 
         rebuild_derived_projections(&transaction, &queue)?;
         ensure_projection_indexes(&transaction)?;
+        ensure_retention_counters(&transaction, true)?;
 
         transaction.commit().map_err(|error| {
             CoreError::Storage(format!(
@@ -434,14 +435,24 @@ pub(crate) fn save_changed_records(
     if queue.is_some() {
         CHANGED_SAVE_QUEUE_WRITES.fetch_add(1, Ordering::Relaxed);
     }
-    verify_existing_sqlite_state_for_migration(path, true)?;
-    let mut connection = open_sqlite(path)?;
-    migrate_schema(&mut connection)?;
+    // This path only updates an already initialized generation. Loading or
+    // migrating the store performs the integrity check before any writer runs.
+    let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|error| CoreError::Storage(format!("open incremental state store: {error}")))?;
+    if sqlite_schema_version(&connection, "during incremental save")? != SQLITE_SCHEMA_VERSION {
+        return Err(CoreError::Storage(
+            "incremental save requires the current state schema".into(),
+        ));
+    }
+    configure_connection(&connection)?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| {
             CoreError::Storage(format!("begin SQLite changed-record transaction: {error}"))
         })?;
+    ensure_retention_counters(&transaction, false)?;
+    let mut history_changed = false;
+    let mut samples_changed = false;
     for torrent in torrents {
         let hash = durable_torrent_key(torrent)?;
         let current_state = torrent.state.as_str();
@@ -480,6 +491,7 @@ pub(crate) fn save_changed_records(
                 ],
             )
             .map_err(|error| CoreError::Storage(format!("write durable torrent: {error}")))?;
+        history_changed |= previous_state.as_deref() != Some(current_state);
         write_history(
             &transaction,
             &hash,
@@ -489,12 +501,43 @@ pub(crate) fn save_changed_records(
         write_canonical_info(&transaction, &hash, raw_info.as_deref())?;
         write_health_snapshot(&transaction, &hash, torrent)?;
         write_current_metrics(&transaction, &hash, torrent, observed_at)?;
-        write_metric_sample(&transaction, &hash, torrent, observed_at)?;
+        if write_metric_sample(&transaction, &hash, torrent, observed_at)? {
+            samples_changed = true;
+            transaction
+                .execute(
+                    "DELETE FROM torrent_metric_samples WHERE id IN (
+                SELECT id FROM torrent_metric_samples WHERE info_hash=?1
+                ORDER BY observed_at DESC, id DESC LIMIT -1 OFFSET ?2)",
+                    params![hash, MAX_METRIC_SAMPLES_PER_TORRENT],
+                )
+                .map_err(|e| CoreError::Storage(format!("prune changed torrent samples: {e}")))?;
+        }
     }
     if let Some(queue) = queue {
         write_queue_state(&transaction, queue)?;
     }
-    prune_retained_rows(&transaction, DURABLE_RETENTION)?;
+    if samples_changed {
+        prune_incremental_overflow(
+            &transaction,
+            "torrent_metric_samples",
+            "observed_at",
+            MAX_METRIC_SAMPLE_ROWS,
+        )?;
+    }
+    if history_changed {
+        prune_incremental_overflow(
+            &transaction,
+            "library_history",
+            "occurred_at",
+            MAX_LIBRARY_HISTORY_ROWS,
+        )?;
+        prune_incremental_overflow(
+            &transaction,
+            "audit_events",
+            "occurred_at",
+            MAX_AUDIT_EVENT_ROWS,
+        )?;
+    }
     let result = transaction.commit().map_err(|error| {
         CoreError::Storage(format!("commit SQLite changed-record transaction: {error}"))
     });
@@ -1682,7 +1725,7 @@ fn write_metric_sample(
     hash: &str,
     torrent: &Torrent,
     observed_at: i64,
-) -> Result<()> {
+) -> Result<bool> {
     let downloaded = torrent.downloaded.to_string();
     let uploaded = torrent.uploaded.to_string();
     let rate_down = torrent.rate_down.to_string();
@@ -1705,7 +1748,7 @@ fn write_metric_sample(
             && previous.2 == rate_down
             && previous.3 == rate_up
     }) {
-        return Ok(());
+        return Ok(false);
     }
     transaction
         .execute(
@@ -1715,6 +1758,55 @@ fn write_metric_sample(
             params![hash, observed_at, downloaded, uploaded, rate_down, rate_up],
         )
         .map_err(|error| CoreError::Storage(format!("write durable metric sample: {error}")))?;
+    Ok(true)
+}
+
+// Optional acceleration structures. Older schema-v2 writers also update the
+// counters through the triggers, including cascading deletes.
+fn ensure_retention_counters(tx: &Transaction<'_>, rebuild: bool) -> Result<()> {
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='retention_counts')",
+        [], |row| row.get(0)).map_err(|e| CoreError::Storage(e.to_string()))?;
+    if exists && !rebuild {
+        return Ok(());
+    }
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS retention_counts(name TEXT PRIMARY KEY, n INTEGER NOT NULL) STRICT;",
+    )
+    .map_err(|e| CoreError::Storage(e.to_string()))?;
+    for (table, time) in [
+        ("torrent_metric_samples", "observed_at"),
+        ("library_history", "occurred_at"),
+        ("audit_events", "occurred_at"),
+    ] {
+        tx.execute_batch(&format!(
+            "INSERT OR REPLACE INTO retention_counts SELECT '{table}', count(*) FROM {table};
+             CREATE INDEX IF NOT EXISTS {table}_retention_order ON {table}({time},id);
+             CREATE TRIGGER IF NOT EXISTS {table}_retention_insert AFTER INSERT ON {table} BEGIN
+                UPDATE retention_counts SET n=n+1 WHERE name='{table}'; END;
+             CREATE TRIGGER IF NOT EXISTS {table}_retention_delete AFTER DELETE ON {table} BEGIN
+                UPDATE retention_counts SET n=n-1 WHERE name='{table}'; END;"
+        ))
+        .map_err(|e| CoreError::Storage(format!("initialize {table} retention: {e}")))?;
+    }
+    Ok(())
+}
+
+fn prune_incremental_overflow(
+    tx: &Transaction<'_>,
+    table: &str,
+    time: &str,
+    limit: i64,
+) -> Result<()> {
+    tx.execute(
+        &format!(
+            "DELETE FROM {table} WHERE id IN (
+        SELECT id FROM {table} ORDER BY {time},id LIMIT
+        (SELECT max(0,n-?1) FROM retention_counts WHERE name=?2))"
+        ),
+        params![limit, table],
+    )
+    .map_err(|e| CoreError::Storage(format!("prune {table}: {e}")))?;
     Ok(())
 }
 

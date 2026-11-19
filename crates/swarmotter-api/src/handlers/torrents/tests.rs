@@ -512,11 +512,12 @@ fn sort_torrent_rows_uses_stable_secondary_name_order() {
     let mut b = minimal_summary();
     b.name = "ALPHA".into();
     b.rate_down = 100;
-    let mut rows = [a, b];
-    sort_torrent_rows(
-        &mut rows,
+    let rows = sorted_torrent_page(
+        vec![a, b],
         TorrentListSort::DownRate,
         TorrentListDirection::Asc,
+        0,
+        2,
     );
     // Equal rate; secondary sort is case-insensitive by name.
     assert_eq!(rows[0].name, "ALPHA");
@@ -525,7 +526,7 @@ fn sort_torrent_rows_uses_stable_secondary_name_order() {
 
 #[test]
 fn sort_torrent_rows_desc_reverses() {
-    let mut rows = vec![
+    let rows = vec![
         summary_with(
             1,
             "alpha",
@@ -553,7 +554,22 @@ fn sort_torrent_rows_desc_reverses() {
             None,
         ),
     ];
-    sort_torrent_rows(&mut rows, TorrentListSort::Name, TorrentListDirection::Desc);
+    let page = sorted_torrent_page(
+        rows.clone(),
+        TorrentListSort::Name,
+        TorrentListDirection::Desc,
+        1,
+        1,
+    );
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].name, "alpha");
+    let rows = sorted_torrent_page(
+        rows,
+        TorrentListSort::Name,
+        TorrentListDirection::Desc,
+        0,
+        2,
+    );
     assert_eq!(rows[0].name, "beta");
     assert_eq!(rows[1].name, "alpha");
 }

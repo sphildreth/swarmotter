@@ -32,6 +32,8 @@ pub struct PieceProgress {
     bitfield: PieceBitfield,
     pub total: usize,
     have_count: usize,
+    #[serde(skip)]
+    verified_v2_bytes: std::sync::OnceLock<u64>,
 }
 
 impl PieceProgress {
@@ -40,20 +42,42 @@ impl PieceProgress {
             bitfield: PieceBitfield::new(total),
             total,
             have_count: 0,
+            verified_v2_bytes: Default::default(),
         }
     }
 
     pub fn have_piece(&mut self, index: usize) {
         if index < self.total && !self.bitfield.has(index) {
+            self.verified_v2_bytes.take();
             self.bitfield.set(index);
             self.have_count += 1;
         }
     }
 
     pub fn replace_from_bitfield(&mut self, bitfield: &PieceBitfield, total: usize) {
+        self.verified_v2_bytes.take();
         self.bitfield = bitfield.clone();
         self.total = total;
         self.have_count = self.bitfield.count(total);
+    }
+
+    pub(crate) fn verified_bytes(&self, meta: &TorrentMeta) -> u64 {
+        if meta.requires_v2_data_plane() {
+            return *self
+                .verified_v2_bytes
+                .get_or_init(|| crate::torrent::verified_bytes(meta, &self.bitfield));
+        }
+        let has_last = meta
+            .piece_count()
+            .checked_sub(1)
+            .is_some_and(|i| self.bitfield.has(i));
+        let full = self.have_count.saturating_sub(usize::from(has_last)) as u64;
+        full.saturating_mul(meta.piece_length)
+            .saturating_add(if has_last {
+                meta.last_piece_length()
+            } else {
+                0
+            })
     }
 
     pub fn pieces_have(&self) -> usize {

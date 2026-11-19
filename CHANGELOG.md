@@ -7,6 +7,21 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## Unreleased
+
+- Source builds require Rust 1.89. The lockfile includes the patched bundled
+  SQLite binding, Tokio, rustls, and WebPKI dependencies.
+
+- Restore and recheck pure-v2 payloads using their file-aligned SHA-256 layout.
+  Incomplete v2 peers serve verified blocks over contained connections.
+- Report library verification progress while the daemon starts. Compose
+  deployments recover from a restarted VPN namespace. Upgrades verify a
+  quiescent state backup before replacing the daemon.
+- Checkpoint parallel downloads during peer rounds and advertise newly written
+  pieces incrementally. Library pages reuse summaries and verified byte counts.
+  Incremental SQLite writes limit retention work to changed records and rows
+  exceeding the configured caps.
+
 ## [2.3.1] - [2026-10-12]
 
 ### Fixed

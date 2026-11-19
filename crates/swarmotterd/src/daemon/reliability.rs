@@ -10,19 +10,35 @@ const STALL_LIMIT: Duration = Duration::from_secs(300);
 
 pub(super) struct Reliability {
     progress: StdMutex<[Instant; 5]>,
+    restoring_since_progress: StdMutex<Option<Instant>>,
     stopping: AtomicBool,
+    pub(super) restore_pieces: std::sync::atomic::AtomicUsize,
+    pub(super) restore_total: std::sync::atomic::AtomicUsize,
+    pub(super) restore_checked: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for Reliability {
     fn default() -> Self {
         Self {
             progress: StdMutex::new([Instant::now(); 5]),
+            restoring_since_progress: StdMutex::new(None),
             stopping: AtomicBool::new(false),
+            restore_pieces: Default::default(),
+            restore_total: Default::default(),
+            restore_checked: Default::default(),
         }
     }
 }
 
 impl DaemonRuntime {
+    pub fn restore_verification_progress(&self) -> (usize, usize, usize) {
+        (
+            self.reliability.restore_checked.load(Ordering::Relaxed),
+            self.reliability.restore_total.load(Ordering::Relaxed),
+            self.reliability.restore_pieces.load(Ordering::Relaxed),
+        )
+    }
+
     pub(super) fn heartbeat(&self, task: usize) {
         if let Ok(mut progress) = self.reliability.progress.lock() {
             progress[task] = Instant::now();
@@ -40,7 +56,33 @@ impl DaemonRuntime {
         self.event_broker.shutdown();
     }
 
+    pub(super) fn restore_heartbeat(&self) {
+        if let Ok(mut last) = self.reliability.restoring_since_progress.lock() {
+            if last.is_some() {
+                *last = Some(Instant::now());
+            }
+        }
+    }
+
+    pub fn finish_restore_supervision(&self) {
+        if let Ok(mut progress) = self.reliability.progress.lock() {
+            *progress = [Instant::now(); 5];
+        }
+        if let Ok(mut last) = self.reliability.restoring_since_progress.lock() {
+            *last = None;
+        }
+    }
+
+    pub fn restore_live(&self) -> bool {
+        !self.is_stopping() && self.loops_responsive()
+    }
+
     fn loops_responsive(&self) -> bool {
+        if let Ok(last) = self.reliability.restoring_since_progress.lock() {
+            if let Some(last) = *last {
+                return last.elapsed() < STALL_LIMIT;
+            }
+        }
         self.reliability
             .progress
             .lock()
@@ -61,12 +103,12 @@ impl DaemonRuntime {
         .is_ok()
     }
 
-    /// Start only after restoration. An OS thread detects even executor
+    /// An OS thread monitors restore progress, then essential loops, detecting executor
     /// starvation and enforces a final shutdown deadline. Normal shutdown
     /// explicitly disarms it after the durable checkpoint.
     pub fn start_watchdog(self: &Arc<Self>) -> Result<Watchdog> {
-        if let Ok(mut progress) = self.reliability.progress.lock() {
-            *progress = [Instant::now(); 5];
+        if let Ok(mut last) = self.reliability.restoring_since_progress.lock() {
+            *last = Some(Instant::now());
         }
         let completed = Arc::new(AtomicBool::new(false));
         let disarmed = completed.clone();
@@ -173,6 +215,12 @@ mod tests {
                 "test",
             ),
         );
+        *runtime.reliability.restoring_since_progress.lock().unwrap() =
+            Some(Instant::now() - STALL_LIMIT);
+        assert!(!runtime.restore_live());
+        runtime.restore_heartbeat();
+        assert!(runtime.restore_live());
+        runtime.finish_restore_supervision();
         runtime.reliability.progress.lock().unwrap()[0] = Instant::now() - STALL_LIMIT;
         assert!(!runtime.application_live().await);
         runtime.begin_shutdown();

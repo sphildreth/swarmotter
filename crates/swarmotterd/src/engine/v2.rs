@@ -15,6 +15,65 @@ use swarmotter_core::peer::{V2Handshake, V2_RESERVED_BIT, V2_RESERVED_BYTE_INDEX
 use swarmotter_core::utp::PeerDuplex;
 use swarmotter_core::v2::V2PieceLayout;
 
+struct V2Upload<'a> {
+    engine: &'a TorrentEngine,
+    storage: &'a StorageIo,
+    layout: &'a V2PieceLayout,
+    peer: PeerAddr,
+}
+
+impl V2Upload<'_> {
+    async fn serve<W: tokio::io::AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+        have: &PieceBitfield,
+        piece: u32,
+        offset: u32,
+        length: u32,
+    ) -> Result<()> {
+        let index = piece as usize;
+        let valid = length > 0
+            && length <= peer::BLOCK_SIZE
+            && have.has(index)
+            && self
+                .layout
+                .piece(index)
+                .is_some_and(|mapping| u64::from(offset) + u64::from(length) <= mapping.length);
+        if valid {
+            if let Ok(block) = self
+                .storage
+                .read_v2_block(self.layout, index, u64::from(offset), length as usize)
+                .await
+            {
+                self.engine
+                    .limiter
+                    .acquire(RateDirection::Upload, u64::from(length))
+                    .await;
+                peer::write_message(
+                    writer,
+                    &Message::Piece {
+                        piece,
+                        offset,
+                        block,
+                    },
+                )
+                .await?;
+                record_peer_uploaded(&self.engine.state, self.peer, u64::from(length)).await;
+                return Ok(());
+            }
+        }
+        peer::write_message(
+            writer,
+            &Message::Reject {
+                piece,
+                offset,
+                length,
+            },
+        )
+        .await
+    }
+}
+
 impl TorrentEngine {
     /// Run the pure-v2 baseline for complete metainfo with verified piece
     /// layers. Hybrid torrents intentionally remain on the existing v1 path
@@ -49,7 +108,7 @@ impl TorrentEngine {
             .with_cow_strategy(self.cow_strategy)
             .with_metrics(self.storage_metrics.clone());
         if self.download_dir != self.complete_dir {
-            let complete_have = complete_storage.recheck_v2(&layout).await?;
+            let complete_have = self.recheck_storage(&complete_storage).await?;
             if self.v2_selection_complete(&layout, &complete_have) {
                 self.update_v2_progress(&layout, &complete_have).await;
                 self.finish_v2_selection(&complete_storage, &layout, &complete_have)
@@ -84,6 +143,9 @@ impl TorrentEngine {
             self.finish_v2_selection(&storage, &layout, &have).await?;
             return Ok(self.state.lock().await.clone());
         }
+
+        self.register_downloader_serve(Arc::new(storage.clone()))
+            .await;
 
         // BEP 52 tracker/DHT requests use the explicit 20-byte truncated
         // SHA-256 wire identity. The full SHA-256 torrent key remains local
@@ -274,6 +336,14 @@ impl TorrentEngine {
         peer::write_message(&mut write_half, &Message::Interested).await?;
         write_half.flush().await.map_err(CoreError::from)?;
 
+        let upload = V2Upload {
+            engine: self,
+            storage,
+            layout,
+            peer: *peer_addr,
+        };
+        peer::write_message(&mut write_half, &Message::Unchoke).await?;
+        write_half.flush().await.map_err(CoreError::from)?;
         let deadline = Instant::now() + Duration::from_secs(45);
         let mut peer_bitfield: Option<Bitfield> = None;
         let mut peer_choking = true;
@@ -334,6 +404,17 @@ impl TorrentEngine {
                             Ok(Err(error)) => return Err(error),
                             Err(_) => break,
                         };
+                        if let Message::Request {
+                            piece,
+                            offset,
+                            length,
+                        } = message
+                        {
+                            upload
+                                .serve(&mut write_half, have, piece, offset, length)
+                                .await?;
+                            continue;
+                        }
                         match message {
                             Message::Piece {
                                 piece: received_piece,
@@ -446,6 +527,17 @@ impl TorrentEngine {
                 Ok(Err(error)) => return Err(error),
                 Err(_) => return Ok(made_progress),
             };
+            if let Message::Request {
+                piece,
+                offset,
+                length,
+            } = message
+            {
+                upload
+                    .serve(&mut write_half, have, piece, offset, length)
+                    .await?;
+                continue;
+            }
             match message {
                 Message::Unchoke => {
                     peer_choking = false;
@@ -516,12 +608,12 @@ impl TorrentEngine {
                     stamps_match,
                     "pure-v2 fast resume does not match on-disk payload; rechecking storage"
                 );
-                storage.recheck_v2(layout).await
+                self.recheck_storage(storage).await
             } else {
                 Ok(resume.piece_bitfield)
             }
         } else {
-            storage.recheck_v2(layout).await
+            self.recheck_storage(storage).await
         }
     }
 

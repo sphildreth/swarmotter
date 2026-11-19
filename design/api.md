@@ -376,3 +376,5 @@ contains no torrent data. VPN unavailability alone does not fail liveness.
 `GET /health` retains its existing network containment response. SSE and
 WebSocket subscriptions close when daemon shutdown begins. Authenticated doctor
 checks include logging delivery counters and persistence performance counters.
+
+During startup the listener serves liveness and aggregate restoration progress. Normal routes become available after durable state restoration (ADR-0080).

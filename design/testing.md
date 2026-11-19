@@ -457,3 +457,14 @@ clients open and verifies successful exit plus a valid SQLite checkpoint.
 Logging tests cover bounded records, queue saturation, and archive retention.
 Run the generated storage profile alone with `cargo test -p swarmotterd --lib
 persistence_large_metadata_profile -- --ignored --nocapture --test-threads=1`.
+
+### Recovery regression coverage
+
+The real-binary startup test holds the library database busy and checks live,
+restoring and ready responses. The two-daemon exchange suite covers pure-v2
+and v1 complementary swarms, plus pure-v2 restore and damaged payload recheck.
+The deployment test starts the built daemon with its Compose environment,
+restarts a disposable VPN namespace owner, and verifies the daemon rejoins it
+and answers through the published port. Archive checks exercise custom state
+mounts, SQLite WAL recovery, and restarting the writer after a backup failure. The parallel worker tests cover bounded HAVE delivery and
+resume checkpoints while a peer round is open.

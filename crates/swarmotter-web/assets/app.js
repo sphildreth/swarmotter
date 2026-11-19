@@ -3,7 +3,7 @@
 
 import { state } from "./js/state.js";
 import { $, $$, applyTheme, toggleTheme, setThemeRefreshHandler, setLogHandler } from "./js/ui.js";
-import { refreshTorrents, refreshTorrentTableTheme, setOpenDetailsHandler, applySavedTorrentQueryView, refreshProfileChoices } from "./js/torrents.js";
+import { pollTorrents, refreshTorrents, refreshTorrentTableTheme, setOpenDetailsHandler, applySavedTorrentQueryView, refreshProfileChoices } from "./js/torrents.js";
 import { openDetails, setRefreshTorrentsHandler } from "./js/details.js";
 import { refreshSettings, setSettingsDependencies } from "./js/settings.js";
 import { refreshNetwork, refreshWatch, refreshLogs, refreshDoctor, refreshDoctorBadge, appendLogLine, setEventsDependencies } from "./js/events.js";
@@ -39,6 +39,6 @@ if (themeToggle) themeToggle.addEventListener("click", toggleTheme);
   applySavedTorrentQueryView();
   await refreshTorrents();
   await refreshDoctorBadge();
-  window.setInterval(refreshTorrents, 5000);
+  window.setInterval(pollTorrents, 5000);
   window.setInterval(refreshDoctorBadge, 10000);
 })();

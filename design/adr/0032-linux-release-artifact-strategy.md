@@ -38,8 +38,8 @@ and stages those same prebuilt binaries through the `runtime-prebuilt`
 Dockerfile target, so release image publication does not compile Rust inside
 emulated Docker builds.
 
-Source builds declare Rust 1.88 as the minimum supported compiler. CI checks
-the locked workspace with Rust 1.88 in addition to the stable-toolchain quality
+Source builds declare Rust 1.89 as the minimum supported compiler. CI checks
+the locked workspace with Rust 1.89 in addition to the stable-toolchain quality
 gate; release builders may use a newer pinned compiler while preserving this
 source compatibility floor.
 

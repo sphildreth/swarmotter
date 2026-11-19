@@ -15,9 +15,9 @@ impl TorrentEngine {
         have: &mut PieceBitfield,
         bad_peers: &mut HashMap<SocketAddr, Instant>,
         peer_backoff: &mut HashMap<SocketAddr, Instant>,
-    ) -> (bool, Vec<PeerAddr>) {
+    ) -> (bool, Vec<PeerAddr>, Vec<EngineCommand>) {
         if candidates.len() < 2 {
-            return (false, Vec::new());
+            return (false, Vec::new(), Vec::new());
         }
 
         const PEER_REFILL_INTERVAL: Duration = Duration::from_secs(5);
@@ -69,7 +69,7 @@ impl TorrentEngine {
 
         if tasks.is_empty() {
             self.update_peer_scheduler_parallel_workers(0).await;
-            return (false, Vec::new());
+            return (false, Vec::new(), Vec::new());
         }
 
         {
@@ -79,127 +79,157 @@ impl TorrentEngine {
             s.peer_scheduler.serial_peer_active = false;
         }
 
+        let mut accounted = 0;
         let mut any_progress = false;
-        while !tasks.is_empty() {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                tasks.abort_all();
-                break;
-            }
-
-            let wait_for = remaining.min(PEER_REFILL_INTERVAL);
-            match timeout(wait_for, tasks.join_next()).await {
-                Ok(Some(joined)) => match joined {
-                    Ok((_, Ok(PeerSessionOutcome::Progressed))) => {
-                        any_progress = true;
+        let mut commands = Vec::new();
+        {
+            let workers = async {
+                while !tasks.is_empty() {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        tasks.abort_all();
+                        break;
                     }
-                    Ok((peer_addr, Ok(PeerSessionOutcome::NoProgress))) => {
-                        tracing::debug!(
-                            peer = %peer_addr.socket_addr(),
-                            "parallel peer session ended without progress"
+
+                    let wait_for = remaining.min(PEER_REFILL_INTERVAL);
+                    match timeout(wait_for, tasks.join_next()).await {
+                        Ok(Some(joined)) => match joined {
+                            Ok((_, Ok(PeerSessionOutcome::Progressed))) => {
+                                any_progress = true;
+                            }
+                            Ok((peer_addr, Ok(PeerSessionOutcome::NoProgress))) => {
+                                tracing::debug!(
+                                    peer = %peer_addr.socket_addr(),
+                                    "parallel peer session ended without progress"
+                                );
+                                backoff_peer(peer_backoff, peer_addr.socket_addr());
+                            }
+                            Ok((_, Ok(PeerSessionOutcome::NoWorkAvailable))) => {
+                                tracing::debug!(
+                                    "parallel peer session had no immediate in-session work"
+                                );
+                                // This peer had useful pieces, but all currently useful work
+                                // was already reserved by other workers. Do not penalize it.
+                            }
+                            Ok((peer_addr, Err(e))) => {
+                                tracing::debug!(peer = %peer_addr.socket_addr(), error = %e, "parallel peer failed; suppressing");
+                                record_peer_disconnect(&self.state).await;
+                                backoff_failed_peer(bad_peers, peer_addr.socket_addr());
+                            }
+                            Err(_) => {
+                                record_peer_disconnect(&self.state).await;
+                            }
+                        },
+                        Ok(None) => break,
+                        Err(_) => {}
+                    }
+
+                    let complete = {
+                        let work = shared.lock().await;
+                        work.remaining == 0
+                    };
+                    if complete {
+                        tasks.abort_all();
+                        break;
+                    }
+
+                    merge_dynamic_parallel_candidates(
+                        &mut candidates,
+                        &mut seen_candidates,
+                        &mut discovered_pex,
+                        &pex_peers,
+                        ParallelCandidateSuppression::new(bad_peers, peer_backoff),
+                        self.allow_ipv6,
+                        self.peer_filter.as_ref(),
+                    )
+                    .await;
+                    if Instant::now() >= next_discovery_refresh {
+                        let refreshed = self.refresh_discovery_peers(false).await;
+                        merge_parallel_candidate_iter(
+                            &mut candidates,
+                            &mut seen_candidates,
+                            refreshed,
+                            bad_peers,
+                            peer_backoff,
+                            self.allow_ipv6,
+                            self.peer_filter.as_ref(),
                         );
-                        backoff_peer(peer_backoff, peer_addr.socket_addr());
+                        next_discovery_refresh = Instant::now() + PEER_REFRESH_INTERVAL;
                     }
-                    Ok((_, Ok(PeerSessionOutcome::NoWorkAvailable))) => {
-                        tracing::debug!("parallel peer session had no immediate in-session work");
-                        // This peer had useful pieces, but all currently useful work
-                        // was already reserved by other workers. Do not penalize it.
-                    }
-                    Ok((peer_addr, Err(e))) => {
-                        tracing::debug!(peer = %peer_addr.socket_addr(), error = %e, "parallel peer failed; suppressing");
-                        record_peer_disconnect(&self.state).await;
-                        backoff_failed_peer(bad_peers, peer_addr.socket_addr());
-                    }
-                    Err(_) => {
-                        record_peer_disconnect(&self.state).await;
-                    }
-                },
-                Ok(None) => break,
-                Err(_) => {}
-            }
 
-            let complete = {
-                let work = shared.lock().await;
-                work.selection.complete(&work.have)
+                    let max_active = self.current_peer_worker_limit().max(1);
+                    let planned_session_count = max_active.min(candidates.len()).max(1);
+                    while !complete && next_candidate < candidates.len() && tasks.len() < max_active
+                    {
+                        spawn_parallel_peer_task(
+                            &mut tasks,
+                            candidates[next_candidate],
+                            self.meta.clone(),
+                            self.binder.clone(),
+                            self.peer_id,
+                            shared.clone(),
+                            storage.clone(),
+                            self.state.clone(),
+                            deadline,
+                            made_progress.clone(),
+                            pex_peers.clone(),
+                            self.limiter.clone(),
+                            self.utp_enabled,
+                            self.utp_prefer_tcp,
+                            self.encryption_mode,
+                            self.pex_enabled && !self.meta.is_private(),
+                            self.allow_ipv6,
+                            self.peer_filter.clone(),
+                            self.pex_max_peers,
+                            planned_session_count,
+                            self.peer_session_budget.clone(),
+                        );
+                        next_candidate += 1;
+                    }
+
+                    self.state.lock().await.active_peers = tasks.len();
+                }
             };
-            if complete {
-                tasks.abort_all();
-                break;
-            }
-
-            merge_dynamic_parallel_candidates(
-                &mut candidates,
-                &mut seen_candidates,
-                &mut discovered_pex,
-                &pex_peers,
-                ParallelCandidateSuppression::new(bad_peers, peer_backoff),
-                self.allow_ipv6,
-                self.peer_filter.as_ref(),
-            )
-            .await;
-            if Instant::now() >= next_discovery_refresh {
-                let refreshed = self.refresh_discovery_peers(false).await;
-                merge_parallel_candidate_iter(
-                    &mut candidates,
-                    &mut seen_candidates,
-                    refreshed,
-                    bad_peers,
-                    peer_backoff,
-                    self.allow_ipv6,
-                    self.peer_filter.as_ref(),
-                );
-                next_discovery_refresh = Instant::now() + PEER_REFRESH_INTERVAL;
-            }
-
-            let planned_session_count = max_active.min(candidates.len()).max(1);
-            while !complete && next_candidate < candidates.len() && tasks.len() < max_active {
-                spawn_parallel_peer_task(
-                    &mut tasks,
-                    candidates[next_candidate],
-                    self.meta.clone(),
-                    self.binder.clone(),
-                    self.peer_id,
-                    shared.clone(),
-                    storage.clone(),
-                    self.state.clone(),
-                    deadline,
-                    made_progress.clone(),
-                    pex_peers.clone(),
-                    self.limiter.clone(),
-                    self.utp_enabled,
-                    self.utp_prefer_tcp,
-                    self.encryption_mode,
-                    self.pex_enabled && !self.meta.is_private(),
-                    self.allow_ipv6,
-                    self.peer_filter.clone(),
-                    self.pex_max_peers,
-                    planned_session_count,
-                    self.peer_session_budget.clone(),
-                );
-                next_candidate += 1;
-            }
-
-            self.state.lock().await.active_peers = tasks.len();
+            let control = async {
+                tokio::pin!(workers);
+                let mut rx = self.commands.lock().await;
+                let mut channel_open = true;
+                let mut reannounce = false;
+                let mut relax_backoff = false;
+                loop {
+                    tokio::select! {
+                        cmd = rx.recv(), if channel_open => match cmd {
+                            Some(EngineCommand::Stop) => {
+                                commands.push(EngineCommand::Stop);
+                                break;
+                            }
+                            Some(EngineCommand::Reannounce) => reannounce = true,
+                            Some(EngineCommand::RelaxPeerBackoff) => relax_backoff = true,
+                            Some(EngineCommand::UpdatePeerWorkerLimit(limit)) => self.set_peer_worker_limit(limit),
+                            Some(EngineCommand::Recheck | EngineCommand::Pause | EngineCommand::Resume) => {}
+                            None => channel_open = false,
+                        },
+                        () = &mut workers => break,
+                    }
+                }
+                if reannounce {
+                    commands.push(EngineCommand::Reannounce);
+                }
+                if relax_backoff {
+                    commands.push(EngineCommand::RelaxPeerBackoff);
+                }
+            };
+            self.with_parallel_checkpoints(&shared, &storage, &mut accounted, control)
+                .await;
         }
-
+        tasks.shutdown().await;
+        self.checkpoint_parallel_progress(&shared, &storage, &mut accounted)
+            .await;
         let merged = shared.lock().await.have.clone();
         let progressed = any_progress || made_progress.load(std::sync::atomic::Ordering::Relaxed);
         if progressed {
-            let piece_count = self.meta.piece_count();
-            let newly_verified = merged
-                .count(piece_count)
-                .saturating_sub(have.count(piece_count));
-            for _ in 0..newly_verified {
-                self.mark_resume_piece_verified();
-            }
             *have = merged.clone();
             self.update_progress(&merged).await;
-            if let Err(e) = self
-                .maybe_persist_resume(storage.as_ref(), &merged, false)
-                .await
-            {
-                tracing::warn!(error = %e, "parallel resume persist failed");
-            }
         }
         {
             let mut s = self.state.lock().await;
@@ -216,7 +246,84 @@ impl TorrentEngine {
             self.peer_filter.as_ref(),
         )
         .await;
-        (progressed, discovered_pex)
+        (progressed, discovered_pex, commands)
+    }
+
+    /// Drive the coordinator and checkpoint independently. A queued Tokio
+    /// mutex waiter keeps its place until polled or dropped. Suspending the
+    /// coordinator while awaiting a checkpoint can strand that waiter ahead
+    /// of the checkpoint on the same lock.
+    pub(super) async fn with_parallel_checkpoints(
+        &self,
+        shared: &Mutex<ParallelPieceState>,
+        storage: &StorageIo,
+        accounted: &mut usize,
+        coordinator: impl std::future::Future<Output = ()>,
+    ) {
+        let mut completions = shared.lock().await.completion_count.subscribe();
+        let (finished, mut done) = tokio::sync::oneshot::channel();
+        let control = async {
+            coordinator.await;
+            let _ = finished.send(());
+        };
+        let checkpoints = async {
+            loop {
+                self.checkpoint_parallel_progress(shared, storage, accounted)
+                    .await;
+                let deadline = self.parallel_checkpoint_deadline().await;
+                let timer = async {
+                    match deadline {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    _ = &mut done => break,
+                    () = timer => {},
+                    Ok(()) = completions.changed() => {},
+                }
+            }
+        };
+        tokio::join!(control, checkpoints);
+    }
+
+    pub(super) async fn parallel_checkpoint_deadline(&self) -> Option<tokio::time::Instant> {
+        if self.resume_dirty_generation.load(Ordering::Relaxed)
+            == self.resume_checkpointed_generation.load(Ordering::Relaxed)
+        {
+            return None;
+        }
+        let deadline = *self.resume_checkpoint_at.lock().await + RESUME_CHECKPOINT_INTERVAL;
+        let now = tokio::time::Instant::now();
+        // If a due write failed, retry without spinning on the expired deadline.
+        Some(if deadline <= now {
+            now + Duration::from_secs(1)
+        } else {
+            deadline
+        })
+    }
+
+    pub(super) async fn checkpoint_parallel_progress(
+        &self,
+        shared: &Mutex<ParallelPieceState>,
+        storage: &StorageIo,
+        accounted: &mut usize,
+    ) {
+        let work = shared.lock().await;
+        let count = work.completed.len();
+        self.resume_dirty_generation
+            .fetch_add((count - *accounted) as u64, Ordering::Relaxed);
+        *accounted = count;
+        let Some(generation) = self.resume_checkpoint_due(false).await else {
+            return;
+        };
+        let have = work.have.clone();
+        drop(work);
+        match self.persist_resume(storage, &have).await {
+            Ok(()) => self.complete_resume_checkpoint(generation).await,
+            Err(error) => tracing::warn!(%error, "parallel resume checkpoint failed"),
+        }
     }
 }
 
@@ -318,6 +425,9 @@ pub(super) type PeerWriteHalf = tokio::io::WriteHalf<Box<dyn utp::PeerDuplex>>;
 #[derive(Debug, Clone)]
 pub(super) struct ParallelPieceState {
     pub(super) have: PieceBitfield,
+    pub(super) completed: Vec<u32>,
+    remaining: usize,
+    completion_count: tokio::sync::watch::Sender<usize>,
     pub(super) reserved: HashSet<usize>,
     pub(super) availability: Vec<u16>,
     pub(super) peer_pieces: HashMap<SocketAddr, Bitfield>,
@@ -360,12 +470,29 @@ pub(super) fn piece_shard(peer_addr: SocketAddr, piece_count: usize) -> usize {
 impl ParallelPieceState {
     pub(super) fn new(have: PieceBitfield, piece_count: usize, selection: PieceSelection) -> Self {
         Self {
+            remaining: selection.remaining(&have),
             have,
+            completed: Vec::new(),
+            completion_count: tokio::sync::watch::channel(0).0,
             reserved: HashSet::new(),
             availability: vec![0; piece_count],
             peer_pieces: HashMap::new(),
             selection,
         }
+    }
+
+    pub(super) fn record_verified(&mut self, index: usize) -> bool {
+        self.release_piece(index);
+        if self.have.has(index) {
+            return false;
+        }
+        self.have.set(index);
+        if self.selection.includes(index) {
+            self.remaining -= 1;
+        }
+        self.completed.push(index as u32);
+        self.completion_count.send_replace(self.completed.len());
+        true
     }
 
     pub(super) fn note_peer_bitfield(
@@ -375,15 +502,15 @@ impl ParallelPieceState {
         piece_count: usize,
     ) {
         if let Some(previous) = self.peer_pieces.insert(peer, bitfield.clone()) {
-            for i in 0..piece_count {
+            for (i, count) in self.availability.iter_mut().take(piece_count).enumerate() {
                 if previous.has(i) {
-                    self.availability[i] = self.availability[i].saturating_sub(1);
+                    *count = count.saturating_sub(1);
                 }
             }
         }
-        for i in 0..piece_count {
+        for (i, count) in self.availability.iter_mut().take(piece_count).enumerate() {
             if bitfield.has(i) {
-                self.availability[i] = self.availability[i].saturating_add(1);
+                *count = count.saturating_add(1);
             }
         }
     }
@@ -407,9 +534,9 @@ impl ParallelPieceState {
         let Some(previous) = self.peer_pieces.remove(&peer) else {
             return;
         };
-        for i in 0..piece_count {
+        for (i, count) in self.availability.iter_mut().take(piece_count).enumerate() {
             if previous.has(i) {
-                self.availability[i] = self.availability[i].saturating_sub(1);
+                *count = count.saturating_sub(1);
             }
         }
     }
@@ -776,14 +903,15 @@ pub(super) async fn parallel_peer_session(
 
     let piece_count = meta.piece_count();
     let mut our_bf = Bitfield::new(piece_count);
-    {
+    let mut announced_cursor = {
         let work = shared.lock().await;
         for i in 0..piece_count {
             if work.have.has(i) {
                 our_bf.set(i);
             }
         }
-    }
+        work.completed.len()
+    };
     peer::write_message(&mut write_half, &our_bf.encode_message()).await?;
     let extensions = if pex_enabled {
         vec![(swarmotter_core::extensions::UT_PEX_NAME, 1u8)]
@@ -822,10 +950,6 @@ pub(super) async fn parallel_peer_session(
     // Bounded inbound request queue for download-time serving, plus the set
     // of pieces this session has advertised as Have.
     let mut inbound_serve = InboundUploadQueue::default();
-    let mut announced_pieces = {
-        let work = shared.lock().await;
-        work.have.clone()
-    };
 
     loop {
         if Instant::now() > deadline {
@@ -834,7 +958,7 @@ pub(super) async fn parallel_peer_session(
         }
         let complete = {
             let work = shared.lock().await;
-            work.selection.complete(&work.have)
+            work.remaining == 0
         };
         if complete {
             no_progress_reason = "torrent_complete";
@@ -970,29 +1094,14 @@ pub(super) async fn parallel_peer_session(
                                         session_error = Some(e);
                                         break;
                                     }
-                                    let have_snapshot = {
-                                        let mut work = shared.lock().await;
-                                        if !work.have.has(piece_index) {
-                                            work.have.set(piece_index);
-                                            progressed = true;
-                                            made_progress
-                                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    if shared.lock().await.record_verified(piece_index) {
+                                        progressed = true;
+                                        made_progress.store(true, Ordering::Relaxed);
+                                        let mut live = state.lock().await;
+                                        if !live.pieces_have.has(piece_index) {
+                                            live.pieces_have.set(piece_index);
+                                            live.bytes_completed += data.len() as u64;
                                         }
-                                        work.release_piece(piece_index);
-                                        work.have.clone()
-                                    };
-                                    update_progress_state(&state, &meta, &have_snapshot).await;
-                                    if let Err(e) = peer::write_message(
-                                        &mut write_half,
-                                        &Message::Have {
-                                            piece: piece_index as u32,
-                                        },
-                                    )
-                                    .await
-                                    {
-                                        no_progress_reason = "send_have_failed";
-                                        session_error = Some(e);
-                                        break;
                                     }
                                     if let Err(e) = fill_parallel_piece_window(
                                         &mut write_half,
@@ -1083,12 +1192,12 @@ pub(super) async fn parallel_peer_session(
                             // Download-time serving (ADR-0075): only verified
                             // pieces are offered; invalid or saturated requests
                             // are ignored.
-                            let have_snapshot = shared.lock().await.have.clone();
+                            let work = shared.lock().await;
                             inbound_serve.offer(
                                 piece,
                                 offset,
                                 length,
-                                &have_snapshot,
+                                &work.have,
                                 piece_count,
                                 |index| meta.piece_length_for_index_u32(index).unwrap_or(0) as u64,
                             );
@@ -1122,8 +1231,7 @@ pub(super) async fn parallel_peer_session(
                     if let Err(e) = announce_new_verified_pieces(
                         &mut write_half,
                         &shared,
-                        &mut announced_pieces,
-                        piece_count,
+                        &mut announced_cursor,
                     )
                     .await
                     {
@@ -1226,15 +1334,10 @@ pub(super) async fn parallel_peer_session(
                 offset,
                 length,
             } => {
-                let have_snapshot = shared.lock().await.have.clone();
-                inbound_serve.offer(
-                    piece,
-                    offset,
-                    length,
-                    &have_snapshot,
-                    piece_count,
-                    |index| meta.piece_length_for_index_u32(index).unwrap_or(0) as u64,
-                );
+                let work = shared.lock().await;
+                inbound_serve.offer(piece, offset, length, &work.have, piece_count, |index| {
+                    meta.piece_length_for_index_u32(index).unwrap_or(0) as u64
+                });
             }
             Message::Cancel {
                 piece,
@@ -1260,13 +1363,8 @@ pub(super) async fn parallel_peer_session(
             shared.lock().await.remove_peer(peer_socket, piece_count);
             return Err(e);
         }
-        if let Err(e) = announce_new_verified_pieces(
-            &mut write_half,
-            &shared,
-            &mut announced_pieces,
-            piece_count,
-        )
-        .await
+        if let Err(e) =
+            announce_new_verified_pieces(&mut write_half, &shared, &mut announced_cursor).await
         {
             shared.lock().await.remove_peer(peer_socket, piece_count);
             return Err(e);

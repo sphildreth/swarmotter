@@ -1044,3 +1044,57 @@ fn progress_save_does_not_rewrite_unchanged_canonical_metadata() {
     drop(connection);
     remove_state(&path);
 }
+
+#[test]
+fn incremental_retention_counts_track_inserts_deletes_and_rollbacks() {
+    let path = unique_path("incremental-retention");
+    let mut state = single_torrent_state();
+    save(&path, &state).unwrap();
+    state.torrents[0].uploaded += 1;
+    save_changed_records(&path, &state.torrents, None).unwrap();
+    let mut db = open_sqlite(&path).unwrap();
+    for commit in [false, true] {
+        let tx = db.transaction().unwrap();
+        prune_incremental_overflow(&tx, "torrent_metric_samples", "observed_at", 1).unwrap();
+        assert_eq!(
+            tx.query_row(
+                "SELECT n FROM retention_counts WHERE name='torrent_metric_samples'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM torrent_metric_samples", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        if commit {
+            tx.commit().unwrap()
+        } else {
+            tx.rollback().unwrap()
+        }
+    }
+    db.execute_batch(
+        "UPDATE retention_counts SET n=123; DROP TRIGGER torrent_metric_samples_retention_insert;",
+    )
+    .unwrap();
+    drop(db);
+    rebuild_projections(&path).unwrap();
+    let db = open_sqlite(&path).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT n FROM retention_counts WHERE name='torrent_metric_samples'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
+    assert!(db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='torrent_metric_samples_retention_insert')",
+        [], |row| row.get::<_, bool>(0)).unwrap());
+    drop(db);
+    remove_state(&path);
+}

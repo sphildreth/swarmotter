@@ -16,6 +16,16 @@ services:
       - "${SWARMOTTER_WEB_PORT:-9091}:9091"
     volumes:
       - "${GLUETUN_STATE_DIR:-/srv/swarmotter/gluetun}:/gluetun"
+      - vpn-namespace:/run/swarmotter-vpn
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          /gluetun-entrypoint healthcheck &&
+          ns=$$(readlink /proc/self/ns/net) &&
+          { [ "$$(cat /run/swarmotter-vpn/netns 2>/dev/null)" = "$$ns" ] ||
+          (umask 022 && echo "$$ns" > /run/swarmotter-vpn/netns.tmp &&
+          mv /run/swarmotter-vpn/netns.tmp /run/swarmotter-vpn/netns); }
     logging:
       driver: json-file
       options:
@@ -29,6 +39,7 @@ services:
     depends_on:
       vpn:
         condition: service_healthy
+        restart: true
     # config/swarmotter.container.toml.example explicitly disables in-process
     # containment only because this joins Gluetun's firewall/kill-switch
     # namespace. Do not remove this shared-namespace boundary or attach a
@@ -36,6 +47,7 @@ services:
     network_mode: "service:vpn"
     stop_grace_period: 45s
     environment:
+      VPN_NAMESPACE_FILE: /run/swarmotter-vpn/netns
       SWARMOTTER_API__REQUIRE_AUTH: ${SWARMOTTER_API_REQUIRE_AUTH:-true}
       SWARMOTTER_API__AUTH_TOKEN: ${SWARMOTTER_API_TOKEN:-}
     volumes:
@@ -43,6 +55,7 @@ services:
       - "${SWARMOTTER_DOWNLOADS:-/srv/swarmotter/downloads}:/data/downloads"
       - "${SWARMOTTER_INCOMPLETE:-/srv/swarmotter/incomplete}:/data/incomplete"
       - "${SWARMOTTER_STATE:-/srv/swarmotter/state}:/var/lib/swarmotter"
+      - vpn-namespace:/run/swarmotter-vpn:ro
     security_opt:
       - no-new-privileges:true
     ulimits:
@@ -55,3 +68,6 @@ services:
         max-size: "10m"
         max-file: "3"
     restart: unless-stopped
+
+volumes:
+  vpn-namespace:

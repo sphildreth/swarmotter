@@ -2151,6 +2151,8 @@ async fn pure_v2_engine_completes_a_contained_local_swarm() {
     let binder: Arc<dyn NetworkBinder> = Arc::new(swarmotter_core::net::binder::LoopbackBinder);
     let state = Arc::new(Mutex::new(EngineState::default()));
     let (_commands, receiver) = tokio::sync::mpsc::channel(1);
+    let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = checks.clone();
     let engine = TorrentEngine::new(
         meta.clone(),
         output.clone(),
@@ -2161,6 +2163,10 @@ async fn pure_v2_engine_completes_a_contained_local_swarm() {
         vec![seed],
         0,
     )
+    .with_storage_recheck_executor(Arc::new(move |storage| {
+        observed.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move { storage.recheck().await })
+    }))
     .with_transport(false, true)
     .with_encryption_mode(PeerEncryptionMode::Disabled);
 
@@ -2168,6 +2174,7 @@ async fn pure_v2_engine_completes_a_contained_local_swarm() {
         .await
         .expect("pure-v2 local swarm must not stall")
         .unwrap();
+    assert_eq!(checks.load(Ordering::Relaxed), 1);
     assert!(final_state.finished);
     assert_eq!(final_state.piece_count, 4);
     assert_eq!(final_state.bytes_completed, meta.total_length);
@@ -2472,6 +2479,107 @@ fn checkpoint_engine_fixture(
     .with_torrent_key(key);
     let storage = StorageIo::new(meta, dir.to_path_buf()).with_torrent_key(key);
     (engine, storage)
+}
+
+#[tokio::test]
+async fn checkpoint_and_peer_coordinator_continue_when_both_need_the_piece_lock() {
+    let dir = unique_dir("parallel-checkpoint-lock");
+    let (engine, storage) = checkpoint_engine_fixture(&dir, &[7; 100], 1);
+    let shared = Mutex::new(ParallelPieceState::new(
+        PieceBitfield::new(100),
+        100,
+        PieceSelection::all(&engine.meta),
+    ));
+    let mut accounted = 0;
+    let control = async {
+        let mut work = shared.lock().await;
+        for index in 0..64 {
+            work.record_verified(index);
+        }
+        // Notify the checkpointer while the coordinator still holds the
+        // lock, then require the executor to poll the coordinator to free it.
+        tokio::task::yield_now().await;
+        drop(work);
+        while engine.resume_checkpoints_written() == 0 {
+            tokio::task::yield_now().await;
+        }
+    };
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        engine.with_parallel_checkpoints(&shared, &storage, &mut accounted, control),
+    )
+    .await
+    .expect("the coordinator and checkpoint must make progress together");
+    assert_eq!(accounted, 64);
+    let resume = storage
+        .load_resume(&storage.torrent_key())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resume.piece_bitfield.count(100), 64);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_completions_fan_out_once_and_checkpoint_while_round_is_open() {
+    let dir = unique_dir("parallel-progress");
+    let (engine, storage) = checkpoint_engine_fixture(&dir, &[7; 100], 1);
+    let work = Arc::new(Mutex::new(ParallelPieceState::new(
+        PieceBitfield::new(100),
+        100,
+        PieceSelection::all(&engine.meta),
+    )));
+    let mut accounted = 0;
+    tokio::time::advance(Duration::from_millis(2300)).await;
+    for piece in 0..65 {
+        assert!(work.lock().await.record_verified(piece));
+        assert!(!work.lock().await.record_verified(piece));
+    }
+    engine
+        .checkpoint_parallel_progress(&work, &storage, &mut accounted)
+        .await;
+    let resume = storage
+        .load_resume(&storage.torrent_key())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(resume.piece_bitfield.count(100), 65);
+    let mut cursor = 0;
+    let mut wire = Vec::new();
+    announce_new_verified_pieces(&mut wire, &work, &mut cursor)
+        .await
+        .unwrap();
+    assert_eq!(cursor, 64);
+    announce_new_verified_pieces(&mut wire, &work, &mut cursor)
+        .await
+        .unwrap();
+    let len = wire.len();
+    assert_eq!(cursor, 65);
+    announce_new_verified_pieces(&mut wire, &work, &mut cursor)
+        .await
+        .unwrap();
+    assert_eq!(wire.len(), len);
+
+    let checkpoint_time = *engine.resume_checkpoint_at.lock().await;
+    tokio::time::advance(Duration::from_millis(1400)).await;
+    work.lock().await.record_verified(88);
+    engine
+        .checkpoint_parallel_progress(&work, &storage, &mut accounted)
+        .await;
+    assert_eq!(engine.resume_checkpoints_written(), 1);
+    let deadline = engine.parallel_checkpoint_deadline().await.unwrap();
+    assert_eq!(deadline, checkpoint_time + RESUME_CHECKPOINT_INTERVAL);
+    tokio::time::sleep_until(deadline).await;
+    engine
+        .checkpoint_parallel_progress(&work, &storage, &mut accounted)
+        .await;
+    let resume = storage
+        .load_resume(&storage.torrent_key())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(resume.piece_bitfield.has(88));
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]

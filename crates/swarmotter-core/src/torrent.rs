@@ -218,7 +218,7 @@ impl Torrent {
     }
 
     pub fn bytes_completed(&self) -> u64 {
-        verified_bytes(&self.meta, self.progress.bitfield())
+        self.progress.verified_bytes(&self.meta)
     }
 
     pub fn progress(&self) -> f64 {
@@ -248,10 +248,7 @@ impl Torrent {
             seeding_status: self.seeding_status,
             effective_ratio_limit: None,
             effective_idle_limit: None,
-            piece_count: self
-                .meta
-                .data_piece_count()
-                .unwrap_or_else(|_| self.meta.piece_count()),
+            piece_count: self.progress.total,
             pieces_have: self.pieces_have(),
             piece_length: self.meta.piece_length,
             private: self.meta.is_private(),
@@ -348,6 +345,44 @@ pub fn verified_bytes(meta: &TorrentMeta, bitfield: &crate::storage::PieceBitfie
         .sum()
 }
 
+/// Keep list projections alongside the records they describe. Single-record
+/// mutations evict one entry; arbitrary bulk map edits invalidate all entries.
+#[derive(Debug, Default)]
+pub struct TorrentRecords {
+    inner: BTreeMap<TorrentKey, Torrent>,
+    summaries: BTreeMap<TorrentKey, TorrentSummary>,
+}
+
+impl std::ops::Deref for TorrentRecords {
+    type Target = BTreeMap<TorrentKey, Torrent>;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for TorrentRecords {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.summaries.clear();
+        &mut self.inner
+    }
+}
+
+impl<'a> IntoIterator for &'a TorrentRecords {
+    type Item = (&'a TorrentKey, &'a Torrent);
+    type IntoIter = std::collections::btree_map::Iter<'a, TorrentKey, Torrent>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut TorrentRecords {
+    type Item = (&'a TorrentKey, &'a mut Torrent);
+    type IntoIter = std::collections::btree_map::IterMut<'a, TorrentKey, Torrent>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter_mut()
+    }
+}
+
 /// A registry holding all torrents by full [`TorrentKey`].
 ///
 /// A hybrid torrent is stored only once under its v1 primary key. Its full
@@ -355,7 +390,7 @@ pub fn verified_bytes(meta: &TorrentMeta, bitfield: &crate::storage::PieceBitfie
 /// the same record without allowing two records to claim one alias.
 #[derive(Debug, Default)]
 pub struct TorrentRegistry {
-    pub torrents: BTreeMap<TorrentKey, Torrent>,
+    pub torrents: TorrentRecords,
     aliases: BTreeMap<TorrentKey, TorrentKey>,
 }
 
@@ -369,7 +404,7 @@ impl TorrentRegistry {
                 return Err(*key);
             }
         }
-        self.torrents.insert(primary, torrent);
+        self.torrents.inner.insert(primary, torrent);
         for key in keys {
             if key != primary {
                 self.aliases.insert(key, primary);
@@ -390,7 +425,8 @@ impl TorrentRegistry {
     pub fn remove(&mut self, key: &TorrentKey) -> Option<Torrent> {
         let primary = self.canonical_key(key)?;
         self.aliases.retain(|_, target| *target != primary);
-        self.torrents.remove(&primary)
+        self.torrents.summaries.remove(&primary);
+        self.torrents.inner.remove(&primary)
     }
 
     pub fn get(&self, key: &TorrentKey) -> Option<&Torrent> {
@@ -399,8 +435,25 @@ impl TorrentRegistry {
     }
 
     pub fn get_mut(&mut self, key: &TorrentKey) -> Option<&mut Torrent> {
-        self.canonical_key(key)
-            .and_then(|primary| self.torrents.get_mut(&primary))
+        let primary = self.canonical_key(key)?;
+        self.torrents.summaries.remove(&primary);
+        self.torrents.inner.get_mut(&primary)
+    }
+
+    pub fn list_summaries(
+        &mut self,
+        mut project: impl FnMut(&Torrent, TorrentSummary) -> TorrentSummary,
+    ) -> Vec<TorrentSummary> {
+        let TorrentRecords { inner, summaries } = &mut self.torrents;
+        inner
+            .iter()
+            .map(|(key, torrent)| {
+                let base = summaries
+                    .entry(*key)
+                    .or_insert_with(|| torrent.to_summary());
+                project(torrent, base.clone())
+            })
+            .collect()
     }
 
     pub fn list(&self) -> Vec<&Torrent> {
@@ -428,6 +481,29 @@ mod tests {
         let t2 = Torrent::new(meta, 2);
         assert!(reg.add(t2).is_err()); // duplicate
         assert_eq!(reg.torrents.len(), 1);
+    }
+
+    #[test]
+    fn list_projection_reuses_unchanged_summaries_and_refreshes_verified_bytes() {
+        let mut registry = TorrentRegistry::default();
+        let mut keys = Vec::new();
+        for name in ["one", "two"] {
+            let meta = crate::meta::parse_torrent(&build_single_file_torrent(
+                name, b"abc", 2, None, false,
+            ))
+            .unwrap();
+            let torrent = Torrent::new(meta, 1);
+            keys.push(torrent.key());
+            registry.add(torrent).unwrap();
+        }
+        registry.list_summaries(|_, summary| summary);
+        assert_eq!(registry.torrents.summaries.len(), 2);
+        registry.get_mut(&keys[0]).unwrap().progress.have_piece(1);
+        assert!(registry.torrents.summaries.contains_key(&keys[1]));
+        assert!(!registry.torrents.summaries.contains_key(&keys[0]));
+        registry.list_summaries(|_, summary| summary);
+        assert_eq!(registry.torrents.summaries[&keys[0]].pieces_have, 1);
+        assert_eq!(registry.torrents.summaries[&keys[0]].bytes_completed, 1);
     }
 
     #[test]

@@ -158,36 +158,19 @@ impl InboundUploadQueue {
 pub(super) async fn announce_new_verified_pieces<W>(
     write_half: &mut W,
     shared: &Arc<Mutex<ParallelPieceState>>,
-    announced: &mut PieceBitfield,
-    piece_count: usize,
+    cursor: &mut usize,
 ) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let snapshot = {
+    let pieces = {
         let work = shared.lock().await;
-        work.have.clone()
+        let end = (*cursor + 64).min(work.completed.len());
+        work.completed[*cursor..end].to_vec()
     };
-    // Bound the fan-out per iteration; remaining updates are picked up on
-    // subsequent iterations of the session loop.
-    let mut sent = 0usize;
-    for piece in 0..piece_count {
-        if snapshot.has(piece) && !announced.has(piece) {
-            peer::write_message(
-                write_half,
-                &Message::Have {
-                    piece: u32::try_from(piece).map_err(|_| {
-                        CoreError::MalformedTorrent("piece index exceeds peer-wire range".into())
-                    })?,
-                },
-            )
-            .await?;
-            announced.set(piece);
-            sent += 1;
-            if sent >= 64 {
-                break;
-            }
-        }
+    for piece in pieces {
+        peer::write_message(write_half, &Message::Have { piece }).await?;
+        *cursor += 1;
     }
     Ok(())
 }

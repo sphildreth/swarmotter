@@ -304,6 +304,29 @@ try {
   assert.equal(TabulatorFixture.instances[0].rows.length, 1, "initial torrent row must render");
   assert.equal(elements.get("health-badge").textContent, "OK");
   assert.match(elements.get("stats-summary").textContent, /1 torrents/);
+
+  const { pollTorrents, refreshTorrents } = await import(pathToFileURL(join(fixtureDirectory, "js", "torrents.js")));
+  document.hidden = true;
+  assert.equal(pollTorrents(), undefined);
+  document.hidden = false;
+  elements.get("view-torrents").classList.add("hidden");
+  assert.equal(pollTorrents(), undefined);
+  elements.get("view-torrents").classList.remove("hidden");
+
+  const fixtureFetch = globalThis.fetch;
+  let release;
+  const parked = new Promise(resolve => { release = resolve; });
+  globalThis.fetch = async input => {
+    if (String(input).includes("/torrents/query")) await parked;
+    return fixtureFetch(input);
+  };
+  const stale = pollTorrents();
+  assert.ok(stale);
+  assert.equal(pollTorrents(), undefined, "a delayed poll must not start a second request");
+  globalThis.fetch = fixtureFetch;
+  assert.ok(await refreshTorrents(), "user actions can supersede a pending poll");
+  release();
+  assert.equal(await stale, null, "a stale response must not replace the current query");
 } finally {
   process.off("unhandledRejection", recordUnhandledRejection);
   console.log = originalConsoleLog;

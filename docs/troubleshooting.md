@@ -240,8 +240,17 @@ docker compose --env-file .env -f compose.yml exec swarmotter \
   curl -fsS http://127.0.0.1:9091/health
 ```
 
-If that succeeds but host `curl http://127.0.0.1:9091/health` fails, Gluetun is
-blocking the published control-plane port. Set this in `gluetun.env`:
+If only the in-container request succeeds, compare the network namespaces:
+
+```bash
+docker exec swarmotter readlink /proc/self/ns/net
+docker exec swarmotter-vpn readlink /proc/self/ns/net
+```
+
+Different IDs indicate a stale namespace. The current Compose deployment
+rejoins the daemon automatically after Gluetun becomes healthy. With an older
+deployment, restart the SwarmOtter container and repeat the host check. If
+the IDs match, check the port mapping and the following Gluetun setting:
 
 ```dotenv
 FIREWALL_INPUT_PORTS=9091

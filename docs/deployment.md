@@ -297,6 +297,13 @@ docker buildx imagetools inspect ghcr.io/sphildreth/swarmotter:latest
 docker compose --env-file .env -f compose.yml exec swarmotter curl -fsS https://ifconfig.me
 ```
 
+Gluetun publishes its healthy network namespace ID in a dedicated volume.
+SwarmOtter reads that ID during its container health check. A changed ID causes
+a graceful daemon exit and Docker rejoins the current VPN namespace on restart.
+A VPN reconnect within the same namespace leaves the daemon running. Check
+`curl -fsS http://localhost:9091/health` on the host to verify the published
+port after recovery. Use the updated Compose file with the updated daemon image.
+
 Update explicitly when a new stable release image is published:
 
 ```bash
@@ -318,11 +325,15 @@ helper uses sudo only where needed to read or update deployment secrets and
 state. With no image argument, it resolves the latest GitHub Release and uses
 the matching `ghcr.io/sphildreth/swarmotter:vX.Y.Z` image. If the running
 container already has that version label, the helper exits without backing up,
-pulling, or restarting. Otherwise, it backs up Compose environment files,
-SwarmOtter configuration, SwarmOtter state, and Gluetun state into
-`~/swarmotter-backups`, updates `SWARMOTTER_IMAGE`, and asks supported target
-images to validate the mounted configuration before stopping the healthy
-stack. It then recreates the Compose stack so Docker attaches networks before
+pulling, or restarting. For an upgrade it pulls the image and validates its
+configuration first. It then stops the running daemon, archives the deployment
+files and state into `~/swarmotter-backups`, and restores the active state
+file and its SQLite sidecars in a private directory for verification. This
+also covers a state file placed on a custom persistent mount.
+Keep `verify-state-backup.py` next to the updater and install Python 3.11
+or later with SQLite support on the host. A failed backup stops the upgrade
+and restarts the original daemon. After verification the updater changes
+`SWARMOTTER_IMAGE` and recreates the Compose stack so Docker attaches networks before
 Gluetun installs VPN routes, validates the health endpoint, image labels, and
 contained egress from the SwarmOtter container, and keeps a local rollback
 image tag. Failed validation also prints service status and recent container

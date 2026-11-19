@@ -196,9 +196,14 @@ impl TorrentEngine {
         let mut unusable_since = None;
         let mut empty_since: Option<tokio::time::Instant> = None;
 
+        let mut round_commands = std::collections::VecDeque::new();
         loop {
             // Handle pending commands.
-            match self.poll_commands().await {
+            match if let Some(cmd) = round_commands.pop_front() {
+                self.apply_command(cmd)
+            } else {
+                self.poll_commands().await
+            } {
                 CommandOutcome::Stop => {
                     self.state.lock().await.stopped_by_command = true;
                     // Lifecycle boundary: a stop must not lose verified
@@ -323,7 +328,7 @@ impl TorrentEngine {
             self.record_peer_scheduler(scheduler).await;
 
             if candidates.len() > 1 {
-                let (progressed, pex_peers) = self
+                let (progressed, pex_peers, commands) = self
                     .run_parallel_peer_round(
                         &candidates,
                         max_concurrent,
@@ -333,7 +338,7 @@ impl TorrentEngine {
                         &mut peer_backoff,
                     )
                     .await;
-                made_progress = progressed;
+                made_progress |= progressed;
                 for peer in pex_peers {
                     if self.peer_allowed(&peer) && !discovered.contains(&peer) {
                         discovered.push(peer);
@@ -341,6 +346,10 @@ impl TorrentEngine {
                 }
                 dedupe_peers(&mut discovered);
                 self.state.lock().await.peers = discovered.clone();
+                round_commands.extend(commands);
+                if !round_commands.is_empty() {
+                    continue;
+                }
             }
 
             // Single-peer fallback and diagnostic path. This also preserves
@@ -548,7 +557,7 @@ impl TorrentEngine {
         }
     }
 
-    async fn recheck_storage(&self, storage: &StorageIo) -> Result<PieceBitfield> {
+    pub(super) async fn recheck_storage(&self, storage: &StorageIo) -> Result<PieceBitfield> {
         if let Some(executor) = &self.storage_recheck_executor {
             executor(storage.clone()).await
         } else {
@@ -634,18 +643,22 @@ impl TorrentEngine {
 
     pub(super) async fn poll_commands(&self) -> CommandOutcome {
         let mut rx = self.commands.lock().await;
-        match rx.try_recv() {
-            Ok(EngineCommand::Stop) => CommandOutcome::Stop,
-            Ok(EngineCommand::Pause) => CommandOutcome::Pause,
-            Ok(EngineCommand::Resume) => CommandOutcome::Continue,
-            Ok(EngineCommand::Reannounce) => CommandOutcome::Reannounce,
-            Ok(EngineCommand::Recheck) => CommandOutcome::Continue,
-            Ok(EngineCommand::RelaxPeerBackoff) => CommandOutcome::RelaxPeerBackoff,
-            Ok(EngineCommand::UpdatePeerWorkerLimit(limit)) => {
+        rx.try_recv()
+            .map_or(CommandOutcome::Continue, |cmd| self.apply_command(cmd))
+    }
+
+    fn apply_command(&self, cmd: EngineCommand) -> CommandOutcome {
+        match cmd {
+            EngineCommand::Stop => CommandOutcome::Stop,
+            EngineCommand::Pause => CommandOutcome::Pause,
+            EngineCommand::Resume => CommandOutcome::Continue,
+            EngineCommand::Reannounce => CommandOutcome::Reannounce,
+            EngineCommand::Recheck => CommandOutcome::Continue,
+            EngineCommand::RelaxPeerBackoff => CommandOutcome::RelaxPeerBackoff,
+            EngineCommand::UpdatePeerWorkerLimit(limit) => {
                 self.set_peer_worker_limit(limit);
                 CommandOutcome::Continue
             }
-            Err(_) => CommandOutcome::Continue,
         }
     }
 
