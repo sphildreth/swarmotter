@@ -19,7 +19,9 @@ date or duration estimates.
 
 - Pure-v2 restore and manual recheck verify payloads using their file-aligned
   SHA-256 piece layout. Incomplete v2 peers can exchange verified blocks in
-  both directions over contained connections.
+  both directions over contained connections. Uploads flush buffered replies
+  and share the peer-session deadline while downloads continue under backpressure.
+  Transfer totals survive engine retries.
 - Compose deployments recover when Gluetun restarts into a new network
   namespace. The daemon rejoins that namespace so its published port works
   again. This requires the updated Compose file and daemon image.

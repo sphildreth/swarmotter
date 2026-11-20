@@ -24,6 +24,12 @@ engine, and use the identical containment-gated binder as all other data-plane
 traffic. Verified-piece `Have` messages fan out to connected peers so remote
 peers learn new pieces promptly.
 
+On outbound pure-v2 sessions, the reader queues verified block requests for
+one concurrent writer. The writer flushes each reply, including rejections.
+A bounded request window leaves room for uploads in the same session, and
+the session deadline releases a writer stalled on bandwidth or socket I/O.
+A peer that exceeds the bounded write queue is disconnected.
+
 ## Consequences
 
 - Two (or more) incomplete daemons complete torrents by mutual exchange.

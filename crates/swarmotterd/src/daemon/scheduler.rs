@@ -917,8 +917,24 @@ impl DaemonRuntime {
                 .metrics_for_path(&config, Path::new(&active_dir)),
         );
 
-        let state = Arc::new(Mutex::new(EngineState::default()));
-        self.engine_states.write().await.insert(hash, state.clone());
+        // Uploads from an inbound session can finish as the previous attempt
+        // exits. Keep its counter owner across retries and seed a fresh runtime
+        // from the durable totals. Peer health and piece state are per attempt.
+        let state = self
+            .engine_states
+            .write()
+            .await
+            .entry(hash)
+            .or_default()
+            .clone();
+        {
+            let mut live = state.lock().await;
+            *live = EngineState {
+                downloaded: live.downloaded.max(snapshot.downloaded),
+                uploaded: live.uploaded.max(snapshot.uploaded),
+                ..EngineState::default()
+            };
+        }
         // Installed before task visibility so lifecycle operations can cancel
         // a saturated metadata-admission or startup-recheck wait.
         let storage_work_cancellation = StorageWorkCancellation::new();

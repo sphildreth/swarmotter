@@ -453,7 +453,7 @@ async fn no_peer_path_waits_for_forced_dht_timeout_before_bounded_exit() {
     std::fs::remove_dir_all(fixture.dir).unwrap();
 }
 
-fn unique_dir(label: &str) -> PathBuf {
+pub(super) fn unique_dir(label: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
         "swarmotter-engine-{}-{}-{}",
         label,
@@ -1974,7 +1974,12 @@ async fn engine_start_sizes_file_when_sparse_disabled() {
 }
 
 fn pure_v2_local_swarm_meta() -> (TorrentMeta, Vec<Vec<u8>>) {
-    let piece_length = V2_BLOCK_LENGTH;
+    pure_v2_swarm_meta_with_piece_length(V2_BLOCK_LENGTH)
+}
+
+pub(super) fn pure_v2_swarm_meta_with_piece_length(
+    piece_length: u64,
+) -> (TorrentMeta, Vec<Vec<u8>>) {
     let first = (0..(piece_length as usize + 19))
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();

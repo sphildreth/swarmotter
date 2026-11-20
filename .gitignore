@@ -24,3 +24,4 @@ book/
 .kilo/node_modules/
 deploy/.env
 deploy/gluetun.env
+__pycache__/
