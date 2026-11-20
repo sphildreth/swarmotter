@@ -18,9 +18,7 @@ fn torrent_piece_count(torrent: &Torrent) -> usize {
 fn validate_torrent_piece_progress(torrent: &Torrent, piece_count: usize) -> Result<()> {
     let expected_bitfield_bytes = piece_count.div_ceil(8);
     if torrent.progress.total != piece_count
-        || torrent.progress.bitfield().as_bytes().len() != expected_bitfield_bytes
-        || (piece_count..expected_bitfield_bytes.saturating_mul(8))
-            .any(|index| torrent.progress.bitfield().has(index))
+        || !torrent.progress.bitfield().fits_piece_count(piece_count)
     {
         return Err(CoreError::Storage(format!(
             "daemon state for {} has inconsistent piece progress (total={}, expected_total={}, bitfield_bytes={}, expected_bitfield_bytes={})",
@@ -50,14 +48,38 @@ fn normalize_legacy_unresolved_magnet_progress(torrent: &mut Torrent, piece_coun
     true
 }
 
-fn daemon_state_for_persistence(
-    torrents: Vec<Torrent>,
-    queue: QueueState<TorrentKey>,
-) -> Result<crate::state_store::DaemonState> {
-    for torrent in &torrents {
-        validate_torrent_piece_progress(torrent, torrent_piece_count(torrent))?;
+/// Restore only verified progress. A saved placeholder describes a different
+/// piece space from its resolved torrent even when both use the same key.
+fn recover_piece_progress(torrent: &mut Torrent, previous: Option<&Torrent>) {
+    let count = torrent_piece_count(torrent);
+    match previous {
+        Some(previous)
+            if previous.needs_metadata == torrent.needs_metadata
+                && previous.progress.total == count =>
+        {
+            torrent
+                .progress
+                .replace_from_bitfield(previous.progress.bitfield(), count);
+        }
+        _ => torrent.progress = swarmotter_core::storage::PieceProgress::new(count),
     }
-    Ok(crate::state_store::DaemonState::new(torrents, queue))
+    torrent.recompute_file_bytes_completed();
+    if !torrent.progress.is_complete() {
+        torrent.seeding_status = SeedingStatus::NotEligible;
+        if matches!(
+            torrent.state,
+            TorrentState::Completed | TorrentState::Seeding
+        ) {
+            if torrent_selection_complete(torrent, torrent.progress.bitfield()).unwrap_or(false) {
+                torrent.state = TorrentState::Completed;
+            } else {
+                torrent.state = TorrentState::StorageError;
+                torrent.date_completed = None;
+                torrent.error =
+                    Some("Saved progress cannot confirm completion. Recheck this torrent.".into());
+            }
+        }
+    }
 }
 
 /// Cheap structural identity of a torrent's immutable metadata. When this
@@ -152,6 +174,10 @@ fn torrent_durable_fingerprint(t: &Torrent, meta_structural: u64, meta_full: u64
     hash.update(&meta_structural.to_le_bytes());
     hash.update(&meta_full.to_le_bytes());
     hash.update_field(t.state.as_str().as_bytes());
+    hash.update(&[t
+        .current_pause_reason()
+        .map_or(0, |reason| reason as u8 + 1)]);
+    hash.update_len(t.progress.total);
     hash.update(t.progress.bitfield().as_bytes());
     hash.update(&t.downloaded.to_le_bytes());
     hash.update(&t.uploaded.to_le_bytes());
@@ -296,25 +322,6 @@ fn queue_fingerprint(queue: &QueueState<TorrentKey>) -> u64 {
 }
 
 impl DaemonRuntime {
-    /// Adopt only the generation actually committed, never live values that
-    /// might have changed while the disk write was in progress.
-    async fn adopt_durable_snapshot(&self, state: &crate::state_store::DaemonState) {
-        let mut meta_fps = self.meta_fingerprints.lock().await;
-        let mut fingerprints = self.durable_fingerprints.lock().await;
-        meta_fps.clear();
-        fingerprints.clear();
-        for torrent in &state.torrents {
-            let meta_cheap = meta_identity_fingerprint(torrent);
-            let meta_full = meta_full_fingerprint(torrent);
-            meta_fps.insert(torrent.key(), (meta_cheap, meta_full));
-            fingerprints.insert(
-                torrent.key(),
-                torrent_durable_fingerprint(torrent, meta_cheap, meta_full),
-            );
-        }
-        *self.durable_queue_fingerprint.lock().await = queue_fingerprint(&state.queue);
-    }
-
     pub async fn restore_persisted_state(&self) -> Result<usize> {
         let Some(path) = self.state_path.clone() else {
             return Ok(0);
@@ -720,7 +727,20 @@ impl DaemonRuntime {
         let mut timer = crate::persistence_metrics::SaveTimer::new();
         let _write_guard = self.state_write_lock.lock().await;
         timer.locked();
-        let result = if mode == PersistenceMode::Full
+        let result = self
+            .persist_state_locked(path, original_metainfo, mode)
+            .await;
+        timer.finish(result.is_ok());
+        result
+    }
+
+    async fn persist_state_locked(
+        &self,
+        path: PathBuf,
+        original_metainfo: Option<crate::state_store::OriginalMetainfo>,
+        mode: PersistenceMode,
+    ) -> Result<()> {
+        if mode == PersistenceMode::Full
             || original_metainfo.is_some()
             || !self
                 .incremental_persistence_ready
@@ -730,9 +750,59 @@ impl DaemonRuntime {
                 .await
         } else {
             self.persist_changed_state_locked(path).await
-        };
-        timer.finish(result.is_ok());
-        result
+        }
+    }
+
+    async fn recover_invalid_progress(
+        &self,
+        path: &Path,
+        torrents: &mut [Torrent],
+        fingerprints: &mut [(TorrentKey, u64)],
+    ) -> Result<()> {
+        let mut invalid = Vec::new();
+        for (index, torrent) in torrents.iter().enumerate() {
+            if let Err(error) =
+                validate_torrent_piece_progress(torrent, torrent_piece_count(torrent))
+            {
+                tracing::warn!(%error, "discarding invalid piece update");
+                invalid.push(index);
+            }
+        }
+        if invalid.is_empty() {
+            return Ok(());
+        }
+        let keys: Vec<_> = invalid.iter().map(|index| torrents[*index].key()).collect();
+        let path = path.to_owned();
+        let baselines = tokio::task::spawn_blocking(move || {
+            crate::state_store::load_progress_baselines(&path, &keys)
+        })
+        .await
+        .map_err(|error| CoreError::Storage(format!("read progress baselines task: {error}")))??;
+        for index in invalid {
+            let torrent = &mut torrents[index];
+            let previous = baselines.get(&torrent.key()).filter(|saved| {
+                if let Err(error) = validate_torrent_piece_progress(saved, torrent_piece_count(saved)) {
+                    tracing::warn!(%error, "saved piece map is also inconsistent; starting with no verified pieces");
+                    return false;
+                }
+                true
+            });
+            recover_piece_progress(torrent, previous);
+            fingerprints[index].1 = torrent_durable_fingerprint(
+                torrent,
+                meta_identity_fingerprint(torrent),
+                meta_full_fingerprint(torrent),
+            );
+            if let Some(live) = self.registry.lock().await.get_mut(&torrent.key()) {
+                // A verified engine update or new metadata may have arrived during the read.
+                if Arc::ptr_eq(&live.meta, &torrent.meta)
+                    && validate_torrent_piece_progress(live, torrent_piece_count(live)).is_err()
+                {
+                    recover_piece_progress(live, previous);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Full-save path. Also refreshes the fingerprint maps so subsequent
@@ -744,9 +814,10 @@ impl DaemonRuntime {
         original_metainfo: Option<crate::state_store::OriginalMetainfo>,
     ) -> Result<()> {
         let scan_started = Instant::now();
-        let (torrents, queue, fingerprint_updates, queue_fingerprint_value) = {
+        let (mut torrents, queue, mut fingerprint_updates, queue_fingerprint_value) = {
             let mut meta_fps = self.meta_fingerprints.lock().await;
             let reg = self.registry.lock().await;
+            meta_fps.retain(|key, _| reg.contains(key));
             let mut torrents = Vec::with_capacity(reg.torrents.len());
             let mut fingerprint_updates = Vec::with_capacity(reg.torrents.len());
             for (hash, torrent) in &reg.torrents {
@@ -775,23 +846,17 @@ impl DaemonRuntime {
             )
         };
         crate::persistence_metrics::scanned(scan_started);
-        let state = daemon_state_for_persistence(torrents, queue)?;
-        self.incremental_persistence_ready.store(
-            crate::state_store::supports_incremental_saves(&path).unwrap_or(false),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        self.recover_invalid_progress(&path, &mut torrents, &mut fingerprint_updates)
+            .await?;
+        let state = crate::state_store::DaemonState::new(torrents, queue);
         tokio::task::spawn_blocking(move || {
             crate::state_store::save_with_original_metainfo(&path, &state, original_metainfo)
         })
         .await
         .map_err(|error| CoreError::Storage(format!("save daemon state task: {error}")))??;
-        {
-            let mut fingerprints = self.durable_fingerprints.lock().await;
-            fingerprints.retain(|hash, _| fingerprint_updates.iter().any(|(key, _)| key == hash));
-            for (hash, fingerprint) in fingerprint_updates {
-                fingerprints.insert(hash, fingerprint);
-            }
-        }
+        self.incremental_persistence_ready
+            .store(true, Ordering::Relaxed);
+        *self.durable_fingerprints.lock().await = fingerprint_updates.into_iter().collect();
         *self.durable_queue_fingerprint.lock().await = queue_fingerprint_value;
         Ok(())
     }
@@ -827,12 +892,6 @@ impl DaemonRuntime {
             let queue = self.queue.lock().await.clone();
             let queue_fingerprint = queue_fingerprint(&queue);
             let queue_changed = *self.durable_queue_fingerprint.lock().await != queue_fingerprint;
-            // Validate changed records exactly like the full save does so a
-            // progress update can never persist structurally inconsistent
-            // piece progress.
-            for (_, _, torrent) in &changed {
-                validate_torrent_piece_progress(torrent, torrent_piece_count(torrent))?;
-            }
             (changed, queue, (queue_fingerprint, queue_changed))
         };
         crate::persistence_metrics::scanned(scan_started);
@@ -841,10 +900,12 @@ impl DaemonRuntime {
             return Ok(());
         }
         let queue_to_write = queue_changed.then_some(queue);
-        let (updates, changed_records): (Vec<_>, Vec<_>) = changed
+        let (mut updates, mut changed_records): (Vec<_>, Vec<_>) = changed
             .into_iter()
             .map(|(hash, fingerprint, torrent)| ((hash, fingerprint), torrent))
             .unzip();
+        self.recover_invalid_progress(&path, &mut changed_records, &mut updates)
+            .await?;
         tokio::task::spawn_blocking(move || {
             crate::state_store::save_changed_records(
                 &path,
@@ -921,30 +982,7 @@ impl DaemonRuntime {
                 .map_err(|error| {
                     CoreError::Storage(format!("capture daemon state task: {error}"))
                 })??;
-        let torrents = self
-            .registry
-            .lock()
-            .await
-            .torrents
-            .values()
-            .cloned()
-            .collect();
-        let queue = self.queue.lock().await.clone();
-        let state = daemon_state_for_persistence(torrents, queue)?;
-        let write_path = path.clone();
-        let persisted = tokio::task::spawn_blocking(move || {
-            crate::state_store::save(&write_path, &state)?;
-            Ok::<_, CoreError>(state)
-        })
-        .await
-        .map_err(|error| CoreError::Storage(format!("save daemon state task: {error}")))?;
-        if let Ok(saved_state) = &persisted {
-            self.adopt_durable_snapshot(saved_state).await;
-            self.incremental_persistence_ready.store(
-                crate::state_store::supports_incremental_saves(&path).unwrap_or(false),
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        }
+        let persisted = self.persist_full_state_locked(path.clone(), None).await;
         if let Err(error) = persisted {
             let rollback_path = path.clone();
             let rollback_snapshot = snapshot.clone();
@@ -1185,7 +1223,11 @@ impl DaemonRuntime {
         .await?;
         apply_network_state(&mut torrent, &self.network_health).await;
         if requested_paused && torrent.state != TorrentState::NetworkBlocked {
-            torrent.state = TorrentState::Paused;
+            torrent.pause_for(if torrent.policy.preview_until_started {
+                PauseReason::MetadataPreview
+            } else {
+                PauseReason::AddedPaused
+            });
         }
         let committed_state = torrent.state;
 
@@ -1848,45 +1890,15 @@ impl DaemonRuntime {
                 return Err(storage_work_cancelled_error());
             }
             let previous = torrent.clone();
-            let piece_count = resolved
-                .data_piece_count()
-                .unwrap_or_else(|_| resolved.piece_count());
-            let empty_state = EngineState {
-                pieces_have: swarmotter_core::storage::PieceBitfield::new(piece_count),
-                piece_count,
-                total_length: resolved.total_length,
-                ..EngineState::default()
-            };
-            apply_resolved_metadata(torrent, &resolved, &empty_state);
-            torrent.state = TorrentState::Paused;
+            apply_resolved_metadata(torrent, &resolved);
+            torrent.pause_for(PauseReason::MetadataPreview);
             torrent.seeding_status = SeedingStatus::NotEligible;
             torrent.error = None;
             previous
         };
 
         let persisted = if let Some(path) = state_path.as_ref() {
-            let torrents = self
-                .registry
-                .lock()
-                .await
-                .torrents
-                .values()
-                .cloned()
-                .collect();
-            let queue = self.queue.lock().await.clone();
-            match daemon_state_for_persistence(torrents, queue) {
-                Ok(state) => {
-                    let write_path = path.clone();
-                    tokio::task::spawn_blocking(move || {
-                        crate::state_store::save(&write_path, &state)
-                    })
-                    .await
-                    .map_err(|error| {
-                        CoreError::Storage(format!("save daemon state task: {error}"))
-                    })?
-                }
-                Err(error) => Err(error),
-            }
+            self.persist_full_state_locked(path.clone(), None).await
         } else {
             Ok(())
         };
@@ -2042,13 +2054,28 @@ impl DaemonRuntime {
             }
             return Err(error);
         }
-        if cancellation.is_cancelled() {
-            if storage_admission.is_some() {
-                self.storage_admissions.release(&hash).await;
+        // Keep concurrent library saves from committing provisional metadata.
+        // Acquire this only after root admission and path validation finish.
+        let mut timer = crate::persistence_metrics::SaveTimer::new();
+        let _write_guard = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                if storage_admission.is_some() {
+                    self.storage_admissions.release(&hash).await;
+                }
+                return Err(storage_work_cancelled_error());
             }
-            return Err(storage_work_cancelled_error());
-        }
-        let previous = self.registry.lock().await.get(&hash).cloned();
+            guard = self.state_write_lock.lock() => guard,
+        };
+        timer.locked();
+        let previous = {
+            let mut registry = self.registry.lock().await;
+            registry.get_mut(&hash).map(|torrent| {
+                let previous = torrent.clone();
+                apply_resolved_metadata(torrent, &resolved);
+                previous
+            })
+        };
         let Some(previous) = previous else {
             if let Some(admission) = &storage_admission {
                 let _ = self
@@ -2058,31 +2085,14 @@ impl DaemonRuntime {
             }
             return Err(CoreError::NotFound("torrent".into()));
         };
-        let updated = {
-            let mut registry = self.registry.lock().await;
-            registry.get_mut(&hash).map(|torrent| {
-                let piece_count = resolved
-                    .data_piece_count()
-                    .unwrap_or_else(|_| resolved.piece_count());
-                let empty_state = EngineState {
-                    pieces_have: swarmotter_core::storage::PieceBitfield::new(piece_count),
-                    piece_count,
-                    total_length: resolved.total_length,
-                    ..EngineState::default()
-                };
-                apply_resolved_metadata(torrent, &resolved, &empty_state);
-            })
+        let persisted = if let Some(path) = self.state_path.clone() {
+            self.persist_state_locked(path, None, PersistenceMode::ChangedRecords)
+                .await
+        } else {
+            Ok(())
         };
-        if updated.is_none() {
-            if let Some(admission) = &storage_admission {
-                let _ = self
-                    .storage_admissions
-                    .reserve(hash, admission, previous.meta.total_length)
-                    .await;
-            }
-            return Err(CoreError::NotFound("torrent".into()));
-        }
-        if let Err(error) = self.persist_state().await {
+        timer.finish(persisted.is_ok());
+        if let Err(error) = persisted {
             if let Some(torrent) = self.registry.lock().await.get_mut(&hash) {
                 *torrent = previous.clone();
             }

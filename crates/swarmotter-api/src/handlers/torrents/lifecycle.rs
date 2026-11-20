@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use swarmotter_core::models::torrent::PauseReason;
 
 #[derive(Debug, Deserialize)]
 pub struct RemoveTorrentsBody {
@@ -150,14 +151,22 @@ async fn apply_bulk_action(
     key: &TorrentKey,
 ) -> Result<()> {
     match action {
-        BulkAction::Pause => state.daemon.pause(key).await,
+        BulkAction::Pause => {
+            state
+                .daemon
+                .pause_with_reason(key, PauseReason::BulkAction)
+                .await
+        }
         BulkAction::Resume => state.daemon.resume(key).await,
         BulkAction::Recheck => state.daemon.recheck(key).await,
         // Restart stops the live engine and starts the torrent again, so
         // tracking, announce, and payload state are rebuilt from the durable
         // registry.
         BulkAction::Restart => {
-            state.daemon.stop(key).await?;
+            state
+                .daemon
+                .stop_with_reason(key, PauseReason::BulkAction)
+                .await?;
             state.daemon.start_now(key).await
         }
     }

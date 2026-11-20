@@ -226,6 +226,12 @@ to avoid blocking each other indefinitely. Separate accesses release their
 guards before acquiring the other lock; persistence releases both before
 serialization and database writes.
 
+Resolving magnet metadata establishes its piece space. The engine marks the
+first correctly sized empty map as provisional until storage supplies verified
+progress. Persistence recovers a malformed in-memory update from a compatible
+durable map for the affected torrent, while other changes commit together.
+See [ADR-0081](adr/0081-magnet-progress-and-pause-attribution.md).
+
 ## Durable torrent add and watch ingestion
 
 API file, magnet, and watch-folder additions converge on one daemon transaction

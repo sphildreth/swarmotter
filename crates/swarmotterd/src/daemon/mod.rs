@@ -64,7 +64,7 @@ use swarmotter_core::models::storage::{
     StorageDiagnostics, StorageRootDiagnostics, StorageRootRole,
 };
 use swarmotter_core::models::torrent::{
-    FilePriority, SeedingStatus, TorrentFile, TorrentState, TorrentSummary,
+    FilePriority, PauseReason, SeedingStatus, TorrentFile, TorrentState, TorrentSummary,
 };
 use swarmotter_core::models::tracker::{
     TrackerId, TrackerInfo, TrackerKind, TrackerScrapeStatus, TrackerStatus,

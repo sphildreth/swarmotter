@@ -225,6 +225,10 @@ async fn dropped_explicit_recheck_restores_and_persists_incomplete_state() {
             .map(|torrent| torrent.state),
         Some(TorrentState::Paused)
     );
+    assert_eq!(
+        persisted.torrents[0].current_pause_reason(),
+        Some(PauseReason::RecheckCancelled)
+    );
     assert_eq!(runtime.storage_rechecks.active_counts().len(), 1);
     drop(held_permit);
     assert!(runtime.storage_rechecks.active_counts().is_empty());

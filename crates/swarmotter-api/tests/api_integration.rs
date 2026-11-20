@@ -1012,12 +1012,20 @@ async fn bulk_lifecycle_actions_apply_to_selection_with_per_item_results() {
     assert_eq!(states.len(), 3);
     assert!(states.iter().all(|s| s == "paused"));
 
+    for hash in &hashes {
+        let (_, torrent) = get_json(&app, &format!("/api/v1/torrents/{hash}")).await;
+        assert_eq!(torrent["data"]["pause_reason"], "bulk_action");
+    }
+
     // Bulk resume (unpause).
     let result = post_bulk_lifecycle(&app, "/api/v1/torrents/bulk/resume", &hashes).await;
     assert_eq!(result["action"], "resume");
     assert_eq!(result["succeeded"].as_array().unwrap().len(), 3);
     let states = listed_torrent_states(&app).await;
     assert!(states.iter().all(|s| s == "downloading"));
+
+    let (_, torrent) = get_json(&app, &format!("/api/v1/torrents/{}", hashes[0])).await;
+    assert!(torrent["data"].get("pause_reason").is_none());
 
     // Bulk recheck.
     let result = post_bulk_lifecycle(&app, "/api/v1/torrents/bulk/recheck", &hashes).await;
@@ -1385,6 +1393,7 @@ async fn pause_resume_remove_lifecycle() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["data"]["state"], "paused");
+    assert_eq!(v["data"]["pause_reason"], "api_request");
 
     // Resume.
     let resp = app

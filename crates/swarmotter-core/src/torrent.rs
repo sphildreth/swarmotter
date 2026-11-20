@@ -8,7 +8,8 @@ use crate::hash::{InfoHash, TorrentIdentity, TorrentKey};
 use crate::magnet::MagnetDirectPeer;
 use crate::meta::TorrentMeta;
 use crate::models::torrent::{
-    FilePriority, SeedingStatus, TorrentFile, TorrentHealth, TorrentState, TorrentSummary,
+    FilePriority, PauseReason, SeedingStatus, TorrentFile, TorrentHealth, TorrentState,
+    TorrentSummary,
 };
 use crate::policy::TorrentPolicy;
 use crate::ratio::TorrentSeeding;
@@ -45,6 +46,9 @@ pub enum ContainmentRecoveryIntent {
 pub struct Torrent {
     pub meta: Arc<TorrentMeta>,
     pub state: TorrentState,
+    /// Absent for earlier state files and when no pause has been recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<PauseReason>,
     pub progress: PieceProgress,
     pub downloaded: u64,
     pub uploaded: u64,
@@ -139,6 +143,7 @@ impl Torrent {
         Self {
             meta,
             state: TorrentState::Queued,
+            pause_reason: None,
             progress: PieceProgress::new(piece_count),
             downloaded: 0,
             uploaded: 0,
@@ -233,12 +238,26 @@ impl Torrent {
         }
     }
 
+    /// Preserve the initiating reason on an idempotent pause, including an unknown legacy cause.
+    pub fn pause_for(&mut self, reason: PauseReason) {
+        if self.state != TorrentState::Paused {
+            self.pause_reason = Some(reason);
+            self.state = TorrentState::Paused;
+        }
+    }
+
+    pub fn current_pause_reason(&self) -> Option<PauseReason> {
+        self.pause_reason
+            .filter(|_| self.state == TorrentState::Paused)
+    }
+
     pub fn to_summary(&self) -> TorrentSummary {
         TorrentSummary {
             info_hash: self.key(),
             identity: self.identity().clone(),
             name: self.name().to_string(),
             state: self.state,
+            pause_reason: self.current_pause_reason(),
             error: self.error.clone(),
             total_length: self.meta.total_length,
             bytes_completed: self.bytes_completed(),

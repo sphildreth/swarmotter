@@ -20,6 +20,32 @@ fn engine(meta: &TorrentMeta, path: &std::path::Path) -> TorrentEngine {
     engine
 }
 
+#[test]
+fn full_v2_request_windows_leave_room_for_control_frames() {
+    let (out, _receiver) = V2Outbox::new();
+    for index in 0..MAX_INBOUND_SERVE_QUEUE {
+        out.upload(0, index as u32 * peer::BLOCK_SIZE, peer::BLOCK_SIZE, true)
+            .unwrap();
+    }
+    assert!(out.upload(1, 0, peer::BLOCK_SIZE, true).is_err());
+    for index in 0..REQUEST_WINDOW {
+        out.enqueue(V2Write::Frame(Message::Request {
+            piece: 1,
+            offset: index as u32 * peer::BLOCK_SIZE,
+            length: peer::BLOCK_SIZE,
+        }))
+        .unwrap();
+    }
+    for frame in [
+        Message::Interested,
+        Message::Unchoke,
+        Message::Have { piece: 0 },
+        Message::NotInterested,
+    ] {
+        out.enqueue(V2Write::Frame(frame)).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn incomplete_v2_peers_read_while_writes_are_backpressured() {
     // Each piece spans two request windows. Even one reply cannot fit in

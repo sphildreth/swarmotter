@@ -616,72 +616,56 @@ pub(crate) fn make_peer_id() -> [u8; 20] {
     id
 }
 
-pub(super) fn apply_resolved_metadata(
-    t: &mut Torrent,
-    real: &swarmotter_core::meta::TorrentMeta,
-    state: &EngineState,
-) {
-    // A BEP 53 `so` selection refers to the magnet's eventual file tree, not
-    // the synthetic placeholder. Consume it only as real metadata arrives so
-    // later operator file selections are never re-applied or overridden.
-    let magnet_select_only = if t.needs_metadata {
-        std::mem::take(&mut t.magnet_select_only_file_indices)
-    } else {
-        Vec::new()
-    };
-    let initialize_files = t.needs_metadata || t.meta.files.len() != real.files.len();
-    // Metadata is shared via `Arc` across registry, engines, and storages;
-    // the resolved metadata arrives as an owned value so wrap it once here.
-    let real = std::sync::Arc::new(real.clone());
-    t.meta = std::sync::Arc::clone(&real);
+pub(super) fn apply_resolved_metadata(t: &mut Torrent, real: &Arc<meta::TorrentMeta>) {
+    // A late engine sample can outlive the placeholder it describes. Only
+    // the first resolution installs metadata, progress geometry and intake choices.
+    if !t.needs_metadata {
+        return;
+    }
+    let magnet_select_only = std::mem::take(&mut t.magnet_select_only_file_indices);
+    t.meta = Arc::clone(real);
     t.needs_metadata = false;
     t.magnet_info_hash = None;
     t.magnet_identity = None;
     let piece_count = real
         .data_piece_count()
         .unwrap_or_else(|_| real.piece_count());
-    t.progress
-        .replace_from_bitfield(&state.pieces_have, piece_count);
-    if initialize_files {
-        t.files = real
-            .files
-            .iter()
-            .enumerate()
-            .map(|(i, f)| TorrentFile {
-                index: i,
-                path: f.path.join("/"),
-                length: f.length,
-                bytes_completed: 0,
-                priority: FilePriority::Normal,
-                wanted: true,
-            })
-            .collect();
-        t.priorities = vec![FilePriority::Normal; real.files.len()];
-        t.wanted = vec![true; real.files.len()];
-        // A magnet's placeholder has no authoritative file tree. Apply the
-        // add-time profile/request snapshot only after real metadata arrives,
-        // before a payload engine can build its piece selection.
-        swarmotter_core::policy::apply_intake_file_rules(t);
-        if !magnet_select_only.is_empty() {
-            // Local add-time exclusions and profile rules have already only
-            // removed files from selection. `so` is an additional allow-list,
-            // never a mechanism for a URI to re-enable an excluded file.
-            swarmotter_core::magnet::apply_select_only_file_indices(
-                &mut t.priorities,
-                &mut t.wanted,
-                &magnet_select_only,
-            );
-            for (index, file) in t.files.iter_mut().enumerate() {
-                if let (Some(priority), Some(wanted)) =
-                    (t.priorities.get(index), t.wanted.get(index))
-                {
-                    file.priority = *priority;
-                    file.wanted = *wanted;
-                }
+    t.progress = swarmotter_core::storage::PieceProgress::new(piece_count);
+    t.files = real
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, f)| TorrentFile {
+            index: i,
+            path: f.path.join("/"),
+            length: f.length,
+            bytes_completed: 0,
+            priority: FilePriority::Normal,
+            wanted: true,
+        })
+        .collect();
+    t.priorities = vec![FilePriority::Normal; real.files.len()];
+    t.wanted = vec![true; real.files.len()];
+    // A magnet's placeholder has no authoritative file tree. Apply the
+    // add-time profile/request snapshot only after real metadata arrives,
+    // before a payload engine can build its piece selection.
+    swarmotter_core::policy::apply_intake_file_rules(t);
+    if !magnet_select_only.is_empty() {
+        // Local add-time exclusions and profile rules have already only
+        // removed files from selection. `so` is an additional allow-list,
+        // never a mechanism for a URI to re-enable an excluded file.
+        swarmotter_core::magnet::apply_select_only_file_indices(
+            &mut t.priorities,
+            &mut t.wanted,
+            &magnet_select_only,
+        );
+        for (index, file) in t.files.iter_mut().enumerate() {
+            if let (Some(priority), Some(wanted)) = (t.priorities.get(index), t.wanted.get(index)) {
+                file.priority = *priority;
+                file.wanted = *wanted;
             }
         }
     }
-    t.recompute_file_bytes_completed();
     if !t.progress.is_complete() {
         t.seeding_status = SeedingStatus::NotEligible;
     }

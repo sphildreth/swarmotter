@@ -7,6 +7,18 @@ use crate::hash::{TorrentIdentity, TorrentKey};
 use crate::ratio::TorrentSeeding;
 use serde::{Deserialize, Serialize};
 
+/// Operation that placed a torrent in the paused state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PauseReason {
+    ApiRequest,
+    BulkAction,
+    RecheckIncomplete,
+    RecheckCancelled,
+    AddedPaused,
+    MetadataPreview,
+}
+
 /// Torrent lifecycle state.
 ///
 /// Matches the required states in `design/PRD.md`:
@@ -217,6 +229,9 @@ pub struct TorrentSummary {
     pub identity: TorrentIdentity,
     pub name: String,
     pub state: TorrentState,
+    /// Absent for earlier state files and when no pause has been recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<PauseReason>,
     /// Last terminal/runtime error associated with this torrent, if any.
     pub error: Option<String>,
     pub total_length: u64,

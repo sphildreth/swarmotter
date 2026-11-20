@@ -85,6 +85,18 @@ try {
     `legacy v1 — ${"c".repeat(40)}`,
   );
 
+  for (const [reason, label] of [
+    ["api_request", "Paused by an API request"],
+    ["bulk_action", "Paused by a bulk action"],
+    ["recheck_incomplete", "Recheck found incomplete data"],
+    [undefined, "Reason not recorded"],
+  ]) {
+    details.renderDetailsSummary({ state: "paused", pause_reason: reason });
+    assert.ok(elementFor("#details-summary").innerHTML.includes(label));
+  }
+  details.renderDetailsSummary({ state: "queued" });
+  assert.ok(!elementFor("#details-summary").innerHTML.includes("Pause reason"));
+
   details.renderDetailsPolicy({
     profile: null,
     download_dir: {

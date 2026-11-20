@@ -92,6 +92,11 @@ inserted into the table. Scrape is operational telemetry scheduled by download,
 magnet, reannounce, completion, and active seeder tracker activity; it is not a
 separate user mutation.
 
+For a paused torrent, **Details → Pause reason** shows what placed it in that
+state. For example, “Recheck found incomplete data” means the check ended
+with selected data still missing. “Reason not recorded” appears for pauses
+that predate tracking. Use Resume to return an incomplete torrent to the queue.
+
 The Details summary also displays **Last error** from the native torrent
 summary. If every attempted configured tracker explicitly rejects the
 announce, none succeeded during the run, and no usable alternative source

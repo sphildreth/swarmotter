@@ -20,7 +20,7 @@ use swarmotter_core::config::Config;
 use swarmotter_core::error::CoreError;
 use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::magnet::Magnet;
-use swarmotter_core::models::torrent::{FilePriority, TorrentState, TorrentSummary};
+use swarmotter_core::models::torrent::{FilePriority, PauseReason, TorrentState, TorrentSummary};
 use swarmotter_core::models::tracker::TrackerStatus;
 use url::form_urlencoded;
 
@@ -581,9 +581,18 @@ async fn torrent_action(
         Ok(hashes) => hashes,
         Err(response) => return response,
     };
+    let pause_reason = if hashes.len() > 1
+        || form
+            .get("hashes")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("all"))
+    {
+        PauseReason::BulkAction
+    } else {
+        PauseReason::ApiRequest
+    };
     for hash in hashes {
         let result = match action {
-            TorrentAction::Pause => state.daemon.pause(&hash).await,
+            TorrentAction::Pause => state.daemon.pause_with_reason(&hash, pause_reason).await,
             TorrentAction::Resume => state.daemon.resume(&hash).await,
             TorrentAction::Recheck => state.daemon.recheck(&hash).await,
             TorrentAction::Reannounce => state.daemon.reannounce(&hash).await,

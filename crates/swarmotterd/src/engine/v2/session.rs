@@ -2,15 +2,17 @@
 
 use super::*;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::time::{timeout_at, Instant as TokioInstant};
 
-// Leave room for a full window of replies while requesting our own blocks.
 const REQUEST_WINDOW: usize = MAX_INBOUND_SERVE_QUEUE / 2;
+// Bitfield, interest, unchoke, and a piece-completion announcement.
+const CONTROL_FRAME_SLOTS: usize = 4;
 
 enum V2Write {
     Frame(Message),
     Upload {
+        slot: OwnedSemaphorePermit,
         piece: u32,
         offset: u32,
         length: u32,
@@ -18,17 +20,52 @@ enum V2Write {
     },
 }
 
-fn enqueue(out: &mpsc::Sender<V2Write>, frame: V2Write) -> Result<()> {
-    // Waiting for queue space here would stop socket reads while the peer
-    // is waiting for us to drain its own send buffer.
-    out.try_send(frame).map_err(|error| match error {
-        mpsc::error::TrySendError::Full(_) => {
-            CoreError::Parse("v2 peer exceeded the pending write limit".into())
-        }
-        mpsc::error::TrySendError::Closed(_) => {
-            CoreError::Io(std::io::ErrorKind::BrokenPipe.into())
-        }
-    })
+struct V2Outbox {
+    sender: mpsc::Sender<V2Write>,
+    upload_slots: Arc<Semaphore>,
+}
+
+impl V2Outbox {
+    fn new() -> (Self, mpsc::Receiver<V2Write>) {
+        // A full peer upload queue and our own request window can coexist.
+        // Keep the outbound wire order across replies, requests, and control.
+        let (sender, queue) =
+            mpsc::channel(MAX_INBOUND_SERVE_QUEUE + REQUEST_WINDOW + CONTROL_FRAME_SLOTS);
+        (
+            Self {
+                sender,
+                upload_slots: Arc::new(Semaphore::new(MAX_INBOUND_SERVE_QUEUE)),
+            },
+            queue,
+        )
+    }
+
+    fn enqueue(&self, frame: V2Write) -> Result<()> {
+        // Waiting for queue space here would stop socket reads while the peer
+        // is waiting for us to drain its own send buffer.
+        self.sender.try_send(frame).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => {
+                CoreError::Parse("v2 peer exceeded the pending write limit".into())
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                CoreError::Io(std::io::ErrorKind::BrokenPipe.into())
+            }
+        })
+    }
+
+    fn upload(&self, piece: u32, offset: u32, length: u32, verified: bool) -> Result<()> {
+        let slot =
+            self.upload_slots.clone().try_acquire_owned().map_err(|_| {
+                CoreError::Parse("v2 peer exceeded the pending upload limit".into())
+            })?;
+        self.enqueue(V2Write::Upload {
+            slot,
+            piece,
+            offset,
+            length,
+            verified,
+        })
+    }
 }
 
 pub(super) struct V2Peer<'a> {
@@ -100,7 +137,7 @@ impl V2Peer<'_> {
         duration: Duration,
     ) -> Result<bool> {
         let deadline = TokioInstant::now() + duration;
-        let (out, mut queue) = mpsc::channel(MAX_INBOUND_SERVE_QUEUE);
+        let (out, mut queue) = V2Outbox::new();
         let write = async {
             while let Some(command) = queue.recv().await {
                 if !self.engine.binder.traffic_allowed() {
@@ -112,11 +149,13 @@ impl V2Peer<'_> {
                         writer.flush().await?;
                     }
                     V2Write::Upload {
+                        slot,
                         piece,
                         offset,
                         length,
                         verified,
                     } => {
+                        drop(slot);
                         self.serve(&mut writer, verified, piece, offset, length)
                             .await?;
                     }
@@ -135,7 +174,7 @@ impl V2Peer<'_> {
     async fn next_message<R: AsyncRead + Unpin>(
         &self,
         reader: &mut PeerReader<R>,
-        out: &mpsc::Sender<V2Write>,
+        out: &V2Outbox,
         have: &PieceBitfield,
         deadline: TokioInstant,
     ) -> Result<Option<Message>> {
@@ -146,15 +185,7 @@ impl V2Peer<'_> {
                     offset,
                     length,
                 }))) => {
-                    enqueue(
-                        out,
-                        V2Write::Upload {
-                            piece,
-                            offset,
-                            length,
-                            verified: have.has(piece as usize),
-                        },
-                    )?;
+                    out.upload(piece, offset, length, have.has(piece as usize))?;
                 }
                 Ok(result) => return result,
                 Err(_) => break,
@@ -166,7 +197,7 @@ impl V2Peer<'_> {
     async fn receive<R: AsyncRead + Unpin>(
         &self,
         mut reader: PeerReader<R>,
-        out: mpsc::Sender<V2Write>,
+        out: V2Outbox,
         have: &mut PieceBitfield,
         deadline: TokioInstant,
     ) -> Result<bool> {
@@ -179,7 +210,7 @@ impl V2Peer<'_> {
             }
         }
         for message in [ours.encode_message(), Message::Interested, Message::Unchoke] {
-            enqueue(&out, V2Write::Frame(message))?;
+            out.enqueue(V2Write::Frame(message))?;
         }
         let mut peer_bitfield: Option<Bitfield> = None;
         let mut peer_choking = true;
@@ -198,7 +229,7 @@ impl V2Peer<'_> {
                     .and_then(|bits| self.engine.pick_v2_piece(layout, bits, have))
                 {
                     if !interested {
-                        enqueue(&out, V2Write::Frame(Message::Interested))?;
+                        out.enqueue(V2Write::Frame(Message::Interested))?;
                         interested = true;
                     }
                     let Some(piece) = layout.piece(piece_index) else {
@@ -220,14 +251,11 @@ impl V2Peer<'_> {
                     })?;
                     let mut pending = requests.iter();
                     let request = |&(offset, length): &(u32, u32)| {
-                        enqueue(
-                            &out,
-                            V2Write::Frame(Message::Request {
-                                piece: wire_piece,
-                                offset,
-                                length,
-                            }),
-                        )
+                        out.enqueue(V2Write::Frame(Message::Request {
+                            piece: wire_piece,
+                            offset,
+                            length,
+                        }))
                     };
                     for block in pending.by_ref().take(REQUEST_WINDOW) {
                         request(block)?;
@@ -340,12 +368,12 @@ impl V2Peer<'_> {
                     self.engine
                         .maybe_persist_v2_resume(storage, layout, have, false)
                         .await?;
-                    enqueue(&out, V2Write::Frame(Message::Have { piece: wire_piece }))?;
+                    out.enqueue(V2Write::Frame(Message::Have { piece: wire_piece }))?;
                     continue;
                 }
                 if peer_bitfield.is_some() {
                     if interested {
-                        enqueue(&out, V2Write::Frame(Message::NotInterested))?;
+                        out.enqueue(V2Write::Frame(Message::NotInterested))?;
                         interested = false;
                     }
                     if !peer_interested {

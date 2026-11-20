@@ -185,6 +185,14 @@ the process-wide connection-limit authority.
 | PUT | `/torrents/:hash/policy` | Set/clear explicit profile: `{ profile: "name" }` or `{ profile: null }`. |
 | POST | `/torrents/:hash/storage-preview` | Read-only path proposal: `{ download_dir?, incomplete_dir?, profile? }`. |
 
+Paused torrents in the native list, query rows, and detail responses include
+`pause_reason` when the cause was recorded. Values are `api_request` for a
+single pause or stop, `bulk_action` for a bulk pause or the stop step of a
+bulk restart, `recheck_incomplete`, `recheck_cancelled`, `added_paused`,
+and `metadata_preview`. Repeating a pause preserves its original reason.
+The field is absent for active torrents and for legacy pauses with unknown
+origin. SQLite audit events include the reason when a pause is recorded.
+
 The bulk lifecycle endpoints (`/torrents/bulk/pause`, `/torrents/bulk/resume`,
 `/torrents/bulk/recheck`, and `/torrents/bulk/restart`) accept
 `{ info_hashes: [locator, ...] }` and apply the action to every selected

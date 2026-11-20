@@ -180,7 +180,7 @@ impl DaemonRuntime {
                 Some(torrent) if restore.was_completed => {
                     torrent.containment_recovery_intent = None;
                     if restore.was_manually_paused {
-                        torrent.state = TorrentState::Paused;
+                        torrent.pause_for(PauseReason::RecheckCancelled);
                         torrent.seeding_status = SeedingStatus::StoppedManual;
                         (Some(TorrentState::Paused), true)
                     } else {
@@ -191,7 +191,7 @@ impl DaemonRuntime {
                 }
                 Some(torrent) => {
                     torrent.containment_recovery_intent = None;
-                    torrent.state = TorrentState::Paused;
+                    torrent.pause_for(PauseReason::RecheckCancelled);
                     torrent.seeding_status = SeedingStatus::NotEligible;
                     (Some(TorrentState::Paused), true)
                 }
@@ -252,6 +252,7 @@ impl DaemonRuntime {
                 .ok_or_else(|| CoreError::NotFound("torrent".into()))?;
             torrent.containment_recovery_intent = None;
             torrent.policy.preview_until_started = false;
+            torrent.pause_reason = None;
             if torrent.progress.is_complete() {
                 torrent.state = TorrentState::Completed;
                 torrent.seeding_status = SeedingStatus::Queued;
@@ -373,6 +374,10 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn pause(&self, hash: &TorrentKey) -> Result<()> {
+        self.pause_with_reason(hash, PauseReason::ApiRequest).await
+    }
+
+    async fn pause_with_reason(&self, hash: &TorrentKey, reason: PauseReason) -> Result<()> {
         let canonical_hash = self.require_torrent_key(*hash).await?;
         let hash = &canonical_hash;
         // Stop the live engine; the torrent stays in the registry as paused.
@@ -382,7 +387,7 @@ impl DaemonOps for DaemonRuntime {
             match reg.get_mut(hash) {
                 Some(t) => {
                     t.containment_recovery_intent = None;
-                    t.state = TorrentState::Paused;
+                    t.pause_for(reason);
                     t.seeding_status = if t.progress.is_complete() {
                         SeedingStatus::StoppedManual
                     } else {
@@ -426,6 +431,7 @@ impl DaemonOps for DaemonRuntime {
                 Some(t) => {
                     t.containment_recovery_intent = None;
                     t.policy.preview_until_started = false;
+                    t.pause_reason = None;
                     if t.progress.is_complete() {
                         t.state = TorrentState::Completed;
                         t.seeding_status = SeedingStatus::Queued;
@@ -492,7 +498,11 @@ impl DaemonOps for DaemonRuntime {
             if let Some(torrent) = reg.get_mut(hash) {
                 torrent.containment_recovery_intent = None;
                 torrent.policy.preview_until_started = false;
-                if torrent.state == TorrentState::TrackerError {
+                if matches!(
+                    torrent.state,
+                    TorrentState::TrackerError | TorrentState::Paused
+                ) {
+                    torrent.pause_reason = None;
                     torrent.state = TorrentState::Queued;
                     torrent.error = None;
                 }
@@ -514,6 +524,10 @@ impl DaemonOps for DaemonRuntime {
     async fn stop(&self, hash: &TorrentKey) -> Result<()> {
         let canonical_hash = self.require_torrent_key(*hash).await?;
         self.pause(&canonical_hash).await
+    }
+
+    async fn stop_with_reason(&self, hash: &TorrentKey, reason: PauseReason) -> Result<()> {
+        self.pause_with_reason(hash, reason).await
     }
 
     async fn recheck(&self, hash: &TorrentKey) -> Result<()> {
@@ -557,6 +571,7 @@ impl DaemonOps for DaemonRuntime {
             match reg.get_mut(hash) {
                 Some(t) => {
                     t.containment_recovery_intent = None;
+                    t.pause_reason = None;
                     t.state = TorrentState::Checking;
                     t.seeding_status = SeedingStatus::NotEligible;
                     true
@@ -617,7 +632,7 @@ impl DaemonOps for DaemonRuntime {
                         t.date_completed = Some(now());
                         final_state = Some(TorrentState::Completed);
                     } else if t.state == TorrentState::Checking {
-                        t.state = TorrentState::Paused;
+                        t.pause_for(PauseReason::RecheckIncomplete);
                         t.seeding_status = SeedingStatus::NotEligible;
                         final_state = Some(TorrentState::Paused);
                     }

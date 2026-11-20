@@ -2286,7 +2286,6 @@ mod tests {
             reader.read_message().await.unwrap(),
             Some(Message::Piece { piece: 0, block, .. }) if block == content[..1024]
         ));
-        assert_eq!(state.lock().await.uploaded, 1024);
         state.lock().await.pieces_have.set(1);
         let have = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -2300,6 +2299,9 @@ mod tests {
         })
         .await;
         assert!(have.is_ok(), "newly verified v2 piece was not announced");
+        // The next HAVE confirms the server finished accounting for the
+        // previous write. Receiving the block alone can race that update.
+        assert_eq!(state.lock().await.uploaded, 1024);
 
         drop(reader);
         drop(write);

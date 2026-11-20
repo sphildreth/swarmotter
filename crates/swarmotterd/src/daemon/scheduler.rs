@@ -1183,7 +1183,7 @@ impl DaemonRuntime {
                             // placeholder meta with the real one and rebuild the
                             // file/piece bookkeeping.
                             if let Some(real) = final_state.resolved_meta.as_ref() {
-                                apply_resolved_metadata(t, real, &final_state);
+                                apply_resolved_metadata(t, real);
                                 metadata_received = needed_metadata && !t.needs_metadata;
                             }
                             t.downloaded = final_state.downloaded;
@@ -1220,7 +1220,7 @@ impl DaemonRuntime {
                                 // any payload path. An explicit start/resume
                                 // clears the durable gate and launches a
                                 // normal engine later.
-                                t.state = TorrentState::Paused;
+                                t.pause_for(PauseReason::MetadataPreview);
                                 t.seeding_status = SeedingStatus::NotEligible;
                                 t.error = None;
                             } else if t.state == TorrentState::DownloadingMetadata {

@@ -38,6 +38,9 @@ ADR-0009 and ADR-0010.
   can subscribe instead of polling list endpoints for every update.
 - SSE streams use keep-alives, WebSocket streams use pings, and subscribers that
   fall behind the broker buffer receive an `events_dropped` notice.
+- Native list and detail summaries expose an optional `pause_reason` while
+  paused. The daemon records the operation that caused the transition. An
+  absent reason on a legacy record means its origin is unknown (ADR-0081).
 - Native torrent add requests support add-time options such as paused start
   behavior without requiring add-then-pause sequencing; see ADR-0029.
 - Native add requests may also register metadata-first previews and a

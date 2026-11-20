@@ -34,6 +34,7 @@ fn summary_with(
         identity: swarmotter_core::hash::TorrentIdentity::v1(hash(seed)),
         name: name.to_string(),
         state,
+        pause_reason: None,
         error: None,
         total_length: 1000,
         bytes_completed: 500,

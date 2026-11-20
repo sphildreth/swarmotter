@@ -265,6 +265,37 @@ fn sqlite_v1_state_migrates_to_metric_history_schema_without_losing_state() {
 }
 
 #[test]
+fn pause_audit_records_source_changes_across_full_and_incremental_saves() {
+    use swarmotter_core::models::torrent::{PauseReason, TorrentState};
+    let path = unique_path("pause-reasons");
+    let mut state = single_torrent_state();
+    state.torrents[0].pause_for(PauseReason::BulkAction);
+    save(&path, &state).unwrap();
+    // Checking may finish before its intermediate state gets checkpointed.
+    state.torrents[0].state = TorrentState::Checking;
+    state.torrents[0].pause_for(PauseReason::RecheckIncomplete);
+    save_changed_records(&path, &state.torrents, None).unwrap();
+    save(&path, &state).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let events: Vec<(String, String)> = connection.prepare(
+        "SELECT action, json_extract(detail_json, '$.pause_reason') FROM audit_events ORDER BY id"
+    ).unwrap().query_map([], |row| Ok((row.get(0)?, row.get(1)?))).unwrap()
+        .collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(
+        events,
+        vec![
+            ("torrent_registered".into(), "bulk_action".into()),
+            (
+                "torrent_pause_reason_changed".into(),
+                "recheck_incomplete".into()
+            )
+        ]
+    );
+    drop(connection);
+    remove_state(&path);
+}
+
+#[test]
 fn state_writes_record_changed_metrics_and_foundational_audit_events() {
     let path = unique_path("metric-and-audit-recording");
     let mut state = single_torrent_state();

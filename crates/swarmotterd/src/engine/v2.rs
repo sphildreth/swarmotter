@@ -206,6 +206,7 @@ impl TorrentEngine {
             .fold(0u64, |total, piece| total.saturating_add(piece.length));
         let mut state = self.state.lock().await;
         state.pieces_have = have.clone();
+        state.metadata_progress_pending = false;
         state.piece_count = layout.piece_count();
         state.total_length = self.meta.total_length;
         state.bytes_completed = bytes_completed.min(self.meta.total_length);

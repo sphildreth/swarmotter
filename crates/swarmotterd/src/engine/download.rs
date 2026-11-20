@@ -33,38 +33,19 @@ impl TorrentEngine {
                 rebuilt.files.len(),
             )
             .map_err(CoreError::InvalidArgument)?;
-            if self.metadata_only {
-                // A preview is allowed to use the same contained peer,
-                // tracker, and metadata paths as ordinary magnet discovery,
-                // but must return before payload ownership, storage layout,
-                // announces, or piece requests begin.
-                self.meta = rebuilt.clone();
-                {
-                    let mut state = self.state.lock().await;
-                    state.piece_count = rebuilt
-                        .data_piece_count()
-                        .unwrap_or_else(|_| rebuilt.piece_count());
-                    state.total_length = rebuilt.total_length;
-                    state.resolved_meta = Some(rebuilt.clone());
-                    state.tracker_message =
-                        Some("metadata received; payload transfer awaits explicit start".into());
-                }
-                // The daemon installs a preview-only callback that commits the
-                // resolved file tree and captured intake selection durably.
-                // Do this before reporting success so UI/events can never
-                // expose preview metadata that did not reach durable state.
-                if let Some(preflight) = &self.metadata_preflight {
-                    preflight(rebuilt).await?;
-                }
-                return Ok(self.state.lock().await.clone());
-            }
+            // The daemon commits intake or preview metadata before it becomes
+            // visible to reconciliation. Storage establishes verified pieces later.
             if let Some(preflight) = &self.metadata_preflight {
                 preflight(rebuilt.clone()).await?;
             }
-            // Stash the real metadata so the daemon can update the record.
-            self.state.lock().await.resolved_meta = Some(rebuilt.clone());
-            // Replace the placeholder meta with the real one.
             self.meta = rebuilt;
+            let mut state = self.state.lock().await;
+            state.publish_resolved_metadata(self.meta.clone())?;
+            if self.metadata_only {
+                state.tracker_message =
+                    Some("metadata received; payload transfer awaits explicit start".into());
+                return Ok(state.clone());
+            }
         }
         if self.meta.requires_v2_data_plane() {
             return self.run_v2().await;

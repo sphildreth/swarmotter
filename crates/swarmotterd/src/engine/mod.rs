@@ -286,6 +286,8 @@ pub struct TrackerScrapeSnapshot {
 #[derive(Debug, Clone, Default)]
 pub struct EngineState {
     pub pieces_have: PieceBitfield,
+    /// A resolved magnet has a correctly sized map before storage verifies it.
+    pub metadata_progress_pending: bool,
     pub piece_count: usize,
     /// Bytes received from peers over the network. This intentionally does
     /// not include bytes found by fast-resume or disk recheck.
@@ -349,6 +351,15 @@ pub struct EngineState {
 }
 
 impl EngineState {
+    fn publish_resolved_metadata(&mut self, meta: Arc<TorrentMeta>) -> Result<()> {
+        self.piece_count = meta.data_piece_count()?;
+        self.pieces_have = PieceBitfield::new(self.piece_count);
+        self.metadata_progress_pending = true;
+        self.total_length = meta.total_length;
+        self.resolved_meta = Some(meta);
+        Ok(())
+    }
+
     /// Return the terminal tracker error when every attempted configured
     /// tracker explicitly rejected the announce and no non-tracker source
     /// produced a usable candidate or payload. A successful tracker response

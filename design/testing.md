@@ -352,6 +352,10 @@ transition.
 ### Storage tests
 
 - Fast resume.
+- Concurrent magnet resolution, preview and save across restart, including
+  interim empty maps and preservation of verified pieces.
+- Independent persistence of other torrents during malformed progress updates,
+  full and incremental saves, durable pause attribution and unknown legacy reasons.
 - Same-size changed-file detection and corrupt-resume quarantine.
 - Forced recheck.
 - Interrupted write recovery.

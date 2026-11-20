@@ -224,6 +224,53 @@ pub fn load(path: &Path) -> Result<Option<DaemonState>> {
     }
 }
 
+/// Read only the affected torrent rows when an in-memory piece map is invalid.
+/// The caller already holds the daemon state-write lock.
+pub(super) fn load_progress_baselines(
+    path: &Path,
+    keys: &[TorrentKey],
+) -> Result<std::collections::HashMap<TorrentKey, Torrent>> {
+    let mut records = std::collections::HashMap::new();
+    match classify_state_file(path)? {
+        StateFileKind::Missing => {}
+        StateFileKind::LegacyJson => {
+            for torrent in load_legacy_json(path)?.torrents {
+                if keys.contains(&torrent.key()) {
+                    records.insert(torrent.key(), torrent);
+                }
+            }
+        }
+        StateFileKind::Sqlite => {
+            let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| CoreError::Storage(format!("open progress baseline: {error}")))?;
+            let mut query = connection
+                .prepare("SELECT torrent_json FROM torrent_records WHERE info_hash = ?1")
+                .map_err(|error| CoreError::Storage(format!("prepare progress lookup: {error}")))?;
+            for key in keys {
+                let locator = key.to_locator();
+                let bytes: Option<Vec<u8>> = query
+                    .query_row([&locator], |row| row.get(0))
+                    .optional()
+                    .map_err(|error| {
+                        CoreError::Storage(format!("load progress for {key}: {error}"))
+                    })?;
+                if let Some(bytes) = bytes {
+                    let torrent: Torrent = serde_json::from_slice(&bytes).map_err(|error| {
+                        CoreError::Storage(format!("decode saved progress for {key}: {error}"))
+                    })?;
+                    if durable_torrent_key(&torrent)? != locator {
+                        return Err(CoreError::Storage(format!(
+                            "incorrect saved progress identity for {key}"
+                        )));
+                    }
+                    records.insert(*key, torrent);
+                }
+            }
+        }
+    }
+    Ok(records)
+}
+
 /// Rebuild SQLite rows and indexes that are projections of durable torrent and
 /// queue records.
 ///
@@ -402,13 +449,6 @@ pub(crate) fn save_with_original_metainfo(
     }
 }
 
-/// Whether the durable state file is a SQLite generation that supports
-/// proportional changed-record saves. Legacy JSON and missing state files
-/// must first be migrated by a full save.
-pub(crate) fn supports_incremental_saves(path: &Path) -> Result<bool> {
-    Ok(classify_state_file(path)? == StateFileKind::Sqlite)
-}
-
 /// Save only torrents whose durable content changed, plus an optionally
 /// changed queue document.
 ///
@@ -457,16 +497,7 @@ pub(crate) fn save_changed_records(
         let hash = durable_torrent_key(torrent)?;
         let current_state = torrent.state.as_str();
         let observed_at = unix_timestamp();
-        let previous_state: Option<String> = transaction
-            .query_row(
-                "SELECT lifecycle_state FROM torrent_records WHERE info_hash = ?1",
-                params![&hash],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| {
-                CoreError::Storage(format!("read durable torrent history: {error}"))
-            })?;
+        let (previous_state, previous_reason) = prior_lifecycle(&transaction, &hash, torrent)?;
         let (torrent_json, raw_info) = encode_torrent(torrent)?;
         crate::persistence_metrics::SERIALIZED_BYTES
             .fetch_add(torrent_json.len() as u64, Ordering::Relaxed);
@@ -491,12 +522,12 @@ pub(crate) fn save_changed_records(
                 ],
             )
             .map_err(|error| CoreError::Storage(format!("write durable torrent: {error}")))?;
-        history_changed |= previous_state.as_deref() != Some(current_state);
-        write_history(
+        history_changed |= write_history(
             &transaction,
             &hash,
             previous_state.as_deref(),
-            current_state,
+            previous_reason.as_deref(),
+            torrent,
         )?;
         write_canonical_info(&transaction, &hash, raw_info.as_deref())?;
         write_health_snapshot(&transaction, &hash, torrent)?;
@@ -1425,16 +1456,7 @@ fn write_state_transaction(
         let hash = durable_torrent_key(torrent)?;
         let current_state = torrent.state.as_str();
         let observed_at = unix_timestamp();
-        let previous_state: Option<String> = transaction
-            .query_row(
-                "SELECT lifecycle_state FROM torrent_records WHERE info_hash = ?1",
-                params![&hash],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|error| {
-                CoreError::Storage(format!("read durable torrent history: {error}"))
-            })?;
+        let (previous_state, previous_reason) = prior_lifecycle(transaction, &hash, torrent)?;
         let (torrent_json, raw_info) = encode_torrent(torrent)?;
         transaction
             .execute(
@@ -1463,7 +1485,13 @@ fn write_state_transaction(
                 ],
             )
             .map_err(|error| CoreError::Storage(format!("write durable torrent: {error}")))?;
-        write_history(transaction, &hash, previous_state.as_deref(), current_state)?;
+        write_history(
+            transaction,
+            &hash,
+            previous_state.as_deref(),
+            previous_reason.as_deref(),
+            torrent,
+        )?;
         write_canonical_info(transaction, &hash, raw_info.as_deref())?;
         write_health_snapshot(transaction, &hash, torrent)?;
         write_current_metrics(transaction, &hash, torrent, observed_at)?;
@@ -1513,6 +1541,7 @@ fn write_state_transaction(
 
 fn encode_torrent(torrent: &Torrent) -> Result<(Vec<u8>, Option<Vec<u8>>)> {
     let mut stored = torrent.clone();
+    stored.pause_reason = stored.current_pause_reason();
     let mut meta = (*stored.meta).clone();
     let raw_info = meta.raw_info.take();
     stored.meta = Arc::new(meta);
@@ -1577,12 +1606,34 @@ fn write_original_metainfo(
     Ok(())
 }
 
+fn prior_lifecycle(
+    tx: &Transaction<'_>,
+    hash: &str,
+    torrent: &Torrent,
+) -> Result<(Option<String>, Option<String>)> {
+    // Read the previous reason only when a paused-to-paused recheck could
+    // change it without an intervening durable "checking" generation.
+    tx.query_row(
+        "SELECT lifecycle_state, CASE WHEN ?2 AND lifecycle_state='paused'
+         THEN json_extract(CAST(torrent_json AS TEXT), '$.pause_reason') END
+         FROM torrent_records WHERE info_hash=?1",
+        params![hash, torrent.current_pause_reason().is_some()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .optional()
+    .map(Option::unwrap_or_default)
+    .map_err(|error| CoreError::Storage(format!("read durable torrent history: {error}")))
+}
+
 fn write_history(
     transaction: &Transaction<'_>,
     hash: &str,
     previous_state: Option<&str>,
-    current_state: &str,
-) -> Result<()> {
+    previous_reason: Option<&str>,
+    torrent: &Torrent,
+) -> Result<bool> {
+    let current_state = torrent.state.as_str();
+    let pause_reason = serde_json::json!(torrent.current_pause_reason());
     let event_kind = match previous_state {
         None => Some("registered"),
         Some(previous) if previous != current_state => Some("state_changed"),
@@ -1605,23 +1656,25 @@ fn write_history(
             .map_err(|error| {
                 CoreError::Storage(format!("write durable library history: {error}"))
             })?;
-        let action = if event_kind == "registered" {
-            "torrent_registered"
-        } else {
-            "torrent_state_changed"
-        };
-        write_audit_event(
-            transaction,
-            Some("daemon"),
-            action,
-            &serde_json::json!({
-                "info_hash": hash,
-                "previous_state": previous_state,
-                "current_state": current_state,
-            }),
-        )?;
     }
-    Ok(())
+    let action = match event_kind {
+        Some("registered") => "torrent_registered",
+        Some(_) => "torrent_state_changed",
+        None if pause_reason.as_str() != previous_reason => "torrent_pause_reason_changed",
+        None => return Ok(false),
+    };
+    write_audit_event(
+        transaction,
+        Some("daemon"),
+        action,
+        &serde_json::json!({
+            "info_hash": hash,
+            "previous_state": previous_state,
+            "current_state": current_state,
+            "pause_reason": pause_reason,
+        }),
+    )?;
+    Ok(true)
 }
 
 fn write_audit_event(

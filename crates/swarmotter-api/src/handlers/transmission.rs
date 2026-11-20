@@ -19,7 +19,9 @@ use swarmotter_core::config::Config;
 use swarmotter_core::error::CoreError;
 use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::models::peer::{Peer, PeerDirection};
-use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
+use swarmotter_core::models::torrent::{
+    FilePriority, PauseReason, TorrentFile, TorrentState, TorrentSummary,
+};
 use swarmotter_core::models::tracker::{TrackerInfo, TrackerStatus};
 
 use crate::encoding::decode_base64;
@@ -659,12 +661,20 @@ async fn torrent_action(
 ) -> RpcResult<Value> {
     let args = request.args();
     let summaries = selected_summaries(state, &args).await?;
+    let pause_reason = if value_arg(&args, &["ids"]).is_none_or(|ids| {
+        ids.as_array().is_some_and(|items| items.len() != 1)
+            || ids.as_str().is_some_and(is_recently_active_selector)
+    }) {
+        PauseReason::BulkAction
+    } else {
+        PauseReason::ApiRequest
+    };
     for summary in summaries {
         let hash = summary.info_hash;
         let result = match action {
             TorrentAction::Resume => state.daemon.resume(&hash).await,
             TorrentAction::StartNow => state.daemon.start_now(&hash).await,
-            TorrentAction::Stop => state.daemon.stop(&hash).await,
+            TorrentAction::Stop => state.daemon.stop_with_reason(&hash, pause_reason).await,
             TorrentAction::Recheck => state.daemon.recheck(&hash).await,
             TorrentAction::Reannounce => state.daemon.reannounce(&hash).await,
             TorrentAction::QueueTop => state.daemon.queue_move_to_top(&hash).await,

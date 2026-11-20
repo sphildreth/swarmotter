@@ -45,9 +45,7 @@ async fn persistence_and_queue_planning_remain_responsive(incremental: bool) {
         .unwrap();
     runtime.queue.lock().await.add(hash);
     if incremental {
-        // The first save creates SQLite; the next detects the existing
-        // database and enables changed-record persistence.
-        runtime.persist_state().await.unwrap();
+        // Create the initial SQLite generation.
         runtime.persist_state().await.unwrap();
     }
     assert_eq!(
@@ -365,6 +363,8 @@ async fn boundary_file_bytes_are_exact_after_restore_and_each_recheck() {
     );
     runtime.restore_persisted_state().await.unwrap();
     let restored = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    assert_eq!(restored.state, TorrentState::Paused);
+    assert_eq!(restored.current_pause_reason(), None);
     assert_eq!(restored.bytes_completed(), 5);
     assert_eq!(
         restored
@@ -377,6 +377,10 @@ async fn boundary_file_bytes_are_exact_after_restore_and_each_recheck() {
 
     runtime.recheck(&hash).await.unwrap();
     let partial = runtime.registry.lock().await.get(&hash).cloned().unwrap();
+    assert_eq!(
+        partial.current_pause_reason(),
+        Some(PauseReason::RecheckIncomplete)
+    );
     assert_eq!(partial.bytes_completed(), 5);
     assert_eq!(
         partial
@@ -743,52 +747,241 @@ async fn durable_restore_normalizes_legacy_zero_progress_unresolved_magnet() {
 }
 
 #[tokio::test]
-async fn persistence_rejects_inconsistent_piece_progress_before_commit() {
-    let root = unique_dir("persist-invalid-progress");
+async fn invalid_progress_recovers_one_record_and_commits_other_changes() {
+    use swarmotter_core::storage::PieceBitfield;
+    let root = unique_dir("isolated-invalid-progress");
     let state_path = root.join("state.sqlite");
-    let cfg = Config::default();
     let runtime = DaemonRuntime::with_paths_broker_and_state(
-        cfg,
+        Config::default(),
         disabled_health(),
         None,
         None,
         Some(state_path.clone()),
         EventBroker::default(),
     );
-    let meta =
-        swarmotter_core::meta::parse_torrent(&swarmotter_core::meta::build_single_file_torrent(
-            "generated-persistence-fixture.bin",
-            b"generated persistence validation payload",
-            8,
-            None,
-            false,
-        ))
-        .unwrap();
-    let key = TorrentKey::v1(meta.info_hash);
-    runtime
-        .registry
-        .lock()
-        .await
-        .add(Torrent::new(meta, now()))
-        .unwrap();
-    runtime.queue.lock().await.add(key);
+    let build = |name| {
+        let bytes = meta::build_single_file_torrent(name, b"local partial payload", 8, None, false);
+        Torrent::new(meta::parse_torrent(&bytes).unwrap(), now())
+    };
+    let mut partial = build("partial.bin");
+    partial.progress.have_piece(1);
+    partial.recompute_file_bytes_completed();
+    partial.pause_for(PauseReason::ApiRequest);
+    let key = partial.key();
+    let healthy = build("other.bin");
+    let other = healthy.key();
+    for torrent in [partial, healthy] {
+        runtime.queue.lock().await.add(torrent.key());
+        runtime.registry.lock().await.add(torrent).unwrap();
+    }
     runtime.persist_state().await.unwrap();
-    let valid_generation = std::fs::read(&state_path).unwrap();
 
+    // Exercise both incremental and full (transactional lifecycle) writes.
+    for uploaded in [11, 22] {
+        {
+            let mut registry = runtime.registry.lock().await;
+            let invalid = registry.get_mut(&key).unwrap();
+            if uploaded == 11 {
+                // A total-only change must still dirty the record.
+                invalid.progress.total += 1;
+            } else {
+                let count = invalid.progress.total;
+                invalid
+                    .progress
+                    .replace_from_bitfield(&PieceBitfield::default(), count);
+            }
+            registry.get_mut(&other).unwrap().uploaded = uploaded;
+        }
+        if uploaded == 11 {
+            runtime.persist_state().await.unwrap();
+        } else {
+            runtime.persist_state_with_file_rollback().await.unwrap();
+        }
+        let saved = crate::state_store::load(&state_path).unwrap().unwrap();
+        assert_eq!(saved.queue.order.len(), 2);
+        let saved_partial = saved.torrents.iter().find(|t| t.key() == key).unwrap();
+        assert_eq!(
+            saved_partial.current_pause_reason(),
+            Some(PauseReason::ApiRequest)
+        );
+        assert_eq!(saved_partial.progress.bitfield().as_bytes(), &[0x40]);
+        assert_eq!(saved_partial.files[0].bytes_completed, 8);
+        assert_eq!(
+            saved
+                .torrents
+                .iter()
+                .find(|t| t.key() == other)
+                .unwrap()
+                .uploaded,
+            uploaded
+        );
+        assert_eq!(runtime.get_torrent(&key).await.unwrap().pieces_have, 1);
+    }
+
+    // A new record has no verified baseline, even when its broken snapshot
+    // claimed completion. Keep its queue entry and require verification.
+    let mut new = build("no-baseline.bin");
+    let new_key = new.key();
+    new.state = TorrentState::Completed;
+    new.progress
+        .replace_from_bitfield(&PieceBitfield::from_bytes(vec![0xff]), new.progress.total);
+    runtime.registry.lock().await.add(new).unwrap();
+    runtime.queue.lock().await.add(new_key);
+    runtime.persist_state().await.unwrap();
+    let summary = runtime.get_torrent(&new_key).await.unwrap();
+    assert_eq!(summary.state, TorrentState::StorageError);
+    assert_eq!(summary.pieces_have, 0);
+
+    let restarted = DaemonRuntime::with_paths_broker_and_state(
+        Config::default(),
+        disabled_health(),
+        None,
+        None,
+        Some(state_path),
+        EventBroker::default(),
+    );
+    assert_eq!(restarted.restore_persisted_state().await.unwrap(), 3);
+    assert_eq!(restarted.get_torrent(&other).await.unwrap().uploaded, 22);
+    assert_eq!(restarted.get_torrent(&key).await.unwrap().pieces_have, 1);
+    assert_eq!(
+        restarted.get_torrent(&key).await.unwrap().pause_reason,
+        Some(PauseReason::ApiRequest)
+    );
+    assert_eq!(
+        restarted.get_torrent(&new_key).await.unwrap().pieces_have,
+        0
+    );
+    assert!(restarted.queue.lock().await.order.contains(&new_key));
+    restarted.start_now(&key).await.unwrap();
+    let started = restarted.get_torrent(&key).await.unwrap();
+    assert_ne!(started.state, TorrentState::Paused);
+    assert_eq!(started.pause_reason, None);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_magnet_resolution_and_save_preserve_verified_progress_on_restart() {
+    use swarmotter_core::storage::PieceBitfield;
+    let root = unique_dir("concurrent-magnet-progress");
+    let state_path = root.join("state.sqlite");
+    let dir = root.display().to_string();
+    let mut cfg = Config::default();
+    cfg.queue.auto_start = false;
+    cfg.storage.download_dir = Some(dir.clone());
+    let make_runtime = || {
+        DaemonRuntime::with_paths_broker_and_state(
+            cfg.clone(),
+            disabled_health(),
+            None,
+            None,
+            Some(state_path.clone()),
+            EventBroker::default(),
+        )
+    };
+    let runtime = make_runtime();
+    let build = |name, count: usize| {
+        Arc::new(
+            meta::parse_torrent(&meta::build_single_file_torrent(
+                name,
+                &vec![0x42; count * 8],
+                8,
+                None,
+                false,
+            ))
+            .unwrap(),
+        )
+    };
+    let first = build("resolved.bin", 1774);
+    let preview = build("preview.bin", 2515);
+    let first_key = first.identity.primary_key().unwrap();
+    let preview_key = preview.identity.primary_key().unwrap();
+    for key in [first_key, preview_key] {
+        let mut placeholder = Torrent::new(build("placeholder", 1), now());
+        placeholder.needs_metadata = true;
+        placeholder.state = TorrentState::DownloadingMetadata;
+        placeholder.policy.preview_until_started = key == preview_key;
+        set_test_v1_magnet_identity(&mut placeholder, key);
+        runtime.registry.lock().await.add(placeholder).unwrap();
+        runtime.queue.lock().await.add(key);
+    }
+    runtime.persist_state().await.unwrap();
+    let guard = runtime.state_write_lock.lock().await;
+    let mut resolving = Box::pin(runtime.reserve_resolved_magnet_metadata(
+        first_key,
+        first.clone(),
+        dir.clone(),
+        dir,
+        StorageWorkCancellation::new(),
+    ));
+    let mut previewing = Box::pin(runtime.commit_metadata_preview_resolution(preview_key, preview));
+    let mut saving = Box::pin(runtime.persist_state());
+    assert!(futures_util::poll!(&mut resolving).is_pending());
+    assert!(futures_util::poll!(&mut previewing).is_pending());
+    assert!(futures_util::poll!(&mut saving).is_pending());
+    assert!(
+        runtime
+            .registry
+            .lock()
+            .await
+            .get(&first_key)
+            .unwrap()
+            .needs_metadata
+    );
+    drop(guard);
+    let (a, b, c) = tokio::join!(resolving, previewing, saving);
+    a.unwrap();
+    b.unwrap();
+    c.unwrap();
+
+    let mut verified = PieceBitfield::new(1774);
+    verified.set(1001);
+    let state = Arc::new(Mutex::new(EngineState {
+        resolved_meta: Some(first.clone()),
+        piece_count: 1774,
+        pieces_have: verified,
+        ..Default::default()
+    }));
     runtime
-        .registry
-        .lock()
+        .engine_states
+        .write()
         .await
-        .get_mut(&key)
-        .unwrap()
-        .progress
-        .total += 1;
-    let error = runtime.persist_state().await.unwrap_err();
-    assert!(error.to_string().contains("inconsistent piece progress"));
-    assert_eq!(std::fs::read(&state_path).unwrap(), valid_generation);
-
+        .insert(first_key, state.clone());
+    runtime.reconcile_engine_progress_for_transition().await;
+    runtime.persist_state().await.unwrap();
+    for (map, pending) in [
+        (PieceBitfield::default(), false),
+        (PieceBitfield::new(1774), true),
+    ] {
+        {
+            let mut state = state.lock().await;
+            state.pieces_have = map;
+            state.metadata_progress_pending = pending;
+        }
+        runtime.reconcile_engine_progress_for_transition().await;
+        runtime.persist_state().await.unwrap();
+        assert_eq!(
+            runtime.get_torrent(&first_key).await.unwrap().pieces_have,
+            1
+        );
+    }
     drop(runtime);
-    std::fs::remove_dir_all(root).ok();
+    let restarted = make_runtime();
+    assert_eq!(restarted.restore_persisted_state().await.unwrap(), 2);
+    let registry = restarted.registry.lock().await;
+    let first = registry.get(&first_key).unwrap();
+    assert!(!first.needs_metadata);
+    assert_eq!(first.progress.bitfield().as_bytes().len(), 222);
+    assert!(first.progress.bitfield().has(1001));
+    let preview = registry.get(&preview_key).unwrap();
+    assert!(!preview.needs_metadata);
+    assert_eq!(preview.progress.bitfield().as_bytes().len(), 315);
+    assert_eq!(
+        preview.current_pause_reason(),
+        Some(PauseReason::MetadataPreview)
+    );
+    drop(registry);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -1608,7 +1801,7 @@ async fn rollback_save_adopts_only_committed_snapshot_fingerprint() {
         .unwrap()
         .uploaded = 1;
     // Delay post-save fingerprint adoption until the on-disk snapshot is visible.
-    let fingerprint_guard = runtime.meta_fingerprints.lock().await;
+    let fingerprint_guard = runtime.durable_fingerprints.lock().await;
     let saving = runtime.clone();
     let save = tokio::spawn(async move { saving.persist_state_with_file_rollback().await });
     tokio::time::timeout(Duration::from_secs(5), async {

@@ -233,7 +233,7 @@ impl DaemonRuntime {
                 let previous_state = t.state;
                 let needed_metadata = t.needs_metadata;
                 if let Some(real) = s.resolved_meta.as_ref() {
-                    apply_resolved_metadata(t, real, s);
+                    apply_resolved_metadata(t, real);
                     if needed_metadata && !t.needs_metadata {
                         events.push(torrent_metadata_event(*hash));
                     }
@@ -336,7 +336,7 @@ impl DaemonRuntime {
                     // A metadata-only preview remains manually paused even
                     // while the short-lived metadata engine is still visible
                     // to this periodic reconciler.
-                    t.state = TorrentState::Paused;
+                    t.pause_for(PauseReason::MetadataPreview);
                     t.seeding_status = SeedingStatus::NotEligible;
                 } else if !t.state.is_error() && t.state != TorrentState::Paused {
                     if s.finished {
@@ -426,11 +426,9 @@ impl DaemonRuntime {
             .meta
             .data_piece_count()
             .unwrap_or_else(|_| torrent.meta.piece_count());
-        let expected_bitfield_bytes = piece_count.div_ceil(8);
-        state.piece_count == piece_count
-            && state.pieces_have.as_bytes().len() == expected_bitfield_bytes
-            && !(piece_count..expected_bitfield_bytes.saturating_mul(8))
-                .any(|index| state.pieces_have.has(index))
+        !state.metadata_progress_pending
+            && state.piece_count == piece_count
+            && state.pieces_have.fits_piece_count(piece_count)
     }
 
     /// Periodically compute autopilot decisions from contained runtime

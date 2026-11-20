@@ -130,6 +130,14 @@ export function renderDetailsSummary(t) {
     <h3>Details</h3>
     ${renderKv([
       ["State", t.state],
+      ...(t.state === "paused" ? [["Pause reason", ({
+        api_request: "Paused by an API request",
+        bulk_action: "Paused by a bulk action",
+        recheck_incomplete: "Recheck found incomplete data",
+        recheck_cancelled: "Recheck was cancelled",
+        added_paused: "Added paused",
+        metadata_preview: "Preview awaiting start",
+      })[t.pause_reason] || "Reason not recorded"]] : []),
       ["Identity", formatTorrentIdentity(t.identity, t.info_hash)],
       ["Last error", t.error || ""],
       ["Peers", `${fmtCount(t.active_peer_workers)} active / ${fmtCount(t.known_peers)} known`],

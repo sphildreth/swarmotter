@@ -16,6 +16,7 @@ pub(super) async fn update_progress_state(
 ) {
     let mut s = state.lock().await;
     s.pieces_have = have.clone();
+    s.metadata_progress_pending = false;
     let complete_pieces = have.count(s.piece_count) as u64;
     let mut completed = complete_pieces.saturating_mul(meta.piece_length);
     if s.piece_count > 0 && have.has(s.piece_count - 1) {

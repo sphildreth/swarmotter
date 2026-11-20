@@ -21,7 +21,9 @@ use swarmotter_core::models::peer::Peer;
 use swarmotter_core::models::stats::{
     AutopilotDecision, AutopilotInput, GlobalStats, TorrentDiagnostics,
 };
-use swarmotter_core::models::torrent::{FilePriority, TorrentFile, TorrentState, TorrentSummary};
+use swarmotter_core::models::torrent::{
+    FilePriority, PauseReason, TorrentFile, TorrentState, TorrentSummary,
+};
 use swarmotter_core::models::tracker::{
     TrackerId, TrackerInfo, TrackerKind, TrackerScrapeStatus, TrackerStatus, TrackerTier,
 };
@@ -298,7 +300,11 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         t.download_dir = options.download_dir.clone();
         let paused = apply_fake_add_policy(&self.config, &mut t, &options).await?;
         if paused {
-            t.state = TorrentState::Paused;
+            t.pause_for(if options.preview {
+                PauseReason::MetadataPreview
+            } else {
+                PauseReason::AddedPaused
+            });
         }
         self.insert(t).await
     }
@@ -325,11 +331,11 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
         t.magnet_trackers = m.trackers.clone();
         t.download_dir = options.download_dir.clone();
         let paused = apply_fake_add_policy(&self.config, &mut t, &options).await?;
-        t.state = if paused {
-            TorrentState::Paused
+        if paused {
+            t.pause_for(PauseReason::AddedPaused);
         } else {
-            TorrentState::DownloadingMetadata
-        };
+            t.state = TorrentState::DownloadingMetadata;
+        }
         self.insert(t).await
     }
     async fn remove_torrent(&self, hash: &TorrentKey, _delete_data: bool) -> Result<()> {
@@ -342,11 +348,15 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             .ok_or_else(|| CoreError::NotFound("torrent".into()))
     }
     async fn pause(&self, hash: &TorrentKey) -> Result<()> {
+        self.pause_with_reason(hash, PauseReason::ApiRequest).await
+    }
+
+    async fn pause_with_reason(&self, hash: &TorrentKey, reason: PauseReason) -> Result<()> {
         self.record_call("pause").await;
         let mut reg = self.registry.lock().await;
         match reg.get_mut(hash) {
             Some(t) => {
-                t.state = TorrentState::Paused;
+                t.pause_for(reason);
                 Ok(())
             }
             None => Err(CoreError::NotFound("torrent".into())),
@@ -369,6 +379,10 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
     async fn stop(&self, hash: &TorrentKey) -> Result<()> {
         self.pause(hash).await
     }
+    async fn stop_with_reason(&self, hash: &TorrentKey, reason: PauseReason) -> Result<()> {
+        self.pause_with_reason(hash, reason).await
+    }
+
     async fn recheck(&self, hash: &TorrentKey) -> Result<()> {
         let mut reg = self.registry.lock().await;
         match reg.get_mut(hash) {

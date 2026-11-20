@@ -7,6 +7,23 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [Unreleased]
+
+### Fixed
+
+- Resolving a magnet preserves verified pieces through concurrent metadata,
+  progress, and save operations. An invalid piece update recovers from the
+  last compatible saved map while other torrents and their queue changes
+  continue to save.
+- Bidirectional v2 peers have room for local requests and control frames
+  alongside queued upload replies, preserving the per-peer upload limit.
+
+### Added
+
+- Paused torrents show their recorded reason in the native API and Web UI.
+  The durable audit records transitions caused by single and bulk pause
+  requests, rechecks, paused intake, and metadata previews.
+
 ## [2.4.0] - [2026-11-19]
 
 ### Added

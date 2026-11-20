@@ -2363,7 +2363,9 @@ async fn pure_v2_metadata_only_preview_resolves_verified_candidate_without_paylo
         .is_some_and(|v2| v2.piece_layers_verified));
     assert_eq!(resolved.data_piece_count().unwrap(), 3);
     assert!(!final_state.finished);
+    assert!(final_state.metadata_progress_pending);
     assert_eq!(final_state.piece_count, 3);
+    assert!(final_state.pieces_have.fits_piece_count(3));
     assert_eq!(final_state.pieces_have.count(3), 0);
     assert!(final_state.tracker_announces.is_empty());
     assert!(final_state.last_announce.is_none());

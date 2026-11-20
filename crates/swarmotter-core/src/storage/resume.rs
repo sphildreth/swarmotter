@@ -50,6 +50,16 @@ impl PieceBitfield {
         }
     }
 
+    /// Check the wire/storage length and unused low bits of the final byte.
+    pub fn fits_piece_count(&self, total: usize) -> bool {
+        let unused = (8 - total % 8) % 8;
+        self.0.len() == total.div_ceil(8)
+            && self
+                .0
+                .last()
+                .is_none_or(|byte| byte & ((1u8 << unused) - 1) == 0)
+    }
+
     pub fn count(&self, total: usize) -> usize {
         let full = total / 8;
         let rem = total % 8;

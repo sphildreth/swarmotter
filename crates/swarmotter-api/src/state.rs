@@ -22,8 +22,8 @@ use swarmotter_core::models::network::NetworkHealth;
 use swarmotter_core::models::peer::Peer;
 use swarmotter_core::models::stats::{AutopilotDecision, GlobalStats, TorrentDiagnostics};
 use swarmotter_core::models::storage::StorageDiagnostics;
-use swarmotter_core::models::torrent::TorrentFile;
 use swarmotter_core::models::torrent::TorrentSummary;
+use swarmotter_core::models::torrent::{PauseReason, TorrentFile};
 use swarmotter_core::models::tracker::TrackerInfo;
 use swarmotter_core::peer_filter::{ManualPeerBan, PeerFilterConfig, PeerFilterStatus};
 use swarmotter_core::policy::PolicyFileExclusionRule;
@@ -192,12 +192,20 @@ pub trait DaemonOps: Send + Sync + 'static {
     }
     /// Pause a torrent.
     async fn pause(&self, hash: &TorrentKey) -> Result<()>;
+    /// Pause with the origin available to implementations that record lifecycle history.
+    async fn pause_with_reason(&self, hash: &TorrentKey, _reason: PauseReason) -> Result<()> {
+        self.pause(hash).await
+    }
     /// Resume a torrent.
     async fn resume(&self, hash: &TorrentKey) -> Result<()>;
     /// Start a torrent now (bypass queue).
     async fn start_now(&self, hash: &TorrentKey) -> Result<()>;
     /// Stop a torrent.
     async fn stop(&self, hash: &TorrentKey) -> Result<()>;
+    /// Stop with an operation source when history attribution is available.
+    async fn stop_with_reason(&self, hash: &TorrentKey, _reason: PauseReason) -> Result<()> {
+        self.stop(hash).await
+    }
     /// Force a recheck.
     async fn recheck(&self, hash: &TorrentKey) -> Result<()>;
     /// Reannounce to trackers.
