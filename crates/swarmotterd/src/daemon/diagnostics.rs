@@ -1006,22 +1006,28 @@ pub(super) fn torrent_selection_complete(
     torrent: &Torrent,
     have: &swarmotter_core::storage::PieceBitfield,
 ) -> Result<bool> {
+    let wanted = |file: usize| {
+        torrent.wanted.get(file).copied().unwrap_or(true)
+            && torrent
+                .priorities
+                .get(file)
+                .copied()
+                .unwrap_or(FilePriority::Normal)
+                != FilePriority::Unwanted
+    };
+    if torrent.meta.requires_v2_data_plane() {
+        let layout = torrent.meta.v2_piece_layout()?;
+        return Ok((0..layout.piece_count()).all(|index| {
+            have.has(index)
+                || layout
+                    .piece(index)
+                    .is_some_and(|piece| !wanted(piece.file_index))
+        }));
+    }
     for piece in 0..torrent.meta.piece_count() {
         let selected = swarmotter_core::storage::piece_file_ranges(&torrent.meta, piece)?
-            .into_iter()
-            .any(|slice| {
-                torrent
-                    .wanted
-                    .get(slice.file_index)
-                    .copied()
-                    .unwrap_or(true)
-                    && torrent
-                        .priorities
-                        .get(slice.file_index)
-                        .copied()
-                        .unwrap_or(FilePriority::Normal)
-                        != FilePriority::Unwanted
-            });
+            .iter()
+            .any(|slice| wanted(slice.file_index));
         if selected && !have.has(piece) {
             return Ok(false);
         }

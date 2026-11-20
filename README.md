@@ -12,7 +12,7 @@
     <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0">
   </a>
   <a href="Cargo.toml">
-    <img src="https://img.shields.io/badge/rust-1.88%2B-orange" alt="Rust 1.88+">
+    <img src="https://img.shields.io/badge/rust-1.89%2B-orange" alt="Rust 1.89+">
   </a>
   <a href="design/vpn-network-containment.md">
     <img src="https://img.shields.io/badge/network-fail--closed-success" alt="Fail-closed network containment">
@@ -95,7 +95,7 @@ See [Use and License](docs/legal.md) for the notice and license references.
 
 ### Prerequisites
 
-- Rust 1.88 or newer (see `rust-version` in `Cargo.toml`)
+- Rust 1.89 or newer (see `rust-version` in `Cargo.toml`)
 - Cargo
 - Git
 - Linux is recommended for network-containment development and testing

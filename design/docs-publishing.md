@@ -76,7 +76,7 @@ pushes to `main`:
 
 The container image publishing job remains separate. Documentation publishing
 and the container image both depend on the stable-toolchain `build-test` job
-and the locked Rust 1.88 compatibility check, so published artifacts come from
+and the locked Rust 1.89 compatibility check, so published artifacts come from
 a commit that passed both compiler gates.
 
 ## GitHub Pages repository settings

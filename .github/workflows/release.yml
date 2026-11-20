@@ -117,7 +117,7 @@ jobs:
           install -m 0755 dist/binary/swarmotterd "${stage}/bin/swarmotterd"
           cp LICENSE README.md CHANGELOG.md THIRD_PARTY_LICENSES.md "${stage}/"
           cp config/swarmotter.toml.example config/swarmotter.container.toml.example "${stage}/config/"
-          cp deploy/.env.example deploy/compose.yml deploy/gluetun.env.example deploy/swarmotterd.service "${stage}/deploy/"
+          cp deploy/.env.example deploy/compose.yml deploy/gluetun.env.example deploy/swarmotterd.service deploy/update-swarmotter.sh deploy/verify-state-backup.py "${stage}/deploy/"
           cp docs/SUMMARY.md docs/api.md docs/configuration.md docs/deployment.md docs/getting-started.md docs/index.md docs/legal.md docs/network-containment.md docs/troubleshooting.md docs/web-ui.md "${stage}/docs/"
           cp -R docs/assets "${stage}/docs/assets"
 

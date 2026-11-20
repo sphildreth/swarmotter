@@ -22,7 +22,7 @@ FROM debian:bookworm-slim AS runtime-base
 
 ARG SWARMOTTER_BUILD_COMMIT=unknown
 ARG SWARMOTTER_IMAGE_CREATED=unknown
-ARG SWARMOTTER_VERSION=2.3.1
+ARG SWARMOTTER_VERSION=2.4.0
 
 LABEL org.opencontainers.image.title="SwarmOtter" \
       org.opencontainers.image.description="SwarmOtter BitTorrent daemon and web UI" \
@@ -44,9 +44,11 @@ RUN apt-get update \
 
 COPY --chown=swarmotter:swarmotter --chmod=0600 config/swarmotter.container.toml.example /etc/swarmotter/swarmotter.toml
 
+COPY --chmod=0755 deploy/container-health.sh /usr/local/bin/swarmotter-health
+
 VOLUME ["/etc/swarmotter", "/data/downloads", "/data/incomplete", "/var/lib/swarmotter"]
 EXPOSE 9091
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl -fsS http://127.0.0.1:9091/live >/dev/null || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD ["/usr/local/bin/swarmotter-health"]
 USER swarmotter:swarmotter
 ENTRYPOINT ["/bin/sh", "-c", "umask 077; exec /usr/local/bin/swarmotterd \"$@\"", "swarmotter-entrypoint"]
 CMD ["--config", "/etc/swarmotter/swarmotter.toml"]

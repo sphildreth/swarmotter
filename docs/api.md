@@ -917,3 +917,14 @@ tracker, and file endpoints delegate to their native operations.
 The qBittorrent torrent-info response continues to expose its documented
 `ratio` and `uploaded` counters from the native summary. It does not claim
 `ratio_limit` or `seeding_time_limit` policy options.
+
+
+### Startup health
+
+While library restoration makes progress, `GET /live` returns HTTP 200. The
+watchdog marks a stalled restore unhealthy and triggers recovery. Other requests
+receive HTTP 503 with `Retry-After` and `data.status = "restoring"`.
+`data.total` and `data.checked` count completed torrents requiring verification
+and finished checks. `data.pieces_checked` advances as payload verification
+proceeds. The API and Web UI become ready after restore. A restore failure
+exits the daemon and preserves the last committed library.

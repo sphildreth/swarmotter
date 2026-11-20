@@ -296,24 +296,17 @@ impl DaemonOps for DaemonRuntime {
             .map(|(i, hash)| (*hash, i + 1))
             .collect();
         let _lifecycle = self.seeder_lifecycle_lock.lock().await;
-        self.registry
-            .lock()
-            .await
-            .list()
-            .iter()
-            .map(|t| {
-                let mut summary = t.to_summary();
-                summary.queue_position = positions.get(&t.key()).copied();
-                let policy = Self::effective_policy_with_config(&config, t);
-                summary.effective_ratio_limit = (!policy.seed_forever.value)
-                    .then_some(policy.ratio_limit.value)
-                    .flatten();
-                summary.effective_idle_limit = (!policy.seed_forever.value)
-                    .then_some(policy.idle_limit.value)
-                    .flatten();
-                summary
-            })
-            .collect()
+        self.registry.lock().await.list_summaries(|t, mut summary| {
+            summary.queue_position = positions.get(&t.key()).copied();
+            let policy = Self::effective_policy_with_config(&config, t);
+            summary.effective_ratio_limit = (!policy.seed_forever.value)
+                .then_some(policy.ratio_limit.value)
+                .flatten();
+            summary.effective_idle_limit = (!policy.seed_forever.value)
+                .then_some(policy.idle_limit.value)
+                .flatten();
+            summary
+        })
     }
 
     async fn get_torrent(&self, hash: &TorrentKey) -> Option<TorrentSummary> {
@@ -612,7 +605,7 @@ impl DaemonOps for DaemonRuntime {
                 let mut reg = self.registry.lock().await;
                 if let Some(t) = reg.get_mut(hash) {
                     t.progress
-                        .replace_from_bitfield(&bf, torrent.meta.piece_count());
+                        .replace_from_bitfield(&bf, torrent.meta.data_piece_count()?);
                     t.recompute_file_bytes_completed();
                     if torrent_selection_complete(t, &bf)? {
                         t.state = TorrentState::Completed;

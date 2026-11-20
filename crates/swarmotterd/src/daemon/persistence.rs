@@ -325,11 +325,13 @@ impl DaemonRuntime {
         else {
             return Ok(0);
         };
+        self.restore_heartbeat();
         let traffic_allowed = self.network_health.read().await.traffic_allowed;
         let restore_config = self.config.read().await.clone();
         let mut restored = TorrentRegistry::default();
         let mut normalized_legacy_progress = 0usize;
         for mut torrent in stored.torrents.drain(..) {
+            self.restore_heartbeat();
             let persisted_state = torrent.state;
             if torrent
                 .seeding
@@ -548,9 +550,13 @@ impl DaemonRuntime {
             .collect::<Result<HashMap<_, _>>>()?;
         *self.registry.lock().await = restored;
         *self.queue.lock().await = stored.queue;
+        self.restore_heartbeat();
         self.verify_restored_completed_torrents().await?;
+        self.restore_heartbeat();
         self.reconcile_queue().await;
+        self.restore_heartbeat();
         self.reconcile_seeders().await;
+        self.restore_heartbeat();
         self.persist_state().await?;
         tracing::info!(count, path = %self.state_path.as_ref().unwrap().display(), "restored daemon state");
         Ok(count)
@@ -564,64 +570,106 @@ impl DaemonRuntime {
             .await
             .torrents
             .values()
-            .filter(|torrent| torrent.state == TorrentState::Completed)
-            .cloned()
+            .filter(|torrent| {
+                torrent.state == TorrentState::Completed
+                    || (torrent.state == TorrentState::NetworkBlocked
+                        && torrent.containment_recovery_intent
+                            == Some(ContainmentRecoveryIntent::Seeding))
+            })
+            .map(Torrent::key)
             .collect::<Vec<_>>();
-        for torrent in torrents {
-            let hash = torrent.key();
-            let complete_dir = self.resolve_download_dir(&torrent).await;
-            let storage_dir = if torrent.progress.is_complete() {
-                complete_dir
-            } else {
-                self.resolve_incomplete_dir_for(&torrent).await
-            };
-            let storage =
-                storage_io_with_config(torrent.meta.clone(), PathBuf::from(storage_dir), &cfg)
-                    .with_partial_file_suffix(
-                        (!torrent.progress.is_complete())
-                            .then(|| Self::partial_file_suffix_for_active_storage(&torrent))
-                            .flatten(),
+        self.reliability
+            .restore_total
+            .store(torrents.len(), std::sync::atomic::Ordering::Relaxed);
+        self.reliability
+            .restore_checked
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Limit memory and concurrent hashing on unconfigured disks. Each job
+        // additionally acquires the operator's most-specific root permit.
+        use futures_util::{stream, TryStreamExt};
+        stream::iter(torrents.into_iter().map(Ok))
+            .try_for_each_concurrent(2, |hash| self.verify_restored_torrent(hash, &cfg))
+            .await
+    }
+
+    async fn verify_restored_torrent(&self, hash: TorrentKey, cfg: &Config) -> Result<()> {
+        let Some(torrent) = self.registry.lock().await.get(&hash).cloned() else {
+            return Ok(());
+        };
+        let complete_dir = self.resolve_download_dir(&torrent).await;
+        let storage_dir = if torrent.progress.is_complete() {
+            complete_dir
+        } else {
+            self.resolve_incomplete_dir_for(&torrent).await
+        };
+        let storage = storage_io_with_config(torrent.meta.clone(), PathBuf::from(storage_dir), cfg)
+            .with_partial_file_suffix(
+                (!torrent.progress.is_complete())
+                    .then(|| Self::partial_file_suffix_for_active_storage(&torrent))
+                    .flatten(),
+            );
+        let check = storage.recheck_with_progress(|| {
+            self.restore_heartbeat();
+            self.reliability
+                .restore_pieces
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        match self
+            .run_root_scoped_recheck(storage.base_dir(), None, check)
+            .await
+        {
+            Ok(bitfield) => {
+                let selection_complete = torrent_selection_complete(&torrent, &bitfield)?;
+                let traffic_allowed = self.network_health.read().await.traffic_allowed;
+                if let Some(restored) = self.registry.lock().await.get_mut(&hash) {
+                    restored.progress.replace_from_bitfield(
+                        &bitfield,
+                        restored
+                            .meta
+                            .data_piece_count()
+                            .unwrap_or_else(|_| restored.meta.piece_count()),
                     );
-            match self
-                .recheck_storage_under_root_control(&storage, None)
-                .await
-            {
-                Ok(bitfield) => {
-                    let selection_complete = torrent_selection_complete(&torrent, &bitfield)?;
-                    let traffic_allowed = self.network_health.read().await.traffic_allowed;
-                    if let Some(restored) = self.registry.lock().await.get_mut(&hash) {
-                        restored.progress.replace_from_bitfield(
-                            &bitfield,
-                            restored
-                                .meta
-                                .data_piece_count()
-                                .unwrap_or_else(|_| restored.meta.piece_count()),
-                        );
-                        restored.recompute_file_bytes_completed();
-                        if !selection_complete {
-                            restored.state = if traffic_allowed {
-                                TorrentState::Queued
-                            } else {
-                                TorrentState::NetworkBlocked
-                            };
-                            restored.error = Some(
+                    restored.recompute_file_bytes_completed();
+                    if !selection_complete {
+                        if restored.containment_recovery_intent
+                            == Some(ContainmentRecoveryIntent::Seeding)
+                        {
+                            restored.containment_recovery_intent =
+                                Some(ContainmentRecoveryIntent::Downloading);
+                        }
+                        restored.state = if traffic_allowed {
+                            TorrentState::Queued
+                        } else {
+                            TorrentState::NetworkBlocked
+                        };
+                        restored.error = Some(
                                 "restored payload failed verification; selected pieces queued for recovery"
                                     .into(),
                             );
-                            restored.seeding_status = SeedingStatus::NotEligible;
-                        } else {
-                            restored.seeding_status = SeedingStatus::Queued;
-                        }
-                    }
-                }
-                Err(error) => {
-                    if let Some(restored) = self.registry.lock().await.get_mut(&hash) {
-                        restored.state = TorrentState::StorageError;
-                        restored.error = Some(error.to_string());
+                        restored.seeding_status = SeedingStatus::NotEligible;
+                    } else if restored.state == TorrentState::Completed {
+                        restored.seeding_status = SeedingStatus::Queued;
                     }
                 }
             }
+            Err(error) => {
+                if let Some(restored) = self.registry.lock().await.get_mut(&hash) {
+                    restored.state = TorrentState::StorageError;
+                    restored.containment_recovery_intent = None;
+                    restored.seeding_status = SeedingStatus::NotEligible;
+                    let total = restored.progress.total;
+                    restored.progress.replace_from_bitfield(
+                        &swarmotter_core::storage::PieceBitfield::new(total),
+                        total,
+                    );
+                    restored.recompute_file_bytes_completed();
+                    restored.error = Some(error.to_string());
+                }
+            }
         }
+        self.reliability
+            .restore_checked
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 

@@ -28,6 +28,8 @@ rollback_tag=""
 previous_env_image=""
 env_updated=0
 updated_service=0
+stopped_for_backup=0
+backup_tmp=""
 
 usage() {
     cat <<EOF
@@ -379,34 +381,34 @@ select_docker_command() {
 }
 
 backup_paths() {
+    local -n result_paths="$1"
     local gluetun_env_file
     local swarmotter_config
     local swarmotter_state
     local gluetun_state
     local gluetun_env_path
+    local path
 
     gluetun_env_file="$(read_env_value GLUETUN_ENV_FILE gluetun.env)"
     swarmotter_config="$(read_env_value SWARMOTTER_CONFIG_DIR "")"
     if [[ -z "$swarmotter_config" ]]; then
-        swarmotter_config="$(read_env_value SWARMOTTER_CONFIG /srv/swarmotter/config/swarmotter.toml)"
+        swarmotter_config="$(read_env_value SWARMOTTER_CONFIG /srv/swarmotter/config)"
     fi
     swarmotter_state="$(read_env_value SWARMOTTER_STATE /srv/swarmotter/state)"
     gluetun_state="$(read_env_value GLUETUN_STATE_DIR /srv/swarmotter/gluetun)"
     gluetun_env_path="$(resolve_path "$gluetun_env_file")"
 
-    printf '%s\0' "$ENV_FILE"
-    printf '%s\0' "$COMPOSE_FILE"
-
-    [[ -e "$gluetun_env_path" ]] && printf '%s\0' "$gluetun_env_path"
-    [[ -e "$swarmotter_config" ]] && printf '%s\0' "$swarmotter_config"
-    [[ -e "$swarmotter_state" ]] && printf '%s\0' "$swarmotter_state"
-    [[ -e "$gluetun_state" ]] && printf '%s\0' "$gluetun_state"
+    result_paths=("$ENV_FILE" "$COMPOSE_FILE")
+    for path in "$gluetun_env_path" "$(resolve_path "$swarmotter_config")" \
+                "$(resolve_path "$swarmotter_state")" \
+                "$(resolve_path "$gluetun_state")"; do
+        if sudo test -e "$path"; then result_paths+=("$path"); fi
+    done
 }
 
 create_backup() {
-    local stamp backup_tmp backup_path manifest_path
+    local stamp backup_path manifest_path
     local -a paths
-    local tar_status
     stamp="$(date -u +'%Y%m%dT%H%M%SZ')"
     backup_path="$BACKUP_DIR/swarmotter-backup-$stamp.tar.gz"
     backup_tmp="$backup_path.tmp"
@@ -416,24 +418,65 @@ create_backup() {
     sudo -v
 
     log "Creating backup at $backup_path"
-    mapfile -d '' -t paths < <(backup_paths)
-    ((${#paths[@]} > 0)) || die "no backup paths were found"
-
+    backup_paths paths
+    local known state_file running path sidecar covered
+    local -a verify_options=()
+    local verifier="$SCRIPT_DIR/verify-state-backup.py"
+    known="$(docker_cmd container ls -a --format '{{.Names}}')"
     umask 077
-    set +e
-    # The tar process runs with sudo so it can read container-owned state; the
-    # redirect intentionally runs as the invoking user so the backup is theirs.
-    # shellcheck disable=SC2024
-    sudo tar --ignore-failed-read --warning=no-file-changed -czf - "${paths[@]}" > "$backup_tmp"
-    tar_status=$?
-    set -e
-    if [[ "$tar_status" -gt 1 ]]; then
-        rm -f "$backup_tmp"
-        die "backup failed with tar exit status $tar_status"
+    if grep -Fxq -- "$CONTAINER_NAME" <<<"$known"; then
+        state_file="$(docker_cmd inspect "$CONTAINER_NAME" | sudo python3 "$verifier" --inspect-path)"
+        running="$(docker_cmd inspect -f '{{.State.Running}}' "$CONTAINER_NAME")"
+        case "$running" in
+            true) stopped_for_backup=1; docker_cmd stop --timeout 45 "$CONTAINER_NAME" ;;
+            false) ;;
+            *) die "could not determine whether the state writer is running" ;;
+        esac
+        [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" == false ]] ||
+            die "state writer is still running"
+    else
+        state_file="$(compose config --format json | sudo python3 "$verifier" --compose-path "$SERVICE_NAME")"
+        if ! sudo test -e "$state_file"; then verify_options+=(--allow-empty); fi
     fi
-    if [[ "$tar_status" -eq 1 ]]; then
-        log "Backup completed with tar warnings; archive was still written"
-    fi
+    state_file="$(realpath -m -- "$state_file")"
+    local -a normalized_paths=()
+    for path in "${paths[@]}"; do
+        path="$(realpath -m -- "$path")"
+        local covered_by_parent=0
+        for sidecar in "${normalized_paths[@]}"; do
+            if [[ "$path" == "$sidecar" ]]; then
+                covered_by_parent=1
+                break
+            fi
+            if [[ "$path" == "$sidecar/"* ]] && sudo test -d "$sidecar"; then
+                covered_by_parent=1
+                break
+            fi
+        done
+        if [[ $covered_by_parent == 1 ]]; then continue; fi
+        if sudo test -d "$path"; then
+            local -a retained_paths=()
+            for sidecar in "${normalized_paths[@]}"; do
+                [[ "$sidecar" == "$path/"* ]] || retained_paths+=("$sidecar")
+            done
+            normalized_paths=("${retained_paths[@]}")
+        fi
+        normalized_paths+=("$path")
+    done
+    paths=("${normalized_paths[@]}")
+    # A custom state file may live on another mount. Include it and its SQLite
+    # sidecars individually without archiving any adjacent payload directories.
+    for sidecar in "$state_file" "$state_file-wal" "$state_file-shm" "$state_file-journal"; do
+        sidecar="$(realpath -m -- "$sidecar")"
+        sudo test -e "$sidecar" || continue
+        covered=0
+        for path in "${paths[@]}"; do
+            if [[ "$sidecar" == "$path" || "$sidecar" == "${path%/}/"* ]]; then covered=1; break; fi
+        done
+        if [[ $covered == 0 ]]; then paths+=("$sidecar"); fi
+    done
+    sudo tar -czf - -- "${paths[@]}" > "$backup_tmp"
+    python3 "$verifier" "$backup_tmp" "$state_file" "${verify_options[@]}"
     mv "$backup_tmp" "$backup_path"
     sha256sum "$backup_path" > "$manifest_path"
 
@@ -462,14 +505,15 @@ recreate_stack() {
 preflight_target_image() {
     local supported
 
-    supported="$(docker_cmd image inspect -f '{{ index .Config.Labels "io.swarmotter.config-check" }}' "$TARGET_IMAGE" 2>/dev/null || true)"
+    supported="$(docker_cmd image inspect -f '{{ index .Config.Labels "io.swarmotter.config-check" }}' "$TARGET_IMAGE")"
     if [[ "$supported" != "true" ]]; then
         log "Target image does not advertise config preflight support; skipping"
         return
     fi
 
     log "Validating mounted configuration with target image"
-    compose run --rm --no-deps "$SERVICE_NAME" \
+    python3 -c 'import json,sys; print(json.dumps({"services":{sys.argv[1]:{"image":sys.argv[2],"network_mode":"none"}}}))' "$SERVICE_NAME" "$TARGET_IMAGE" |
+        compose -f - run -T --rm --no-deps "$SERVICE_NAME" \
         --config "$PREFLIGHT_CONFIG_PATH" --check-config
 }
 
@@ -484,27 +528,43 @@ validate_health() {
     local port
     local url
     local container_url
-    local attempt
+    local attempt=0 previous_progress=-1 progress body response started current_started
 
     port="$(read_env_value SWARMOTTER_WEB_PORT 9091)"
     url="${SWARMOTTER_HEALTH_URL:-http://127.0.0.1:$port/health}"
     container_url="${SWARMOTTER_CONTAINER_HEALTH_URL:-http://127.0.0.1:9091/health}"
 
     log "Waiting for health endpoint: $url"
-    for attempt in {1..30}; do
-        if curl --max-time 5 -fsS "$url" >/dev/null; then
+    started="$(docker_cmd inspect -f '{{.State.StartedAt}}' "$CONTAINER_NAME")"
+    while ((attempt < 30)); do
+        current_started="$(docker_cmd inspect -f '{{.State.StartedAt}}' "$CONTAINER_NAME")"
+        [[ "$current_started" == "$started" ]] || die "target restarted during health validation"
+        response="$(curl --noproxy '*' --max-time 5 -sS -w '\n%{http_code}' "$url" || true)"
+        if [[ "${response##*$'\n'}" == 2[0-9][0-9] ]]; then
             log "Health endpoint passed"
             return
         fi
-        if ((attempt < 30)); then
-            sleep 2
+        # A large healthy seed library can take many probe cycles to restore.
+        # Allow ongoing work while retaining a bounded wait for a stalled daemon.
+        body="${response%$'\n'*}"
+        progress="$(python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)["data"]
+    if d["status"] == "restoring": print(sum(int(d[k]) for k in ("checked", "total", "pieces_checked")))
+except (KeyError, TypeError, ValueError): pass' <<<"$body")"
+        if [[ "$progress" =~ ^[0-9]+$ ]] && ((progress > previous_progress)); then
+            previous_progress="$progress"
+            attempt=0
+        else
+            attempt=$((attempt+1))
         fi
+        ((attempt >= 30)) || sleep 2
     done
 
     show_service_diagnostics
     log "Host health check failed; checking health inside the SwarmOtter network namespace: $container_url"
     if compose exec -T "$SERVICE_NAME" curl --max-time 5 -fsS "$container_url" >/dev/null; then
-        die "health passes inside the SwarmOtter container but not through the host-published port. For Gluetun deployments, set FIREWALL_INPUT_PORTS=9091 in the Gluetun environment file."
+        die "health passes inside the SwarmOtter container but not through the host-published port. For Gluetun deployments, compare container network namespaces and verify FIREWALL_INPUT_PORTS includes 9091."
     fi
 
     die "health endpoint did not pass: $url"
@@ -542,6 +602,7 @@ validate_egress() {
 rollback() {
     local code="$1"
 
+    [[ -z "$backup_tmp" ]] || rm -f -- "$backup_tmp"
     if [[ "$updated_service" == "1" && "$ROLLBACK_ON_FAILURE" == "1" && -n "$rollback_tag" ]]; then
         log "Validation failed; rolling back to $rollback_tag"
         set_env_image "$rollback_tag"
@@ -555,9 +616,14 @@ rollback() {
         set_env_image "$previous_env_image" || true
     fi
 
+    if [[ "$stopped_for_backup" == "1" && "$updated_service" == "0" ]]; then
+        docker_cmd start "$CONTAINER_NAME"
+    fi
     exit "$code"
 }
 
+trap 'exit 130' INT
+trap 'exit 143' TERM
 trap 'code=$?; if [[ $code -ne 0 ]]; then rollback "$code"; fi' EXIT
 
 main() {
@@ -574,6 +640,7 @@ main() {
     check_command sed
     check_command sha256sum
     check_command sudo
+    check_command python3
     check_command tar
 
     select_docker_command
@@ -592,15 +659,14 @@ main() {
     skip_if_current
     compose config >/dev/null
     tag_rollback_image
+    log "Pulling and validating target image"
+    docker_cmd pull "$TARGET_IMAGE"
+    preflight_target_image
     create_backup
 
     log "Updating SWARMOTTER_IMAGE in $ENV_FILE"
     set_env_image "$TARGET_IMAGE"
     env_updated=1
-
-    log "Pulling target image"
-    compose pull "$SERVICE_NAME"
-    preflight_target_image
 
     log "Restarting the Compose stack so Docker attaches networks before VPN routes are installed"
     updated_service=1
@@ -615,4 +681,4 @@ main() {
     [[ -n "$previous_env_image" ]] && log "Previous env image was $previous_env_image"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

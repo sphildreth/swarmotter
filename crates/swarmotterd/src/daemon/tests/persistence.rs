@@ -275,6 +275,40 @@ async fn restart_reconstructs_eligible_seeder_and_preserves_automatic_and_manual
 }
 
 #[tokio::test]
+async fn blocked_seed_with_unreadable_payload_cannot_resume_serving_on_vpn_recovery() {
+    let root = unique_dir("failed-seed-restore");
+    // Opening this payload for reading must return a hard I/O error.
+    // A missing or short file instead represents incomplete download data.
+    std::fs::create_dir(root.join("seed.bin")).unwrap();
+    let bytes =
+        swarmotter_core::meta::build_single_file_torrent("seed.bin", b"seed", 4, None, false);
+    let mut torrent = Torrent::new(swarmotter_core::meta::parse_torrent(&bytes).unwrap(), now());
+    let hash = torrent.key();
+    torrent.state = TorrentState::NetworkBlocked;
+    torrent.containment_recovery_intent = Some(ContainmentRecoveryIntent::Seeding);
+    torrent.progress.have_piece(0);
+    let mut config = Config::default();
+    config.storage.download_dir = Some(root.display().to_string());
+    let blocked = NetworkHealth::blocked(
+        NetworkContainmentMode::Strict,
+        swarmotter_core::models::network::NetworkContainmentStatus::BlockedFailClosed,
+        "fixture",
+    );
+    let runtime = DaemonRuntime::new(config, blocked);
+    runtime.registry.lock().await.add(torrent).unwrap();
+    runtime.verify_restored_completed_torrents().await.unwrap();
+    runtime.recover_containment_work(disabled_health()).await;
+    let registry = runtime.registry.lock().await;
+    let restored = registry.get(&hash).unwrap();
+    assert_eq!(restored.state, TorrentState::StorageError);
+    assert!(restored.containment_recovery_intent.is_none());
+    assert_eq!(restored.progress.pieces_have(), 0);
+    assert!(!runtime.seeder_registry.contains(&hash).await);
+    drop(registry);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn boundary_file_bytes_are_exact_after_restore_and_each_recheck() {
     let root = unique_dir("file-boundary-restore-recheck");
     let state_path = root.join("state.json");

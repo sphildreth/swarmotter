@@ -1042,23 +1042,32 @@ impl DaemonRuntime {
             let _lifecycle = self.seeder_lifecycle_lock.lock().await;
             let live = self.seeder_registry.keys().await;
             let mut reg = self.registry.lock().await;
-            for (hash, torrent) in &mut reg.torrents {
-                if live.contains(hash) {
-                    torrent.state = TorrentState::Seeding;
-                    torrent.seeding_status = SeedingStatus::Active;
-                } else if let Some(status) = desired_status.get(hash).copied() {
-                    torrent.state = TorrentState::Completed;
-                    torrent.seeding_status = status;
-                } else if torrent.state != TorrentState::NetworkBlocked
-                    && torrent.state != TorrentState::Paused
-                    && !torrent.progress.is_complete()
-                {
-                    torrent.seeding_status = SeedingStatus::NotEligible;
-                } else if torrent.state == TorrentState::Seeding
-                    || torrent.seeding_status == SeedingStatus::Active
-                {
-                    torrent.state = TorrentState::Completed;
-                    torrent.seeding_status = SeedingStatus::Queued;
+            let updates: Vec<_> = reg
+                .torrents
+                .iter()
+                .filter_map(|(hash, torrent)| {
+                    let desired = if live.contains(hash) {
+                        (TorrentState::Seeding, SeedingStatus::Active)
+                    } else if let Some(status) = desired_status.get(hash).copied() {
+                        (TorrentState::Completed, status)
+                    } else if torrent.state != TorrentState::NetworkBlocked
+                        && torrent.state != TorrentState::Paused
+                        && !torrent.progress.is_complete()
+                    {
+                        (torrent.state, SeedingStatus::NotEligible)
+                    } else if torrent.state == TorrentState::Seeding
+                        || torrent.seeding_status == SeedingStatus::Active
+                    {
+                        (TorrentState::Completed, SeedingStatus::Queued)
+                    } else {
+                        return None;
+                    };
+                    (desired != (torrent.state, torrent.seeding_status)).then_some((*hash, desired))
+                })
+                .collect();
+            for (hash, desired) in updates {
+                if let Some(torrent) = reg.get_mut(&hash) {
+                    (torrent.state, torrent.seeding_status) = desired;
                 }
             }
         }

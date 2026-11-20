@@ -373,16 +373,21 @@ impl DaemonRuntime {
         let now = Instant::now();
         let recovered = {
             let mut reg = self.registry.lock().await;
-            let mut recovered = Vec::new();
-            for (hash, torrent) in reg.torrents.iter_mut() {
-                if matches!(
-                    torrent.state,
-                    TorrentState::Downloading | TorrentState::DownloadingMetadata
-                ) && !running.contains(hash)
-                {
+            let recovered: Vec<_> = reg
+                .torrents
+                .iter()
+                .filter_map(|(hash, torrent)| {
+                    (matches!(
+                        torrent.state,
+                        TorrentState::Downloading | TorrentState::DownloadingMetadata
+                    ) && !running.contains(hash))
+                    .then_some(*hash)
+                })
+                .collect();
+            for hash in &recovered {
+                if let Some(torrent) = reg.get_mut(hash) {
                     torrent.state = TorrentState::Queued;
                     torrent.error = Some(STALE_ACTIVE_RECOVERY_MESSAGE.into());
-                    recovered.push(*hash);
                 }
             }
             recovered
@@ -912,8 +917,24 @@ impl DaemonRuntime {
                 .metrics_for_path(&config, Path::new(&active_dir)),
         );
 
-        let state = Arc::new(Mutex::new(EngineState::default()));
-        self.engine_states.write().await.insert(hash, state.clone());
+        // Uploads from an inbound session can finish as the previous attempt
+        // exits. Keep its counter owner across retries and seed a fresh runtime
+        // from the durable totals. Peer health and piece state are per attempt.
+        let state = self
+            .engine_states
+            .write()
+            .await
+            .entry(hash)
+            .or_default()
+            .clone();
+        {
+            let mut live = state.lock().await;
+            *live = EngineState {
+                downloaded: live.downloaded.max(snapshot.downloaded),
+                uploaded: live.uploaded.max(snapshot.uploaded),
+                ..EngineState::default()
+            };
+        }
         // Installed before task visibility so lifecycle operations can cancel
         // a saturated metadata-admission or startup-recheck wait.
         let storage_work_cancellation = StorageWorkCancellation::new();

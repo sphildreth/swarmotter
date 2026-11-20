@@ -1462,7 +1462,14 @@ impl StorageIo {
         // If the file is missing, treat as not-yet-present (not a hard error).
         let data = match self.read_piece(piece_index).await {
             Ok(d) => d,
-            Err(CoreError::Io(_)) => return Ok(false),
+            Err(CoreError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Ok(false)
+            }
             Err(e) => return Err(e),
         };
         if let Some(metrics) = &self.metrics {
@@ -1484,7 +1491,14 @@ impl StorageIo {
         }
         let data = match self.read_v2_piece(layout, piece_index).await {
             Ok(data) => data,
-            Err(CoreError::Io(_)) => return Ok(false),
+            Err(CoreError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                return Ok(false)
+            }
             Err(error) => return Err(error),
         };
         if let Some(metrics) = &self.metrics {
@@ -1496,24 +1510,42 @@ impl StorageIo {
     /// Full recheck: verify every piece on disk and return a bitfield of
     /// verified pieces.
     pub async fn recheck(&self) -> Result<PieceBitfield> {
-        let mut bf = PieceBitfield::new(self.meta.piece_count());
-        for i in 0..self.meta.piece_count() {
-            if self.verify_piece_on_disk(i).await? {
-                bf.set(i);
-            }
-        }
-        Ok(bf)
+        self.recheck_with_progress(|| {}).await
     }
 
-    /// Full BEP 52 recheck over its file-aligned piece address space.
+    /// Notify the caller after each piece examined, including missing pieces.
+    pub async fn recheck_with_progress(&self, checked: impl FnMut()) -> Result<PieceBitfield> {
+        let layout = self
+            .meta
+            .requires_v2_data_plane()
+            .then(|| self.meta.v2_piece_layout())
+            .transpose()?;
+        self.recheck_layout(layout.as_ref(), checked).await
+    }
+
+    /// Reuse an already validated file-aligned BEP 52 layout.
     pub async fn recheck_v2(&self, layout: &V2PieceLayout) -> Result<PieceBitfield> {
-        let mut bitfield = PieceBitfield::new(layout.piece_count());
-        for index in 0..layout.piece_count() {
-            if self.verify_v2_piece_on_disk(layout, index).await? {
-                bitfield.set(index);
+        self.recheck_layout(Some(layout), || {}).await
+    }
+
+    async fn recheck_layout(
+        &self,
+        layout: Option<&V2PieceLayout>,
+        mut checked: impl FnMut(),
+    ) -> Result<PieceBitfield> {
+        let count = layout.map_or_else(|| self.meta.piece_count(), V2PieceLayout::piece_count);
+        let mut have = PieceBitfield::new(count);
+        for index in 0..count {
+            let valid = match layout {
+                Some(layout) => self.verify_v2_piece_on_disk(layout, index).await?,
+                None => self.verify_piece_on_disk(index).await?,
+            };
+            if valid {
+                have.set(index);
             }
+            checked();
         }
-        Ok(bitfield)
+        Ok(have)
     }
 
     /// Persist fast-resume metadata next to active torrent data.

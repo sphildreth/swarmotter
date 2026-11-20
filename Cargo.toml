@@ -8,10 +8,10 @@ members = [
 ]
 
 [workspace.package]
-version = "2.3.1"
+version = "2.4.0"
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.88"
+rust-version = "1.89"
 repository = "https://github.com/sphildreth/swarmotter"
 
 [workspace.dependencies]
@@ -32,7 +32,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # HTTP API framework (control plane only)
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["fs", "trace", "cors"] }
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
@@ -43,7 +42,7 @@ sha2 = "0.11"
 
 # Durable local state. `bundled` keeps deployment behavior independent of a
 # host SQLite package while still using SQLite's public-domain amalgamation.
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # Hex/encoding
 hex = "0.4"

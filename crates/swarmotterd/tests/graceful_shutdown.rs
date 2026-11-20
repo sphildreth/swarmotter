@@ -43,6 +43,15 @@ resume_dir = "{0}/resume"
     )
     .unwrap();
     let state = root.join("state.sqlite");
+    let saved = swarmotterd::state_store::DaemonState::new(
+        Vec::new(),
+        swarmotter_core::queue::QueueState::new(Default::default()),
+    );
+    swarmotterd::state_store::save(&state, &saved).unwrap();
+    let locked = rusqlite::Connection::open(&state).unwrap();
+    locked
+        .execute_batch("PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE;")
+        .unwrap();
     let mut child = Process(
         Command::new(env!("CARGO_BIN_EXE_swarmotterd"))
             .args([
@@ -70,6 +79,30 @@ resume_dir = "{0}/resume"
         std::thread::sleep(Duration::from_millis(20));
     };
     sse.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let request = |method: &str, path: &str| {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(stream, "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let mut body = String::new();
+        stream.read_to_string(&mut body).unwrap();
+        body
+    };
+    assert!(request("GET", "/live").starts_with("HTTP/1.1 200"));
+    let status = request("GET", "/health");
+    assert!(
+        status.starts_with("HTTP/1.1 503") && status.contains("restoring"),
+        "{status}"
+    );
+    assert!(request("POST", "/api/v1/torrents/reset").starts_with("HTTP/1.1 503"));
+    locked.execute_batch("ROLLBACK").unwrap();
+    drop(locked);
+    let ready_by = Instant::now() + Duration::from_secs(5);
+    while !request("GET", "/health").starts_with("HTTP/1.1 200") {
+        assert!(Instant::now() < ready_by);
+        std::thread::sleep(Duration::from_millis(10));
+    }
     sse.write_all(b"GET /api/v1/events HTTP/1.1\r\nHost: localhost\r\n\r\n")
         .unwrap();
     let mut response = [0; 1024];

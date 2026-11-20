@@ -13,7 +13,7 @@ pull requests:
   - ES-module syntax validation for every embedded Web UI JavaScript asset
   - executable Web UI DOM-state harnesses
   - docker compose config for the supported deployment manifest
-  - cargo +1.88.0 check --locked --workspace --all-targets --all-features
+  - cargo +1.89.0 check --locked --workspace --all-targets --all-features
   - mdbook build
 
 The script uses Rich for progress feedback. Install it with:
@@ -63,7 +63,7 @@ PR_CHECKS = (
     "scripts/check-web-ui-startup.sh",
     "node crates/swarmotter-web/tests/watch-history.test.js && node crates/swarmotter-web/tests/seeding-policy.test.js",
     "GLUETUN_ENV_FILE=gluetun.env.example docker compose --env-file deploy/.env.example -f deploy/compose.yml config",
-    "cargo +1.88.0 check --locked --workspace --all-targets --all-features",
+    "cargo +1.89.0 check --locked --workspace --all-targets --all-features",
     "mdbook build",
 )
 
@@ -430,7 +430,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--minimum-rust-toolchain",
-        default="1.88.0",
+        default="1.89.0",
         help="Minimum supported Rust toolchain used by the locked workspace check.",
     )
     parser.add_argument(

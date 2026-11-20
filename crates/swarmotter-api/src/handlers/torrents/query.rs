@@ -125,13 +125,12 @@ pub async fn query_torrents(
 ) -> Response {
     let all_rows = state.daemon.list_torrents().await;
     let total = all_rows.len();
-    let mut rows = filter_torrent_rows(all_rows, &query);
+    let rows = filter_torrent_rows(all_rows, &query);
     let filtered = rows.len();
     let counts = torrent_list_counts(&rows);
     let groups = torrent_list_groups(&rows, query.group_by);
     let sort = query.sort.unwrap_or_default();
     let dir = query.dir.unwrap_or_default();
-    sort_torrent_rows(&mut rows, sort, dir);
 
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query
@@ -143,12 +142,8 @@ pub async fn query_torrents(
     } else {
         filtered.div_ceil(per_page)
     };
-    let rows = if per_page == 0 {
-        Vec::new()
-    } else {
-        let start = page.saturating_sub(1).saturating_mul(per_page);
-        rows.into_iter().skip(start).take(per_page).collect()
-    };
+    let start = page.saturating_sub(1).saturating_mul(per_page);
+    let rows = sorted_torrent_page(rows, sort, dir, start, per_page);
 
     into_response(Ok(TorrentListResponse {
         rows,
@@ -224,17 +219,38 @@ pub(super) fn filter_torrent_rows(
         .collect()
 }
 
-pub(super) fn sort_torrent_rows(
-    rows: &mut [TorrentSummary],
+pub(super) fn sorted_torrent_page(
+    mut rows: Vec<TorrentSummary>,
     sort: TorrentListSort,
     dir: TorrentListDirection,
-) {
-    rows.sort_by(|a, b| {
-        compare_torrent_rows(a, b, sort).then_with(|| compare_strings(&a.name, &b.name))
-    });
-    if dir == TorrentListDirection::Desc {
-        rows.reverse();
+    start: usize,
+    size: usize,
+) -> Vec<TorrentSummary> {
+    if size == 0 || start >= rows.len() {
+        return Vec::new();
     }
+    let compare = |a: &TorrentSummary, b: &TorrentSummary| {
+        let order = compare_torrent_rows(a, b, sort)
+            .then_with(|| compare_strings(&a.name, &b.name))
+            .then_with(|| a.info_hash.cmp(&b.info_hash));
+        if dir == TorrentListDirection::Desc {
+            order.reverse()
+        } else {
+            order
+        }
+    };
+    // The registry's primary key breaks ties across pages. Partition in linear
+    // time before sorting only the rows that the client will receive.
+    if start > 0 {
+        rows.select_nth_unstable_by(start, compare);
+    }
+    let page = &mut rows[start..];
+    if size < page.len() {
+        page.select_nth_unstable_by(size, compare);
+    }
+    let end = start.saturating_add(size).min(rows.len());
+    rows[start..end].sort_unstable_by(compare);
+    rows.drain(start..end).collect()
 }
 
 pub(super) fn compare_torrent_rows(
@@ -352,7 +368,10 @@ pub(super) fn normalize_filter_text(value: impl AsRef<str>) -> String {
 }
 
 pub(super) fn compare_strings(a: &str, b: &str) -> Ordering {
-    normalize_filter_text(a).cmp(&normalize_filter_text(b))
+    a.trim()
+        .bytes()
+        .map(|b| b.to_ascii_lowercase())
+        .cmp(b.trim().bytes().map(|b| b.to_ascii_lowercase()))
 }
 
 pub(super) fn compare_f64(a: f64, b: f64) -> Ordering {

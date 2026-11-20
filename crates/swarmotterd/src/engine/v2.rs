@@ -15,6 +15,8 @@ use swarmotter_core::peer::{V2Handshake, V2_RESERVED_BIT, V2_RESERVED_BYTE_INDEX
 use swarmotter_core::utp::PeerDuplex;
 use swarmotter_core::v2::V2PieceLayout;
 
+mod session;
+
 impl TorrentEngine {
     /// Run the pure-v2 baseline for complete metainfo with verified piece
     /// layers. Hybrid torrents intentionally remain on the existing v1 path
@@ -49,7 +51,7 @@ impl TorrentEngine {
             .with_cow_strategy(self.cow_strategy)
             .with_metrics(self.storage_metrics.clone());
         if self.download_dir != self.complete_dir {
-            let complete_have = complete_storage.recheck_v2(&layout).await?;
+            let complete_have = self.recheck_storage(&complete_storage).await?;
             if self.v2_selection_complete(&layout, &complete_have) {
                 self.update_v2_progress(&layout, &complete_have).await;
                 self.finish_v2_selection(&complete_storage, &layout, &complete_have)
@@ -84,6 +86,9 @@ impl TorrentEngine {
             self.finish_v2_selection(&storage, &layout, &have).await?;
             return Ok(self.state.lock().await.clone());
         }
+
+        self.register_downloader_serve(Arc::new(storage.clone()))
+            .await;
 
         // BEP 52 tracker/DHT requests use the explicit 20-byte truncated
         // SHA-256 wire identity. The full SHA-256 torrent key remains local
@@ -246,7 +251,7 @@ impl TorrentEngine {
         }
         let _peer_permit = self.peer_session_budget.acquire_outbound().await?;
         let wire_hash = self.v2_wire_hash()?;
-        let (mut reader, mut write_half, transport) = connect_v2_peer_wire_with_transport(
+        let (reader, write_half, transport) = connect_v2_peer_wire_with_transport(
             self.binder.clone(),
             *peer_addr,
             wire_hash,
@@ -264,226 +269,14 @@ impl TorrentEngine {
         );
         record_peer_connected(&self.state, *peer_addr).await;
 
-        let mut ours = Bitfield::new(layout.piece_count());
-        for index in 0..layout.piece_count() {
-            if have.has(index) {
-                ours.set(index);
-            }
+        session::V2Peer {
+            engine: self,
+            storage,
+            layout,
+            peer: *peer_addr,
         }
-        peer::write_message(&mut write_half, &ours.encode_message()).await?;
-        peer::write_message(&mut write_half, &Message::Interested).await?;
-        write_half.flush().await.map_err(CoreError::from)?;
-
-        let deadline = Instant::now() + Duration::from_secs(45);
-        let mut peer_bitfield: Option<Bitfield> = None;
-        let mut peer_choking = true;
-        let mut made_progress = false;
-
-        loop {
-            if !self.binder.traffic_allowed() || Instant::now() >= deadline {
-                return Ok(made_progress);
-            }
-
-            if !peer_choking {
-                if let Some(piece_index) = peer_bitfield
-                    .as_ref()
-                    .and_then(|bits| self.pick_v2_piece(layout, bits, have))
-                {
-                    let Some(piece) = layout.piece(piece_index) else {
-                        return Err(CoreError::Internal(
-                            "v2 layout lost a selected piece".into(),
-                        ));
-                    };
-                    let piece_length = u32::try_from(piece.length).map_err(|_| {
-                        CoreError::MalformedTorrent(format!(
-                            "BEP 52 piece {piece_index} length {} exceeds peer-wire range",
-                            piece.length
-                        ))
-                    })?;
-                    let requests = peer::block_requests(piece_length);
-                    let expected = requests.iter().copied().collect::<HashMap<_, _>>();
-                    for (offset, length) in &requests {
-                        peer::write_message(
-                            &mut write_half,
-                            &Message::Request {
-                                piece: u32::try_from(piece_index).map_err(|_| {
-                                    CoreError::MalformedTorrent(
-                                        "BEP 52 piece index exceeds peer-wire range".into(),
-                                    )
-                                })?,
-                                offset: *offset,
-                                length: *length,
-                            },
-                        )
-                        .await?;
-                    }
-                    write_half.flush().await.map_err(CoreError::from)?;
-
-                    let mut assembler =
-                        peer::PieceAssembler::new(piece_index as u32, piece_length as usize);
-                    let mut received = 0usize;
-                    let mut rejected = false;
-                    while received < requests.len() {
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        if remaining.is_zero() {
-                            break;
-                        }
-                        let message = match timeout(remaining, reader.read_message()).await {
-                            Ok(Ok(Some(message))) => message,
-                            Ok(Ok(None)) => break,
-                            Ok(Err(error)) => return Err(error),
-                            Err(_) => break,
-                        };
-                        match message {
-                            Message::Piece {
-                                piece: received_piece,
-                                offset,
-                                block,
-                            } if received_piece as usize == piece_index => {
-                                let Some(expected_length) = expected.get(&offset).copied() else {
-                                    continue;
-                                };
-                                if block.len() != expected_length as usize {
-                                    continue;
-                                }
-                                let block_index = offset as usize / peer::BLOCK_SIZE as usize;
-                                let was_missing = assembler
-                                    .received
-                                    .get(block_index)
-                                    .is_some_and(|value| !*value);
-                                if assembler.add_block(offset, &block).is_ok() && was_missing {
-                                    received = received.saturating_add(1);
-                                    record_peer_block(&self.state, *peer_addr, block.len() as u64)
-                                        .await;
-                                }
-                            }
-                            Message::Reject {
-                                piece: rejected_piece,
-                                ..
-                            } if rejected_piece as usize == piece_index => {
-                                rejected = true;
-                                break;
-                            }
-                            Message::Choke => {
-                                peer_choking = true;
-                                record_peer_choked(&self.state, *peer_addr).await;
-                                break;
-                            }
-                            Message::Unchoke => {
-                                peer_choking = false;
-                                record_peer_unchoked(&self.state, *peer_addr).await;
-                            }
-                            Message::Bitfield { bits } => {
-                                let bits = Bitfield::from_bytes(bits, layout.piece_count());
-                                record_peer_availability(
-                                    &self.state,
-                                    *peer_addr,
-                                    &bits,
-                                    have,
-                                    layout.piece_count(),
-                                )
-                                .await;
-                                peer_bitfield = Some(bits);
-                            }
-                            Message::Have { piece } => {
-                                apply_peer_have(&mut peer_bitfield, layout.piece_count(), piece);
-                            }
-                            Message::Keepalive
-                            | Message::Interested
-                            | Message::NotInterested
-                            | Message::Request { .. }
-                            | Message::Cancel { .. }
-                            | Message::Reject { .. }
-                            | Message::HashRequest { .. }
-                            | Message::Hashes { .. }
-                            | Message::HashReject { .. }
-                            | Message::Extended { .. }
-                            | Message::Unknown { .. }
-                            | Message::Piece { .. } => {}
-                        }
-                    }
-
-                    if rejected || received != requests.len() {
-                        continue;
-                    }
-                    let data = assembler.data().to_vec();
-                    if !layout.verify_piece(piece_index, &data) {
-                        record_peer_hash_failure(&self.state, *peer_addr).await;
-                        continue;
-                    }
-                    self.limiter
-                        .acquire(RateDirection::Download, data.len() as u64)
-                        .await;
-                    storage.write_v2_piece(layout, piece_index, &data).await?;
-                    have.set(piece_index);
-                    made_progress = true;
-                    self.update_v2_progress(layout, have).await;
-                    // Coalesced checkpoint policy (ADR-0074).
-                    self.mark_resume_piece_verified();
-                    self.maybe_persist_v2_resume(storage, layout, have, false)
-                        .await?;
-                    peer::write_message(
-                        &mut write_half,
-                        &Message::Have {
-                            piece: u32::try_from(piece_index).map_err(|_| {
-                                CoreError::MalformedTorrent(
-                                    "BEP 52 piece index exceeds peer-wire range".into(),
-                                )
-                            })?,
-                        },
-                    )
-                    .await?;
-                    write_half.flush().await.map_err(CoreError::from)?;
-                    continue;
-                }
-                return Ok(made_progress);
-            }
-
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let message = match timeout(remaining, reader.read_message()).await {
-                Ok(Ok(Some(message))) => message,
-                Ok(Ok(None)) => return Ok(made_progress),
-                Ok(Err(error)) => return Err(error),
-                Err(_) => return Ok(made_progress),
-            };
-            match message {
-                Message::Unchoke => {
-                    peer_choking = false;
-                    record_peer_unchoked(&self.state, *peer_addr).await;
-                }
-                Message::Choke => {
-                    peer_choking = true;
-                    record_peer_choked(&self.state, *peer_addr).await;
-                }
-                Message::Bitfield { bits } => {
-                    let bits = Bitfield::from_bytes(bits, layout.piece_count());
-                    record_peer_availability(
-                        &self.state,
-                        *peer_addr,
-                        &bits,
-                        have,
-                        layout.piece_count(),
-                    )
-                    .await;
-                    peer_bitfield = Some(bits);
-                }
-                Message::Have { piece } => {
-                    apply_peer_have(&mut peer_bitfield, layout.piece_count(), piece);
-                }
-                Message::Keepalive
-                | Message::Interested
-                | Message::NotInterested
-                | Message::Request { .. }
-                | Message::Piece { .. }
-                | Message::Cancel { .. }
-                | Message::Reject { .. }
-                | Message::HashRequest { .. }
-                | Message::Hashes { .. }
-                | Message::HashReject { .. }
-                | Message::Extended { .. }
-                | Message::Unknown { .. } => {}
-            }
-        }
+        .exchange(reader, write_half, have, Duration::from_secs(45))
+        .await
     }
 
     fn v2_wire_hash(&self) -> Result<PeerInfoHash> {
@@ -516,12 +309,12 @@ impl TorrentEngine {
                     stamps_match,
                     "pure-v2 fast resume does not match on-disk payload; rechecking storage"
                 );
-                storage.recheck_v2(layout).await
+                self.recheck_storage(storage).await
             } else {
                 Ok(resume.piece_bitfield)
             }
         } else {
-            storage.recheck_v2(layout).await
+            self.recheck_storage(storage).await
         }
     }
 
@@ -675,10 +468,13 @@ async fn connect_v2_peer_wire_with_transport(
                         swarmotter_core::extensions::EXTENSION_RESERVED,
                     ),
                 };
-                peer::write_v2_handshake(&mut write_half, &handshake).await?;
-                write_half.flush().await.map_err(CoreError::from)?;
                 let mut reader = PeerReader::new(read_half);
-                let theirs = timeout(Duration::from_secs(10), reader.read_v2_handshake()).await??;
+                let theirs = timeout(Duration::from_secs(10), async {
+                    peer::write_v2_handshake(&mut write_half, &handshake).await?;
+                    write_half.flush().await?;
+                    reader.read_v2_handshake().await
+                })
+                .await??;
                 if theirs.info_hash != wire_hash {
                     last_error = Some(CoreError::Internal(
                         "pure-v2 peer handshake hash mismatch".into(),

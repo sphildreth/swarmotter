@@ -345,3 +345,5 @@ Event clients close before HTTP drain; current worker transactions finish before
 torrent shutdown and checkpointing. Logging uses bounded background delivery.
 Persistence doctor counters report cumulative lock wait, snapshot/scan, SQLite
 write, total/maximum operation latency, errors, and serialized record bytes.
+
+Startup readiness, verified peer completion notifications, incremental retention, and Compose recovery follow [ADR-0080](adr/0080-library-and-container-recovery.md).

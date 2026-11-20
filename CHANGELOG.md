@@ -7,6 +7,43 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [2.4.0] - [2026-11-19]
+
+### Added
+
+- The daemon exposes `/live` during startup. While the library is being
+  restored, other routes return HTTP 503 with verification progress and a
+  `Retry-After` header.
+
+### Fixed
+
+- Pure-v2 restore and manual recheck verify payloads using their file-aligned
+  SHA-256 piece layout. Incomplete v2 peers can exchange verified blocks in
+  both directions over contained connections. Uploads flush buffered replies
+  and share the peer-session deadline while downloads continue under backpressure.
+  Transfer totals survive engine retries.
+- Compose deployments recover when Gluetun restarts into a new network
+  namespace. The daemon rejoins that namespace so its published port works
+  again. This requires the updated Compose file and daemon image.
+- The Compose updater stops the daemon before archiving its state, verifies
+  the active database and its SQLite sidecars, and restarts the original
+  daemon if backup verification fails. The updater requires Python 3.11 or
+  later with SQLite support.
+- Parallel downloads checkpoint verified pieces during active peer sessions
+  and advertise newly verified pieces incrementally. Checkpoint writes and
+  peer coordination can continue when both need the piece-state lock.
+
+### Changed
+
+- Library queries reuse torrent summaries and verified byte counts and sort
+  only the requested page. The Web UI skips background list polls while the
+  torrent view is hidden or a refresh is in progress.
+- Incremental SQLite saves limit retention work to changed torrents and rows
+  exceeding the configured caps. Full integrity checks run during load,
+  migration, and offline maintenance.
+- Source builds require Rust 1.89. The lockfile includes patched versions of
+  the bundled SQLite binding, Tokio, rustls, and WebPKI dependencies.
+
 ## [2.3.1] - [2026-10-12]
 
 ### Fixed

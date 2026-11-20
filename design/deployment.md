@@ -17,7 +17,7 @@ SwarmOtter supports these deployment surfaces:
 - `deploy/compose.yml` for Docker Compose homelab deployments.
 - Reverse proxy deployments in front of the API/Web UI control plane.
 
-Source builds require Rust 1.88 or newer. CI checks the locked workspace at
+Source builds require Rust 1.89 or newer. CI checks the locked workspace at
 that compiler floor while release artifacts use the separately pinned release
 builder described in ADR-0032.
 

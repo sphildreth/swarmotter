@@ -89,7 +89,18 @@ export function buildTorrentQueryParams(state) {
   return query.toString();
 }
 
+let refreshGeneration = 0;
+let pendingRefreshes = 0;
+
+export function pollTorrents() {
+  if (!document.hidden && !$("#view-torrents")?.classList.contains("hidden") && !pendingRefreshes) {
+    return refreshTorrents();
+  }
+}
+
 export async function refreshTorrents() {
+  const generation = ++refreshGeneration;
+  pendingRefreshes++;
   if (state.torrentQueryRefreshTimer) {
     window.clearTimeout(state.torrentQueryRefreshTimer);
     state.torrentQueryRefreshTimer = null;
@@ -101,6 +112,7 @@ export async function refreshTorrents() {
       api(`/torrents/query${queryParams ? `?${queryParams}` : ""}`),
       api("/stats"),
     ]);
+    if (generation !== refreshGeneration) return null;
     const torrents = query?.rows || [];
     state.torrentQueryState.sort = normalizeTorrentSort(query?.sort);
     state.torrentQueryState.dir = normalizeTorrentDir(query?.dir);
@@ -116,6 +128,7 @@ export async function refreshTorrents() {
     const rows = torrents.map(normalizeTorrentRow);
     ensureTorrentTable();
     await setTorrentTableData(rows);
+    if (generation !== refreshGeneration) return null;
     if (!state.isApplyingSortFromServer) syncTorrentTableSort(state.torrentQueryState.sort, state.torrentQueryState.dir);
     if ($("#query-summary")) $("#query-summary").textContent = renderTorrentQuerySummary(query);
     updateTorrentPaginationControls(query);
@@ -132,6 +145,8 @@ export async function refreshTorrents() {
   } catch (e) {
     log("torrent list error: " + e.message);
     return null;
+  } finally {
+    pendingRefreshes--;
   }
 }
 

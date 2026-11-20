@@ -652,6 +652,33 @@ async fn combined_peer_and_occupied_listener_update_rolls_back_live_seeder() {
 }
 
 #[tokio::test]
+async fn engine_retry_preserves_durable_and_late_inbound_transfer_totals() {
+    let (runtime, hash, root, _) = active_engine_reconfiguration_fixture("retry-accounting").await;
+    runtime.force_stop_engine(&hash).await;
+    {
+        let mut registry = runtime.registry.lock().await;
+        let torrent = registry.get_mut(&hash).unwrap();
+        torrent.uploaded = 100;
+        torrent.downloaded = 300;
+    }
+    let inbound = Arc::new(Mutex::new(EngineState {
+        uploaded: 125,
+        ..EngineState::default()
+    }));
+    runtime
+        .engine_states
+        .write()
+        .await
+        .insert(hash, inbound.clone());
+    runtime.start_engine(hash).await;
+    inbound.lock().await.uploaded += 10;
+    let live = runtime.engine_state_snapshot(&hash).await.unwrap();
+    assert_eq!((live.uploaded, live.downloaded), (135, 300));
+    runtime.force_stop_engine(&hash).await;
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn active_engine_patch_reconstructs_on_commit_and_exactly_rolls_back_failure() {
     let (runtime, hash, root, _) =
         active_engine_reconfiguration_fixture("active-engine-patch").await;
