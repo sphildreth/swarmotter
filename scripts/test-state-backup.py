@@ -35,16 +35,19 @@ class StateBackupTest(unittest.TestCase):
             config["Cmd"][-1] = "--state-file=/ephemeral/library"
             with self.assertRaisesRegex(ValueError, "persistent mount"):
                 active_state_path(spec)
+            config["Env"] = []
+            config["Cmd"] = ["-c/etc/daemon.toml"]
+            self.assertEqual(active_state_path(spec), Path("/fast/state/state.json"))
 
     def test_updater_stops_writer_and_restarts_it_on_invalid_backup(self):
         updater = Path(__file__).resolve().parents[1] / "deploy/update-swarmotter.sh"
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            for name in ("state", "custom", "config", "gluetun"):
+            for name in ("state", "custom", "config"):
                 (root / name).mkdir()
             for name in ("compose.yml", "gluetun.env"):
                 (root / name).touch()
-            (root / ".env").write_text("SWARMOTTER_STATE=state\nSWARMOTTER_CONFIG_DIR=config\nGLUETUN_STATE_DIR=gluetun\n")
+            (root / ".env").write_text("SWARMOTTER_STATE=./custom\nSWARMOTTER_CONFIG_DIR=config\nGLUETUN_STATE_DIR=gluetun\n")
             db = root / "custom" / "library"
             (root / "inspect.json").write_text(json.dumps([{
                 "Config": {"Cmd": ["--state-file=/custom/library"], "Env": []},
@@ -77,10 +80,13 @@ class StateBackupTest(unittest.TestCase):
                 result = subprocess.run(["bash", "-c", script, "_", updater, root, backup_dir],
                                         capture_output=True, text=True)
                 if valid:
-                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                     self.assertEqual((root / "running").read_text().strip(), "false")
                     archive, = (root / backup_dir).glob("*.tar.gz")
                     verify(archive, db)
+                    with tarfile.open(archive, "r:gz") as backup:
+                        names = [entry.name for entry in backup]
+                    self.assertEqual(sum(name.endswith("/custom/library") for name in names), 1)
                 else:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual((root / "running").read_text().strip(), "true")

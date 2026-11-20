@@ -387,6 +387,7 @@ backup_paths() {
     local swarmotter_state
     local gluetun_state
     local gluetun_env_path
+    local path
 
     gluetun_env_file="$(read_env_value GLUETUN_ENV_FILE gluetun.env)"
     swarmotter_config="$(read_env_value SWARMOTTER_CONFIG_DIR "")"
@@ -397,9 +398,12 @@ backup_paths() {
     gluetun_state="$(read_env_value GLUETUN_STATE_DIR /srv/swarmotter/gluetun)"
     gluetun_env_path="$(resolve_path "$gluetun_env_file")"
 
-    result_paths=("$ENV_FILE" "$COMPOSE_FILE" "$gluetun_env_path" "$(resolve_path "$swarmotter_config")"
-           "$(resolve_path "$swarmotter_state")" "$(resolve_path "$gluetun_state")")
-
+    result_paths=("$ENV_FILE" "$COMPOSE_FILE" "$gluetun_env_path")
+    for path in "$(resolve_path "$swarmotter_config")" \
+                "$(resolve_path "$swarmotter_state")" \
+                "$(resolve_path "$gluetun_state")"; do
+        if sudo test -e "$path"; then result_paths+=("$path"); fi
+    done
 }
 
 create_backup() {
@@ -434,9 +438,36 @@ create_backup() {
         state_file="$(compose config --format json | sudo python3 "$verifier" --compose-path "$SERVICE_NAME")"
         if ! sudo test -e "$state_file"; then verify_options+=(--allow-empty); fi
     fi
+    state_file="$(realpath -m -- "$state_file")"
+    local -a normalized_paths=()
+    for path in "${paths[@]}"; do
+        path="$(realpath -m -- "$path")"
+        local covered_by_parent=0
+        for sidecar in "${normalized_paths[@]}"; do
+            if [[ "$path" == "$sidecar" ]]; then
+                covered_by_parent=1
+                break
+            fi
+            if [[ "$path" == "$sidecar/"* ]] && sudo test -d "$sidecar"; then
+                covered_by_parent=1
+                break
+            fi
+        done
+        if [[ $covered_by_parent == 1 ]]; then continue; fi
+        if sudo test -d "$path"; then
+            local -a retained_paths=()
+            for sidecar in "${normalized_paths[@]}"; do
+                [[ "$sidecar" == "$path/"* ]] || retained_paths+=("$sidecar")
+            done
+            normalized_paths=("${retained_paths[@]}")
+        fi
+        normalized_paths+=("$path")
+    done
+    paths=("${normalized_paths[@]}")
     # A custom state file may live on another mount. Include it and its SQLite
     # sidecars individually without archiving any adjacent payload directories.
     for sidecar in "$state_file" "$state_file-wal" "$state_file-shm" "$state_file-journal"; do
+        sidecar="$(realpath -m -- "$sidecar")"
         sudo test -e "$sidecar" || continue
         covered=0
         for path in "${paths[@]}"; do

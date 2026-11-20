@@ -48,6 +48,8 @@ def active_state_path(spec, from_compose=False):
             for name in names:
                 if token.startswith(name + "="):
                     return token[len(name) + 1:]
+                if name == "-c" and token.startswith(name) and token != name:
+                    return token[len(name):]
         return default
 
     explicit = option(("--state-file",), env.get("SWARMOTTER_STATE_FILE"))
