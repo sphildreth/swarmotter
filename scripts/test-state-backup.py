@@ -45,8 +45,7 @@ class StateBackupTest(unittest.TestCase):
             root = Path(temporary)
             for name in ("state", "custom", "config"):
                 (root / name).mkdir()
-            for name in ("compose.yml", "gluetun.env"):
-                (root / name).touch()
+            (root / "compose.yml").touch()
             (root / ".env").write_text("SWARMOTTER_STATE=./custom\nSWARMOTTER_CONFIG_DIR=config\nGLUETUN_STATE_DIR=gluetun\n")
             db = root / "custom" / "library"
             (root / "inspect.json").write_text(json.dumps([{
@@ -73,10 +72,15 @@ class StateBackupTest(unittest.TestCase):
                 }
                 create_backup
             """
-            for valid in (True, False):
+            for backup_dir, valid, vpn_env in (("with-env", True, True),
+                                               ("without-env", True, False),
+                                               ("invalid", False, False)):
+                if vpn_env:
+                    (root / "gluetun.env").touch()
+                else:
+                    (root / "gluetun.env").unlink(missing_ok=True)
                 (root / "running").write_text("true")
                 db.write_text(json.dumps({"version": 1, "queue": {}, "torrents": []}) if valid else "invalid")
-                backup_dir = "valid" if valid else "invalid"
                 result = subprocess.run(["bash", "-c", script, "_", updater, root, backup_dir],
                                         capture_output=True, text=True)
                 if valid:
@@ -87,6 +91,7 @@ class StateBackupTest(unittest.TestCase):
                     with tarfile.open(archive, "r:gz") as backup:
                         names = [entry.name for entry in backup]
                     self.assertEqual(sum(name.endswith("/custom/library") for name in names), 1)
+                    self.assertEqual(any(name.endswith("/gluetun.env") for name in names), vpn_env)
                 else:
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual((root / "running").read_text().strip(), "true")

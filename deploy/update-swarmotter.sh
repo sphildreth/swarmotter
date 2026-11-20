@@ -398,8 +398,8 @@ backup_paths() {
     gluetun_state="$(read_env_value GLUETUN_STATE_DIR /srv/swarmotter/gluetun)"
     gluetun_env_path="$(resolve_path "$gluetun_env_file")"
 
-    result_paths=("$ENV_FILE" "$COMPOSE_FILE" "$gluetun_env_path")
-    for path in "$(resolve_path "$swarmotter_config")" \
+    result_paths=("$ENV_FILE" "$COMPOSE_FILE")
+    for path in "$gluetun_env_path" "$(resolve_path "$swarmotter_config")" \
                 "$(resolve_path "$swarmotter_state")" \
                 "$(resolve_path "$gluetun_state")"; do
         if sudo test -e "$path"; then result_paths+=("$path"); fi
