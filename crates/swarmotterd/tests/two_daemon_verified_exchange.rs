@@ -8,6 +8,7 @@
 //! public tracker or third-party content is contacted.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use swarmotter_api::handlers::events::EventBroker;
@@ -18,10 +19,10 @@ use swarmotter_core::models::network::{
     NetworkContainmentMode, NetworkContainmentStatus, NetworkHealth,
 };
 use swarmotter_core::models::torrent::TorrentState;
-use swarmotter_core::peer::PeerAddr;
 use swarmotter_core::storage::StorageIo;
 use swarmotterd::daemon::DaemonRuntime;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::{oneshot, Barrier};
 
 fn unique_dir(label: &str) -> PathBuf {
     let p = std::env::temp_dir().join(format!(
@@ -36,46 +37,40 @@ fn unique_dir(label: &str) -> PathBuf {
     p
 }
 
-/// A minimal local HTTP tracker that answers every announce with a compact
-/// peer list containing BOTH swarm members.
-async fn run_two_peer_tracker(
-    listener: tokio::net::TcpListener,
-    peers: std::sync::Arc<tokio::sync::RwLock<Vec<PeerAddr>>>,
-) -> std::io::Result<()> {
-    loop {
-        let (mut stream, _) = listener.accept().await?;
-        let peers = peers.clone();
-        tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            let _ = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
-            let mut encoded_peers = Vec::new();
-            let peers = loop {
-                let peers = peers.read().await.clone();
-                if !peers.is_empty() {
-                    break peers;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            };
-            for peer in &peers {
-                if let std::net::IpAddr::V4(v4) = peer.ip {
-                    encoded_peers.extend_from_slice(&v4.octets());
-                    encoded_peers.extend_from_slice(&peer.port.to_be_bytes());
+/// Each daemon has its own announce URL for the same info hash. Return only
+/// its counterpart's loopback endpoint, after both engines have announced
+/// their verified pieces and registered their inbound serving contexts.
+async fn swarm_tracker(first_announces: Arc<Barrier>) -> (String, oneshot::Sender<u16>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let (port_tx, port_rx) = oneshot::channel::<u16>();
+    tokio::spawn(async move {
+        let port = port_rx.await.unwrap();
+        let mut body = b"d8:intervali5e8:completei0e10:incompletei2e5:peers6:".to_vec();
+        body.extend_from_slice(&std::net::Ipv4Addr::LOCALHOST.octets());
+        body.extend_from_slice(&port.to_be_bytes());
+        body.push(b'e');
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ).into_bytes();
+        response.extend_from_slice(&body);
+        let mut ready = Some(first_announces);
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = BufReader::new(&mut stream).lines();
+            while let Ok(Some(line)) = headers.next_line().await {
+                if line.is_empty() {
+                    break;
                 }
             }
-            let mut body = Vec::new();
-            body.extend_from_slice(b"d8:intervali5e8:completei0e10:incompletei2e5:peers");
-            body.extend_from_slice(format!("{}:", encoded_peers.len()).as_bytes());
-            body.extend_from_slice(&encoded_peers);
-            body.extend_from_slice(b"e");
-            let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = stream.write_all(resp.as_bytes()).await;
-            let _ = stream.write_all(&body).await;
-            let _ = stream.flush().await;
-        });
-    }
+            if let Some(barrier) = ready.take() {
+                barrier.wait().await;
+            }
+            let _ = stream.write_all(&response).await;
+        }
+    });
+    (url, port_tx)
 }
 
 fn daemon_config(dir: &Path, listen_port: u16) -> Config {
@@ -179,38 +174,35 @@ async fn exchange(pure_v2: bool) {
         .map(|i| (i * 37 % 251) as u8)
         .collect();
 
-    let tracker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let tracker_port = tracker.local_addr().unwrap().port();
     let dir_a = unique_dir("peer-a");
     let dir_b = unique_dir("peer-b");
-
-    let tracker_peers = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new()));
-    let tracker_peers_for_task = tracker_peers.clone();
-    tokio::spawn(async move {
-        let _ = run_two_peer_tracker(tracker, tracker_peers_for_task).await;
-    });
-
-    let url = format!("http://127.0.0.1:{tracker_port}/announce");
-    let torrent_bytes = if pure_v2 {
-        pure_v2_metainfo(&payload, piece_len, &url)
-    } else {
-        build_single_file_torrent(
-            "verified-exchange.bin",
-            &payload,
-            piece_len,
-            Some(&url),
-            false,
-        )
+    let first_announces = Arc::new(Barrier::new(2));
+    let (url_a, peer_for_a) = swarm_tracker(first_announces.clone()).await;
+    let (url_b, peer_for_b) = swarm_tracker(first_announces).await;
+    let metainfo = |url: &str| {
+        if pure_v2 {
+            pure_v2_metainfo(&payload, piece_len, url)
+        } else {
+            build_single_file_torrent(
+                "verified-exchange.bin",
+                &payload,
+                piece_len,
+                Some(url),
+                false,
+            )
+        }
     };
-    let piece_count = parse_torrent(&torrent_bytes)
+    let torrent_a = metainfo(&url_a);
+    let torrent_b = metainfo(&url_b);
+    let piece_count = parse_torrent(&torrent_a)
         .unwrap()
         .data_piece_count()
         .unwrap();
     assert_eq!(piece_count, 16);
 
     // Complementary halves: A verifies pieces 0..8, B verifies 8..16.
-    prewrite_pieces(&torrent_bytes, &dir_a, &payload, 0..8).await;
-    prewrite_pieces(&torrent_bytes, &dir_b, &payload, 8..16).await;
+    prewrite_pieces(&torrent_a, &dir_a, &payload, 0..8).await;
+    prewrite_pieces(&torrent_b, &dir_b, &payload, 8..16).await;
 
     let runtime_a = DaemonRuntime::with_paths_broker_and_state(
         daemon_config(&dir_a, 0),
@@ -230,11 +222,11 @@ async fn exchange(pure_v2: bool) {
     );
 
     let hash_a = runtime_a
-        .add_torrent_file_with_options(torrent_bytes.clone(), AddTorrentOptions::new(None, false))
+        .add_torrent_file_with_options(torrent_a, AddTorrentOptions::new(None, false))
         .await
         .unwrap();
     let hash_b = runtime_b
-        .add_torrent_file_with_options(torrent_bytes.clone(), AddTorrentOptions::new(None, false))
+        .add_torrent_file_with_options(torrent_b, AddTorrentOptions::new(None, false))
         .await
         .unwrap();
     assert_eq!(
@@ -246,16 +238,8 @@ async fn exchange(pure_v2: bool) {
     runtime_b.start_now(&hash_b).await.unwrap();
     let addr_a = runtime_a.seeder_listener_addr().await.unwrap();
     let addr_b = runtime_b.seeder_listener_addr().await.unwrap();
-    *tracker_peers.write().await = vec![
-        PeerAddr {
-            ip: addr_a.ip(),
-            port: addr_a.port(),
-        },
-        PeerAddr {
-            ip: addr_b.ip(),
-            port: addr_b.port(),
-        },
-    ];
+    peer_for_a.send(addr_b.port()).unwrap();
+    peer_for_b.send(addr_a.port()).unwrap();
 
     // Both daemons must reach full completion by exchanging their verified
     // halves; neither has a complete seed.
