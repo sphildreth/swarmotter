@@ -103,6 +103,16 @@ pub async fn delete_subscription(
     }
 }
 
+pub async fn preview_draft_subscription(
+    State(state): State<SharedState>,
+    Json(subscription): Json<RssSubscription>,
+) -> Response {
+    match state.daemon.rss_preview_draft(subscription).await {
+        Ok(preview) => into_response(Ok(preview)),
+        Err(error) => err_response(error),
+    }
+}
+
 pub async fn preview_subscription(
     State(state): State<SharedState>,
     Path(id): Path<String>,

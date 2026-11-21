@@ -1006,13 +1006,9 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
                 DoctorCheck {
                     id: "watch".into(),
                     label: "Watch folders".into(),
-                    level: if watch.folders.is_empty() {
-                        DiagnosticLevel::Warning
-                    } else {
-                        DiagnosticLevel::Ok
-                    },
+                    level: DiagnosticLevel::Ok,
                     detail: if watch.folders.is_empty() {
-                        "no watch folders are configured".into()
+                        "not configured (optional)".into()
                     } else {
                         "watch folders are configured".into()
                     },

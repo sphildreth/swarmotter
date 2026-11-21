@@ -425,6 +425,7 @@ never substitutes canonical `info` bytes for an original document (ADR-0084).
 | Method | Path | Description |
 | --- | --- | --- |
 | GET/POST | `/rss` | List or create subscriptions. |
+| POST | `/rss/preview` | Preview an unsaved subscription body without persisting or marking entries seen. |
 | PUT/DELETE | `/rss/{id}` | Replace or delete a subscription. History and completions survive deletion. |
 | GET | `/rss/{id}/preview` | Explain listing decisions without adding or marking entries seen. |
 | POST | `/rss/{id}/poll` | Poll on demand; optional explicit current-match import or reconsider. |

@@ -603,6 +603,12 @@ const ROUTES: &[RouteDoc] = &[
         gated: true,
     },
     RouteDoc {
+        path: "/api/v1/rss/preview",
+        methods: &["POST"],
+        tag: "RSS",
+        gated: true,
+    },
+    RouteDoc {
         path: "/api/v1/rss/{id}/preview",
         methods: &["GET"],
         tag: "RSS",
@@ -1079,21 +1085,23 @@ fn request_body(path: &str, method: &str) -> Option<Value> {
         ("/api/v1/trash/{id}/restore", "POST") => {
             json_body("RestoreRequest", json!({ "collision_policy": "fail" }))
         }
-        ("/api/v1/rss", "POST") | ("/api/v1/rss/{id}", "PUT") => json_body(
-            "RssSubscriptionRequest",
-            json!({
-                "id": "distro-isos",
-                "name": "Distribution releases",
-                "url": "https://distributor.example/feed.xml",
-                "enabled": true,
-                "poll_interval_seconds": 900,
-                "profile": "archive",
-                "start_behavior": "paused",
-                "import_mode": "new_only",
-                "rules": { "include": [{ "title": "*ISO*" }], "exclude": [{ "title": "*live*" }] },
-                "labels": ["linux"]
-            }),
-        ),
+        ("/api/v1/rss", "POST") | ("/api/v1/rss/preview", "POST") | ("/api/v1/rss/{id}", "PUT") => {
+            json_body(
+                "RssSubscriptionRequest",
+                json!({
+                    "id": "distro-isos",
+                    "name": "Distribution releases",
+                    "url": "https://distributor.example/feed.xml",
+                    "enabled": true,
+                    "poll_interval_seconds": 900,
+                    "profile": "archive",
+                    "start_behavior": "paused",
+                    "import_mode": "new_only",
+                    "rules": { "include": [{ "title": "*ISO*" }], "exclude": [{ "title": "*live*" }] },
+                    "labels": ["linux"]
+                }),
+            )
+        }
         ("/transmission/rpc", "POST") => json_body(
             "TransmissionRpcRequest",
             json!({

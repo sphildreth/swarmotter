@@ -11,3 +11,4 @@ node crates/swarmotter-web/tests/peer-filter.test.mjs
 node crates/swarmotter-web/tests/policy-source-labels.test.mjs
 node crates/swarmotter-web/tests/port-mapping.test.mjs
 node crates/swarmotter-web/tests/port-test.test.mjs
+node crates/swarmotter-web/tests/rss-id.test.mjs

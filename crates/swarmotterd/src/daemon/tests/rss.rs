@@ -317,6 +317,22 @@ async fn rss_end_to_end_imports_match_explains_exclusion_and_skips_after_selfish
     let store = runtime.rss_history_store().await.unwrap();
     assert!(store.feed_state("feed-a").unwrap().is_none());
 
+    // The Web UI previews an unsaved draft body before the operator commits it.
+    let draft_subscription = subscription(
+        "draft-preview",
+        format!("{base}/feed-a.xml"),
+        fixture_rules(),
+        RssImportMode::CurrentMatches,
+    );
+    let draft = runtime
+        .preview_rss_draft(&draft_subscription)
+        .await
+        .unwrap();
+    assert_eq!(draft.subscription_id, "draft-preview");
+    assert_eq!(draft.decisions.len(), 4);
+    assert!(store.feed_state("draft-preview").unwrap().is_none());
+    assert!(runtime.registry.lock().await.torrents.is_empty());
+
     // Establish feed B's baseline before the torrent exists anywhere.
     let baseline_b = runtime
         .poll_rss_subscription("feed-b", false, false)

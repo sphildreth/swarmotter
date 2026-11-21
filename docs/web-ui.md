@@ -416,15 +416,22 @@ interface name in its current network namespace. See
 ## RSS subscriptions
 
 The Watch view includes RSS subscription controls below the watch-folder cards.
-Add a feed with a stable id, name, URL, polling interval, optional intake
-profile, start behavior, first-poll mode, and rule lines. Rule lines use
+Add a feed with a name, URL, polling interval, optional intake profile, start
+behavior, first-poll mode, and rule lines. The stable subscription identifier
+is generated from the name automatically (with a numeric suffix on collision)
+and is not shown as an input. Editing a subscription keeps its identifier and
+history; the generated identifier remains visible under the subscription name
+for API use. Rule lines use
 `+title|category` for includes and `-title|category` for excludes; `*` and `?`
 are wildcards and an omitted field is blank. The operator can pause automatic
 polling without deleting history.
 
-**Preview feed** shows each listing's proposed action, reason, and resolved
-torrent identities. It performs no library change and does not mark entries
-seen. **Poll** runs the configured first-poll behavior; **Import current**
+**Preview feed** previews the current form even before the subscription is
+saved (using an unsaved draft request), then scrolls to the preview card. It
+shows each listing's proposed action, reason, and resolved torrent identities,
+performs no library change, and does not mark entries seen. Saving a
+subscription also refreshes and reveals its preview automatically. The
+subscription row's **Preview** action previews the saved configuration. **Poll** runs the configured first-poll behavior; **Import current**
 explicitly imports current matches. The subscription row shows the baseline
 state, last success, latest error, imported/completed counts, and any retryable
 failures. **Decisions** loads paginated per-feed history, **Reconsider older** re-runs

@@ -223,6 +223,47 @@ nav { display: flex; gap: 0.3rem; }
 .watch-layout .card {
   margin-bottom: 0;
 }
+.rss-subscription-list {
+  display: grid;
+  gap: 0.75rem;
+}
+.rss-subscription {
+  min-width: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--tile-soft-bg);
+}
+.rss-subscription-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+}
+.rss-subscription-head h4 {
+  margin: 0;
+}
+.rss-subscription-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+.rss-subscription-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: 0.55rem 1rem;
+  margin-top: 0.65rem;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+.rss-subscription-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.75rem;
+}
 .settings-layout {
   display: grid;
   gap: 0.85rem;

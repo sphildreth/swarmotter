@@ -2,6 +2,7 @@
 // RSS subscription controls for the Watch view.
 
 import { api } from "./js/api.js";
+import { uniqueRssId } from "./js/rss-id.js";
 import { $, escapeHtml, fmtCount, fmtUnixSeconds, renderKv, renderStatus, showError, showToast, log } from "./js/ui.js";
 
 let editingId = null;
@@ -44,24 +45,39 @@ function actionStatus(action) {
 
 function renderSubscriptionRow(sub) {
   const counts = sub.counts || {};
-  return `<tr>
-    <td><strong>${escapeHtml(sub.name)}</strong><div class="muted">${escapeHtml(sub.id)}</div></td>
-    <td>${escapeHtml(sub.url)}</td>
-    <td>${sub.enabled ? "enabled" : "paused"}<div class="muted">every ${fmtCount(sub.poll_interval_seconds)}s</div></td>
-    <td>${renderStatus(sub.poll_in_progress ? "warning" : sub.baseline_established ? "ok" : "warning")}<div class="muted">${sub.poll_in_progress ? "polling" : sub.baseline_established ? "baseline ready" : "baseline pending"}</div></td>
-    <td>${fmtCount(counts.imported)} imported<br>${fmtCount(counts.previously_completed)} completed${counts.failed ? `<br>${fmtCount(counts.failed)} failed` : ""}</td>
-    <td>${escapeHtml(sub.last_success_at ? fmtUnixSeconds(sub.last_success_at) : "never")}${sub.latest_error ? `<div class="muted">${escapeHtml(sub.latest_error)}</div>` : ""}</td>
-    <td class="rss-actions">
+  const baseline = sub.poll_in_progress
+    ? "polling"
+    : sub.baseline_established
+      ? "baseline ready"
+      : "baseline pending";
+  return `<article class="rss-subscription" data-rss-id="${escapeHtml(sub.id)}">
+    <div class="rss-subscription-head">
+      <div>
+        <h4>${escapeHtml(sub.name)}</h4>
+        <div class="muted">${escapeHtml(sub.id)}</div>
+      </div>
+      <div class="rss-subscription-status">
+        ${renderStatus(sub.enabled ? "ok" : "warning")} ${sub.enabled ? "enabled" : "paused"}
+        <span class="muted">every ${fmtCount(sub.poll_interval_seconds)}s</span>
+      </div>
+    </div>
+    <div class="rss-subscription-meta">
+      <div><span class="muted">Feed</span><br>${escapeHtml(sub.url)}</div>
+      <div><span class="muted">Baseline</span><br>${renderStatus(sub.poll_in_progress ? "warning" : sub.baseline_established ? "ok" : "warning")} ${baseline}</div>
+      <div><span class="muted">Counts</span><br>${fmtCount(counts.imported)} imported · ${fmtCount(counts.previously_completed)} completed${counts.failed ? ` · ${fmtCount(counts.failed)} failed` : ""}</div>
+      <div><span class="muted">Last success</span><br>${escapeHtml(sub.last_success_at ? fmtUnixSeconds(sub.last_success_at) : "never")}${sub.latest_error ? `<div class="muted">${escapeHtml(sub.latest_error)}</div>` : ""}</div>
+    </div>
+    <div class="rss-subscription-actions">
       <button type="button" data-rss-action="preview" data-rss-id="${escapeHtml(sub.id)}">Preview</button>
+      <button type="button" data-rss-action="edit" data-rss-id="${escapeHtml(sub.id)}">Edit</button>
       <button type="button" data-rss-action="poll" data-rss-id="${escapeHtml(sub.id)}">Poll</button>
       <button type="button" data-rss-action="import-current" data-rss-id="${escapeHtml(sub.id)}">Import current</button>
-      <button type="button" data-rss-action="edit" data-rss-id="${escapeHtml(sub.id)}">Edit</button>
       <button type="button" data-rss-action="decisions" data-rss-id="${escapeHtml(sub.id)}">Decisions</button>
       <button type="button" data-rss-action="reconsider" data-rss-id="${escapeHtml(sub.id)}">Reconsider older</button>
       <button type="button" data-rss-action="retry" data-rss-id="${escapeHtml(sub.id)}">Retry dismissed</button>
       <button type="button" class="danger" data-rss-action="delete" data-rss-id="${escapeHtml(sub.id)}">Delete</button>
-    </td>
-  </tr>`;
+    </div>
+  </article>`;
 }
 
 function renderRss(statuses) {
@@ -69,11 +85,10 @@ function renderRss(statuses) {
   if (!list) return;
   list.innerHTML = statuses.length === 0
     ? `<p class="muted">No RSS subscriptions configured.</p>`
-    : `<table><thead><tr><th>Name</th><th>Feed</th><th>Schedule</th><th>Baseline</th><th>Counts</th><th>Last success</th><th>Actions</th></tr></thead><tbody>${statuses.map(renderSubscriptionRow).join("")}</tbody></table>`;
+    : `<div class="rss-subscription-list">${statuses.map(renderSubscriptionRow).join("")}</div>`;
   const template = statuses.find(sub => sub.id === editingId);
   if (template && $("#rss-form")) {
     $("#rss-id").value = template.id;
-    $("#rss-id").disabled = true;
     $("#rss-name").value = template.name;
     $("#rss-url").value = "";
     $("#rss-url").placeholder = "Leave blank to keep the configured feed URL";
@@ -102,6 +117,7 @@ function renderPreview(preview) {
         <td>${escapeHtml(row.reason)}</td>
         <td>${escapeHtml((row.torrent_keys || []).join(", "))}</td>
       </tr>`).join("")}</tbody></table>`}`;
+  target.scrollIntoView?.({ behavior: "smooth", block: "start" });
 }
 
 function renderDecisions(page, append = false) {
@@ -159,14 +175,42 @@ function subscriptionPayload() {
   };
 }
 
+async function previewCurrentSubscription() {
+  const payload = subscriptionPayload();
+  if (!payload.name) throw new Error("Subscription name is required");
+  if (editingId) {
+    payload.id = editingId;
+    if (!payload.url) {
+      renderPreview(await api(`/rss/${encodeURIComponent(editingId)}/preview`));
+      return;
+    }
+  } else {
+    if (!payload.url) throw new Error("Feed URL is required to preview");
+    const statuses = await api("/rss");
+    payload.id = uniqueRssId(
+      payload.name,
+      statuses.map(subscription => subscription.id),
+    );
+  }
+  renderPreview(
+    await api("/rss/preview", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  );
+}
+
 export async function saveRssSubscription(event) {
   event?.preventDefault?.();
   try {
     const payload = subscriptionPayload();
-    if (!payload.name || !payload.id) throw new Error("Subscription id and name are required");
+    if (!payload.name) throw new Error("Subscription name is required");
+    let saved;
     if (editingId) {
+      payload.id = editingId;
       // A blank URL leaves the configured value unchanged on the server.
-      await api(`/rss/${encodeURIComponent(editingId)}`, {
+      saved = await api(`/rss/${encodeURIComponent(editingId)}`, {
         method: "PUT",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
@@ -174,7 +218,12 @@ export async function saveRssSubscription(event) {
       showToast("RSS subscription updated", payload.name, "success");
     } else {
       if (!payload.url) throw new Error("Feed URL is required");
-      await api("/rss", {
+      const statuses = await api("/rss");
+      payload.id = uniqueRssId(
+        payload.name,
+        statuses.map(subscription => subscription.id),
+      );
+      saved = await api("/rss", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload),
@@ -183,6 +232,13 @@ export async function saveRssSubscription(event) {
     }
     resetRssForm();
     await refreshRss();
+    if (saved?.id) {
+      try {
+        renderPreview(await api(`/rss/${encodeURIComponent(saved.id)}/preview`));
+      } catch (previewError) {
+        showError("RSS saved, but preview failed", previewError);
+      }
+    }
   } catch (error) {
     showError("RSS save failed", error);
   }
@@ -194,7 +250,7 @@ export function resetRssForm() {
   const form = $("#rss-form");
   if (!form) return;
   form.reset();
-  $("#rss-id").disabled = false;
+  $("#rss-id").value = "";
   $("#rss-url").placeholder = "https://example.test/feed.xml";
   $("#rss-enabled").checked = true;
   $("#rss-interval").value = "900";
@@ -209,6 +265,8 @@ async function runAction(action, id) {
       editingId = id;
       const statuses = await api("/rss");
       renderRss(statuses);
+      $("#rss-form-card")?.scrollIntoView?.({ behavior: "smooth", block: "start" });
+      $("#rss-name")?.focus?.();
       return;
     }
     if (action === "delete") {
@@ -265,7 +323,13 @@ $("#rss-subscriptions")?.addEventListener("click", event => {
 
 $("#rss-form")?.addEventListener("submit", saveRssSubscription);
 $("#rss-reset-btn")?.addEventListener("click", resetRssForm);
-$("#rss-preview-btn")?.addEventListener("click", () => runAction("preview", editingId || $("#rss-id")?.value.trim()));
+$("#rss-preview-btn")?.addEventListener("click", async () => {
+  try {
+    await previewCurrentSubscription();
+  } catch (error) {
+    showError("RSS preview failed", error);
+  }
+});
 $("#rss-decisions")?.addEventListener("click", async event => {
   if (event.target.id !== "rss-more-decisions") return;
   if (!selectedId || !decisionsBefore) return;

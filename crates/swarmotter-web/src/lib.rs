@@ -33,6 +33,7 @@ const UI_JS: &str = include_str!("../assets/js/ui.js");
 const CREATE_JS: &str = include_str!("../assets/js/create.js");
 const PROVENANCE_JS: &str = include_str!("../assets/js/provenance.js");
 const TRASH_JS: &str = include_str!("../assets/js/trash.js");
+const RSS_ID_JS: &str = include_str!("../assets/js/rss-id.js");
 #[cfg(test)]
 const APP_JS: &str = concat!(
     include_str!("../assets/app.js"),
@@ -47,6 +48,7 @@ const APP_JS: &str = concat!(
     include_str!("../assets/js/provenance.js"),
     include_str!("../assets/js/trash.js"),
     include_str!("../assets/rss.js"),
+    include_str!("../assets/js/rss-id.js"),
 );
 const SEEDING_POLICY_JS: &str = include_str!("../assets/seeding-policy.js");
 const RSS_JS: &str = include_str!("../assets/rss.js");
@@ -90,6 +92,7 @@ pub fn web_router() -> Router {
         .route("/js/create.js", get(create_js))
         .route("/js/provenance.js", get(provenance_js))
         .route("/js/trash.js", get(trash_js))
+        .route("/js/rss-id.js", get(rss_id_js))
         .route("/seeding-policy.js", get(seeding_policy_js))
         .route("/rss.js", get(rss_js))
         .route("/watch-history.js", get(watch_history_js))
@@ -191,6 +194,10 @@ async fn seeding_policy_js() -> Response {
         SEEDING_POLICY_JS,
     )
         .into_response()
+}
+
+async fn rss_id_js() -> Response {
+    javascript(RSS_ID_JS)
 }
 
 async fn rss_js() -> Response {
@@ -1032,15 +1039,31 @@ mod tests {
             "id=\"rss-subscriptions\"",
             "id=\"rss-preview\"",
             "id=\"rss-decisions\"",
-            "src=\"/rss.js\"",
+            "id=\"rss-id\" type=\"hidden\"",
+            "uniqueRssId(",
+            "previewCurrentSubscription(",
+            "/rss/preview",
+            "rss-subscription-list",
+            "rss-subscription-actions",
+            "import { refreshRss } from \"./rss.js\"",
             "data-rss-action=\"import-current\"",
             "data-rss-action=\"reconsider\"",
         ] {
             assert!(
-                INDEX_HTML.contains(needle) || RSS_JS.contains(needle),
+                INDEX_HTML.contains(needle)
+                    || RSS_JS.contains(needle)
+                    || APP_JS_ENTRY.contains(needle),
                 "RSS UI is missing {needle}"
             );
         }
+        assert!(
+            !INDEX_HTML.contains("<span>Id</span>"),
+            "RSS UI should generate and hide the stable subscription id"
+        );
+        assert!(
+            !INDEX_HTML.contains("src=\"/rss.js\"") && !INDEX_HTML.contains("src=\"/js/trash.js\""),
+            "feature modules must load through the app.js module graph, not as classic scripts"
+        );
     }
 
     #[test]
@@ -1439,6 +1462,7 @@ mod tests {
             ("js/create.js", CREATE_JS),
             ("js/provenance.js", PROVENANCE_JS),
             ("js/trash.js", TRASH_JS),
+            ("js/rss-id.js", RSS_ID_JS),
             ("seeding-policy.js", SEEDING_POLICY_JS),
             ("watch-history.js", WATCH_HISTORY_JS),
             ("rss.js", RSS_JS),
@@ -1551,6 +1575,7 @@ mod tests {
             ),
             ("/watch-history.js", "application/javascript; charset=utf-8"),
             ("/rss.js", "application/javascript; charset=utf-8"),
+            ("/js/rss-id.js", "application/javascript; charset=utf-8"),
             ("/js/create.js", "application/javascript; charset=utf-8"),
             ("/js/provenance.js", "application/javascript; charset=utf-8"),
             ("/js/trash.js", "application/javascript; charset=utf-8"),

@@ -616,6 +616,14 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn rss_preview(&self, _id: &str) -> Result<swarmotter_core::rss::RssPreview> {
         Err(CoreError::NotFound("rss subscription".into()))
     }
+    /// Preview an unsaved subscription body without persisting it, adding
+    /// torrents, or marking entries seen.
+    async fn rss_preview_draft(
+        &self,
+        _subscription: swarmotter_core::rss::RssSubscription,
+    ) -> Result<swarmotter_core::rss::RssPreview> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
     /// Poll one feed on demand. `import_current` explicitly imports current
     /// matches; `reconsider` re-evaluates stored older listings.
     async fn rss_poll(

@@ -2717,6 +2717,13 @@ impl DaemonOps for DaemonRuntime {
         self.preview_rss_subscription(id).await
     }
 
+    async fn rss_preview_draft(
+        &self,
+        subscription: swarmotter_core::rss::RssSubscription,
+    ) -> Result<swarmotter_core::rss::RssPreview> {
+        self.preview_rss_draft(&subscription).await
+    }
+
     async fn rss_poll(
         &self,
         id: &str,

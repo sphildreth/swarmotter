@@ -107,9 +107,9 @@ impl DaemonRuntime {
                 checks,
                 "watch_folders",
                 "Watch folders",
-                DiagnosticLevel::Warning,
-                "no watch folders are configured",
-                Some("add [[watch]] entries if automatic .torrent import is desired"),
+                DiagnosticLevel::Ok,
+                "not configured (optional)",
+                None,
             );
             return;
         }

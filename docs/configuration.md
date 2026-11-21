@@ -1064,7 +1064,9 @@ title = "*live*"
 ```
 
 `id` is immutable and may contain ASCII letters, digits, `-`, `_`, and `.`.
-`enabled = false` pauses automatic polling and imports; on-demand preview and
+The Web UI generates it from the subscription name and keeps it out of the
+primary form; configuration files and API callers may still supply an explicit
+id. `enabled = false` pauses automatic polling and imports; on-demand preview and
 poll remain available and history is retained. `poll_interval_seconds` must be
 between 30 and 86,400. Changing `profile` affects future imports; per-torrent
 policy captured by the standard intake workflow remains authoritative.

@@ -613,14 +613,14 @@
         <button id="watch-scan-btn" disabled>Scan Now</button>
         <div id="rss-config" class="card settings-wide">
           <h3>RSS subscriptions</h3>
-          <p class="muted">Feeds are fetched only through the contained network path. Preview explains every decision before anything is added; the first successful poll establishes the baseline for new-entries-only mode.</p>
+          <p class="muted">Feeds are fetched only through the contained network path. Use Preview, Edit, or Delete on each saved subscription below. Preview explains every decision before anything is added; the first successful poll establishes the baseline for new-entries-only mode.</p>
           <div id="rss-subscriptions"><p class="muted">Loading RSS subscriptions…</p></div>
         </div>
         <div id="rss-form-card" class="card settings-wide">
           <h3>Add or edit subscription</h3>
           <form id="rss-form">
             <div class="settings-form-grid">
-              <label class="settings-field"><span>Id</span><input id="rss-id" type="text" required pattern="[A-Za-z0-9._-]+"></label>
+              <input id="rss-id" type="hidden">
               <label class="settings-field"><span>Name</span><input id="rss-name" type="text" required></label>
               <label class="settings-field settings-wide"><span>Feed URL</span><input id="rss-url" type="url" placeholder="https://example.test/feed.xml"></label>
               <label class="settings-field"><span>Poll interval (seconds)</span><input id="rss-interval" type="number" min="30" max="86400" step="1" value="900" required></label>
@@ -628,6 +628,7 @@
               <label class="settings-field"><span>Start behavior</span><select id="rss-start"><option value="start">Start</option><option value="paused">Paused</option></select></label>
               <label class="settings-field"><span>First poll</span><select id="rss-import-mode"><option value="new_only">New entries only</option><option value="current_matches">Import current matches</option></select></label>
               <label class="settings-check"><input id="rss-enabled" type="checkbox" checked><span>Enabled (automatic polling)</span></label>
+              <p class="muted settings-wide">A stable subscription identifier is generated from the name. Renaming keeps the existing identifier and history.</p>
               <label class="settings-field settings-wide"><span>Rules (one per line: <code>+title|category</code> to include, <code>-title|category</code> to exclude; <code>*</code> wildcard)</span><textarea id="rss-rules" class="settings-list" rows="5" spellcheck="false" placeholder="+*FLAC*|Music/Lossless&#10;-*live*|"></textarea></label>
             </div>
             <div class="rss-form-actions">
@@ -726,8 +727,6 @@
   <script src="/vendor/tabulator/tabulator.min.js"></script>
   <script src="/seeding-policy.js"></script>
   <script src="/watch-history.js"></script>
-  <script src="/rss.js"></script>
-  <script src="/js/trash.js"></script>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

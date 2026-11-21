@@ -375,6 +375,10 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             put(handlers::rss::update_subscription).delete(handlers::rss::delete_subscription),
         )
         .route(
+            "/rss/preview",
+            post(handlers::rss::preview_draft_subscription),
+        )
+        .route(
             "/rss/{id}/preview",
             get(handlers::rss::preview_subscription),
         )

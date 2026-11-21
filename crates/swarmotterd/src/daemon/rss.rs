@@ -1346,7 +1346,8 @@ impl DaemonRuntime {
         })
     }
 
-    /// Preview one feed without adding a torrent or marking any entry seen.
+    /// Preview one saved feed without adding a torrent or marking any entry
+    /// seen.
     pub(super) async fn preview_rss_subscription(
         &self,
         subscription_id: &str,
@@ -1356,6 +1357,27 @@ impl DaemonRuntime {
             .subscription(subscription_id)
             .cloned()
             .ok_or_else(|| CoreError::NotFound(format!("rss subscription {subscription_id}")))?;
+        self.preview_rss_subscription_with(config, subscription)
+            .await
+    }
+
+    /// Preview an unsaved subscription body. This supports the Web UI's
+    /// Preview button before the operator commits the subscription to config.
+    pub(super) async fn preview_rss_draft(
+        &self,
+        subscription: &RssSubscription,
+    ) -> Result<RssPreview> {
+        subscription.validate()?;
+        let config = self.config.read().await.rss.clone();
+        self.preview_rss_subscription_with(config, subscription.clone())
+            .await
+    }
+
+    async fn preview_rss_subscription_with(
+        &self,
+        config: RssConfig,
+        subscription: RssSubscription,
+    ) -> Result<RssPreview> {
         let store = self.rss_history_store().await?;
         let state = {
             let store = store.clone();

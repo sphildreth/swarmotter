@@ -878,6 +878,7 @@ redact feed URL credentials and sensitive query values.
 | --- | --- | --- |
 | GET | `/rss` | List subscriptions with poll state, latest error, counts, and baseline state. |
 | POST | `/rss` | Create a subscription. |
+| POST | `/rss/preview` | Preview a full, unsaved subscription body without persisting it, adding torrents, or marking entries seen. |
 | PUT | `/rss/{id}` | Replace a subscription. A blank `url` preserves the configured URL; the id is immutable. |
 | DELETE | `/rss/{id}` | Delete a subscription. History and verified completions remain durable. |
 | GET | `/rss/{id}/preview` | Fetch and explain current decisions without adding torrents or marking entries seen. |
@@ -887,7 +888,8 @@ redact feed URL credentials and sensitive query values.
 | DELETE | `/rss/history/completions` | Explicitly clear verified completion identities. |
 | GET | `/rss/diagnostics` | Report whether duplicate lookups use their indexes. |
 
-A subscription body uses `id`, `name`, `url`, `enabled`,
+The Web UI generates `id` from the subscription name; API clients must supply
+their own stable id. A subscription body uses `id`, `name`, `url`, `enabled`,
 `poll_interval_seconds`, `profile`, `start_behavior`, `import_mode`, `labels`,
 and `rules: { include: [...], exclude: [...] }`. A rule has optional `title` and
 `category` wildcard fields. `import_mode` is `new_only` (default) or

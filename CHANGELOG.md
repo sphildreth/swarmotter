@@ -9,6 +9,27 @@ date or duration estimates.
 
 ## [Unreleased]
 
+### Fixed
+
+- A clean installation no longer reports unconfigured watch folders as a
+  doctor warning. Watch folders are optional; the check now reports `ok` with
+  `not configured (optional)` until a folder is added.
+- The Watch view now generates stable RSS subscription identifiers from the
+  subscription name, adds a suffix on collision, and hides the identifier input.
+  Existing identifiers still display under the subscription name for API use.
+- RSS **Preview feed** now previews the current unsaved form through the new
+  draft preview endpoint, scrolls to the preview results, and saving a
+  subscription automatically displays its preview.
+- Saved RSS subscriptions now render as cards with visible Preview, Edit, and
+  Delete controls instead of a wide table whose action column could be
+  off-screen. Editing scrolls the configuration form into view.
+
+### Changed
+
+- RSS naming no longer asks operators to choose an API/history key in the
+  primary form. Configuration files and API clients may still provide explicit
+  ids.
+
 ### Added
 
 - Tracker diagnostics now show effective priority/allow policy, last success
