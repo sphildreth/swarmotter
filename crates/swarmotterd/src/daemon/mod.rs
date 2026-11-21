@@ -27,6 +27,7 @@ mod scheduler;
 mod seeding;
 mod settings;
 mod storage_controls;
+mod tracker_ops;
 mod trash;
 #[path = "watch.rs"]
 mod watch_runtime;
@@ -562,6 +563,7 @@ struct EngineStartSnapshot {
     intake_selection: Option<swarmotter_core::policy::IntakePolicySnapshot>,
     partial_file_suffix: Option<String>,
     tracker_host_rules: Vec<swarmotter_core::policy::TrackerHostRule>,
+    disabled_trackers: Vec<String>,
     magnet_info_hash: Option<InfoHash>,
     magnet_identity: Option<swarmotter_core::hash::TorrentIdentity>,
     magnet_name: Option<String>,
@@ -598,6 +600,7 @@ impl EngineStartSnapshot {
                 .as_ref()
                 .and_then(|snapshot| snapshot.partial_file_suffix.clone()),
             tracker_host_rules: policy.tracker.host_rules.value,
+            disabled_trackers: torrent.disabled_trackers.clone(),
             magnet_info_hash: torrent.magnet_info_hash,
             magnet_identity: torrent.magnet_identity.clone(),
             magnet_name: torrent.magnet_name.clone(),

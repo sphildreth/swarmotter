@@ -27,6 +27,9 @@ directory.
 - Cleanup previews, profile/label/state retention rules, local trash and restore
   with no-overwrite collision handling, stale-partial cleanup, and explicit
   purge.
+- Tracker policy and runtime diagnostics, peer-source attribution, webseed
+  contribution/error evidence, safe tracker maintenance, and redacted
+  diagnostics export.
 - IPv4 and IPv6 torrent networking when enabled by configuration.
 - Strict data-plane containment through an interface, source address, or network
   namespace.

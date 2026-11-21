@@ -319,6 +319,48 @@ pub trait DaemonOps: Send + Sync + 'static {
     /// Edit a tracker.
     async fn edit_tracker(&self, hash: &TorrentKey, old_url: String, new_url: String)
         -> Result<()>;
+    /// Retry tracker discovery now. The daemon may reannounce every configured
+    /// tracker for the torrent; the supplied URL identifies the operator action.
+    async fn retry_tracker(&self, _hash: &TorrentKey, _url: String) -> Result<()> {
+        Err(CoreError::NotFound("tracker".into()))
+    }
+    /// Enable or disable one exact tracker URL for this torrent.
+    async fn set_tracker_enabled(
+        &self,
+        _hash: &TorrentKey,
+        _url: String,
+        _enabled: bool,
+    ) -> Result<Vec<TrackerInfo>> {
+        Err(CoreError::NotFound("tracker".into()))
+    }
+    /// Preview trackers at or above a consecutive-failure threshold.
+    async fn cleanup_trackers_preview(
+        &self,
+        _hash: &TorrentKey,
+        _failure_threshold: u32,
+    ) -> Result<Vec<TrackerInfo>> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
+    /// Disable affected trackers after a preview. The daemon revalidates the
+    /// threshold at execution time.
+    async fn cleanup_trackers(
+        &self,
+        _hash: &TorrentKey,
+        _failure_threshold: u32,
+    ) -> Result<Vec<TrackerInfo>> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
+    /// Redacted tracker/webseed/peer-source diagnostic text.
+    async fn tracker_diagnostics(&self, _hash: &TorrentKey) -> Result<String> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
+    /// Enabled webseeds and their verified byte/error/retry evidence.
+    async fn list_webseeds(
+        &self,
+        _hash: &TorrentKey,
+    ) -> Option<Vec<swarmotter_core::models::tracker::WebseedInfo>> {
+        None
+    }
 
     /// List peers for a torrent.
     async fn list_peers(&self, hash: &TorrentKey) -> Option<Vec<Peer>>;

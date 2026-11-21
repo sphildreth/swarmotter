@@ -292,6 +292,16 @@ hash as the completed verified piece map; queue/seeder reconciliation then
 starts the contained seeder. A duplicate or registration error still returns the
 export and reports the seed error (ADR-0083).
 
+## Discovery performance diagnostics
+
+Engine state retains bounded per-tracker attempt/success/retry/latency/yield
+evidence, per-peer discovery-source sets, and per-webseed verified-byte/error
+state. Tracker policy is resolved from live profile host rules plus exact
+per-torrent disables. The daemon exposes these facts through tracker/peer/webseed
+rows and safe maintenance endpoints; copied diagnostics redact passkeys and
+credentials. No diagnostic creates a socket outside the contained binder
+(ADR-0088).
+
 ## Versioned OpenAPI and interactive documentation
 
 The API crate owns a route catalog that generates an OpenAPI 3.1 document served

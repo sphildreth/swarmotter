@@ -435,6 +435,42 @@ const ROUTES: &[RouteDoc] = &[
         gated: true,
     },
     RouteDoc {
+        path: "/api/v1/torrents/{hash}/trackers/retry",
+        methods: &["POST"],
+        tag: "Torrents",
+        gated: true,
+    },
+    RouteDoc {
+        path: "/api/v1/torrents/{hash}/trackers/policy",
+        methods: &["POST"],
+        tag: "Torrents",
+        gated: true,
+    },
+    RouteDoc {
+        path: "/api/v1/torrents/{hash}/trackers/cleanup/preview",
+        methods: &["POST"],
+        tag: "Torrents",
+        gated: true,
+    },
+    RouteDoc {
+        path: "/api/v1/torrents/{hash}/trackers/cleanup",
+        methods: &["POST"],
+        tag: "Torrents",
+        gated: true,
+    },
+    RouteDoc {
+        path: "/api/v1/torrents/{hash}/trackers/diagnostics",
+        methods: &["GET"],
+        tag: "Torrents",
+        gated: true,
+    },
+    RouteDoc {
+        path: "/api/v1/torrents/{hash}/webseeds",
+        methods: &["GET"],
+        tag: "Torrents",
+        gated: true,
+    },
+    RouteDoc {
         path: "/api/v1/torrents/{hash}/trackers/{url}",
         methods: &["DELETE"],
         tag: "Torrents",
@@ -1108,6 +1144,13 @@ fn responses(path: &str, method: &str) -> Value {
         })
     } else if path == "/api/v1/ws" {
         json!({ "101": { "description": "WebSocket upgrade" } })
+    } else if path == "/api/v1/torrents/{hash}/trackers/diagnostics" {
+        json!({
+            "200": {
+                "description": "Redacted tracker, webseed, and peer-source diagnostic text.",
+                "content": { "text/plain": { "schema": { "type": "string" } } }
+            }
+        })
     } else if path == "/api/docs" {
         json!({
             "200": {
@@ -1398,6 +1441,59 @@ fn components() -> Value {
                 "required": ["hashes"],
                 "properties": { "hashes": { "type": "array", "items": { "type": "string" } } },
                 "additionalProperties": false
+            },
+            "TrackerUrlRequest": {
+                "type": "object", "required": ["url"],
+                "properties": { "url": { "type": "string" } },
+                "additionalProperties": false
+            },
+            "TrackerPolicyRequest": {
+                "type": "object", "required": ["url", "enabled"],
+                "properties": { "url": { "type": "string" }, "enabled": { "type": "boolean" } },
+                "additionalProperties": false
+            },
+            "TrackerCleanupRequest": {
+                "type": "object", "required": ["failure_threshold"],
+                "properties": { "failure_threshold": { "type": "integer", "minimum": 1 }, "confirm": { "type": "boolean" } },
+                "additionalProperties": false
+            },
+            "TrackerInfo": {
+                "type": "object",
+                "required": ["id", "url", "status", "allowed", "effective_priority"],
+                "properties": {
+                    "url": { "type": "string" },
+                    "status": { "type": "string" },
+                    "allowed": { "type": "boolean" },
+                    "effective_priority": { "type": "string", "enum": ["low", "normal", "high"] },
+                    "policy_source": { "type": "string" },
+                    "last_success": { "type": ["integer", "null"] },
+                    "last_attempt": { "type": ["integer", "null"] },
+                    "retries": { "type": "integer" },
+                    "latency_ms": { "type": ["integer", "null"] },
+                    "peers_returned": { "type": ["integer", "null"] },
+                    "sample_status": { "type": "string", "enum": ["unavailable", "stale", "current"] },
+                    "last_error": { "type": ["string", "null"] },
+                    "recent_errors": { "type": "array", "items": { "type": "string" } }
+                },
+                "additionalProperties": true
+            },
+            "WebseedInfo": {
+                "type": "object",
+                "required": ["url", "enabled", "status", "bytes_verified", "attempts", "retries"],
+                "properties": {
+                    "url": { "type": "string" },
+                    "enabled": { "type": "boolean" },
+                    "status": { "type": "string" },
+                    "bytes_verified": { "type": "integer" },
+                    "attempts": { "type": "integer" },
+                    "retries": { "type": "integer" },
+                    "last_success": { "type": ["integer", "null"] },
+                    "last_attempt": { "type": ["integer", "null"] },
+                    "last_error": { "type": ["string", "null"] },
+                    "recent_errors": { "type": "array", "items": { "type": "string" } },
+                    "latency_ms": { "type": ["integer", "null"] }
+                },
+                "additionalProperties": true
             },
             "AnnotationRequest": {
                 "type": "object",

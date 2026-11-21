@@ -834,6 +834,41 @@ resume/state/temporary/log placement roots. `cow_strategy_supported` is `null`
 when the host cannot determine support safely; an explicit unsupported NOCOW
 request fails before payload bytes are written.
 
+## Tracker, peer-source, and webseed diagnostics
+
+Tracker rows include effective policy and runtime evidence:
+
+- `effective_priority`: `low`, `normal`, or `high` after profile host rules.
+- `allowed`: false for profile-disabled or exact per-torrent disabled URLs.
+- `policy_source`: the selected policy layer or `torrent override`.
+- `last_success` and `last_attempt`, separate from each other.
+- `retries`, `latency_ms`, and `peers_returned` (null = never measured, `0` =
+  measured zero).
+- `sample_status`: `current`, `stale`, or `unavailable`.
+- `recent_errors`: bounded recent announce errors.
+
+Peer rows include `sources`: tracker URL, `dht`, `pex`, `direct`, `resume`, or
+empty when provenance is unknown. Multiple sources are retained.
+
+`GET /api/v1/torrents/:hash/webseeds` returns enabled webseeds with status,
+verified byte contribution, attempts, retries, last success/attempt, latency,
+last error, and bounded recent errors.
+
+Tracker maintenance endpoints:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| POST | `/api/v1/torrents/:hash/trackers/retry` | Trigger a tracker reannounce now (`{ "url": ... }`). |
+| POST | `/api/v1/torrents/:hash/trackers/policy` | Enable/disable one exact tracker URL (`{ "url": ..., "enabled": bool }`). |
+| POST | `/api/v1/torrents/:hash/trackers/cleanup/preview` | List trackers at or above `{ "failure_threshold": N }`. |
+| POST | `/api/v1/torrents/:hash/trackers/cleanup` | Disable affected trackers; requires `confirm: true` after preview. |
+| GET | `/api/v1/torrents/:hash/trackers/diagnostics` | Copyable diagnostic text with redacted tracker/webseed credentials. |
+
+Cleanup preview must be reviewed before apply. Tracker disable is reversible
+through the policy endpoint. Diagnostics redact user information and sensitive
+query values; `swarmotterctl` and the Web UI use the same API contract. All
+announce/scrape/webseed traffic remains on the contained network path.
+
 ## RSS subscriptions
 
 All routes require the normal native API authentication. Status responses

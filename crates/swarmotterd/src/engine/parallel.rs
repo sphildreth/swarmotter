@@ -1440,7 +1440,7 @@ pub(super) async fn handle_parallel_pex_message(
     };
     let mut peers = pex_peers.lock().await;
     let before = peers.len();
-    add_pex_peers(
+    let added = add_pex_peers(
         &mut peers,
         pex.added.into_iter().chain(pex.added6),
         allow_ipv6,
@@ -1451,5 +1451,6 @@ pub(super) async fn handle_parallel_pex_message(
         let mut s = state.lock().await;
         s.pex_discovery_ok = true;
         s.pex_last_seen = Some(Instant::now());
+        s.record_peer_sources(added, PeerSource::Pex);
     }
 }

@@ -18,6 +18,18 @@ impl TorrentEngine {
         if webseeds.is_empty() {
             return false;
         }
+        {
+            let mut state = self.state.lock().await;
+            for url in &webseeds {
+                state
+                    .webseeds
+                    .entry(url.clone())
+                    .or_insert_with(|| WebseedSnapshot {
+                        status: TrackerStatus::NotContacted,
+                        ..Default::default()
+                    });
+            }
+        }
 
         let piece_count = self.meta.piece_count();
         let mut missing: Vec<usize> = (0..piece_count)
@@ -161,7 +173,7 @@ pub(super) async fn download_webseed_piece(
         }
     }
 
-    let data = fetch_webseed_piece(binder, &meta, piece_index, &webseeds).await?;
+    let data = fetch_webseed_piece(binder, &meta, piece_index, &webseeds, &state).await?;
     if !verify_piece(&meta, piece_index, &data) {
         return Err(CoreError::Internal(format!(
             "webseed piece {piece_index} hash mismatch"
@@ -191,6 +203,7 @@ pub(super) async fn fetch_webseed_piece(
     meta: &TorrentMeta,
     piece_index: usize,
     webseeds: &[String],
+    state: &Arc<Mutex<EngineState>>,
 ) -> Result<Vec<u8>> {
     if webseeds.is_empty() {
         return Err(CoreError::Internal("torrent has no usable webseeds".into()));
@@ -205,9 +218,41 @@ pub(super) async fn fetch_webseed_piece(
             .wrapping_add(attempt.wrapping_mul(stride)))
             % webseeds.len();
         let base = &webseeds[index];
+        let started = Instant::now();
+        {
+            let mut state = state.lock().await;
+            if let Some(snapshot) = state.webseeds.get_mut(base) {
+                snapshot.status = TrackerStatus::Updating;
+                snapshot.attempts = snapshot.attempts.saturating_add(1);
+                snapshot.last_attempt = Some(now_secs());
+            }
+        }
         match fetch_piece_from_webseed(binder.as_ref(), meta, piece_index, base).await {
-            Ok(piece) => return Ok(piece),
+            Ok(piece) => {
+                let mut state = state.lock().await;
+                if let Some(snapshot) = state.webseeds.get_mut(base) {
+                    snapshot.status = TrackerStatus::Ok;
+                    snapshot.bytes_verified =
+                        snapshot.bytes_verified.saturating_add(piece.len() as u64);
+                    snapshot.retries = 0;
+                    snapshot.last_success = Some(now_secs());
+                    snapshot.last_error = None;
+                    snapshot.latency_ms =
+                        Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+                }
+                return Ok(piece);
+            }
             Err(e) => {
+                let mut state = state.lock().await;
+                if let Some(snapshot) = state.webseeds.get_mut(base) {
+                    snapshot.status = TrackerStatus::Error;
+                    snapshot.retries = snapshot.retries.saturating_add(1);
+                    snapshot.last_error = Some(e.to_string());
+                    snapshot.recent_errors.push(e.to_string());
+                    snapshot.recent_errors.truncate(8);
+                    snapshot.latency_ms =
+                        Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+                }
                 tracing::debug!(piece = piece_index, webseed = %base, error = %e, "webseed mirror failed");
                 last_error = Some(e);
             }

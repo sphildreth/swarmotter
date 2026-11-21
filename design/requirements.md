@@ -42,6 +42,14 @@ time or duration estimates.
   aliases. Verified completion and removal evidence is written to the main
   database in the same transaction as the library change, applied to history
   idempotently, and recovered with the paired backup (ADR-0082).
+- **Discovery performance diagnostics and maintenance:** expose per-tracker
+  effective policy, last attempt/success, retries, latency, measured peer yield,
+  sample freshness, and bounded recent errors; attribute peers to tracker, DHT,
+  PEX, direct, or resume where observed and keep multiple/unknown provenance
+  honest; expose enabled webseed contribution, retries, latency, and recent
+  errors; provide retry-now, exact disable/enable, failure-threshold cleanup
+  preview/apply, and redacted copyable diagnostics. All network operations use
+  the contained binder and diagnostics remain bounded (ADR-0088).
 - **Versioned API discovery and compatibility contracts:** publish a
   version-matched OpenAPI 3.1 document and interactive explorer for native
   `/api/v1`, document explicit supported qBittorrent and Transmission subsets
@@ -153,6 +161,11 @@ for `v1.0.0` only when every item in the `v1.0.0` completion checklist (see
 `design/PRD.md`) is complete and:
 
 - All required torrent input methods work.
+- Discovery-diagnostics acceptance covers effective tracker policy, sample
+  freshness/measured zero, retries/latency/yield, peer source attribution,
+  webseed contribution/errors, maintenance preview/apply, diagnostic redaction,
+  bounded output, and local tracker/peer/webseed fixtures with contrasting
+  success/failure histories.
 - API-discovery acceptance covers version-matched OpenAPI 3.1, native route and
   schema documentation, qBittorrent/Transmission parity limits, `/api/docs`
   authentication/origin behavior, machine-readable artifacts, route drift

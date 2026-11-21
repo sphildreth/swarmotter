@@ -11,6 +11,20 @@ date or duration estimates.
 
 ### Added
 
+- Tracker diagnostics now show effective priority/allow policy, last success
+  separately from last attempt, consecutive retries, latency, measured peer
+  yield, bounded recent errors, and current/stale/unavailable sample status.
+- Peer rows expose tracker, DHT, PEX, direct, and resume discovery provenance
+  where observed, retaining multiple sources and leaving unknown provenance
+  empty.
+- Webseed diagnostics expose enabled status, verified byte contribution,
+  attempts, retries, latency, last success/attempt, and recent errors.
+- Added reversible per-tracker disable/enable, retry-now, failure-threshold
+  cleanup preview/apply, and redacted copyable diagnostics. All network
+  operations remain contained and diagnostics are bounded.
+- ADR-0088 and API/Web UI/troubleshooting documentation for discovery
+  diagnostics and maintenance.
+
 - A version-matched OpenAPI 3.1 document at `/api/openapi.json` and a
   dependency-free interactive explorer at `/api/docs`. The document covers
   native `/api/v1`, explicit qBittorrent and Transmission compatibility subsets,

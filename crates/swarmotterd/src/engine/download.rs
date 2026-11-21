@@ -159,6 +159,10 @@ impl TorrentEngine {
                 discovered.push(*p);
             }
         }
+        self.state
+            .lock()
+            .await
+            .record_peer_sources(self.seed_peers.iter().copied(), PeerSource::Direct);
         let dht_peers = self.discover_dht_peers().await;
         merge_unique_peers(&mut discovered, dht_peers);
         dedupe_peers(&mut discovered);
@@ -418,12 +422,7 @@ impl TorrentEngine {
                         // A trackerless/DHT-disabled engine has no discovery
                         // work to await and retains the same bounded exit.
                         let trackers_attempted = !state.tracker_announces.is_empty()
-                            || swarmotter_core::policy::prioritized_tracker_tiers(
-                                self.meta.announce.as_deref(),
-                                &self.meta.announce_list,
-                                &self.tracker_host_rules,
-                            )
-                            .is_empty();
+                            || self.effective_tracker_tiers().is_empty();
                         let dht_finished = !self.dht_enabled()
                             || state
                                 .dht_last_lookup_completed

@@ -555,3 +555,23 @@ infer support from another client. Transmission support is listed in
 If `/api/openapi.json` is unavailable, check that the daemon build is current and
 that the control-plane listener is reachable. The document is generated from the
 same route catalog checked against the router in CI.
+
+## Weak swarm or tracker diagnostics
+
+Open Torrent Details → Trackers. A tracker with `sample_status: unavailable`
+has no successful sample yet; `measured zero` appears as `peers_returned: 0`,
+which is different from `null`/unavailable. `last_attempt` can update while
+`last_success` stays older, and `retries` counts consecutive failures. Check the
+effective priority/allowed state and policy source before assuming a tracker is
+being used.
+
+If one tracker is failing, inspect the others and the Peers table. Peer sources
+show tracker, DHT, PEX, direct, or resume provenance when observed; an empty
+Sources column means SwarmOtter did not observe provenance, not that the peer is
+invalid. Webseeds have a separate tab with verified byte contributions and
+recent errors.
+
+Use **Preview Failure Cleanup** before disabling trackers. The preview identifies
+the exact affected URLs and the apply action requires confirmation. Tracker
+disable is reversible through the same table. **Copy Diagnostics** redacts
+tracker passkeys and credentials; do not paste an unredacted URL yourself.

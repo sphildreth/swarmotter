@@ -779,6 +779,7 @@ impl DaemonRuntime {
             intake_selection,
             partial_file_suffix,
             tracker_host_rules,
+            disabled_trackers,
         ) = {
             let complete_dir = snapshot.complete_dir.clone();
             let active_dir = snapshot.active_dir.clone();
@@ -823,6 +824,7 @@ impl DaemonRuntime {
                 snapshot.intake_selection.clone(),
                 snapshot.partial_file_suffix.clone(),
                 snapshot.tracker_host_rules.clone(),
+                snapshot.disabled_trackers.clone(),
             )
         };
 
@@ -1075,6 +1077,9 @@ impl DaemonRuntime {
         ));
         if !tracker_host_rules.is_empty() {
             engine = engine.with_tracker_host_rules(tracker_host_rules);
+        }
+        if !disabled_trackers.is_empty() {
+            engine = engine.with_disabled_trackers(disabled_trackers);
         }
         if let Some(selection) = intake_selection {
             engine = engine.with_intake_selection(selection);

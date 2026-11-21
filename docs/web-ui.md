@@ -57,6 +57,21 @@ conflict. Purge permanently deletes the trash copy after confirmation. An
 interrupted staging entry appears as `incomplete`; inspect or purge it, but do
 not expect restore until a complete manifest exists.
 
+## Tracker, peer-source, and webseed diagnostics
+
+Torrent Details → Trackers shows each tracker's effective priority and
+allow/disable policy, last success vs last attempt, retries, latency, observed
+peer yield, sample status, scrape state, and bounded recent errors. **Retry Now**
+reannounces; **Disable/Enable** changes that exact tracker; **Preview Failure
+Cleanup** lists affected trackers before **Disable Affected** is enabled.
+**Copy Diagnostics** copies redacted tracker/webseed/peer evidence.
+
+The Peers table includes discovery sources (tracker, DHT, PEX, direct, resume)
+and leaves the field blank when provenance is unknown. The new Webseeds tab
+shows enabled webseeds, verified byte contribution, attempts, retries, last
+success/attempt, latency, and recent errors. A failing tracker or webseed does
+not hide successful peers or other successful sources.
+
 ## Provenance, magnets, and export
 
 Torrent Details shows available source comment, creator, creation date, and

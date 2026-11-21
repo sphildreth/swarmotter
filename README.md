@@ -65,6 +65,7 @@ SwarmOtter provides a comprehensive set of BitTorrent features:
 - **Cleanup safety** with dry-run previews, profile/label/state retention rules, recoverable local trash, no-overwrite restore, and explicit purge
 - **`swarmotterctl`** API-backed CLI with human and versioned JSON output, stable exit codes, filters, pagination, and SSH/job scripting
 - **Versioned OpenAPI 3.1** and a dependency-free interactive API explorer with explicit qBittorrent/Transmission parity limits
+- **Discovery diagnostics** for tracker policy/yield/latency/retries, peer-source attribution, webseed contribution/errors, and safe tracker maintenance
 - **Advanced controls** for file selection, queueing, bandwidth, ratio, and seeding
 - **Policy profiles** with deterministic label selection
 - **Disk-aware storage** with filesystem diagnostics and placement

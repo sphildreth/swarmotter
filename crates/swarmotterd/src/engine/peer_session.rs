@@ -429,7 +429,7 @@ impl TorrentEngine {
                         if let Ok(pex) = swarmotter_core::extensions::parse_pex(&payload) {
                             let max_peers = self.pex_max_peers;
                             let before = discovered.len();
-                            add_pex_peers(
+                            let added = add_pex_peers(
                                 discovered,
                                 pex.added.into_iter().chain(pex.added6),
                                 self.allow_ipv6,
@@ -440,6 +440,7 @@ impl TorrentEngine {
                                 let mut st = self.state.lock().await;
                                 st.pex_discovery_ok = true;
                                 st.pex_last_seen = Some(Instant::now());
+                                st.record_peer_sources(added, PeerSource::Pex);
                                 st.peers = discovered.clone();
                             }
                         }

@@ -474,7 +474,8 @@ mounts, SQLite WAL recovery, paired RSS history verification, local torrent
 creation and immediate local-peer seeding, provenance/magnet/annotation behavior,
 mixed metainfo archive export, trash preview/apply/restore/purge and retention
 rules, API-backed CLI add/inspect/operate flows in human and JSON modes,
-OpenAPI route-catalog drift checks, emitted-schema examples, and live
-native/qBittorrent/Transmission exchanges, and restarting the writer after a
+OpenAPI route-catalog drift checks, emitted-schema examples, live
+native/qBittorrent/Transmission exchanges, tracker/peer/webseed diagnostics with
+local fixtures, and restarting the writer after a
 backup failure. The parallel worker tests cover bounded HAVE delivery and
 resume checkpoints while a peer round is open.

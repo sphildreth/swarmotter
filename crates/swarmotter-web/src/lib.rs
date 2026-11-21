@@ -947,6 +947,24 @@ mod tests {
     }
 
     #[test]
+    fn web_ui_exposes_tracker_and_webseed_diagnostics_controls() {
+        for needle in [
+            "id=\"tracker-cleanup-preview-btn\"",
+            "id=\"tracker-cleanup-apply-btn\"",
+            "id=\"tracker-copy-diagnostics-btn\"",
+            "id=\"webseeds-table\"",
+            "data-tab=\"webseeds\"",
+        ] {
+            assert!(
+                INDEX_HTML.contains(needle)
+                    || DETAILS_JS.contains(needle)
+                    || APP_JS.contains(needle),
+                "tracker/webseed diagnostics UI is missing {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn web_ui_exposes_cleanup_and_trash_controls() {
         for needle in [
             "id=\"trash-config\"",

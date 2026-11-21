@@ -627,7 +627,22 @@ impl DaemonRuntime {
         state: Arc<Mutex<EngineState>>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Option<JoinHandle<()>> {
-        let tracker_tiers = tracker::announce_tiers(meta.announce.as_deref(), &meta.announce_list);
+        let disabled = self
+            .registry
+            .lock()
+            .await
+            .get(&hash)
+            .map(|torrent| torrent.disabled_trackers.clone())
+            .unwrap_or_default();
+        let tracker_tiers = tracker::announce_tiers(meta.announce.as_deref(), &meta.announce_list)
+            .into_iter()
+            .map(|tier| {
+                tier.into_iter()
+                    .filter(|url| !disabled.iter().any(|disabled| disabled == url))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|tier| !tier.is_empty())
+            .collect::<Vec<_>>();
         if tracker_tiers.is_empty() {
             return None;
         }
@@ -795,6 +810,11 @@ impl DaemonRuntime {
                                 last_error: None,
                                 last_message: Some("seeder announce ok".into()),
                                 last_announce: Some(announce_at),
+                                last_success: Some(announce_at),
+                                retries: 0,
+                                latency_ms: None,
+                                peers_returned: Some(response.peers.len() as u64),
+                                recent_errors: Vec::new(),
                             },
                         )
                     }
@@ -817,9 +837,14 @@ impl DaemonRuntime {
                                 seeders: response.seeders,
                                 leechers: response.leechers,
                                 downloads: 0,
-                                last_error: Some(error),
+                                last_error: Some(error.clone()),
                                 last_message: None,
                                 last_announce: Some(announce_at),
+                                last_success: None,
+                                retries: 1,
+                                latency_ms: None,
+                                peers_returned: None,
+                                recent_errors: vec![error],
                             },
                         )
                     }
@@ -840,9 +865,14 @@ impl DaemonRuntime {
                                 seeders: 0,
                                 leechers: 0,
                                 downloads: 0,
-                                last_error: Some(error),
+                                last_error: Some(error.clone()),
                                 last_message: None,
                                 last_announce: Some(announce_at),
+                                last_success: None,
+                                retries: 1,
+                                latency_ms: None,
+                                peers_returned: None,
+                                recent_errors: vec![error],
                             },
                         )
                     }
@@ -864,6 +894,11 @@ impl DaemonRuntime {
                                 last_error: Some("seeder announce timed out".into()),
                                 last_message: None,
                                 last_announce: Some(announce_at),
+                                last_success: None,
+                                retries: 1,
+                                latency_ms: None,
+                                peers_returned: None,
+                                recent_errors: vec!["seeder announce timed out".into()],
                             },
                         )
                     }

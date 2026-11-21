@@ -261,6 +261,7 @@
         <button data-tab="files" class="tab">Files</button>
         <button data-tab="peers" class="tab">Peers</button>
         <button data-tab="trackers" class="tab">Trackers</button>
+        <button data-tab="webseeds" class="tab">Webseeds</button>
       </div>
       <div id="tab-activity" class="tab-pane">
         <div id="details-activity" class="card"></div>
@@ -269,7 +270,7 @@
         <table id="files-table"><thead><tr><th>Path</th><th>Size</th><th>Done</th><th>Priority</th><th>Wanted</th><th>Rename</th></tr></thead><tbody></tbody></table>
       </div>
       <div id="tab-peers" class="tab-pane hidden">
-        <table id="peers-table"><thead><tr><th>Address</th><th>Client</th><th>Progress</th><th>Down</th><th>Up</th><th>Actions</th></tr></thead><tbody></tbody></table>
+        <table id="peers-table"><thead><tr><th>Address</th><th>Sources</th><th>Client</th><th>Progress</th><th>Down</th><th>Up</th><th>Actions</th></tr></thead><tbody></tbody></table>
       </div>
       <div id="tab-trackers" class="tab-pane hidden">
         <div class="tracker-add-row">
@@ -277,7 +278,18 @@
           <input id="tracker-add-url" type="url" placeholder="https://tracker.example/announce">
           <button id="tracker-add-btn" type="button">Add Tracker</button>
         </div>
-        <table id="trackers-table"><thead><tr><th>URL</th><th>Tier</th><th>Announce</th><th>Scrape</th><th>Last scrape</th><th>Scrape counts (S/L/D)</th><th>Seeders</th><th>Leechers</th><th>Downloads</th><th>Actions</th></tr></thead><tbody></tbody></table>
+        <div class="details-command-row">
+          <button id="tracker-retry-all-btn" type="button" class="secondary">Retry Now</button>
+          <button id="tracker-cleanup-preview-btn" type="button" class="secondary">Preview Failure Cleanup</button>
+          <button id="tracker-cleanup-apply-btn" type="button" class="danger" disabled>Disable Affected</button>
+          <button id="tracker-copy-diagnostics-btn" type="button" class="secondary">Copy Diagnostics</button>
+          <label class="settings-field"><span>Failure threshold</span><input id="tracker-cleanup-threshold" type="number" min="1" step="1" value="3"></label>
+        </div>
+        <div id="tracker-cleanup-result" aria-live="polite"></div>
+        <table id="trackers-table"><thead><tr><th>URL</th><th>Tier</th><th>Priority / allowed</th><th>Announce</th><th>Last success / attempt</th><th>Retry</th><th>Latency</th><th>Peers returned</th><th>Sample</th><th>Scrape</th><th>Last scrape</th><th>Scrape counts (S/L/D)</th><th>Seeders</th><th>Leechers</th><th>Downloads</th><th>Actions</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div id="tab-webseeds" class="tab-pane hidden">
+        <table id="webseeds-table"><thead><tr><th>URL</th><th>Enabled</th><th>Status</th><th>Verified bytes</th><th>Attempts</th><th>Retries</th><th>Last success / attempt</th><th>Latency</th><th>Last error</th></tr></thead><tbody></tbody></table>
       </div>
     </section>
 

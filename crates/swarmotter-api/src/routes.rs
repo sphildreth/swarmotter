@@ -281,6 +281,30 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             get(handlers::trackers::list_trackers).post(handlers::trackers::add_tracker),
         )
         .route(
+            "/torrents/{hash}/trackers/retry",
+            post(handlers::trackers::retry_tracker),
+        )
+        .route(
+            "/torrents/{hash}/trackers/policy",
+            post(handlers::trackers::set_tracker_policy),
+        )
+        .route(
+            "/torrents/{hash}/trackers/cleanup/preview",
+            post(handlers::trackers::cleanup_trackers_preview),
+        )
+        .route(
+            "/torrents/{hash}/trackers/cleanup",
+            post(handlers::trackers::cleanup_trackers),
+        )
+        .route(
+            "/torrents/{hash}/trackers/diagnostics",
+            get(handlers::trackers::tracker_diagnostics),
+        )
+        .route(
+            "/torrents/{hash}/webseeds",
+            get(handlers::trackers::list_webseeds),
+        )
+        .route(
             "/torrents/{hash}/trackers/{url}",
             axum::routing::delete(handlers::trackers::remove_tracker),
         )

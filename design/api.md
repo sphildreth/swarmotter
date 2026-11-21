@@ -349,6 +349,20 @@ limits, verifies v1 and BEP 52 hashes, revalidates the source snapshot, and
 requires the generated document to round-trip through the normal parser
 (ADR-0083).
 
+## Tracker, peer-source, and webseed diagnostics
+
+Tracker rows expose effective priority, allowed/disabled state, policy source,
+last attempt, last success, retries, latency, measured peer yield (`null` vs
+zero), sample freshness, and bounded recent errors. Peer rows expose observed
+discovery sources (tracker/DHT/PEX/direct/resume) with multiple sources allowed
+and empty meaning unknown. Webseed rows expose enabled status, verified bytes,
+attempts, retries, latency, last success/attempt, and bounded recent errors.
+
+Maintenance endpoints provide retry-now, exact tracker enable/disable,
+failure-threshold cleanup preview and confirmed apply, and redacted diagnostic
+text. Preview lists affected trackers; apply revalidates. All discovery traffic
+remains on the contained binder (ADR-0088).
+
 ## OpenAPI and interactive documentation
 
 `GET /api/openapi.json` serves the version-matched OpenAPI 3.1 document.

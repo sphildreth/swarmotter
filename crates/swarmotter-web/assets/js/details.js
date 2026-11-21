@@ -27,7 +27,7 @@ export function beginDetailsLoad() {
   $("#details-seeding-error").textContent = "";
   $("#tracker-add-btn").disabled = true;
   $("#tracker-add-url").value = "";
-  for (const selector of ["#files-table tbody", "#peers-table tbody", "#trackers-table tbody"]) {
+  for (const selector of ["#files-table tbody", "#peers-table tbody", "#trackers-table tbody", "#webseeds-table tbody"]) {
     $(selector).innerHTML = "";
   }
 }
@@ -73,6 +73,7 @@ export async function openDetails(hash) {
     loadFiles(hash);
     loadPeers(hash);
     loadTrackers(hash);
+    loadWebseeds(hash);
   } catch (e) {
     if (!detailsRequestIsCurrent(hash)) return;
     $("#details-title").textContent = "Torrent details";
@@ -551,7 +552,7 @@ export async function loadPeers(hash) {
         : p.banned
           ? `<span class="status-pill status-invalid" title="This IP is globally manually banned">Banned globally</span>`
           : `<button type="button" class="peer-ban secondary" data-peer-ip="${escapeHtml(ip)}">Ban IP</button>`;
-      tr.innerHTML = `<td>${escapeHtml(p.address)}</td><td>${escapeHtml(p.client)}</td><td>${fmtPercentFromFraction(p.progress, 0)}</td><td>${fmtRate(p.rate_down)}</td><td>${fmtRate(p.rate_up)}</td><td>${action}</td>`;
+      tr.innerHTML = `<td>${escapeHtml(p.address)}</td><td>${escapeHtml((p.sources || []).join(", "))}</td><td>${escapeHtml(p.client)}</td><td>${fmtPercentFromFraction(p.progress, 0)}</td><td>${fmtRate(p.rate_down)}</td><td>${fmtRate(p.rate_up)}</td><td>${action}</td>`;
       tbody.appendChild(tr);
     });
     $$("#peers-table .peer-ban").forEach(button => button.addEventListener("click", async () => {
@@ -598,7 +599,13 @@ export async function loadTrackers(hash) {
       const scrapeCounts = [t.scrape_seeders, t.scrape_leechers, t.scrape_downloads]
         .map(value => fmtCount(value) || "–")
         .join(" / ");
-      tr.innerHTML = `<td>${escapeHtml(t.url)}</td><td>${fmtCount(t.tier)}</td><td>${escapeHtml(t.status)}</td><td>${escapeHtml(scrapeDetail)}</td><td>${escapeHtml(fmtUnixSeconds(t.last_scrape))}</td><td>${escapeHtml(scrapeCounts)}</td><td>${fmtCount(t.seeders)}</td><td>${fmtCount(t.leechers)}</td><td>${fmtCount(t.downloads)}</td><td><div class="tracker-edit-row"><input type="url" class="tracker-edit-url" value="${escapeHtml(t.url)}" aria-label="Edit tracker ${escapeHtml(t.url)}"><button type="button" class="tracker-save secondary" data-url="${escapeHtml(t.url)}">Save</button><button type="button" class="tracker-remove danger" data-url="${escapeHtml(t.url)}">Remove</button></div></td>`;
+      const allowed = t.allowed ? "allowed" : "disabled";
+      const lastSuccess = t.last_success ? fmtUnixSeconds(t.last_success) : "never";
+      const lastAttempt = t.last_attempt ? fmtUnixSeconds(t.last_attempt) : "never";
+      const peersReturned = t.peers_returned === null || t.peers_returned === undefined ? "unavailable" : fmtCount(t.peers_returned);
+      const latency = t.latency_ms === null || t.latency_ms === undefined ? "unavailable" : `${fmtCount(t.latency_ms)} ms`;
+      const policy = `${t.effective_priority || "normal"} / ${allowed}${t.policy_source ? ` (${t.policy_source})` : ""}`;
+      tr.innerHTML = `<td>${escapeHtml(t.url)}</td><td>${fmtCount(t.tier)}</td><td>${escapeHtml(policy)}</td><td>${escapeHtml(t.status)}</td><td>${escapeHtml(lastSuccess)} / ${escapeHtml(lastAttempt)}</td><td>${fmtCount(t.retries)}</td><td>${escapeHtml(latency)}</td><td>${escapeHtml(peersReturned)}</td><td>${escapeHtml(t.sample_status || "unavailable")}</td><td>${escapeHtml(scrapeDetail)}</td><td>${escapeHtml(fmtUnixSeconds(t.last_scrape))}</td><td>${escapeHtml(scrapeCounts)}</td><td>${fmtCount(t.seeders)}</td><td>${fmtCount(t.leechers)}</td><td>${fmtCount(t.downloads)}</td><td><div class="tracker-edit-row"><input type="url" class="tracker-edit-url" value="${escapeHtml(t.url)}" aria-label="Edit tracker ${escapeHtml(t.url)}"><button type="button" class="tracker-save secondary" data-url="${escapeHtml(t.url)}">Save</button><button type="button" class="tracker-retry secondary" data-url="${escapeHtml(t.url)}">Retry</button><button type="button" class="tracker-policy secondary" data-url="${escapeHtml(t.url)}" data-enabled="${t.allowed ? "true" : "false"}">${t.allowed ? "Disable" : "Enable"}</button><button type="button" class="tracker-remove danger" data-url="${escapeHtml(t.url)}">Remove</button></div></td>`;
       tbody.appendChild(tr);
     });
     $$("#trackers-table .tracker-save").forEach(button => button.addEventListener("click", async () => {
@@ -618,6 +625,20 @@ export async function loadTrackers(hash) {
         if (detailsRequestIsCurrent(hash)) showError("Tracker update failed", e);
       }
     }));
+    $$("#trackers-table .tracker-retry").forEach(button => button.addEventListener("click", async () => {
+      try {
+        await api(`/torrents/${hash}/trackers/retry`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: button.dataset.url }) });
+        showToast("Tracker retry requested", button.dataset.url, "success");
+      } catch (e) { showError("Tracker retry failed", e); }
+    }));
+    $$("#trackers-table .tracker-policy").forEach(button => button.addEventListener("click", async () => {
+      try {
+        const enabled = button.dataset.enabled !== "true";
+        await api(`/torrents/${hash}/trackers/policy`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: button.dataset.url, enabled }) });
+        showToast(enabled ? "Tracker enabled" : "Tracker disabled", button.dataset.url, "success");
+        await loadTrackers(hash);
+      } catch (e) { showError("Tracker policy update failed", e); }
+    }));
     $$("#trackers-table .tracker-remove").forEach(button => button.addEventListener("click", async () => {
       const url = button.dataset.url;
       if (!window.confirm(`Remove tracker ${url}?`)) return;
@@ -632,6 +653,71 @@ export async function loadTrackers(hash) {
     }));
   } catch (e) { log("trackers error: " + e.message); }
 }
+
+
+export async function loadWebseeds(hash) {
+  try {
+    const webseeds = await api(`/torrents/${hash}/webseeds`) || [];
+    if (!detailsRequestIsCurrent(hash)) return;
+    const tbody = $("#webseeds-table tbody");
+    if (!tbody) return;
+    tbody.innerHTML = "";
+    webseeds.forEach(w => {
+      const tr = document.createElement("tr");
+      const errors = [w.last_error, ...(w.recent_errors || [])].filter(Boolean).slice(-3).join("; ");
+      tr.innerHTML = `<td>${escapeHtml(w.url)}</td><td>${w.enabled ? "yes" : "no"}</td><td>${escapeHtml(w.status)}</td><td>${fmtBytes(w.bytes_verified || 0)}</td><td>${fmtCount(w.attempts)}</td><td>${fmtCount(w.retries)}</td><td>${escapeHtml(w.last_success ? fmtUnixSeconds(w.last_success) : "never")} / ${escapeHtml(w.last_attempt ? fmtUnixSeconds(w.last_attempt) : "never")}</td><td>${w.latency_ms == null ? "unavailable" : `${fmtCount(w.latency_ms)} ms`}</td><td>${escapeHtml(errors)}</td>`;
+      tbody.appendChild(tr);
+    });
+    if (webseeds.length === 0) tbody.innerHTML = `<tr><td colspan="9" class="muted">No webseeds configured.</td></tr>`;
+  } catch (e) { log("webseeds error: " + e.message); }
+}
+
+$("#tracker-retry-all-btn")?.addEventListener("click", async () => {
+  if (!state.currentHash) return;
+  const trackers = await api(`/torrents/${state.currentHash}/trackers`).catch(() => []);
+  for (const tracker of trackers) {
+    await api(`/torrents/${state.currentHash}/trackers/retry`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: tracker.url }) }).catch(() => {});
+  }
+  showToast("Tracker retries requested", "", "success");
+});
+
+$("#tracker-cleanup-preview-btn")?.addEventListener("click", async () => {
+  if (!state.currentHash) return;
+  try {
+    const threshold = Number($("#tracker-cleanup-threshold").value || 3);
+    const affected = await api(`/torrents/${state.currentHash}/trackers/cleanup/preview`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ failure_threshold: threshold }) });
+    $("#tracker-cleanup-result").innerHTML = affected.length
+      ? `<p class="warning">Affected trackers: ${affected.map(t => `<code>${escapeHtml(t.url)}</code>`).join(", ")}</p>`
+      : `<p class="muted">No trackers meet the failure threshold.</p>`;
+    const apply = $("#tracker-cleanup-apply-btn");
+    if (apply) apply.disabled = affected.length === 0;
+  } catch (e) { showError("Tracker cleanup preview failed", e); }
+});
+
+$("#tracker-cleanup-apply-btn")?.addEventListener("click", async () => {
+  if (!state.currentHash) return;
+  if (!window.confirm("Disable every tracker identified by the failure preview?")) return;
+  try {
+    const threshold = Number($("#tracker-cleanup-threshold").value || 3);
+    const affected = await api(`/torrents/${state.currentHash}/trackers/cleanup`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ failure_threshold: threshold, confirm: true }) });
+    showToast("Trackers disabled", `${affected.length} affected`, "success");
+    $("#tracker-cleanup-result").innerHTML = "";
+    $("#tracker-cleanup-apply-btn").disabled = true;
+    await loadTrackers(state.currentHash);
+  } catch (e) { showError("Tracker cleanup failed", e); }
+});
+
+$("#tracker-copy-diagnostics-btn")?.addEventListener("click", async () => {
+  if (!state.currentHash) return;
+  try {
+    const response = await apiFetch(`/torrents/${state.currentHash}/trackers/diagnostics`);
+    if (!response.ok) throw new Error(await responseErrorMessage(response));
+    const text = await response.text();
+    if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(text);
+    else window.prompt("Tracker diagnostics", text);
+    showToast("Tracker diagnostics copied", "credentials redacted", "success");
+  } catch (e) { showError("Copy diagnostics failed", e); }
+});
 
 $("#tracker-add-btn").addEventListener("click", async () => {
   const hash = state.currentHash;

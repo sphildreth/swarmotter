@@ -72,6 +72,10 @@ pub struct Torrent {
     pub annotation_updated_at: Option<u64>,
     #[serde(default)]
     pub annotation_updated_by: Option<String>,
+    /// Exact tracker URLs disabled by an explicit operator action for this
+    /// torrent. This is deliberately separate from profile host rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_trackers: Vec<String>,
     /// Named profile assignment and explicit policy overrides. Missing from
     /// pre-profile state means normal global inheritance.
     #[serde(default)]
@@ -166,6 +170,7 @@ impl Torrent {
             annotation: None,
             annotation_updated_at: None,
             annotation_updated_by: None,
+            disabled_trackers: Vec::new(),
             policy: TorrentPolicy::default(),
             download_dir: None,
             date_added,
