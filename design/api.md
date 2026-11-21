@@ -349,6 +349,22 @@ limits, verifies v1 and BEP 52 hashes, revalidates the source snapshot, and
 requires the generated document to round-trip through the normal parser
 (ADR-0083).
 
+## Cleanup, trash, and retention API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/trash` | Trash path, retention rules, ready entries, and incomplete staging entries. |
+| POST | `/trash/preview` | Dry-run selection by hashes or retention rule; returns exact paths, rule decision, qualification, and blockers. |
+| POST | `/trash/apply` | Revalidate and move whole torrents or stale partials into trash. |
+| POST | `/trash/{id}/restore` | Restore ready entry with fail-only collision policy. |
+| DELETE | `/trash/{id}` | Explicit permanent purge. |
+
+Selections distinguish whole-torrent cleanup from stale-partial cleanup. Trash
+paths use exclusive/no-overwrite moves, ready manifests, and visible staging
+entries. Restore preflights every destination and re-registers whole records
+through the normal durable add transaction. Shared paths, symlinks, changed
+layouts, missing paths, and restore conflicts are per-item outcomes (ADR-0085).
+
 ## Provenance, magnet, and export API
 
 | Method | Path | Description |

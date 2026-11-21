@@ -1,6 +1,7 @@
 # SwarmOtter Comparison Matrix
 
-Last reviewed: 2026-07-13
+Client comparison reviewed on 2026-07-13. SwarmOtter roadmap entries
+verified against Hamstik on 2026-11-21.
 
 This document compares SwarmOtter with popular free and open-source torrent
 clients. It is intended to help users understand product fit, feature coverage,
@@ -67,13 +68,13 @@ candidates.
 | Partial | Supported with meaningful limitations, narrower scope, or less direct UI/API coverage. |
 | Plugin | Available through an official or common plugin/extension path. |
 | ❌ | Not provided by the checked project sources. |
-| Roadmap P1/P2/P3 | Product or research work tracked at that priority in Hamstik project `SWO`. |
+| Roadmap P1/P2/P3 | Open work in Hamstik. P1, P2, and P3 are the original priority tiers. The SWO number identifies the work item. |
 
 ## Project Positioning
 
 | Project | Best Fit | Main Surfaces | Notable Strengths | Important Trade-Offs |
 | --- | --- | --- | --- | --- |
-| SwarmOtter | Linux/server and homelab torrent daemon with strong operational controls | Daemon, REST API, WebSocket/SSE events, Web UI, bounded qBittorrent and Transmission automation adapters | Fail-closed VPN/NIC containment, API-first design, doctor/health checks, performance diagnostics | No desktop-native UI; no built-in search/indexer; some ecosystem and shared-server features are roadmap items |
+| SwarmOtter | Linux/server and homelab torrent daemon with strong operational controls | Daemon, REST API, WebSocket/SSE events, Web UI, bounded qBittorrent and Transmission automation adapters | Fail-closed VPN/NIC containment, API-first design, doctor/health checks, performance diagnostics | No desktop-native UI or built-in search/indexer. Extensions are under consideration (SWO-39). Shared-server network paths (SWO-14) and user isolation (SWO-15) are conditional roadmap items. |
 | Transmission | Simple, lightweight desktop/server torrenting | Native desktop UIs, daemon, Web UI, `transmission-remote`, Transmission RPC | Low resource use, mature native UIs, straightforward remote control | Smaller feature surface than qBittorrent/BiglyBT; limited policy/profile model |
 | qBittorrent | Full-featured desktop and Web UI client | Qt desktop UI, Web UI, WebUI API | Broad core feature coverage, RSS, search plugins, categories/tags, sequential download, bandwidth scheduler | Desktop-first architecture; no SwarmOtter-style fail-closed data-plane containment |
 | Deluge | Daemon/client model with plugin-friendly operation | Daemon, GTK UI, Web UI, Console UI, Deluge RPC/Web API | Thin-client architecture, libtorrent core, plugins, multiple official UIs | Feature depth often depends on plugins; no SwarmOtter-style containment model |
@@ -88,10 +89,10 @@ candidates.
 | Desktop GUI | ❌ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
 | Web UI | ✅ | ✅ | ✅ | ✅ | Plugin | ❌ bundled Web UI | ✅ via ruTorrent |
 | Headless/server mode | ✅ | ✅ | ✅ | ✅ | Partial | ✅ | ✅ |
-| CLI/TUI | Roadmap P1 CLI, Roadmap P3 TUI | `transmission-remote` and tools | Partial server binary | Console UI | ❌ primary CLI/TUI | ✅ | ✅ |
+| CLI/TUI | Roadmap P1 CLI (SWO-5), Roadmap P3 TUI (SWO-42) | `transmission-remote` and tools | Partial server binary | Console UI | ❌ primary CLI/TUI | ✅ | ✅ |
 | Native API/RPC | REST, WebSocket, SSE | Transmission RPC | WebUI API | Deluge RPC/Web API | Plugin/remote APIs | JSON-RPC, XML-RPC | XMLRPC |
 | Compatibility API | Partial (Transmission RPC and bounded qBittorrent WebUI automation adapters) | Native Transmission RPC | Native qBittorrent WebUI API | ❌ | Transmission-style remote control support | ❌ | ❌ |
-| Plugin/extension model | Roadmap P3 | Limited add-ons | Search plugins | ✅ | ✅ | ❌ | ruTorrent plugins and scripts |
+| Plugin/extension model | Roadmap P3 (SWO-39) | Limited add-ons | Search plugins | ✅ | ✅ | ❌ | ruTorrent plugins and scripts |
 | License | Apache-2.0 | GPLv2/GPLv3 family | GPLv2+ source, GPLv3+ binaries | GPLv3 with OpenSSL exception | GPLv2 | GPLv2 | rTorrent GPLv2, ruTorrent GPLv3+ |
 
 ## Core Torrent Features
@@ -121,27 +122,27 @@ candidates.
 | Capability | SwarmOtter | Transmission | qBittorrent | Deluge | BiglyBT | aria2 | rTorrent + ruTorrent |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Watch folders | ✅ | ✅ | ✅ | Plugin | ✅ | ❌ | ✅ |
-| RSS feed automation | ✅ (user-configured feeds, rules, durable history) | ❌ | ✅ | Plugin | ✅ + Plugin | ❌ | Plugin/scripts |
+| RSS feed automation | ✅ User-configured feeds, rules, and durable history (SWO-1) | ❌ | ✅ | Plugin | ✅ + Plugin | ❌ | Plugin/scripts |
 | Built-in search/indexer | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | Plugin |
-| Sequential download/streaming | Roadmap P2 | Partial | ✅ | Partial | ✅ | Partial | Partial |
-| Torrent creation | ✅ (v1, v2, hybrid, export, immediate seed) | ✅ | ✅ | Plugin | ✅ | ❌ | Plugin/scripts |
+| Sequential download/streaming | Roadmap P2 (SWO-27) | Partial | ✅ | Partial | ✅ | Partial | Partial |
+| Torrent creation | ✅ Create, export, and immediately seed v1, v2, and hybrid torrents (SWO-2) | ✅ | ✅ | Plugin | ✅ | ❌ | Plugin/scripts |
 | Superseeding/initial seeding | Roadmap P2 (SWO-18) | Partial | ✅ | ✅ | ✅ | ❌ | ✅ |
 | IP filtering/blocklists | ✅ | ✅ | ✅ | Plugin | ✅ | ❌ | Partial |
 | UPnP/NAT-PMP | ✅ (opt-in, contained) | ✅ | ✅ | ✅ | ✅ | ❌ | Partial |
 | SOCKS/proxy support | ✅ (opt-in, contained TCP CONNECT; UDP unavailable) | ❌ | ✅ | ✅ | ✅ | ✅ | Partial |
 | HTTP/HTTPS proxy support | Roadmap P2 (SWO-24) | ❌ | ✅ | ❌ | ❌ | ✅ | Partial |
 | Listen port reachability test | ✅ (opt-in, contained operator endpoint) | ✅ | ✅ | ✅ | ✅ | ❌ | Partial |
-| Anonymous mode | Roadmap P1 | ❌ | ✅ | ✅ | ✅ | ❌ | Partial |
-| Torrent metadata display (comment, creator, date) | Roadmap P1 | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
-| Magnet link generation from added torrents | Roadmap P1 | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
-| Torrent file export | ✅ (exact original, Web UI, batch archive, magnet generation) | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
+| Anonymous mode | Roadmap P1 (SWO-12) | ❌ | ✅ | ✅ | ✅ | ❌ | Partial |
+| Torrent metadata display (comment, creator, date) | ✅ (SWO-3) | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
+| Magnet link generation from added torrents | ✅ (SWO-3) | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
+| Torrent file export | ✅ Export original bytes or a batch archive from the Web UI (SWO-3) | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
 | Categories/tags/policy groups | Partial (labels and named profiles) | Partial | ✅ | Plugin | ✅ | ❌ | Partial |
 | Large-library UI operations | ✅ (server-side query, pagination, and efficient table workflows) | Partial | Partial | Partial | Partial | ❌ | Partial |
-| Bulk import/export and backup | Roadmap P2 | Partial | Partial | Partial | Migration tooling | Session files | Session files |
+| Bulk import/export and backup | Roadmap P2 (SWO-32) for portable library bundles | Partial | Partial | Partial | Migration tooling | Session files | Session files |
 | Automation hooks | Roadmap P2 (SWO-17) | Completion script | External program/API | Execute plugin/API | Plugins | RPC/scripts | XMLRPC/scripts |
-| OpenAPI/interactive API docs | Roadmap P1 | ❌ | ❌ | Partial docs | ❌ | RPC docs | ❌ |
-| Long-horizon observability | Roadmap P2; peak logs exist | Partial | Partial | Plugin | Plugin | Logs/RPC | Scripts/plugins |
-| Disk cache / I/O buffer configuration | Roadmap P2 | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
+| OpenAPI/interactive API docs | Roadmap P1 (SWO-6) | ❌ | ❌ | Partial docs | ❌ | RPC docs | ❌ |
+| Long-horizon observability | Peak logs available. Extended history is Roadmap P2 (SWO-29). | Partial | Partial | Plugin | Plugin | Logs/RPC | Scripts/plugins |
+| Disk cache / I/O buffer configuration | Roadmap P2 (SWO-26) | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
 
 ## SwarmOtter Differentiators
 
@@ -158,10 +159,10 @@ candidates.
 | Adaptive swarm performance autopilot | ✅ | ❌ | ❌ | ❌ | Partial/plugin concepts | ❌ | Scripts/plugins |
 | Storage-root resource controls | ✅ | ❌ | ❌ | ❌ | Partial disk views | ❌ | Manual |
 | Filesystem-aware storage strategy and state placement | ✅ (mount/I/O diagnostics, placement, explicit Btrfs NOCOW) | ❌ | ❌ | ❌ | Partial disk views | ❌ | Manual |
-| Per-profile/per-torrent network path binding | Roadmap P1 (conditional) | ❌ | ❌ | ❌ | Partial VPN helper | ❌ | Manual |
-| Multi-user/multi-tenant operation | Roadmap P1 (conditional) | ❌ | ❌ | Partial auth | ❌ | RPC token only | Partial via deployment |
-| Permissioned extension system | Roadmap P3 | ❌ | Search plugins only | ✅ | ✅ | ❌ | ruTorrent plugins |
-| Swarm merging | Roadmap P3 | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
+| Per-profile/per-torrent network path binding | Conditional Roadmap P1 (SWO-14) | ❌ | ❌ | ❌ | Partial VPN helper | ❌ | Manual |
+| Multi-user/multi-tenant operation | Conditional Roadmap P1 (SWO-15) | ❌ | ❌ | Partial auth | ❌ | RPC token only | Partial via deployment |
+| Permissioned extension system | Roadmap P3 (SWO-39) | ❌ | Search plugins only | ✅ | ✅ | ❌ | ruTorrent plugins |
+| Swarm merging | Roadmap P3 (SWO-41) | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
 
 ## Roadmap Gap Map
 

@@ -917,6 +917,42 @@ match the source basename so the generated relative paths address the existing
 files. A source that changes during hashing fails the request rather than
 publishing a stale export or completed seed. See ADR-0083.
 
+### `[trash]`
+
+Trash is disabled unless `path` is set. The root must not overlap a configured
+payload or storage root. Trash rules select cleanup candidates; they do not
+delete data in the background.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `path` | unset | Local trash root. Enables preview/apply/restore/purge. |
+| `retention[].name` | required | Stable rule name shown in preview and status. |
+| `retention[].profile` | any | Exact effective profile name. |
+| `retention[].label` | any | Case-insensitive attached label. |
+| `retention[].states` | any | Lifecycle states such as `paused`, `completed`, `seeding`. |
+| `retention[].min_age_seconds` | `0` | Minimum age from completion, or add time when incomplete. |
+
+```toml
+[trash]
+path = "/srv/swarmotter/trash"
+
+[[trash.retention]]
+name = "old-paused"
+profile = "archive"
+label = "cleanup"
+states = ["paused", "completed"]
+min_age_seconds = 2592000
+```
+
+Every populated rule field must match. Preview reports the age, `qualifies_at`,
+rule decision, exact paths, and blockers. Apply revalidates ownership, roots,
+symlinks, shared payloads, and path existence before moving. Whole-torrent
+entries retain the serialized record and exact original metainfo when available;
+stale-partial entries retain only selected files. Ready entries live under
+`entries/<id>`; interrupted moves remain under `.staging/<id>` and are listed as
+`incomplete`. Restore uses a `fail` collision policy: existing destinations are
+never overwritten. Purging an entry is explicit and irreversible. See ADR-0085.
+
 ### `[[watch]]`
 
 | Option | Default | Meaning |

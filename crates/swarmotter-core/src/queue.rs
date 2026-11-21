@@ -77,6 +77,23 @@ pub struct QueueMembershipSnapshot {
     bypass_index: Option<usize>,
 }
 
+impl QueueMembershipSnapshot {
+    pub const fn new(order_index: Option<usize>, bypass_index: Option<usize>) -> Self {
+        Self {
+            order_index,
+            bypass_index,
+        }
+    }
+
+    pub const fn order_index(&self) -> Option<usize> {
+        self.order_index
+    }
+
+    pub const fn bypass_index(&self) -> Option<usize> {
+        self.bypass_index
+    }
+}
+
 /// Queue state over a full torrent identity key.
 ///
 /// The default is retained for source compatibility. New daemon ownership

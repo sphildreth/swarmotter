@@ -633,6 +633,29 @@
           <h3>Decision history</h3>
           <p class="muted">Select Decisions on a subscription to load paginated history.</p>
         </div>
+        <div id="trash-config" class="card settings-wide">
+          <h3>Cleanup &amp; Trash</h3>
+          <p id="trash-summary" class="muted">Loading trash status…</p>
+          <div class="settings-card-heading">
+            <h4>Retention rules</h4>
+            <button id="trash-refresh-btn" type="button" class="secondary">Refresh</button>
+          </div>
+          <div id="trash-rules"></div>
+          <h4>Preview / apply cleanup</h4>
+          <div class="settings-form-grid">
+            <label class="settings-field"><span>Mode</span><select id="trash-mode"><option value="torrent">Whole torrents</option><option value="stale_partials">Stale partials only</option></select></label>
+            <label class="settings-field"><span>Retention rule</span><select id="trash-rule"><option value="">Explicit hashes</option></select></label>
+            <label class="settings-field settings-wide"><span>Torrent hashes (optional; one or comma-separated)</span><textarea id="trash-hashes" rows="2" spellcheck="false" placeholder="40- or 64-character full locator"></textarea></label>
+          </div>
+          <div class="details-command-row">
+            <button id="trash-preview-btn" type="button">Preview</button>
+            <button id="trash-apply-btn" type="button" class="danger" disabled>Apply Eligible</button>
+          </div>
+          <p class="muted">Preview performs no file, queue, or metainfo change. Apply revalidates ownership, roots, and source paths before moving anything.</p>
+          <div id="trash-preview-results" aria-live="polite"></div>
+          <h4>Trash entries</h4>
+          <div id="trash-entries"><p class="muted">Loading entries…</p></div>
+        </div>
       </div>
     </section>
 
@@ -692,6 +715,7 @@
   <script src="/seeding-policy.js"></script>
   <script src="/watch-history.js"></script>
   <script src="/rss.js"></script>
+  <script src="/js/trash.js"></script>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

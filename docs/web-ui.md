@@ -41,6 +41,22 @@ Creation hashing participates in the selected root's
 `max_concurrent_rechecks` limit. If the source changes during hashing, the UI
 shows an error and publishes nothing.
 
+## Cleanup and trash
+
+The Watch view's **Cleanup & Trash** card shows the configured trash path,
+retention rules, ready entries, and incomplete staging entries. Choose whole
+torrents or stale partials, optionally select a retention rule or enter explicit
+hashes, then **Preview**. The preview lists exact paths, ownership, action,
+reason, rule qualification, and blockers; it changes nothing. **Apply Eligible**
+re-runs the selection through execution-time ownership/root revalidation and
+moves only eligible items.
+
+Ready entries offer **Restore** and **Purge**. Restore never overwrites an
+existing destination; a conflict leaves the entry intact and reports the
+conflict. Purge permanently deletes the trash copy after confirmation. An
+interrupted staging entry appears as `incomplete`; inspect or purge it, but do
+not expect restore until a complete manifest exists.
+
 ## Provenance, magnets, and export
 
 Torrent Details shows available source comment, creator, creation date, and

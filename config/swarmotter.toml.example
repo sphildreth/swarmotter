@@ -209,6 +209,18 @@ blocked_client_ids = []
 # destinations are never overwritten. In-root archive/failure descendants are
 # excluded from this folder's recursive scan; no watch/action path may be blank
 # or normalize to the watch root itself.
+# Local cleanup trash is disabled unless path is set. The path must not overlap
+# configured payload/storage roots. Retention rules select preview/apply
+# candidates; nothing is deleted in the background.
+# [trash]
+# path = "/data/trash"
+#
+# [[trash.retention]]
+# name = "old-paused"
+# label = "cleanup"
+# states = ["paused", "completed"]
+# min_age_seconds = 2592000
+
 # RSS intake is user-configured. Feed and attachment requests use the contained
 # network path. The dedicated history database defaults to
 # <state file>.rss.sqlite and must be backed up with the main state file.

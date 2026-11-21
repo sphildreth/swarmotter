@@ -331,6 +331,12 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             "/network/diagnostics",
             get(handlers::diagnostics::network_diagnostics),
         )
+        // Local trash, cleanup preview, restore, and retention rules
+        .route("/trash", get(handlers::trash::status))
+        .route("/trash/preview", post(handlers::trash::preview))
+        .route("/trash/apply", post(handlers::trash::apply))
+        .route("/trash/{id}/restore", post(handlers::trash::restore))
+        .route("/trash/{id}", axum::routing::delete(handlers::trash::purge))
         // RSS subscriptions and durable history
         .route(
             "/rss",

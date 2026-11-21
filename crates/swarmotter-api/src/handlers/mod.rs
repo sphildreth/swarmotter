@@ -21,4 +21,5 @@ pub mod storage;
 pub mod torrents;
 pub mod trackers;
 pub mod transmission;
+pub mod trash;
 pub mod watch;

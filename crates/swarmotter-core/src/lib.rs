@@ -33,6 +33,7 @@ pub mod rss;
 pub mod storage;
 pub mod torrent;
 pub mod tracker;
+pub mod trash;
 pub mod udp_tracker;
 pub mod utp;
 pub mod v2;

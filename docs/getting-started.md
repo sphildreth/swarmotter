@@ -109,6 +109,29 @@ curl -X POST http://127.0.0.1:9091/api/v1/torrents/file \
   -H 'Content-Type: application/x-bittorrent'
 ```
 
+## Clean up safely with trash
+
+Configure a trash root outside your payload roots:
+
+```toml
+[trash]
+path = "/home/YOU/Downloads/swarmotter-trash"
+
+[[trash.retention]]
+name = "old-paused"
+label = "cleanup"
+states = ["paused"]
+min_age_seconds = 604800
+```
+
+In the Watch view, choose whole torrents or stale partials, select a retention
+rule or enter torrent hashes, and click **Preview**. The preview lists exact
+paths and explains every rule/blocker without changing files or queue state.
+**Apply Eligible** revalidates ownership, roots, symlinks, and shared payloads
+before moving data. Ready trash entries can be restored without overwriting or
+purged explicitly. Interrupted moves appear as incomplete staging entries and
+are never presented as restorable.
+
 ## Inspect, share, and export torrents
 
 Torrent Details shows any source comment, creator, creation date, and encoding.

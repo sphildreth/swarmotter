@@ -11,6 +11,20 @@ date or duration estimates.
 
 ### Added
 
+- Cleanup preview and local trash workflows for whole torrents and stale
+  partials. Preview lists exact paths, ownership, actions, retention-rule
+  decisions, qualification times, and blockers without changing files, queue
+  state, or metainfo; apply performs execution-time root/ownership/symlink/path
+  revalidation and exclusive no-overwrite moves.
+- Configurable retention rules select candidates by effective profile,
+  case-insensitive label, lifecycle state, and minimum age. Ready trash entries
+  retain the serialized record and exact original metainfo when available,
+  restore with a fail-only collision policy, and support explicit purge.
+  Interrupted moves remain visible as incomplete staging entries.
+- Added ADR-0085 plus API, configuration, Web UI, operations, architecture,
+  requirements, testing, README, and troubleshooting documentation for cleanup,
+  trash, retention, recovery, and per-item failure reporting.
+
 - Torrent details now expose source comment, creator, creation date, and
   encoding when present. A separate operator annotation can be set or cleared
   without changing source metadata or retained original bytes, and annotation

@@ -167,6 +167,11 @@ the process-wide connection-limit authority.
 | GET | `/torrents/:hash/magnet` | Generate a deterministic full-identity magnet with tracker policy and optional private-tracker consent. |
 | PUT | `/torrents/:hash/annotation` | Set or clear the operator annotation without changing source metadata. |
 | POST | `/torrents/export` | Download a tar archive of retained originals with a per-item manifest. |
+| GET | `/trash` | Trash path, retention rules, ready entries, and incomplete staging entries. |
+| POST | `/trash/preview` | Dry-run cleanup preview by explicit hashes or retention rule. |
+| POST | `/trash/apply` | Revalidate and move eligible torrents or stale partials into trash. |
+| POST | `/trash/{id}/restore` | Restore a ready entry with `{ "collision_policy": "fail" }`. |
+| DELETE | `/trash/{id}` | Permanently purge a ready or staging trash entry. |
 | GET | `/torrents/:hash` | Torrent details. |
 | GET | `/torrents/:hash/metainfo` | Return the retained, byte-exact original `.torrent` document when one exists. |
 | GET | `/torrents/:hash/stats` | Per-torrent counters and live engine diagnostics. |
@@ -302,6 +307,37 @@ found error for magnet-only or pre-retention records.
 
 Strict fail-closed network blocking can still put the new torrent in
 `network_blocked` instead of `paused`.
+
+## Cleanup and trash
+
+Cleanup preview accepts:
+
+```json
+{
+  "hashes": ["<locator>"],
+  "rule": "old-paused",
+  "mode": "torrent"
+}
+```
+
+`mode` is `torrent` or `stale_partials`. An empty `hashes` list selects by the
+named retention rule; preview may include rule matches that are not yet
+qualified and reports `qualifies_at`, while apply moves only eligible/qualified
+items. Apply without explicit hashes or a rule is rejected. Preview never
+touches files, queue state, or metainfo.
+
+Preview rows list exact paths with role (`complete`, `active`, `resume`),
+existence, size, intended action, reason, and blocker. Shared payload paths,
+symlinks, root changes, and missing/changed source data are explicit blockers or
+skips. Stale-partial mode covers files marked unwanted in current metainfo and
+orphan files under a multi-file torrent's top-level directory.
+
+A ready entry contains a manifest, the serialized torrent record, optional exact
+original metainfo, and role-specific payload trees. Restore accepts only
+`collision_policy: "fail"`; existing destinations abort without overwriting or
+losing the trash copy. Whole-torrent restore re-registers the record and saves
+queue position. Payload-only restore restores selected stale files. Incomplete
+staging entries cannot be restored, but are visible and purgeable.
 
 ## Torrent creation
 

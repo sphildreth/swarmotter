@@ -2,7 +2,7 @@
 
 The SwarmOtter product backlog is maintained in Hamstik, organization `sph`,
 project `SWO`. Each work item holds its scope, acceptance criteria, design
-references and current status. [Open Hamstik](https://hamstik.com)
+references and current status. [Open the public SwarmOtter backlog in Hamstik](https://hamstik.com/t/sph/projects/SWO)
 
 Use the Hamstik CLI to list the backlog or read an individual item.
 

@@ -8,6 +8,7 @@ import { openDetails, setRefreshTorrentsHandler } from "./js/details.js";
 import { refreshSettings, setSettingsDependencies } from "./js/settings.js";
 import { refreshNetwork, refreshWatch, refreshLogs, refreshDoctor, refreshDoctorBadge, appendLogLine, setEventsDependencies } from "./js/events.js";
 import { refreshRss } from "./rss.js";
+import { refreshTrash } from "./js/trash.js";
 import { resetCreateForm } from "./js/create.js";
 
 setOpenDetailsHandler(openDetails);
@@ -27,7 +28,7 @@ function openView(view, activeButton = null) {
   if (view === "add") { refreshProfileChoices(); resetCreateForm(); }
   if (view === "network") refreshNetwork();
   if (view === "settings") refreshSettings();
-  if (view === "watch") { refreshWatch(); refreshRss(); }
+  if (view === "watch") { refreshWatch(); refreshRss(); refreshTrash(); }
   if (view === "logs") refreshLogs();
   if (view === "doctor") refreshDoctor();
 }

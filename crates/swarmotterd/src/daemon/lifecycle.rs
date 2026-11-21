@@ -2525,6 +2525,36 @@ impl DaemonOps for DaemonRuntime {
         self.torrent_creation_roots().await
     }
 
+    async fn trash_status(&self) -> Result<swarmotter_core::trash::TrashStatus> {
+        self.trash_status().await
+    }
+
+    async fn preview_trash(
+        &self,
+        request: swarmotter_core::trash::TrashSelectionRequest,
+    ) -> Result<swarmotter_core::trash::TrashPreview> {
+        self.preview_trash(request).await
+    }
+
+    async fn apply_trash(
+        &self,
+        request: swarmotter_core::trash::TrashSelectionRequest,
+    ) -> Result<swarmotter_core::trash::TrashApplyResult> {
+        self.apply_trash(request).await
+    }
+
+    async fn restore_trash(
+        &self,
+        entry_id: &str,
+        request: swarmotter_core::trash::RestoreRequest,
+    ) -> Result<swarmotter_core::trash::RestoreResult> {
+        self.restore_trash(entry_id, request).await
+    }
+
+    async fn purge_trash(&self, entry_id: &str) -> Result<()> {
+        self.purge_trash(entry_id).await
+    }
+
     async fn rss_status(&self) -> Vec<swarmotter_core::rss::RssSubscriptionStatus> {
         self.rss_status().await
     }

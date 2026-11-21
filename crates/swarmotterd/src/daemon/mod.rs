@@ -27,6 +27,7 @@ mod scheduler;
 mod seeding;
 mod settings;
 mod storage_controls;
+mod trash;
 #[path = "watch.rs"]
 mod watch_runtime;
 

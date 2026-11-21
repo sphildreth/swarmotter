@@ -292,6 +292,23 @@ hash as the completed verified piece map; queue/seeder reconciliation then
 starts the contained seeder. A duplicate or registration error still returns the
 export and reports the seed error (ADR-0083).
 
+## Cleanup preview, trash, and retention
+
+Cleanup selection is recomputed at execution time: configured roots, current
+path ownership, symlink status, shared payload paths, and existence are checked
+again rather than trusting a preview snapshot. Whole-torrent moves use the
+existing exclusive storage move path, retain a serialized record and optional
+exact original metainfo, then remove the live record in the durable state
+transaction. Stale-partial moves retain only selected files and leave the record
+live.
+
+Trash entries are filesystem-backed under `entries/<id>`; in-progress moves stay
+under `.staging/<id>` and are visible as incomplete. Restore accepts only a
+fail collision policy and preflights every destination before moving. Retention
+rules select by effective profile, label, state, and age; they never delete
+data in the background. No trash operation creates torrent network traffic
+(ADR-0085).
+
 ## Provenance, deterministic magnets, and portable export
 
 Source comment, creator, creation date, and encoding are parsed from metainfo and

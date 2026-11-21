@@ -506,6 +506,39 @@ pub trait DaemonOps: Send + Sync + 'static {
     /// Watch-folder import history.
     async fn watch_history(&self) -> Vec<swarmotter_core::watch::ImportResult>;
 
+    /// Current local trash status and retention rules.
+    async fn trash_status(&self) -> Result<swarmotter_core::trash::TrashStatus> {
+        Err(CoreError::NotFound("trash".into()))
+    }
+    /// Preview cleanup without touching files, queue state, or metainfo.
+    async fn preview_trash(
+        &self,
+        _request: swarmotter_core::trash::TrashSelectionRequest,
+    ) -> Result<swarmotter_core::trash::TrashPreview> {
+        Err(CoreError::NotFound("trash".into()))
+    }
+    /// Execute a previously previewed cleanup selection with execution-time
+    /// ownership and root revalidation.
+    async fn apply_trash(
+        &self,
+        _request: swarmotter_core::trash::TrashSelectionRequest,
+    ) -> Result<swarmotter_core::trash::TrashApplyResult> {
+        Err(CoreError::NotFound("trash".into()))
+    }
+    /// Restore one ready trash entry. Existing destinations are never
+    /// overwritten.
+    async fn restore_trash(
+        &self,
+        _entry_id: &str,
+        _request: swarmotter_core::trash::RestoreRequest,
+    ) -> Result<swarmotter_core::trash::RestoreResult> {
+        Err(CoreError::NotFound("trash".into()))
+    }
+    /// Permanently purge one trash entry.
+    async fn purge_trash(&self, _entry_id: &str) -> Result<()> {
+        Err(CoreError::NotFound("trash".into()))
+    }
+
     /// Create metainfo from a bounded local source and optionally seed it.
     async fn create_torrent(
         &self,

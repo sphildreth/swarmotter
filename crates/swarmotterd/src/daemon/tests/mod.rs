@@ -269,6 +269,7 @@ mod reconcile;
 mod rss;
 mod scheduler;
 mod trackers;
+mod trash;
 mod watch;
 
 // --- Coalesced peer worker limit distribution (ADR-0071) ---

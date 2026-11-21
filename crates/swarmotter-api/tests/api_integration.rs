@@ -2072,6 +2072,50 @@ async fn torrent_creation_routes_require_api_auth() {
 }
 
 #[tokio::test]
+async fn trash_routes_require_api_auth() {
+    let mut cfg = Config::default();
+    cfg.api.require_auth = true;
+    cfg.api.auth_token = Some("trash-token".into());
+    let app = swarmotter_api::app_router(fake_daemon::fake_state_with_config(cfg));
+    for (method, uri, body) in [
+        ("GET", "/api/v1/trash", None),
+        (
+            "POST",
+            "/api/v1/trash/preview",
+            Some(r#"{"hashes":[],"mode":"torrent"}"#),
+        ),
+        (
+            "POST",
+            "/api/v1/trash/apply",
+            Some(r#"{"hashes":[],"mode":"torrent"}"#),
+        ),
+        ("POST", "/api/v1/trash/entry/restore", Some(r#"{}"#)),
+        ("DELETE", "/api/v1/trash/entry", None),
+    ] {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let request = builder
+            .body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/trash")
+                .header("x-swarmotter-auth", "trash-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn provenance_routes_require_api_auth() {
     let mut cfg = Config::default();
     cfg.api.require_auth = true;

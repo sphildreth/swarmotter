@@ -24,6 +24,9 @@ directory.
 - Source provenance display, separate operator annotations, deterministic
   magnets with tracker policies, exact single export, and batch metainfo
   archives with per-item availability.
+- Cleanup previews, profile/label/state retention rules, local trash and restore
+  with no-overwrite collision handling, stale-partial cleanup, and explicit
+  purge.
 - IPv4 and IPv6 torrent networking when enabled by configuration.
 - Strict data-plane containment through an interface, source address, or network
   namespace.

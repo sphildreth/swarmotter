@@ -42,6 +42,15 @@ time or duration estimates.
   aliases. Verified completion and removal evidence is written to the main
   database in the same transaction as the library change, applied to history
   idempotently, and recovered with the paired backup (ADR-0082).
+- **Cleanup preview, trash, and retention safety:** preview exact payload paths,
+  owning torrents, intended actions, selection reasons, applicable retention
+  rule, qualification time, and blockers without changing files, queue state, or
+  metainfo. Apply revalidates roots, ownership, symlinks, shared payloads, and
+  path changes before exclusive/no-overwrite moves. Trash supports whole records
+  and stale partials, retains ready manifests and optional exact original
+  metainfo, exposes incomplete staging after interrupted moves, restores with a
+  fail-only collision policy, and purges only explicitly. Retention rules select
+  by profile, label, state, and age (ADR-0085).
 - **Torrent creation and immediate seeding:** create metainfo from a local file
   or directory in v1, pure v2, or hybrid format with configurable piece size,
   ordered tracker tiers, optional webseeds, and the private flag. Sources must
@@ -128,6 +137,11 @@ for `v1.0.0` only when every item in the `v1.0.0` completion checklist (see
 `design/PRD.md`) is complete and:
 
 - All required torrent input methods work.
+- Cleanup/trash acceptance covers dry-run isolation, exact path/rule/blocker
+  previews, shared/symlink/root/path revalidation, whole-record and stale-partial
+  moves, ready/incomplete staging visibility, no-overwrite restore conflicts,
+  retention qualification, idempotent re-runs, explicit purge, and per-item
+  failure reporting.
 - Provenance acceptance covers source metadata persistence and display, missing
   outer fields for magnet-only records, separate audited annotations, exact
   original bytes, deterministic escaped magnets with full identities and BEP 53

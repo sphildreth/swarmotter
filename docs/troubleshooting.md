@@ -500,3 +500,20 @@ Single export and batch export include only retained original documents. A
 from a magnet or predates original-byte retention. SwarmOtter does not
 reconstruct a source document from canonical `info` bytes. Re-add a locally
 supplied `.torrent` if you need to establish a new retained original.
+
+## Cleanup and trash problems
+
+If `trash.path` overlaps a configured payload or storage root, configuration
+validation rejects it. Choose a local path outside download/incomplete/temp and
+root-control roots.
+
+A preview item with `eligible: false` explains the blocker: a shared payload
+path, an unsupported symlink/special file, a missing/changed source path, or a
+retention rule whose `qualifies_at` is still in the future. Preview never
+changes anything; run it again after resolving the blocker.
+
+Restore refuses to overwrite an existing destination. Remove/move the conflicting
+file deliberately and retry; the trash entry remains intact. Entries listed as
+`incomplete` came from an interrupted move under `.staging/<id>`. Inspect or purge
+them; they are not restorable without a complete manifest. Purging is permanent
+and removes the trash copy, so confirm the entry is no longer needed.

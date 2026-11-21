@@ -92,6 +92,8 @@ pub struct Config {
     #[serde(default)]
     pub watch: Vec<WatchFolderConfig>,
     #[serde(default)]
+    pub trash: crate::trash::TrashConfig,
+    #[serde(default)]
     pub rss: crate::rss::RssConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -720,6 +722,47 @@ impl Config {
             }
         }
         validate_profiles(&self.profiles).map_err(CoreError::InvalidConfig)?;
+        self.trash.validate()?;
+        if let Some(path) = self.trash.path.as_deref() {
+            if self.trash.retention.iter().any(|rule| {
+                rule.profile
+                    .as_deref()
+                    .is_some_and(|profile| !self.profiles.profiles.contains_key(profile))
+            }) {
+                return Err(CoreError::InvalidConfig(
+                    "trash retention rules reference an unknown profile".into(),
+                ));
+            }
+            let trash = lexical_absolute_path(Path::new(path)).map_err(|error| {
+                CoreError::InvalidConfig(format!("trash.path could not be normalized: {error}"))
+            })?;
+            let mut payload_roots = Vec::new();
+            for root in [
+                self.storage.download_dir.as_deref(),
+                self.storage.incomplete_dir.as_deref(),
+                self.storage.temp_dir.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Ok(root) = lexical_absolute_path(Path::new(root)) {
+                    payload_roots.push(root);
+                }
+            }
+            for control in &self.storage.root_controls {
+                if let Ok(root) = lexical_absolute_path(Path::new(&control.path)) {
+                    payload_roots.push(root);
+                }
+            }
+            if payload_roots
+                .iter()
+                .any(|root| trash.starts_with(root) || root.starts_with(&trash))
+            {
+                return Err(CoreError::InvalidConfig(
+                    "trash.path must not overlap a configured payload/storage root".into(),
+                ));
+            }
+        }
         self.rss.validate()?;
         for subscription in &self.rss.subscriptions {
             if let Some(profile) = subscription.profile.as_deref() {
