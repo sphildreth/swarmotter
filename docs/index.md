@@ -19,6 +19,8 @@ directory.
 - `.torrent`, magnet, tracker, DHT, PEX, TCP, UDP tracker, and uTP support.
 - Watch-folder and user-configured RSS intake with preview, wildcard rules, and
   durable cross-feed completion history.
+- Local v1, BEP 52 v2, and hybrid torrent creation with tracker tiers, optional
+  webseeds, export, and immediate verified seeding.
 - IPv4 and IPv6 torrent networking when enabled by configuration.
 - Strict data-plane containment through an interface, source address, or network
   namespace.

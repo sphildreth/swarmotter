@@ -11,6 +11,7 @@ pub mod autopilot;
 pub mod bandwidth;
 pub mod bencode;
 pub mod config;
+pub mod creation;
 pub mod dht;
 pub mod endgame;
 pub mod error;

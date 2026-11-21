@@ -273,6 +273,25 @@ use create-new copy/remove semantics so an existing file is never replaced.
 Post-action failure remains attached to the primary result for UI/event
 reporting and requires operator intervention rather than repeated import.
 
+## Local torrent creation and immediate seeding
+
+Local creation is a daemon-owned blocking operation over a snapshot restricted
+to configured storage roots. Source entries must be regular files or
+directories; symlinks and special files are rejected, and file identity is
+checked before and after reading. The streaming hasher produces v1 SHA-1
+pieces across file order and BEP 52 block/piece roots per file without loading
+the source into memory. It runs under the most-specific root's recheck permit,
+so creation participates in existing storage budgets.
+
+The canonical builder emits v1, pure-v2, or hybrid bencode with optional tracker
+tiers, webseeds, and private flag. The exact document is re-parsed by the normal
+bounded parser before the API returns `metainfo_hex` or the Web UI offers a
+download. Immediate seeding registers the generated metainfo through the normal
+durable add mutation with the source parent as the data root and the creation
+hash as the completed verified piece map; queue/seeder reconciliation then
+starts the contained seeder. A duplicate or registration error still returns the
+export and reports the seed error (ADR-0083).
+
 ## RSS intake and durable history
 
 RSS subscriptions are configuration entries, but accepted magnets and torrent

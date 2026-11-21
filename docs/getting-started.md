@@ -109,6 +109,24 @@ curl -X POST http://127.0.0.1:9091/api/v1/torrents/file \
   -H 'Content-Type: application/x-bittorrent'
 ```
 
+## Create and seed a torrent
+
+Create metainfo from a file or directory inside a configured storage root using
+the Add view or:
+
+```bash
+curl -X POST http://127.0.0.1:9091/api/v1/torrents/create \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"/home/YOU/Downloads/swarmotter/downloads/release","format":"hybrid","seed":true}'
+```
+
+The response contains `metainfo_hex`, the exact `.torrent` export bytes. The Web
+UI offers a direct download. `seed: true` registers the torrent and starts
+seeding from the verified source data. Use `"format":"v1"`, `"v2"`, or
+`"hybrid"`; BEP 52 formats require a power-of-two piece length. Trackers and
+webseeds are inserted only when supplied. Out-of-root paths, symlinks, and
+sources that change during hashing are rejected.
+
 ## Subscribe to RSS feeds
 
 RSS feeds are optional user-configured intake. SwarmOtter fetches feeds and

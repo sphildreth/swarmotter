@@ -2492,6 +2492,17 @@ impl DaemonOps for DaemonRuntime {
         self.watch_imports.lock().await.iter().cloned().collect()
     }
 
+    async fn create_torrent(
+        &self,
+        request: swarmotter_core::creation::TorrentCreationRequest,
+    ) -> Result<swarmotter_core::creation::TorrentCreationResult> {
+        self.create_torrent(request).await
+    }
+
+    async fn torrent_creation_roots(&self) -> Vec<String> {
+        self.torrent_creation_roots().await
+    }
+
     async fn rss_status(&self) -> Vec<swarmotter_core::rss::RssSubscriptionStatus> {
         self.rss_status().await
     }

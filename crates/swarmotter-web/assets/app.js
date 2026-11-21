@@ -8,6 +8,7 @@ import { openDetails, setRefreshTorrentsHandler } from "./js/details.js";
 import { refreshSettings, setSettingsDependencies } from "./js/settings.js";
 import { refreshNetwork, refreshWatch, refreshLogs, refreshDoctor, refreshDoctorBadge, appendLogLine, setEventsDependencies } from "./js/events.js";
 import { refreshRss } from "./rss.js";
+import { resetCreateForm } from "./js/create.js";
 
 setOpenDetailsHandler(openDetails);
 setRefreshTorrentsHandler(refreshTorrents);
@@ -23,7 +24,7 @@ function openView(view, activeButton = null) {
   $$(".view").forEach(element => element.classList.add("hidden"));
   $("#view-" + view).classList.remove("hidden");
   if (view === "torrents") refreshTorrents();
-  if (view === "add") refreshProfileChoices();
+  if (view === "add") { refreshProfileChoices(); resetCreateForm(); }
   if (view === "network") refreshNetwork();
   if (view === "settings") refreshSettings();
   if (view === "watch") { refreshWatch(); refreshRss(); }

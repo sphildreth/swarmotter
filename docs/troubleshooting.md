@@ -458,3 +458,29 @@ clearing them is an explicit destructive API action. Preview never marks entries
 seen, so use it to adjust rules before a poll. The first successful poll
 establishes the baseline; only `current_matches` or an explicit import-current
 action imports existing matches at that point.
+
+## Torrent creation problems
+
+Creation accepts only source paths inside a configured storage root
+(`storage.download_dir`, `storage.incomplete_dir`, `storage.temp_dir`, or a
+`storage.root_controls` path). An `outside the configured storage roots` error
+means the resolved source path is not under those boundaries. Move the source
+into a managed root or add an explicit root control; do not rely on a symlink,
+because symlink sources and symlink entries are rejected.
+
+`source data changed` means the file set, length, modification identity, or
+inode changed between the initial snapshot, hashing, or the post-hash
+revalidation. Stop writers or copying processes and retry. A failed hash never
+publishes an export or a completed seed.
+
+BEP 52 and hybrid output require a power-of-two piece length of at least 16384
+bytes. The default is 262144 bytes. A generated document larger than the 16 MiB
+metadata limit is rejected; reduce the piece count by using a larger piece
+length.
+
+Immediate seeding requires the torrent name to equal the source basename so the
+torrent-relative paths resolve to the existing files. A custom name is valid for
+export but returns a seed error for in-place seeding. If seeding reports a
+duplicate, the torrent already exists in the library and the generated export
+is still returned. Hashing is bounded by the root's
+`max_concurrent_rechecks`; active verification can make creation wait.

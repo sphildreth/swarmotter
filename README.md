@@ -60,6 +60,7 @@ SwarmOtter provides a comprehensive set of BitTorrent features:
 - **Versioned SQLite storage** with migration from legacy JSON state
 - **Watch-folder import** functionality
 - **RSS subscription intake** with preview, wildcard rules, durable cross-feed history, and verified-completion deduplication
+- **Local torrent creation** for v1, pure v2, and hybrid formats with export and immediate verified seeding
 - **Advanced controls** for file selection, queueing, bandwidth, ratio, and seeding
 - **Policy profiles** with deterministic label selection
 - **Disk-aware storage** with filesystem diagnostics and placement

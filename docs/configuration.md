@@ -887,6 +887,27 @@ socket is opened and inbound peers before service; peer-ID-prefix rules run
 after the BitTorrent handshake. Neither rule type replaces the required
 network-containment path.
 
+### Torrent creation source roots
+
+Local torrent creation accepts source paths only inside a configured storage
+root: `storage.download_dir`, `storage.incomplete_dir`, `storage.temp_dir`, or
+any `[[storage.root_controls]]` path. There is no separate allow-list option;
+adding a source root is an explicit storage configuration change. The daemon
+rejects symlink sources and symlink entries, special files, empty sources, and
+paths that resolve outside those roots.
+
+Creation streams SHA-1 and/or BEP 52 SHA-256 hashes under the matching storage
+root's `max_concurrent_rechecks` permit. `max_write_bytes_per_second` and
+download admission do not throttle read-only creation hashing. The generated
+piece length is selected per request; BEP 52 requires a power-of-two length of
+at least 16384 bytes, and the default is 262144 bytes. Tracker tiers and
+webseeds are opt-in per request; an ordinary creation inserts neither.
+
+Immediate seeding uses the source parent as the data root. The torrent name must
+match the source basename so the generated relative paths address the existing
+files. A source that changes during hashing fails the request rather than
+publishing a stale export or completed seed. See ADR-0083.
+
 ### `[[watch]]`
 
 | Option | Default | Meaning |

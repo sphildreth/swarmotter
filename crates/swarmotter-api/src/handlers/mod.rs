@@ -3,6 +3,7 @@
 //! API request handlers.
 
 pub mod autopilot;
+pub mod creation;
 pub mod diagnostics;
 pub mod events;
 pub mod files;

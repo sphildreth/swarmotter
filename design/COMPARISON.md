@@ -124,7 +124,7 @@ candidates.
 | RSS feed automation | ✅ (user-configured feeds, rules, durable history) | ❌ | ✅ | Plugin | ✅ + Plugin | ❌ | Plugin/scripts |
 | Built-in search/indexer | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | Plugin |
 | Sequential download/streaming | Roadmap P2 | Partial | ✅ | Partial | ✅ | Partial | Partial |
-| Torrent creation | Roadmap P1 | ✅ | ✅ | Plugin | ✅ | ❌ | Plugin/scripts |
+| Torrent creation | ✅ (v1, v2, hybrid, export, immediate seed) | ✅ | ✅ | Plugin | ✅ | ❌ | Plugin/scripts |
 | Superseeding/initial seeding | Roadmap P2 (SWO-18) | Partial | ✅ | ✅ | ✅ | ❌ | ✅ |
 | IP filtering/blocklists | ✅ | ✅ | ✅ | Plugin | ✅ | ❌ | Partial |
 | UPnP/NAT-PMP | ✅ (opt-in, contained) | ✅ | ✅ | ✅ | ✅ | ❌ | Partial |

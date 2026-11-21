@@ -2038,6 +2038,40 @@ async fn api_auth_blocks_v1_without_token_and_accepts_bearer() {
 }
 
 #[tokio::test]
+async fn torrent_creation_routes_require_api_auth() {
+    let mut cfg = Config::default();
+    cfg.api.require_auth = true;
+    cfg.api.auth_token = Some("create-token".into());
+    let app = swarmotter_api::app_router(fake_daemon::fake_state_with_config(cfg));
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"source":"/unused","format":"v1","seed":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let roots = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents/create/roots")
+                .header("x-swarmotter-auth", "create-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(roots.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn rss_routes_require_api_auth_and_return_subscription_status() {
     let mut cfg = Config::default();
     cfg.api.require_auth = true;

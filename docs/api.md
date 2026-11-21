@@ -162,6 +162,8 @@ the process-wide connection-limit authority.
 | POST | `/torrents/magnet` | Add magnet JSON with storage, profile, preview, file-selection, structured exclusion, and active-file-suffix options. |
 | POST | `/torrents/file` | Upload raw `.torrent` body; query supports start, profile, label, preview, selection, active-root, and partial-suffix options. |
 | POST | `/torrents/bulk` | Add multiple magnets and/or base64 `.torrent` payloads. |
+| POST | `/torrents/create` | Create metainfo from a local file/directory and optionally seed it immediately. |
+| GET | `/torrents/create/roots` | List configured storage roots allowed to contain creation sources. |
 | GET | `/torrents/:hash` | Torrent details. |
 | GET | `/torrents/:hash/metainfo` | Return the retained, byte-exact original `.torrent` document when one exists. |
 | GET | `/torrents/:hash/stats` | Per-torrent counters and live engine diagnostics. |
@@ -297,6 +299,57 @@ found error for magnet-only or pre-retention records.
 
 Strict fail-closed network blocking can still put the new torrent in
 `network_blocked` instead of `paused`.
+
+## Torrent creation
+
+| Method | Path | Description |
+| --- | --- | --- |
+| POST | `/torrents/create` | Create metainfo from a local file or directory and optionally seed it. |
+| GET | `/torrents/create/roots` | List configured storage roots that may contain creation sources. |
+
+Request body:
+
+```json
+{
+  "source": "/data/downloads/distribution",
+  "name": "distribution",
+  "format": "hybrid",
+  "piece_length": 262144,
+  "tracker_tiers": [["https://tracker.example/announce"]],
+  "webseeds": [],
+  "private": false,
+  "seed": true
+}
+```
+
+`format` is `v1` (default), `v2`, or `hybrid`. `piece_length` is optional and
+defaults to `262144`; BEP 52 formats require a power-of-two piece length of at
+least 16384 bytes. `tracker_tiers` is ordered, and an empty list inserts no
+`announce`/`announce-list`. `webseeds` is optional and empty by default.
+`private` and `seed` default to false.
+
+`source` must resolve inside a configured local storage root:
+`storage.download_dir`, `storage.incomplete_dir`, `storage.temp_dir`, or a
+`storage.root_controls` path. The source and every recursive entry must be a
+regular file or directory; symlinks and special files are rejected. A
+directory's files are hashed in deterministic relative-path order. For
+immediate seeding, the torrent name must match the source basename so the
+torrent-relative file layout resolves to the existing files; custom names are
+available for export only.
+
+The response includes `name`, `format`, `total_length`, `piece_length`,
+`piece_count`, `file_count`, `private`, `torrent_keys`, `tracker_tiers`,
+`webseeds`, `metainfo_bytes`, and `metainfo_hex`. `metainfo_hex` is the exact
+generated `.torrent` document; decode it to obtain the export bytes. The Web UI
+turns it into a download. `seeded` reports whether registration started a
+contained seed, and `seed_error` reports a duplicate/registration problem while
+still returning the generated export.
+
+Creation streams hashes under the selected storage root's
+`max_concurrent_rechecks` permit. It rejects out-of-root paths, symlinks,
+unreadable data, and sources that change during hashing. Generated metainfo is
+bounded by the normal 16 MiB metadata limit and must round-trip through the
+standard parser before it is returned.
 
 ## Policy profiles
 

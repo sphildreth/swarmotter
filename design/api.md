@@ -333,6 +333,22 @@ not accept restart-required fields.
   Existing ratio/uploaded fields use native truthful accounting; no new
   compatibility policy controls are implied by this endpoint.
 
+## Torrent creation API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| POST | `/torrents/create` | Create v1, pure v2, or hybrid metainfo from a local file/directory; optional immediate seed. |
+| GET | `/torrents/create/roots` | Configured storage roots permitted to contain creation sources. |
+
+The request carries `source`, optional `name`, `format`, `piece_length`,
+ordered `tracker_tiers`, `webseeds`, `private`, and `seed`. The response carries
+the exact document as `metainfo_hex`, canonical identities, size/piece/file
+counts, and `seeded`/`seed_error`. Source traversal rejects out-of-root paths,
+symlinks, and special files; streaming hashing runs under root-scoped recheck
+limits, verifies v1 and BEP 52 hashes, revalidates the source snapshot, and
+requires the generated document to round-trip through the normal parser
+(ADR-0083).
+
 ## RSS subscription API
 
 | Method | Path | Description |

@@ -11,6 +11,20 @@ date or duration estimates.
 
 ### Added
 
+- Local torrent creation from the native API and Web UI. Operators can create
+  v1, pure BEP 52 v2, or hybrid metainfo from a file or directory inside a
+  configured storage root, with configurable piece length, ordered tracker
+  tiers, optional webseeds, and the private flag.
+- Generated metainfo is exported as exact bytes through `metainfo_hex` and a
+  Web UI download. An explicit immediate-seed action registers the verified
+  source data and starts a contained seeder; a local peer can download and
+  verify the original payload.
+- Creation streaming hashes run under existing storage-root recheck permits,
+  reject out-of-root paths, symlinks, special files, and changing sources, and
+  round-trip every generated document through the normal bounded parser.
+- ADR-0083 documents creation source confinement, streaming hash behavior,
+  canonical metainfo construction, export, and immediate-seeding decisions.
+
 - RSS subscriptions in the Watch UI and authenticated native API. Operators can
   preview each listing decision, configure interval, intake profile, start
   behavior, first-poll mode, and case-insensitive title/category include and

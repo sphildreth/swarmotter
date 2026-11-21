@@ -255,6 +255,7 @@ fn disabled_health() -> NetworkHealth {
 
 mod autopilot;
 mod config_data_plane;
+mod creation;
 mod health;
 mod intake;
 mod metadata_identity;

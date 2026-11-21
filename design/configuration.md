@@ -140,6 +140,12 @@ updates use two API paths:
   `archive_dir` and `failure_dir` actions create missing directories but never
   overwrite an existing destination. Observation/history state is deliberately
   not durable (ADR-0054).
+- Torrent creation sources are confined to existing local storage roots
+  (`download_dir`, `incomplete_dir`, `temp_dir`, or a `root_controls` path).
+  Symlinks and special files are rejected. Hashing uses the most-specific root's
+  `max_concurrent_rechecks` permit; no new creation-specific config table is
+  required. Piece length, tracker tiers, webseeds, privacy, and immediate-seed
+  intent are per-request values (ADR-0083).
 - `[rss]` subscriptions are operator-visible intake configuration. The feed
   id is immutable, intervals and parser/document/attachment limits are
   validated, and include/exclude wildcard rules are case-insensitive with

@@ -484,6 +484,18 @@ pub trait DaemonOps: Send + Sync + 'static {
     /// Watch-folder import history.
     async fn watch_history(&self) -> Vec<swarmotter_core::watch::ImportResult>;
 
+    /// Create metainfo from a bounded local source and optionally seed it.
+    async fn create_torrent(
+        &self,
+        _request: swarmotter_core::creation::TorrentCreationRequest,
+    ) -> Result<swarmotter_core::creation::TorrentCreationResult> {
+        Err(CoreError::NotFound("torrent creation".into()))
+    }
+    /// Configured local roots permitted to contain creation sources.
+    async fn torrent_creation_roots(&self) -> Vec<String> {
+        Vec::new()
+    }
+
     /// RSS subscription status, including poll state and bounded counts.
     async fn rss_status(&self) -> Vec<swarmotter_core::rss::RssSubscriptionStatus> {
         Vec::new()

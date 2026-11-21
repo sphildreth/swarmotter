@@ -1533,6 +1533,7 @@ dependencies = [
  "bytes",
  "clap",
  "futures-util",
+ "hex",
  "hyper",
  "libc",
  "once_cell",
