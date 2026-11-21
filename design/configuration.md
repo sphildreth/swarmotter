@@ -140,6 +140,16 @@ updates use two API paths:
   `archive_dir` and `failure_dir` actions create missing directories but never
   overwrite an existing destination. Observation/history state is deliberately
   not durable (ADR-0054).
+- `[rss]` subscriptions are operator-visible intake configuration. The feed
+  id is immutable, intervals and parser/document/attachment limits are
+  validated, and include/exclude wildcard rules are case-insensitive with
+  exclusions winning. The first successful poll establishes the baseline; an
+  explicit current-matches import and reconsider/retry actions are separate.
+  Feed and attachment traffic uses the contained HTTP client. The dedicated
+  shared history database is `<state file>.rss.sqlite` by default (or
+  `rss.history_file`) and is paired with the main database for backup/restore.
+  Completion/removal events are written to the main transactional outbox before
+  being applied idempotently to history (ADR-0082).
 - Transport option changes are release-facing compatibility decisions.
 
 ## Compatibility boundaries

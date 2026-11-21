@@ -333,6 +333,24 @@ not accept restart-required fields.
   Existing ratio/uploaded fields use native truthful accounting; no new
   compatibility policy controls are implied by this endpoint.
 
+## RSS subscription API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET/POST | `/rss` | List or create subscriptions. |
+| PUT/DELETE | `/rss/{id}` | Replace or delete a subscription. History and completions survive deletion. |
+| GET | `/rss/{id}/preview` | Explain listing decisions without adding or marking entries seen. |
+| POST | `/rss/{id}/poll` | Poll on demand; optional explicit current-match import or reconsider. |
+| POST | `/rss/{id}/retry` | Explicit retry after dismissal or transient failure. |
+| GET | `/rss/{id}/decisions` | Paginated per-feed decision history. |
+| DELETE | `/rss/history/completions` | Explicitly clear verified completion identities. |
+| GET | `/rss/diagnostics` | Indexed duplicate-lookup diagnostic. |
+
+Status rows expose poll state, baseline state, last success/error, retry
+schedule, bounded counts, and redacted feed URLs. Decision actions distinguish
+import, already present, previously completed, filtered, dismissed, unsupported,
+failed, deferred, and baseline (ADR-0082).
+
 ## Watch-folder API and event contract
 
 - `ImportResult` retains `path`, `success`, `info_hash_hex`, `error`, and

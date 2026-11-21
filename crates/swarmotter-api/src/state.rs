@@ -483,6 +483,68 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn watch_status(&self) -> WatchStatus;
     /// Watch-folder import history.
     async fn watch_history(&self) -> Vec<swarmotter_core::watch::ImportResult>;
+
+    /// RSS subscription status, including poll state and bounded counts.
+    async fn rss_status(&self) -> Vec<swarmotter_core::rss::RssSubscriptionStatus> {
+        Vec::new()
+    }
+    /// Create or replace one RSS subscription through the daemon's validated
+    /// configuration transaction. `previous_id` supports an id-preserving
+    /// edit; renaming is intentionally a delete plus create.
+    async fn rss_upsert_subscription(
+        &self,
+        _subscription: swarmotter_core::rss::RssSubscription,
+        _previous_id: Option<String>,
+    ) -> Result<swarmotter_core::rss::RssSubscriptionStatus> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
+    /// Delete one RSS subscription. History and verified completions remain
+    /// durable unless completions are explicitly cleared.
+    async fn rss_delete_subscription(&self, _id: &str) -> Result<()> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
+    /// Preview a feed without adding torrents or marking entries seen.
+    async fn rss_preview(&self, _id: &str) -> Result<swarmotter_core::rss::RssPreview> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
+    /// Poll one feed on demand. `import_current` explicitly imports current
+    /// matches; `reconsider` re-evaluates stored older listings.
+    async fn rss_poll(
+        &self,
+        _id: &str,
+        _import_current: bool,
+        _reconsider: bool,
+    ) -> Result<swarmotter_core::rss::RssPollResult> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
+    /// Explicitly retry dismissed or failed listings for one subscription.
+    async fn rss_retry(
+        &self,
+        _id: &str,
+        _entry_key: Option<String>,
+    ) -> Result<swarmotter_core::rss::RssPollResult> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
+    /// Paginated RSS decision history.
+    async fn rss_decisions(
+        &self,
+        _id: &str,
+        _limit: usize,
+        _before: Option<i64>,
+    ) -> Result<swarmotter_core::rss::RssDecisionPage> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
+    /// Explicitly clear every verified completion identity. Routine pruning
+    /// and feed deletion never do this.
+    async fn rss_clear_completions(&self) -> Result<usize> {
+        Ok(0)
+    }
+    /// Whether durable duplicate lookups are using their indexes.
+    async fn rss_duplicate_lookup_is_indexed(&self) -> Result<bool> {
+        Ok(true)
+    }
+    /// Backfill completion evidence supported by current durable state.
+    async fn rss_backfill_completion_evidence(&self) {}
 }
 
 /// A patch of safe runtime settings.

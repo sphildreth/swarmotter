@@ -7,6 +7,30 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [Unreleased]
+
+### Added
+
+- RSS subscriptions in the Watch UI and authenticated native API. Operators can
+  preview each listing decision, configure interval, intake profile, start
+  behavior, first-poll mode, and case-insensitive title/category include and
+  exclude rules, pause or enable automatic polling, poll on demand, explicitly
+  import current matches, reconsider older listings, retry dismissals, and page
+  through decision history.
+- A dedicated shared RSS history database records per-feed listings, decisions,
+  retry state, poll state, cross-feed torrent identity aliases, and verified
+  completions. A transactional outbox in the main database captures verified
+  completion and removal evidence, including selfish-mode removal, and applies
+  it idempotently across crashes and restarts.
+- RSS feed requests, DNS, redirects, and torrent attachments use the contained
+  HTTP client with bounded document/attachment sizes, entry counts, redirects,
+  retries, concurrency, request timeouts, conditional requests, and redacted
+  credentials.
+- Backup verification now checks the paired RSS history database when present,
+  and the updater archives both databases and their SQLite sidecars.
+- ADR-0082 documents RSS containment, matching, identity, database handoff,
+  retention, and backup behavior.
+
 ## [2.5.0] - [2026-11-20]
 
 ### Added

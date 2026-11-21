@@ -92,6 +92,8 @@ pub struct Config {
     #[serde(default)]
     pub watch: Vec<WatchFolderConfig>,
     #[serde(default)]
+    pub rss: crate::rss::RssConfig,
+    #[serde(default)]
     pub logging: LoggingConfig,
 }
 
@@ -718,6 +720,17 @@ impl Config {
             }
         }
         validate_profiles(&self.profiles).map_err(CoreError::InvalidConfig)?;
+        self.rss.validate()?;
+        for subscription in &self.rss.subscriptions {
+            if let Some(profile) = subscription.profile.as_deref() {
+                if !self.profiles.profiles.contains_key(profile) {
+                    return Err(CoreError::InvalidConfig(format!(
+                        "rss subscription {:?} references unknown profile {profile}",
+                        subscription.id
+                    )));
+                }
+            }
+        }
         for w in &self.watch {
             if w.path.trim().is_empty() {
                 return Err(CoreError::InvalidConfig(

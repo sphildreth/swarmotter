@@ -146,6 +146,10 @@ impl NetworkBinder for DiscoveryFixtureBinder {
             body: self.body.lock().unwrap().clone(),
             final_url: url.into(),
             content_range: None,
+            etag: None,
+            last_modified: None,
+            content_type: None,
+            retry_after_seconds: None,
         })
     }
 

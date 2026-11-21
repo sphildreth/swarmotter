@@ -645,6 +645,39 @@ resume/state/temporary/log placement roots. `cow_strategy_supported` is `null`
 when the host cannot determine support safely; an explicit unsupported NOCOW
 request fails before payload bytes are written.
 
+## RSS subscriptions
+
+All routes require the normal native API authentication. Status responses
+redact feed URL credentials and sensitive query values.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/rss` | List subscriptions with poll state, latest error, counts, and baseline state. |
+| POST | `/rss` | Create a subscription. |
+| PUT | `/rss/{id}` | Replace a subscription. A blank `url` preserves the configured URL; the id is immutable. |
+| DELETE | `/rss/{id}` | Delete a subscription. History and verified completions remain durable. |
+| GET | `/rss/{id}/preview` | Fetch and explain current decisions without adding torrents or marking entries seen. |
+| POST | `/rss/{id}/poll?import_current=false&reconsider=false` | Poll on demand. Explicitly import current matches or re-evaluate stored older listings. |
+| POST | `/rss/{id}/retry` | Clear dismissal/failure state and retry. Body: `{ "entry_key": null }` for all eligible listings. |
+| GET | `/rss/{id}/decisions?limit=100&before=<id>` | Paginated decision history. |
+| DELETE | `/rss/history/completions` | Explicitly clear verified completion identities. |
+| GET | `/rss/diagnostics` | Report whether duplicate lookups use their indexes. |
+
+A subscription body uses `id`, `name`, `url`, `enabled`,
+`poll_interval_seconds`, `profile`, `start_behavior`, `import_mode`, `labels`,
+and `rules: { include: [...], exclude: [...] }`. A rule has optional `title` and
+`category` wildcard fields. `import_mode` is `new_only` (default) or
+`current_matches`.
+
+Every preview, poll, retry, and paginated decision row reports one of
+`import`, `already_present`, `previously_completed`, `filtered`, `dismissed`,
+`unsupported`, `failed`, `deferred`, `baseline`, with a human-readable reason
+and the full torrent identity aliases used for cross-feed deduplication.
+`success: false` on a poll leaves eligible work in durable retry state; it does
+not mark a torrent downloaded. Transient and server-indicated `Retry-After`
+delays are exposed through `next_attempt_at`. Automatic intake defers when history cannot be
+checked.
+
 ## Watch folders
 
 | Method | Path | Description |

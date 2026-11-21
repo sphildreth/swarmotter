@@ -13,6 +13,7 @@ pub mod peers;
 pub mod policies;
 pub mod qbittorrent;
 pub mod queue;
+pub mod rss;
 pub mod settings;
 pub mod stats;
 pub mod storage;

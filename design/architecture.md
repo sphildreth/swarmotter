@@ -106,11 +106,11 @@ SwarmOtter is a Rust async daemon with these layers:
 
 ```text
 crates/
-├── swarmotterd/      # daemon binary + lib (runtime, DaemonOps impl, live engine, seeder, metadata, dht, netbinder)
+├── swarmotterd/      # daemon binary + lib (runtime, DaemonOps impl, live engine, seeder, metadata, dht, netbinder, rss_store)
 ├── swarmotter-core/  # core types and engine logic
 │   └── src/ bencode, dht, endgame, error, extensions, hash, magnet, meta, models/, net/ (binder, config, probe),
 │            peer, peer_filter, policy, tracker, udp_tracker, utp/ (mod, header, sack, congestion, stream), queue, ratio, bandwidth, storage/ (io, layout, resume),
-│            torrent, watch, config
+│            torrent, watch, rss, config
 ├── swarmotter-api/   # API layer (routes, handlers, envelope, events)
 └── swarmotter-web/   # embedded static Web UI
 ```
@@ -126,6 +126,7 @@ swarmotterd/src/
 │   ├── lifecycle.rs                   # DaemonOps lifecycle implementation
 │   ├── scheduler.rs, seeding.rs       # queue and seeder ownership
 │   ├── settings.rs, watch.rs          # reconfiguration and watch ingestion
+│   ├── rss.rs                         # RSS polling, preview, intake, outbox consumer
 │   ├── policy_runtime.rs              # effective profile resolution + durable assignment
 │   ├── storage_controls.rs            # root admission, write pressure, recheck permits
 │   ├── containment.rs, diagnostics.rs # gate/recovery and observations
@@ -271,6 +272,31 @@ retry/action behavior. Archive/failure actions create missing destinations and
 use create-new copy/remove semantics so an existing file is never replaced.
 Post-action failure remains attached to the primary result for UI/event
 reporting and requires operator intervention rather than repeated import.
+
+## RSS intake and durable history
+
+RSS subscriptions are configuration entries, but accepted magnets and torrent
+attachments use the same durable add transaction as API, magnet, and watch
+intake. Feed XML is parsed by a bounded core reader; feed and attachment
+requests use the shared contained HTTP client (ADR-0082). Preview evaluates
+rules and duplicate state without writing. The first successful poll establishes
+the baseline, with explicit current-match import and retry/reconsider actions as
+separate operations.
+
+The daemon owns one shared RSS SQLite history database (`<state file>.rss.sqlite`
+by default). It stores per-feed listings, decisions, poll/retry state, and
+identity attribution. Full v1 and v2 locators are indexed as aliases of the
+canonical record, so a renamed listing and a hybrid's v2 locator resolve to the
+same torrent. Verified completion evidence is source-agnostic and survives
+removal.
+
+The main SQLite schema adds `rss_outbox`. Completion and removal paths enqueue
+an event in the same transaction as the library update; a consumer applies it
+idempotently to the history database and then acknowledges it. The daemon
+serializes outbox reads/acknowledgements with the existing state-write lane.
+Duplicate checks consult stored completions, unacknowledged events, identity
+attribution, and the live registry. If history is unavailable, automatic RSS
+adds are deferred and the error is exposed rather than risking a duplicate.
 
 ## Runtime ownership and reconfiguration
 

@@ -29,6 +29,19 @@ time or duration estimates.
   scoped to one configured folder so an overlapping root remains independent.
   API and watch adds share one durable registry/queue transaction with exact
   rollback before any event or scheduling side effect (ADR-0054).
+- **RSS subscription intake:** user-configured RSS 2.0 feeds with operator
+  name, URL, interval, intake profile, start behavior, first-poll mode, labels,
+  and case-insensitive title/category include/exclude wildcard rules. Preview
+  explains every decision without adding or consuming entries; only a
+  successful first poll establishes the baseline. Accepted magnets and torrent
+  attachments use the standard intake transaction. Feed, DNS, redirect, and
+  attachment traffic use the contained HTTP client with bounded documents,
+  entries, retries, concurrency, and conditional requests. One dedicated
+  shared SQLite history database stores per-feed listing attribution, decision
+  history, retry/dismissal state, and cross-feed full v1/v2/hybrid identity
+  aliases. Verified completion and removal evidence is written to the main
+  database in the same transaction as the library change, applied to history
+  idempotently, and recovered with the paired backup (ADR-0082).
 - **Peer discovery and alternate data sources:** HTTP trackers, HTTPS
   trackers, UDP trackers, HTTP/HTTPS webseeds (`url-list`), DHT, PEX, tracker
   tiers, manual tracker lists. HTTP(S) announce and supported BEP 48 scrape,
@@ -97,6 +110,13 @@ for `v1.0.0` only when every item in the `v1.0.0` completion checklist (see
 `design/PRD.md`) is complete and:
 
 - All required torrent input methods work.
+- RSS acceptance covers subscription controls and preview, baseline and
+  explicit current-match import, rule precedence, magnet/torrent/page-only/
+  malformed formats, stable listing identity and unchanged polls, cross-feed
+  and hybrid-hash deduplication, verified completion after selfish removal and
+  restart, transient retry after a listing leaves its feed, intentional
+  dismissal and explicit retry, crash-safe outbox replay, paired backup
+  restore, contained failure, bounded scale, and indexed duplicate lookups.
 - Watch-folder acceptance covers partial copies and read-time changes,
   deterministic recursive/non-recursive scans, symlink exclusion, restart
   duplicate handling, permanent/transient retry classification,

@@ -1198,13 +1198,14 @@ impl DaemonRuntime {
     /// itself because it does NOT await the engine task's own join handle
     /// (that would deadlock); the already-returning task is simply detached.
     pub(super) async fn selfish_remove_completed(&self, hash: TorrentKey) {
-        let name = self
-            .registry
-            .lock()
-            .await
-            .get(&hash)
+        let completed = self.registry.lock().await.get(&hash).cloned();
+        let name = completed
+            .as_ref()
             .map(|t| t.name().to_string())
             .unwrap_or_default();
+        if let Some(torrent) = completed.as_ref() {
+            self.queue_rss_removal(torrent).await;
+        }
         // Stop the inbound seeder (a separate task; safe to await).
         self.stop_seeder(&hash).await;
         // Clear live engine bookkeeping. We deliberately do NOT await the
@@ -1232,6 +1233,12 @@ impl DaemonRuntime {
         );
         self.publish_event(torrent_removed_event(hash, false));
         self.publish_event(stats_updated_event());
-        self.persist_state_best_effort("selfish_completion").await;
+        // A removal must stage the complete registry: the changed-record path
+        // intentionally only upserts surviving records and cannot delete a
+        // torrent row. The full transaction also carries the queued RSS
+        // completion/removal events and any pending queue change.
+        if let Err(error) = self.persist_state_full().await {
+            tracing::error!(%error, "failed to persist selfish completion removal");
+        }
     }
 }

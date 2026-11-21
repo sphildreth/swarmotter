@@ -264,6 +264,7 @@ mod profiles;
 mod queue;
 mod recheck_control;
 mod reconcile;
+mod rss;
 mod scheduler;
 mod trackers;
 mod watch;

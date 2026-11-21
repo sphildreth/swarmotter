@@ -7,6 +7,7 @@ import { pollTorrents, refreshTorrents, refreshTorrentTableTheme, setOpenDetails
 import { openDetails, setRefreshTorrentsHandler } from "./js/details.js";
 import { refreshSettings, setSettingsDependencies } from "./js/settings.js";
 import { refreshNetwork, refreshWatch, refreshLogs, refreshDoctor, refreshDoctorBadge, appendLogLine, setEventsDependencies } from "./js/events.js";
+import { refreshRss } from "./rss.js";
 
 setOpenDetailsHandler(openDetails);
 setRefreshTorrentsHandler(refreshTorrents);
@@ -25,7 +26,7 @@ function openView(view, activeButton = null) {
   if (view === "add") refreshProfileChoices();
   if (view === "network") refreshNetwork();
   if (view === "settings") refreshSettings();
-  if (view === "watch") refreshWatch();
+  if (view === "watch") { refreshWatch(); refreshRss(); }
   if (view === "logs") refreshLogs();
   if (view === "doctor") refreshDoctor();
 }

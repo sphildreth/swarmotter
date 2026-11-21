@@ -7,9 +7,9 @@ clients. It is intended to help users understand product fit, feature coverage,
 and roadmap gaps as SwarmOtter matures.
 
 This is a living product comparison, not a release checklist. SwarmOtter
-feature status is based on this repository's `README.md`,
-`design/requirements.md`, `design/v1-completion-tracker.md`, and
-`design/BACKLOG.md`. Other client status is based on official project sites,
+feature status draws on this repository's `README.md`,
+`design/requirements.md` and `design/v1-completion-tracker.md`. Roadmap
+entries are tracked in the [SwarmOtter backlog](BACKLOG.md). Other client status is based on official project sites,
 project-owned documentation, and project repositories listed in
 [Sources](#sources).
 
@@ -67,7 +67,7 @@ candidates.
 | Partial | Supported with meaningful limitations, narrower scope, or less direct UI/API coverage. |
 | Plugin | Available through an official or common plugin/extension path. |
 | ❌ | Not provided by the checked project sources. |
-| Roadmap P1/P2/P3 | Not completed in SwarmOtter and tracked in `design/BACKLOG.md` at that priority. |
+| Roadmap P1/P2/P3 | Product or research work tracked at that priority in Hamstik project `SWO`. |
 
 ## Project Positioning
 
@@ -121,15 +121,15 @@ candidates.
 | Capability | SwarmOtter | Transmission | qBittorrent | Deluge | BiglyBT | aria2 | rTorrent + ruTorrent |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Watch folders | ✅ | ✅ | ✅ | Plugin | ✅ | ❌ | ✅ |
-| RSS feed automation | Roadmap P1 for user-configured feeds | ❌ | ✅ | Plugin | ✅ + Plugin | ❌ | Plugin/scripts |
+| RSS feed automation | ✅ (user-configured feeds, rules, durable history) | ❌ | ✅ | Plugin | ✅ + Plugin | ❌ | Plugin/scripts |
 | Built-in search/indexer | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | Plugin |
 | Sequential download/streaming | Roadmap P2 | Partial | ✅ | Partial | ✅ | Partial | Partial |
 | Torrent creation | Roadmap P1 | ✅ | ✅ | Plugin | ✅ | ❌ | Plugin/scripts |
-| Superseeding/initial seeding | Roadmap P1 | Partial | ✅ | ✅ | ✅ | ❌ | ✅ |
+| Superseeding/initial seeding | Roadmap P2 (SWO-18) | Partial | ✅ | ✅ | ✅ | ❌ | ✅ |
 | IP filtering/blocklists | ✅ | ✅ | ✅ | Plugin | ✅ | ❌ | Partial |
 | UPnP/NAT-PMP | ✅ (opt-in, contained) | ✅ | ✅ | ✅ | ✅ | ❌ | Partial |
 | SOCKS/proxy support | ✅ (opt-in, contained TCP CONNECT; UDP unavailable) | ❌ | ✅ | ✅ | ✅ | ✅ | Partial |
-| HTTP/HTTPS proxy support | Roadmap P1 | ❌ | ✅ | ❌ | ❌ | ✅ | Partial |
+| HTTP/HTTPS proxy support | Roadmap P2 (SWO-24) | ❌ | ✅ | ❌ | ❌ | ✅ | Partial |
 | Listen port reachability test | ✅ (opt-in, contained operator endpoint) | ✅ | ✅ | ✅ | ✅ | ❌ | Partial |
 | Anonymous mode | Roadmap P1 | ❌ | ✅ | ✅ | ✅ | ❌ | Partial |
 | Torrent metadata display (comment, creator, date) | Roadmap P1 | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
@@ -138,7 +138,7 @@ candidates.
 | Categories/tags/policy groups | Partial (labels and named profiles) | Partial | ✅ | Plugin | ✅ | ❌ | Partial |
 | Large-library UI operations | ✅ (server-side query, pagination, and efficient table workflows) | Partial | Partial | Partial | Partial | ❌ | Partial |
 | Bulk import/export and backup | Roadmap P2 | Partial | Partial | Partial | Migration tooling | Session files | Session files |
-| Automation hooks | Roadmap P1 safe hooks | Completion script | External program/API | Execute plugin/API | Plugins | RPC/scripts | XMLRPC/scripts |
+| Automation hooks | Roadmap P2 (SWO-17) | Completion script | External program/API | Execute plugin/API | Plugins | RPC/scripts | XMLRPC/scripts |
 | OpenAPI/interactive API docs | Roadmap P1 | ❌ | ❌ | Partial docs | ❌ | RPC docs | ❌ |
 | Long-horizon observability | Roadmap P2; peak logs exist | Partial | Partial | Plugin | Plugin | Logs/RPC | Scripts/plugins |
 | Disk cache / I/O buffer configuration | Roadmap P2 | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
@@ -165,16 +165,10 @@ candidates.
 
 ## Roadmap Gap Map
 
-`design/BACKLOG.md`'s Feature Map is the authoritative, non-duplicated
-priority list. It deliberately removes completed work rather than retaining a
-checked-off history. This comparison records current support in the tables
-above; consult the Feature Map for the ordered remaining opportunities.
-
-The next P1 work is v1/v2/hybrid torrent creation; source-metadata
-display, deterministic magnet generation, and Web UI/batch exact-metainfo
-portability; cleanup safety; an API-backed CLI; API discovery; and tracker/peer
-operations. Shared-server routing and multi-user features remain conditional,
-and protocol work beyond the completed BEP 52 foundation remains P2.
+Hamstik project `sph/SWO` holds current priorities, scope, acceptance
+criteria and status. Each migrated item records its original priority and
+sequence. See the [backlog guide](BACKLOG.md) for project access and the
+archived Feature Map.
 
 ## Sources
 

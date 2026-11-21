@@ -329,7 +329,14 @@ pulling, or restarting. For an upgrade it pulls the image and validates its
 configuration first. It then stops the running daemon, archives the deployment
 files and state into `~/swarmotter-backups`, and restores the active state
 file and its SQLite sidecars in a private directory for verification. This
-also covers a state file placed on a custom persistent mount.
+also covers a state file placed on a custom persistent mount. When RSS is
+configured, the paired `<state file>.rss.sqlite` history database and its
+SQLite sidecars are archived in the same generation and validated for SQLite
+integrity and required RSS tables. A backup with an absent history database is
+still valid for installations that never enabled RSS. Restore the main state
+file and RSS history database together; using an older history database with a
+newer library can reintroduce a completed torrent because completion evidence
+would be stale.
 Keep `verify-state-backup.py` next to the updater and install Python 3.11
 or later with SQLite support on the host. A failed backup stops the upgrade
 and restarts the original daemon. After verification the updater changes

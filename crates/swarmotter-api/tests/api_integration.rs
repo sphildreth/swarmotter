@@ -2038,6 +2038,41 @@ async fn api_auth_blocks_v1_without_token_and_accepts_bearer() {
 }
 
 #[tokio::test]
+async fn rss_routes_require_api_auth_and_return_subscription_status() {
+    let mut cfg = Config::default();
+    cfg.api.require_auth = true;
+    cfg.api.auth_token = Some("rss-token".into());
+    let app = swarmotter_api::app_router(fake_daemon::fake_state_with_config(cfg));
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/rss")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/rss")
+                .header("x-swarmotter-auth", "rss-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let body: serde_json::Value = axum::body::to_bytes(authorized.into_body(), usize::MAX)
+        .await
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        .unwrap();
+    assert_eq!(body["data"], serde_json::json!([]));
+}
+
+#[tokio::test]
 async fn native_api_rejects_cross_origin_browser_mutations() {
     let state = fake_daemon::fake_state();
     let app = swarmotter_api::app_router(state);

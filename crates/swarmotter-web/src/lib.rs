@@ -40,8 +40,10 @@ const APP_JS: &str = concat!(
     include_str!("../assets/js/settings.js"),
     include_str!("../assets/js/events.js"),
     include_str!("../assets/js/ui.js"),
+    include_str!("../assets/rss.js"),
 );
 const SEEDING_POLICY_JS: &str = include_str!("../assets/seeding-policy.js");
+const RSS_JS: &str = include_str!("../assets/rss.js");
 const WATCH_HISTORY_JS: &str = include_str!("../assets/watch-history.js");
 const THEME_BOOTSTRAP_JS: &str = include_str!("../assets/theme-bootstrap.js");
 const STYLE_CSS: &str = include_str!("../assets/style.css");
@@ -80,6 +82,7 @@ pub fn web_router() -> Router {
         .route("/js/events.js", get(events_js))
         .route("/js/ui.js", get(ui_js))
         .route("/seeding-policy.js", get(seeding_policy_js))
+        .route("/rss.js", get(rss_js))
         .route("/watch-history.js", get(watch_history_js))
         .route("/theme-bootstrap.js", get(theme_bootstrap_js))
         .route("/style.css", get(style_css))
@@ -158,6 +161,17 @@ async fn seeding_policy_js() -> Response {
             "application/javascript; charset=utf-8",
         )],
         SEEDING_POLICY_JS,
+    )
+        .into_response()
+}
+
+async fn rss_js() -> Response {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        RSS_JS,
     )
         .into_response()
 }
@@ -905,6 +919,24 @@ mod tests {
     }
 
     #[test]
+    fn web_ui_exposes_rss_subscription_controls() {
+        for needle in [
+            "id=\"rss-form\"",
+            "id=\"rss-subscriptions\"",
+            "id=\"rss-preview\"",
+            "id=\"rss-decisions\"",
+            "src=\"/rss.js\"",
+            "data-rss-action=\"import-current\"",
+            "data-rss-action=\"reconsider\"",
+        ] {
+            assert!(
+                INDEX_HTML.contains(needle) || RSS_JS.contains(needle),
+                "RSS UI is missing {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn web_ui_renders_stable_watch_outcomes_and_post_action_errors() {
         for needle in [
             "src=\"/watch-history.js\"",
@@ -1299,6 +1331,7 @@ mod tests {
             ("js/ui.js", UI_JS),
             ("seeding-policy.js", SEEDING_POLICY_JS),
             ("watch-history.js", WATCH_HISTORY_JS),
+            ("rss.js", RSS_JS),
             ("theme-bootstrap.js", THEME_BOOTSTRAP_JS),
             ("vendor/tabulator/tabulator.min.js", TABULATOR_JS),
         ] {
@@ -1407,6 +1440,7 @@ mod tests {
                 "application/javascript; charset=utf-8",
             ),
             ("/watch-history.js", "application/javascript; charset=utf-8"),
+            ("/rss.js", "application/javascript; charset=utf-8"),
             (
                 "/vendor/tabulator/tabulator_midnight.min.css",
                 "text/css; charset=utf-8",

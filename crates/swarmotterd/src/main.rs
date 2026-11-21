@@ -212,6 +212,11 @@ async fn run() -> Result<()> {
     });
     let rt = runtime.clone();
     workers.spawn(async move {
+        rt.rss_loop().await;
+        "rss"
+    });
+    let rt = runtime.clone();
+    workers.spawn(async move {
         rt.network_health_loop().await;
         "network"
     });

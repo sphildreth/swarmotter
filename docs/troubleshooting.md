@@ -431,3 +431,30 @@ and serialized bytes currently cover changed-record saves.
 Application logs retain the active file and five numbered archives. Docker logs
 are capped separately. Check both the download filesystem and state filesystem
 for free space; download reserves do not protect a separate SQLite volume.
+
+## RSS subscription problems
+
+RSS status and poll errors are explicit. `rss history unavailable` or a storage
+error means the dedicated history database (`<state file>.rss.sqlite` by default,
+or `rss.history_file`) could not be opened or checked. Automatic RSS
+imports are deferred, not guessed, in that state. Confirm the state directory is
+writable, that both the main state file and RSS history database were restored
+together, and that file permissions allow the daemon user to open the history
+database. Run the offline backup verifier against the pair if SQLite integrity
+is in doubt.
+
+A `network_blocked`, timeout, HTTP status, or transient attachment decision
+remains eligible for retry with backoff, even after the listing leaves the feed.
+Check the subscription's `next_attempt_at` and `latest_error`; use **Retry
+dismissed** or `POST /api/v1/rss/{id}/retry` after fixing the cause. A permanent
+`unsupported` decision (page-only listing, malformed metainfo, or malformed
+magnet) requires a different feed item; it is not retried forever.
+
+A listing that was imported and then deliberately removed before completion is
+`dismissed` until explicit retry. If a later feed offers the same torrent after
+a verified completion, it is reported as `previously_completed` and is not added
+again. Completion identities survive routine pruning and subscription deletion;
+clearing them is an explicit destructive API action. Preview never marks entries
+seen, so use it to adjust rules before a poll. The first successful poll
+establishes the baseline; only `current_matches` or an explicit import-current
+action imports existing matches at that point.

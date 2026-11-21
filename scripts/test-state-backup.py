@@ -13,7 +13,10 @@ import unittest
 
 helper = runpy.run_path(str(Path(__file__).resolve().parents[1] / "deploy/verify-state-backup.py"))
 verify = helper["verify"]
+verify_rss_history = helper["verify_rss_history"]
+rss_history_path = helper["rss_history_path"]
 active_state_path = helper["active_state_path"]
+active_rss_history_path = helper["active_rss_history_path"]
 
 
 class StateBackupTest(unittest.TestCase):
@@ -38,6 +41,12 @@ class StateBackupTest(unittest.TestCase):
             config["Env"] = []
             config["Cmd"] = ["-c/etc/daemon.toml"]
             self.assertEqual(active_state_path(spec), Path("/fast/state/state.json"))
+            (root / "daemon.toml").write_text(
+                '[storage]\nstate_dir = "/data/custom"\n[rss]\nhistory_file = "/data/rss/custom.sqlite"\n'
+            )
+            self.assertEqual(
+                active_rss_history_path(spec), Path("/host/data/rss/custom.sqlite")
+            )
 
     def test_updater_stops_writer_and_restarts_it_on_invalid_backup(self):
         updater = Path(__file__).resolve().parents[1] / "deploy/update-swarmotter.sh"
@@ -96,6 +105,38 @@ class StateBackupTest(unittest.TestCase):
                     self.assertNotEqual(result.returncode, 0)
                     self.assertEqual((root / "running").read_text().strip(), "true")
                     self.assertFalse(list((root / backup_dir).iterdir()))
+
+    def test_paired_rss_history_is_verified(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root)
+            state = root / "state"
+            state.mkdir()
+            library = state / "library"
+            library.write_text(json.dumps({"version": 1, "queue": {}, "torrents": []}))
+            rss = Path(rss_history_path(str(library)))
+            db = sqlite3.connect(rss)
+            try:
+                for table in ("feed_state", "listings", "listing_identities",
+                              "completions", "completion_aliases", "decisions"):
+                    db.execute(f"CREATE TABLE {table}(x INTEGER)")
+                db.commit()
+            finally:
+                db.close()
+            archive = root / "backup.tar.gz"
+            with tarfile.open(archive, "w:gz") as tar:
+                tar.add(state, arcname="srv/state")
+            verify(archive, "/srv/state/library")
+            self.assertTrue(verify_rss_history(archive, rss_history_path("/srv/state/library")))
+            rss.write_bytes(b"broken")
+            with tarfile.open(archive, "w:gz") as tar:
+                tar.add(state, arcname="srv/state")
+            with self.assertRaises((ValueError, sqlite3.DatabaseError)):
+                verify(archive, "/srv/state/library")
+            rss.unlink()
+            with tarfile.open(archive, "w:gz") as tar:
+                tar.add(state, arcname="srv/state")
+            verify(archive, "/srv/state/library")
+            self.assertFalse(verify_rss_history(archive, rss_history_path("/srv/state/library")))
 
     def test_wal_and_corruption(self):
         with tempfile.TemporaryDirectory() as root:

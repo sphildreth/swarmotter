@@ -548,7 +548,7 @@
 
     <!-- Watch view -->
     <section id="view-watch" class="view hidden">
-      <h2>Watch Folders</h2>
+      <h2>Watch Folders &amp; RSS</h2>
       <div class="watch-layout">
         <div id="watch-config" class="card">
           <h3>Watch config</h3>
@@ -563,6 +563,40 @@
           <p class="muted">Recent paths and status stream here.</p>
         </div>
         <button id="watch-scan-btn" disabled>Scan Now</button>
+        <div id="rss-config" class="card settings-wide">
+          <h3>RSS subscriptions</h3>
+          <p class="muted">Feeds are fetched only through the contained network path. Preview explains every decision before anything is added; the first successful poll establishes the baseline for new-entries-only mode.</p>
+          <div id="rss-subscriptions"><p class="muted">Loading RSS subscriptions…</p></div>
+        </div>
+        <div id="rss-form-card" class="card settings-wide">
+          <h3>Add or edit subscription</h3>
+          <form id="rss-form">
+            <div class="settings-form-grid">
+              <label class="settings-field"><span>Id</span><input id="rss-id" type="text" required pattern="[A-Za-z0-9._-]+"></label>
+              <label class="settings-field"><span>Name</span><input id="rss-name" type="text" required></label>
+              <label class="settings-field settings-wide"><span>Feed URL</span><input id="rss-url" type="url" placeholder="https://example.test/feed.xml"></label>
+              <label class="settings-field"><span>Poll interval (seconds)</span><input id="rss-interval" type="number" min="30" max="86400" step="1" value="900" required></label>
+              <label class="settings-field"><span>Intake profile</span><input id="rss-profile" type="text" placeholder="default"></label>
+              <label class="settings-field"><span>Start behavior</span><select id="rss-start"><option value="start">Start</option><option value="paused">Paused</option></select></label>
+              <label class="settings-field"><span>First poll</span><select id="rss-import-mode"><option value="new_only">New entries only</option><option value="current_matches">Import current matches</option></select></label>
+              <label class="settings-check"><input id="rss-enabled" type="checkbox" checked><span>Enabled (automatic polling)</span></label>
+              <label class="settings-field settings-wide"><span>Rules (one per line: <code>+title|category</code> to include, <code>-title|category</code> to exclude; <code>*</code> wildcard)</span><textarea id="rss-rules" class="settings-list" rows="5" spellcheck="false" placeholder="+*FLAC*|Music/Lossless&#10;-*live*|"></textarea></label>
+            </div>
+            <div class="rss-form-actions">
+              <button id="rss-save-btn" type="submit">Add subscription</button>
+              <button id="rss-preview-btn" type="button">Preview feed</button>
+              <button id="rss-reset-btn" type="button" class="secondary">Reset form</button>
+            </div>
+          </form>
+        </div>
+        <div id="rss-preview" class="card settings-wide">
+          <h3>RSS preview</h3>
+          <p class="muted">Preview a feed to see each listing's proposed action and reason. Preview does not add torrents or mark entries seen.</p>
+        </div>
+        <div id="rss-decisions" class="card settings-wide">
+          <h3>Decision history</h3>
+          <p class="muted">Select Decisions on a subscription to load paginated history.</p>
+        </div>
       </div>
     </section>
 
@@ -616,6 +650,7 @@
   <script src="/vendor/tabulator/tabulator.min.js"></script>
   <script src="/seeding-policy.js"></script>
   <script src="/watch-history.js"></script>
+  <script src="/rss.js"></script>
   <script type="module" src="/app.js"></script>
 </body>
 </html>

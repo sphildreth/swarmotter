@@ -1244,6 +1244,12 @@ impl DaemonRuntime {
                         };
                         runtime_for_task.publish_torrent_event(event, hash_for_task, state);
                         if state == TorrentState::Completed {
+                            let completed = registry.lock().await.get(&hash_for_task).cloned();
+                            if let Some(torrent) = completed {
+                                runtime_for_task
+                                    .queue_rss_verified_completion(&torrent)
+                                    .await;
+                            }
                             runtime_for_task.publish_torrent_event(
                                 "torrent_completed",
                                 hash_for_task,

@@ -39,13 +39,29 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
     pub final_url: String,
     pub content_range: Option<String>,
+    /// Validator returned by a conditional feed or attachment request.
+    pub etag: Option<String>,
+    /// Date validator returned by a conditional feed request.
+    pub last_modified: Option<String>,
+    /// Response media type when supplied by the server.
+    pub content_type: Option<String>,
+    /// Server-requested retry delay in seconds (`Retry-After` integer form).
+    pub retry_after_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum RequestPolicy {
     Tracker,
-    WebseedRange { start: u64, end_exclusive: u64 },
+    WebseedRange {
+        start: u64,
+        end_exclusive: u64,
+    },
     UpnpSoap,
+    /// Bounded RSS feed or torrent attachment fetch. A `304 Not Modified` is a
+    /// successful outcome and carries no body.
+    Fetch {
+        max_body: usize,
+    },
 }
 
 impl RequestPolicy {
@@ -57,6 +73,7 @@ impl RequestPolicy {
                 end_exclusive,
             } => range_length(start, end_exclusive),
             Self::UpnpSoap => Ok(MAX_UPNP_SOAP_BODY_BYTES),
+            Self::Fetch { max_body } => Ok(max_body),
         }
     }
 
@@ -67,7 +84,7 @@ impl RequestPolicy {
                 start,
                 end_exclusive,
             } => Some(format!("bytes={start}-{}", end_exclusive - 1)),
-            Self::UpnpSoap => None,
+            Self::UpnpSoap | Self::Fetch { .. } => None,
         }
     }
 
@@ -76,6 +93,7 @@ impl RequestPolicy {
             Self::Tracker => status.is_success(),
             Self::WebseedRange { .. } => status == StatusCode::PARTIAL_CONTENT,
             Self::UpnpSoap => status.is_success(),
+            Self::Fetch { .. } => status.is_success() || status == StatusCode::NOT_MODIFIED,
         }
     }
 }
@@ -85,6 +103,10 @@ struct RawResponse {
     body: Vec<u8>,
     location: Option<String>,
     content_range: Option<String>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    content_type: Option<String>,
+    retry_after_seconds: Option<u64>,
 }
 
 /// One-shot contained HTTP client. Every hop resolves and connects through the
@@ -115,6 +137,17 @@ impl<'a, B: NetworkBinder + ?Sized> ContainedHttpClient<'a, B> {
         }
     }
 
+    /// Construct with an explicit bounded timeout for RSS feed and attachment
+    /// polling. The daemon scopes this from validated RSS configuration; tracker
+    /// and webseed callers retain the fixed protocol timeout.
+    pub fn with_data_timeout(binder: &'a B, request_timeout: Duration) -> Self {
+        Self {
+            binder,
+            tls_config: default_tls_config(),
+            request_timeout,
+        }
+    }
+
     /// Construct with a shorter logical timeout for deterministic cancellation
     /// tests. Production callers cannot override the 30-second policy.
     #[cfg(any(test, feature = "test-binder"))]
@@ -133,6 +166,50 @@ impl<'a, B: NetworkBinder + ?Sized> ContainedHttpClient<'a, B> {
         if !(200..300).contains(&response.status) {
             return Err(CoreError::HttpStatus(format!(
                 "tracker {} returned HTTP {}",
+                response.final_url, response.status
+            )));
+        }
+        Ok(response)
+    }
+
+    /// GET a bounded RSS feed document with optional conditional validators.
+    /// A `304 Not Modified` response is returned normally with an empty body.
+    /// Other non-2xx statuses are also returned so the caller can apply a
+    /// server `Retry-After` delay and expose the exact status.
+    pub async fn get_feed(
+        &self,
+        url: &str,
+        if_none_match: Option<&str>,
+        if_modified_since: Option<&str>,
+        max_body: usize,
+    ) -> Result<HttpResponse> {
+        let mut headers = Vec::new();
+        if let Some(value) = if_none_match.filter(|value| !value.trim().is_empty()) {
+            headers.push((hyper::header::IF_NONE_MATCH, value.to_string()));
+        }
+        if let Some(value) = if_modified_since.filter(|value| !value.trim().is_empty()) {
+            headers.push((hyper::header::IF_MODIFIED_SINCE, value.to_string()));
+        }
+        let response = tokio::time::timeout(
+            self.request_timeout,
+            self.request_with_redirects_headers(url, RequestPolicy::Fetch { max_body }, &headers),
+        )
+        .await??;
+        Ok(response)
+    }
+
+    /// GET a bounded torrent attachment through the contained path. This uses
+    /// the same redirect and body-limit policy as a feed fetch, but accepts
+    /// only a final 2xx response and does not send conditional headers.
+    pub async fn get_attachment(&self, url: &str, max_body: usize) -> Result<HttpResponse> {
+        let response = tokio::time::timeout(
+            self.request_timeout,
+            self.request_with_redirects_headers(url, RequestPolicy::Fetch { max_body }, &[]),
+        )
+        .await??;
+        if !(200..300).contains(&response.status) {
+            return Err(CoreError::HttpStatus(format!(
+                "torrent attachment {} returned HTTP {}",
                 response.final_url, response.status
             )));
         }
@@ -214,6 +291,10 @@ impl<'a, B: NetworkBinder + ?Sized> ContainedHttpClient<'a, B> {
             body: response.body,
             final_url: parsed.to_string(),
             content_range: None,
+            etag: None,
+            last_modified: None,
+            content_type: None,
+            retry_after_seconds: None,
         })
     }
 
@@ -267,6 +348,10 @@ impl<'a, B: NetworkBinder + ?Sized> ContainedHttpClient<'a, B> {
             body: response.body,
             final_url: parsed.to_string(),
             content_range: None,
+            etag: None,
+            last_modified: None,
+            content_type: None,
+            retry_after_seconds: None,
         })
     }
 
@@ -283,6 +368,15 @@ impl<'a, B: NetworkBinder + ?Sized> ContainedHttpClient<'a, B> {
         url: &str,
         policy: RequestPolicy,
     ) -> Result<HttpResponse> {
+        self.request_with_redirects_headers(url, policy, &[]).await
+    }
+
+    async fn request_with_redirects_headers(
+        &self,
+        url: &str,
+        policy: RequestPolicy,
+        headers: &[(hyper::header::HeaderName, String)],
+    ) -> Result<HttpResponse> {
         let mut current = parse_http_url(url)?;
         let mut visited = HashSet::new();
         let body_limit = policy.body_limit()?;
@@ -295,7 +389,10 @@ impl<'a, B: NetworkBinder + ?Sized> ContainedHttpClient<'a, B> {
                 )));
             }
 
-            let response = self.request_one(&current, policy, body_limit).await?;
+            let request = build_request_with_headers(&current, policy, headers)?;
+            let response = self
+                .request_one_with_request(&current, policy, body_limit, request)
+                .await?;
             if is_followed_redirect(response.status) {
                 let location = response
                     .location
@@ -327,6 +424,10 @@ impl<'a, B: NetworkBinder + ?Sized> ContainedHttpClient<'a, B> {
                 body: response.body,
                 final_url: current.to_string(),
                 content_range: response.content_range,
+                etag: response.etag,
+                last_modified: response.last_modified,
+                content_type: response.content_type,
+                retry_after_seconds: response.retry_after_seconds,
             });
         }
 
@@ -433,6 +534,14 @@ fn resolve_redirect(current: &url::Url, location: &str) -> Result<url::Url> {
 }
 
 fn build_request(url: &url::Url, policy: RequestPolicy) -> Result<Request<Full<Bytes>>> {
+    build_request_with_headers(url, policy, &[])
+}
+
+fn build_request_with_headers(
+    url: &url::Url,
+    policy: RequestPolicy,
+    headers: &[(hyper::header::HeaderName, String)],
+) -> Result<Request<Full<Bytes>>> {
     let path = if url.path().is_empty() {
         "/"
     } else {
@@ -452,6 +561,9 @@ fn build_request(url: &url::Url, policy: RequestPolicy) -> Result<Request<Full<B
         .header(USER_AGENT, "SwarmOtter/1.0");
     if let Some(range) = policy.range_header() {
         builder = builder.header(RANGE, range);
+    }
+    for (name, value) in headers {
+        builder = builder.header(name, value);
     }
     builder.body(Full::new(Bytes::new())).map_err(|error| {
         CoreError::HttpProtocol(format!("could not build contained HTTP request: {error}"))
@@ -582,8 +694,25 @@ where
             body: Vec::new(),
             location,
             content_range: None,
+            etag: None,
+            last_modified: None,
+            content_type: None,
+            retry_after_seconds: None,
         });
     }
+
+    let retry_after_seconds = match one_header(
+        response.headers(),
+        hyper::header::RETRY_AFTER,
+        "Retry-After",
+        url,
+    ) {
+        Ok(value) => value.and_then(|value| value.trim().parse::<u64>().ok()),
+        Err(error) => {
+            let driver_error = driver.abort_and_finish(url).await.err();
+            return Err(merge_http_errors(error, driver_error));
+        }
+    };
 
     if !policy.accepts(status) {
         driver.abort_and_finish(url).await?;
@@ -592,6 +721,50 @@ where
             body: Vec::new(),
             location: None,
             content_range: None,
+            etag: None,
+            last_modified: None,
+            content_type: None,
+            retry_after_seconds,
+        });
+    }
+
+    let etag = match one_header(response.headers(), hyper::header::ETAG, "ETag", url) {
+        Ok(value) => value,
+        Err(error) => {
+            let driver_error = driver.abort_and_finish(url).await.err();
+            return Err(merge_http_errors(error, driver_error));
+        }
+    };
+    let last_modified = match one_header(
+        response.headers(),
+        hyper::header::LAST_MODIFIED,
+        "Last-Modified",
+        url,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            let driver_error = driver.abort_and_finish(url).await.err();
+            return Err(merge_http_errors(error, driver_error));
+        }
+    };
+    let content_type = match one_header(response.headers(), CONTENT_TYPE, "Content-Type", url) {
+        Ok(value) => value,
+        Err(error) => {
+            let driver_error = driver.abort_and_finish(url).await.err();
+            return Err(merge_http_errors(error, driver_error));
+        }
+    };
+    if status == StatusCode::NOT_MODIFIED {
+        driver.abort_and_finish(url).await?;
+        return Ok(RawResponse {
+            status,
+            body: Vec::new(),
+            location: None,
+            content_range: None,
+            etag,
+            last_modified,
+            content_type,
+            retry_after_seconds,
         });
     }
 
@@ -622,6 +795,10 @@ where
         body,
         location: None,
         content_range,
+        etag,
+        last_modified,
+        content_type,
+        retry_after_seconds,
     })
 }
 

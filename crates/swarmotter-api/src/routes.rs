@@ -317,6 +317,27 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             "/network/diagnostics",
             get(handlers::diagnostics::network_diagnostics),
         )
+        // RSS subscriptions and durable history
+        .route(
+            "/rss",
+            get(handlers::rss::list_subscriptions).post(handlers::rss::create_subscription),
+        )
+        .route(
+            "/rss/{id}",
+            put(handlers::rss::update_subscription).delete(handlers::rss::delete_subscription),
+        )
+        .route(
+            "/rss/{id}/preview",
+            get(handlers::rss::preview_subscription),
+        )
+        .route("/rss/{id}/poll", post(handlers::rss::poll_subscription))
+        .route("/rss/{id}/retry", post(handlers::rss::retry_subscription))
+        .route("/rss/{id}/decisions", get(handlers::rss::decisions))
+        .route(
+            "/rss/history/completions",
+            axum::routing::delete(handlers::rss::clear_completions),
+        )
+        .route("/rss/diagnostics", get(handlers::rss::diagnostics))
         // Watch folders
         .route("/watch/scan", post(handlers::watch::watch_scan))
         .route("/watch/history", get(handlers::watch::watch_history))

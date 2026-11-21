@@ -109,6 +109,52 @@ curl -X POST http://127.0.0.1:9091/api/v1/torrents/file \
   -H 'Content-Type: application/x-bittorrent'
 ```
 
+## Subscribe to RSS feeds
+
+RSS feeds are optional user-configured intake. SwarmOtter fetches feeds and
+torrent attachments through the contained torrent network path, so strict
+containment must already be healthy. Add a subscription in the Watch view or
+through the native API:
+
+```toml
+[rss]
+# Defaults to <state file>.rss.sqlite. Back up this database with the state file.
+# history_file = "/home/YOU/.local/state/swarmotter/rss-history.sqlite"
+
+[[rss.subscriptions]]
+id = "distro-isos"
+name = "Distribution releases"
+url = "https://distributor.example/feed.xml"
+enabled = true
+poll_interval_seconds = 900
+start_behavior = "paused"
+import_mode = "new_only"   # or "current_matches"
+
+[[rss.subscriptions.rules.include]]
+title = "*ISO*"
+category = "*linux*"
+
+[[rss.subscriptions.rules.exclude]]
+title = "*live*"
+```
+
+The first successful poll establishes the baseline in `new_only` mode, so
+existing listings are recorded without being added. Use **Preview feed** in the
+Watch view or `GET /api/v1/rss/{id}/preview` to see each listing's proposed
+action and reason before intake. To import existing matches explicitly, choose
+`current_matches`, click **Import current**, or call:
+
+```bash
+curl -X POST http://127.0.0.1:9091/api/v1/rss/distro-isos/poll?import_current=true
+```
+
+Add the configured API token header when `api.require_auth = true`. RSS status
+redacts feed credentials. The dedicated history database records per-feed
+listings, decisions, retries, and verified completions; keep it with the main
+state file when backing up or restoring. See
+[Configuration](configuration.md#rss), [Web UI](web-ui.md#rss-subscriptions),
+and [API Reference](api.md#rss-subscriptions).
+
 ## LAN access
 
 To reach the Web UI from another machine on your LAN, bind the control plane to

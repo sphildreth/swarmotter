@@ -105,6 +105,12 @@ queue and control-plane state; restore a valid state backup or re-add the
 torrents intentionally. Restored completed torrents are rechecked before
 seeding.
 
+RSS uses a paired history database at `<state file>.rss.sqlite` unless
+`rss.history_file` is configured. Back up and restore both files together. If
+the RSS history database is missing or cannot be opened, automatic RSS imports
+are deferred and exposed as an error; SwarmOtter does not guess that a feed
+item is new.
+
 The SQLite store retains indexed library/queue state, canonical metainfo,
 byte-exact original locally supplied `.torrent` files, bounded audit history,
 and rolling metric history. It uses full 40-character v1/hybrid-primary or
@@ -946,6 +952,95 @@ insertion order for the current daemon run. Each result keeps compatibility
 fields (`success`, `duplicate`, `error`) and reports `outcome` as `imported`,
 `duplicate`, `permanent_failure`, or `transient_failure`, plus an optional
 `post_action_error`. This operational history is not persisted.
+
+### `[rss]`
+
+RSS is user-configured intake, not a bundled indexer. All feed and attachment
+traffic uses the contained network path and fails closed when that path is
+unavailable.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `history_file` | `<state file>.rss.sqlite` | Dedicated SQLite database shared by all subscriptions. |
+| `max_feed_bytes` | `2097152` | Bound on one feed document (1 byte–16 MiB). |
+| `max_attachment_bytes` | `4194304` | Bound on one torrent attachment (1 byte–16 MiB). |
+| `max_entries` | `2000` | Bound on parsed items per feed (1–20,000). |
+| `request_timeout_seconds` | `30` | Logical timeout for one feed/attachment request (5–300). |
+| `max_concurrent_polls` | `2` | Subscriptions polled concurrently (1–16); one subscription never overlaps itself. |
+| `max_retries` | `5` | Consecutive transient retry limit before an automatic retry stops. |
+| `retry_base_seconds` | `60` | Base for exponential retry backoff. |
+| `retry_max_seconds` | `3600` | Maximum retry backoff. An integer server `Retry-After` delay is honored up to this cap. |
+| `decision_retention` | `5000` | Decision-history rows retained per subscription. |
+| `listing_retention` | `10000` | Non-imported listing rows retained per subscription. |
+
+Each subscription is a `[[rss.subscriptions]]` entry:
+
+```toml
+[rss]
+history_file = "/var/lib/swarmotter/rss-history.sqlite"
+
+[[rss.subscriptions]]
+id = "distro-isos"
+name = "Distribution releases"
+url = "https://distributor.example/feed.xml"
+enabled = true
+poll_interval_seconds = 900
+profile = "archive"
+start_behavior = "paused"
+import_mode = "new_only"
+
+[[rss.subscriptions.rules.include]]
+title = "*ISO*"
+category = "*linux*"
+
+[[rss.subscriptions.rules.exclude]]
+title = "*live*"
+```
+
+`id` is immutable and may contain ASCII letters, digits, `-`, `_`, and `.`.
+`enabled = false` pauses automatic polling and imports; on-demand preview and
+poll remain available and history is retained. `poll_interval_seconds` must be
+between 30 and 86,400. Changing `profile` affects future imports; per-torrent
+policy captured by the standard intake workflow remains authoritative.
+
+`import_mode = "new_only"` is the default. Only a successful first poll
+establishes the baseline. `import_mode = "current_matches"` explicitly imports
+current rule matches on the first successful poll. The API can also request
+`import_current=true` or an explicit reconsider/retry of stored older listings.
+
+Rules are case-insensitive wildcard globs (`*` and `?`). Every populated field
+in one rule must match, any include rule qualifies, an empty include list
+accepts all, and any matching exclusion wins. A missing category cannot satisfy
+a category condition. In the example above a studio ISO matches; a live ISO is
+excluded and the decision explains which rule skipped it.
+
+The first successful poll records listings without importing them in
+`new_only` mode. Later polls import newly observed listings. Preview never adds
+a torrent or marks an entry seen. Feed GUIDs identify listings; when absent the
+stable fallback is link, first enclosure URL, `title|pubDate`, then title, so
+reordered entries and missing dates do not create new listing rows.
+
+Feed URLs must use HTTP or HTTPS and must not contain user information. Sensitive
+query values are redacted from status and logs. Torrent attachments are accepted
+from magnet URIs, `.torrent` links/enclosures, torrent-typed enclosures, and
+documented suffixless download/torrent URLs. A plain details page is reported as
+page-only rather than fetched as arbitrary HTML.
+
+The operator example `https://www.limetorrents.fun/rss/17/` was checked against
+a representative live sample. It is RSS 2.0 with one item per release. The item
+`guid` is the details-page permalink (also used as `link` and `comments`), the
+category is plain text, and the torrent is supplied by an
+`application/x-bittorrent` enclosure such as
+`https://itorrents.org/torrent/<INFOHASH>.torrent?title=<release>`. The
+enclosure path ends in `.torrent`, so SwarmOtter imports it directly; the
+details `link` is page-only and is not fetched as HTML. No extra resolution step
+is required for this feed format.
+
+The dedicated history database holds per-feed listings, decision history,
+identity attribution, poll state, and verified completions. It is backed up and
+restored together with the main state file. Removing a subscription does not
+remove its history or completion identities; only an explicit authenticated
+clear removes completion identities. See ADR-0082.
 
 ### `[logging]`
 

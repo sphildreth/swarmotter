@@ -347,6 +347,27 @@ If the UI shows `interface_missing`, the daemon cannot see the configured
 interface name in its current network namespace. See
 [Troubleshooting](troubleshooting.md).
 
+## RSS subscriptions
+
+The Watch view includes RSS subscription controls below the watch-folder cards.
+Add a feed with a stable id, name, URL, polling interval, optional intake
+profile, start behavior, first-poll mode, and rule lines. Rule lines use
+`+title|category` for includes and `-title|category` for excludes; `*` and `?`
+are wildcards and an omitted field is blank. The operator can pause automatic
+polling without deleting history.
+
+**Preview feed** shows each listing's proposed action, reason, and resolved
+torrent identities. It performs no library change and does not mark entries
+seen. **Poll** runs the configured first-poll behavior; **Import current**
+explicitly imports current matches. The subscription row shows the baseline
+state, last success, latest error, imported/completed counts, and any retryable
+failures. **Decisions** loads paginated per-feed history, **Reconsider older** re-runs
+current rules against stored listings that were never imported, and **Retry
+dismissed** clears an intentional removal or transient failure for explicit
+retry. Deleting
+a subscription keeps its history and verified completion identities; completion
+identities are cleared only through the explicit API action.
+
 ## Logs, Watch status, and doctor report
 
 Operational diagnostics in the UI come from:

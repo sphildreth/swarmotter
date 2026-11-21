@@ -727,10 +727,23 @@ impl DaemonRuntime {
         let mut timer = crate::persistence_metrics::SaveTimer::new();
         let _write_guard = self.state_write_lock.lock().await;
         timer.locked();
+        // Drain the pending RSS events only after the state-write lane is
+        // owned. An event enqueued while this save runs is persisted by the
+        // next generation instead of being silently attached to a rollback.
+        let events = std::mem::take(&mut *self.rss_pending_events.lock().await);
         let result = self
-            .persist_state_locked(path, original_metainfo, mode)
+            .persist_state_locked(path, original_metainfo, mode, events.clone())
             .await;
+        if result.is_err() && !events.is_empty() {
+            let mut pending = self.rss_pending_events.lock().await;
+            let mut restored = events;
+            restored.append(&mut pending);
+            *pending = restored;
+        }
         timer.finish(result.is_ok());
+        if result.is_ok() {
+            self.wake_rss_outbox();
+        }
         result
     }
 
@@ -739,6 +752,7 @@ impl DaemonRuntime {
         path: PathBuf,
         original_metainfo: Option<crate::state_store::OriginalMetainfo>,
         mode: PersistenceMode,
+        events: Vec<crate::rss_store::PendingLibraryEvent>,
     ) -> Result<()> {
         if mode == PersistenceMode::Full
             || original_metainfo.is_some()
@@ -746,10 +760,10 @@ impl DaemonRuntime {
                 .incremental_persistence_ready
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
-            self.persist_full_state_locked(path, original_metainfo)
+            self.persist_full_state_locked(path, original_metainfo, events)
                 .await
         } else {
-            self.persist_changed_state_locked(path).await
+            self.persist_changed_state_locked(path, events).await
         }
     }
 
@@ -812,6 +826,7 @@ impl DaemonRuntime {
         &self,
         path: PathBuf,
         original_metainfo: Option<crate::state_store::OriginalMetainfo>,
+        events: Vec<crate::rss_store::PendingLibraryEvent>,
     ) -> Result<()> {
         let scan_started = Instant::now();
         let (mut torrents, queue, mut fingerprint_updates, queue_fingerprint_value) = {
@@ -850,7 +865,12 @@ impl DaemonRuntime {
             .await?;
         let state = crate::state_store::DaemonState::new(torrents, queue);
         tokio::task::spawn_blocking(move || {
-            crate::state_store::save_with_original_metainfo(&path, &state, original_metainfo)
+            crate::state_store::save_with_original_metainfo_and_events(
+                &path,
+                &state,
+                original_metainfo,
+                &events,
+            )
         })
         .await
         .map_err(|error| CoreError::Storage(format!("save daemon state task: {error}")))??;
@@ -865,7 +885,11 @@ impl DaemonRuntime {
     /// fingerprint changed since the last persisted generation. The registry
     /// lock is held only for the fingerprint scan and the clones of changed
     /// records, never across serialization or database work.
-    async fn persist_changed_state_locked(&self, path: PathBuf) -> Result<()> {
+    async fn persist_changed_state_locked(
+        &self,
+        path: PathBuf,
+        events: Vec<crate::rss_store::PendingLibraryEvent>,
+    ) -> Result<()> {
         self.changed_record_saves
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let scan_started = Instant::now();
@@ -896,7 +920,7 @@ impl DaemonRuntime {
         };
         crate::persistence_metrics::scanned(scan_started);
         let (queue_fingerprint, queue_changed) = queue_changed;
-        if changed.is_empty() && !queue_changed {
+        if changed.is_empty() && !queue_changed && events.is_empty() {
             return Ok(());
         }
         let queue_to_write = queue_changed.then_some(queue);
@@ -907,10 +931,11 @@ impl DaemonRuntime {
         self.recover_invalid_progress(&path, &mut changed_records, &mut updates)
             .await?;
         tokio::task::spawn_blocking(move || {
-            crate::state_store::save_changed_records(
+            crate::state_store::save_changed_records_and_events(
                 &path,
                 &changed_records,
                 queue_to_write.as_ref(),
+                &events,
             )
         })
         .await
@@ -982,7 +1007,10 @@ impl DaemonRuntime {
                 .map_err(|error| {
                     CoreError::Storage(format!("capture daemon state task: {error}"))
                 })??;
-        let persisted = self.persist_full_state_locked(path.clone(), None).await;
+        let events = std::mem::take(&mut *self.rss_pending_events.lock().await);
+        let persisted = self
+            .persist_full_state_locked(path.clone(), None, events)
+            .await;
         if let Err(error) = persisted {
             let rollback_path = path.clone();
             let rollback_snapshot = snapshot.clone();
@@ -1357,6 +1385,9 @@ impl DaemonRuntime {
                     }
                 }
             }
+        }
+        for (_, torrent) in &targets {
+            self.queue_rss_removal(torrent).await;
         }
         {
             let mut reg = self.registry.lock().await;
@@ -1897,8 +1928,10 @@ impl DaemonRuntime {
             previous
         };
 
+        let events = std::mem::take(&mut *self.rss_pending_events.lock().await);
         let persisted = if let Some(path) = state_path.as_ref() {
-            self.persist_full_state_locked(path.clone(), None).await
+            self.persist_full_state_locked(path.clone(), None, events)
+                .await
         } else {
             Ok(())
         };
@@ -2085,8 +2118,9 @@ impl DaemonRuntime {
             }
             return Err(CoreError::NotFound("torrent".into()));
         };
+        let events = std::mem::take(&mut *self.rss_pending_events.lock().await);
         let persisted = if let Some(path) = self.state_path.clone() {
-            self.persist_state_locked(path, None, PersistenceMode::ChangedRecords)
+            self.persist_state_locked(path, None, PersistenceMode::ChangedRecords, events)
                 .await
         } else {
             Ok(())

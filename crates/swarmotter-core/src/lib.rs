@@ -28,6 +28,7 @@ pub mod port_mapping;
 pub mod port_test;
 pub mod queue;
 pub mod ratio;
+pub mod rss;
 pub mod storage;
 pub mod torrent;
 pub mod tracker;

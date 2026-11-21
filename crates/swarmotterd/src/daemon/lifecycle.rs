@@ -639,6 +639,11 @@ impl DaemonOps for DaemonRuntime {
                 }
                 drop(reg);
                 if let Some(state) = final_state {
+                    if state == TorrentState::Completed {
+                        if let Some(torrent) = self.registry.lock().await.get(hash).cloned() {
+                            self.queue_rss_verified_completion(&torrent).await;
+                        }
+                    }
                     self.publish_torrent_event("torrent_changed", *hash, state);
                     if state == TorrentState::Completed {
                         self.publish_torrent_event("torrent_completed", *hash, state);
@@ -1806,6 +1811,9 @@ impl DaemonOps for DaemonRuntime {
             "download state reset requested by API request"
         );
         let registry_hashes: Vec<TorrentKey> = torrents.iter().map(Torrent::key).collect();
+        for torrent in &torrents {
+            self.queue_rss_removal(torrent).await;
+        }
         self.stop_all_torrent_tasks(&registry_hashes).await;
         self.clear_download_runtime_state().await;
 
@@ -2482,6 +2490,106 @@ impl DaemonOps for DaemonRuntime {
 
     async fn watch_history(&self) -> Vec<watch::ImportResult> {
         self.watch_imports.lock().await.iter().cloned().collect()
+    }
+
+    async fn rss_status(&self) -> Vec<swarmotter_core::rss::RssSubscriptionStatus> {
+        self.rss_status().await
+    }
+
+    async fn rss_upsert_subscription(
+        &self,
+        subscription: swarmotter_core::rss::RssSubscription,
+        previous_id: Option<String>,
+    ) -> Result<swarmotter_core::rss::RssSubscriptionStatus> {
+        subscription.validate()?;
+        let mut config = self.config.read().await.clone();
+        let previous_id = previous_id.unwrap_or_else(|| subscription.id.clone());
+        if let Some(index) = config
+            .rss
+            .subscriptions
+            .iter()
+            .position(|candidate| candidate.id == previous_id)
+        {
+            config.rss.subscriptions[index] = subscription.clone();
+        } else if config
+            .rss
+            .subscriptions
+            .iter()
+            .any(|candidate| candidate.id == subscription.id)
+        {
+            return Err(CoreError::InvalidConfig(format!(
+                "rss subscription {:?} already exists",
+                subscription.id
+            )));
+        } else {
+            config.rss.subscriptions.push(subscription.clone());
+        }
+        config.validate()?;
+        self.replace_config(config).await?;
+        Ok(self
+            .rss_status()
+            .await
+            .into_iter()
+            .find(|status| status.id == subscription.id)
+            .ok_or_else(|| CoreError::Internal("RSS subscription disappeared after save".into()))?)
+    }
+
+    async fn rss_delete_subscription(&self, id: &str) -> Result<()> {
+        let mut config = self.config.read().await.clone();
+        let before = config.rss.subscriptions.len();
+        config
+            .rss
+            .subscriptions
+            .retain(|candidate| candidate.id != id);
+        if config.rss.subscriptions.len() == before {
+            return Err(CoreError::NotFound(format!("rss subscription {id}")));
+        }
+        config.validate()?;
+        self.replace_config(config).await?;
+        Ok(())
+    }
+
+    async fn rss_preview(&self, id: &str) -> Result<swarmotter_core::rss::RssPreview> {
+        self.preview_rss_subscription(id).await
+    }
+
+    async fn rss_poll(
+        &self,
+        id: &str,
+        import_current: bool,
+        reconsider: bool,
+    ) -> Result<swarmotter_core::rss::RssPollResult> {
+        self.poll_rss_subscription(id, import_current, reconsider)
+            .await
+    }
+
+    async fn rss_retry(
+        &self,
+        id: &str,
+        entry_key: Option<String>,
+    ) -> Result<swarmotter_core::rss::RssPollResult> {
+        self.retry_rss_listing(id, entry_key.as_deref()).await
+    }
+
+    async fn rss_decisions(
+        &self,
+        id: &str,
+        limit: usize,
+        before: Option<i64>,
+    ) -> Result<swarmotter_core::rss::RssDecisionPage> {
+        self.rss_decisions(id, limit, before).await
+    }
+
+    async fn rss_clear_completions(&self) -> Result<usize> {
+        self.clear_rss_completions().await
+    }
+
+    async fn rss_duplicate_lookup_is_indexed(&self) -> Result<bool> {
+        self.rss_duplicate_lookup_is_indexed().await
+    }
+
+    async fn rss_backfill_completion_evidence(&self) {
+        self.backfill_rss_completion_evidence().await
     }
 }
 

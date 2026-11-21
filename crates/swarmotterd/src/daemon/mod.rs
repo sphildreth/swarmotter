@@ -18,6 +18,8 @@ pub use reliability::Watchdog;
 mod policy_runtime;
 mod port_mapping;
 mod port_test;
+#[path = "rss.rs"]
+mod rss_runtime;
 mod scheduler;
 mod seeding;
 mod settings;
@@ -197,6 +199,8 @@ enum ConfigFileSnapshot {
     Bytes(Vec<u8>),
 }
 
+type RssStoreCache = Arc<RwLock<Option<(PathBuf, Arc<crate::rss_store::RssStore>)>>>;
+
 #[derive(Clone)]
 pub struct DaemonRuntime {
     pub registry: Arc<Mutex<TorrentRegistry>>,
@@ -217,6 +221,22 @@ pub struct DaemonRuntime {
     /// Prevents the background loop and manual scan endpoint from processing
     /// the same eligible fingerprint concurrently.
     watch_scan_lock: Arc<Mutex<()>>,
+    /// Lazily initialized shared RSS history database. The path is derived
+    /// from the active state file (or `rss.history_file`) and re-resolved when
+    /// configuration changes it.
+    rss_store: RssStoreCache,
+    /// Serializes overlapping polls for one subscription while allowing
+    /// unrelated feeds to poll under the configured concurrency bound.
+    rss_poll_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Subscription ids with a poll currently in flight.
+    rss_polls_in_progress: Arc<RwLock<HashSet<String>>>,
+    /// Global intake serialization keeps simultaneous cross-feed offers from
+    /// racing duplicate detection; the library add transaction remains the
+    /// final authority.
+    rss_import_lock: Arc<Mutex<()>>,
+    /// Library changes captured before persistence and written to the main
+    /// database outbox in the same transaction as the library state.
+    rss_pending_events: Arc<Mutex<Vec<crate::rss_store::PendingLibraryEvent>>>,
     config_path: Option<PathBuf>,
     config_write_lock: Arc<Mutex<()>>,
     /// Serializes engine construction with data-plane configuration swaps.
