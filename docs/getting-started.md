@@ -109,6 +109,20 @@ curl -X POST http://127.0.0.1:9091/api/v1/torrents/file \
   -H 'Content-Type: application/x-bittorrent'
 ```
 
+## Inspect, share, and export torrents
+
+Torrent Details shows any source comment, creator, creation date, and encoding.
+Use **Copy Magnet** to copy a deterministic full-identity magnet; choose the
+tracker policy in the same control row, and confirm private-tracker inclusion
+when prompted. Use **Export .torrent** for the exact original document. The
+torrent list's **Export Metainfo** action creates a tar archive for selected
+torrents; its `manifest.json` marks each item as included or unavailable and is
+the authoritative list of which originals existed. Magnet-only and older
+records without a retained original are never reconstructed.
+
+The **Operator annotation** field is separate from the source comment and does
+not change the torrent identity or exported bytes.
+
 ## Create and seed a torrent
 
 Create metainfo from a file or directory inside a configured storage root using

@@ -31,6 +31,7 @@ const SETTINGS_JS: &str = include_str!("../assets/js/settings.js");
 const EVENTS_JS: &str = include_str!("../assets/js/events.js");
 const UI_JS: &str = include_str!("../assets/js/ui.js");
 const CREATE_JS: &str = include_str!("../assets/js/create.js");
+const PROVENANCE_JS: &str = include_str!("../assets/js/provenance.js");
 #[cfg(test)]
 const APP_JS: &str = concat!(
     include_str!("../assets/app.js"),
@@ -42,6 +43,7 @@ const APP_JS: &str = concat!(
     include_str!("../assets/js/events.js"),
     include_str!("../assets/js/ui.js"),
     include_str!("../assets/js/create.js"),
+    include_str!("../assets/js/provenance.js"),
     include_str!("../assets/rss.js"),
 );
 const SEEDING_POLICY_JS: &str = include_str!("../assets/seeding-policy.js");
@@ -84,6 +86,7 @@ pub fn web_router() -> Router {
         .route("/js/events.js", get(events_js))
         .route("/js/ui.js", get(ui_js))
         .route("/js/create.js", get(create_js))
+        .route("/js/provenance.js", get(provenance_js))
         .route("/seeding-policy.js", get(seeding_policy_js))
         .route("/rss.js", get(rss_js))
         .route("/watch-history.js", get(watch_history_js))
@@ -144,6 +147,10 @@ async fn events_js() -> Response {
 
 async fn create_js() -> Response {
     javascript(CREATE_JS)
+}
+
+async fn provenance_js() -> Response {
+    javascript(PROVENANCE_JS)
 }
 
 async fn ui_js() -> Response {
@@ -926,6 +933,28 @@ mod tests {
     }
 
     #[test]
+    fn web_ui_exposes_provenance_and_portability_controls() {
+        for needle in [
+            "id=\"details-magnet-btn\"",
+            "id=\"details-export-btn\"",
+            "id=\"details-annotation\"",
+            "id=\"export-selected-torrents-btn\"",
+            "id=\"torrent-context-menu\"",
+            "id=\"details-magnet-policy\"",
+            "provenance.js",
+        ] {
+            assert!(
+                INDEX_HTML.contains(needle)
+                    || PROVENANCE_JS.contains(needle)
+                    || DETAILS_JS.contains(needle)
+                    || TORRENTS_JS.contains(needle)
+                    || APP_JS_ENTRY.contains(needle),
+                "provenance/portability UI is missing {needle}"
+            );
+        }
+    }
+
+    #[test]
     fn web_ui_exposes_torrent_creation_controls() {
         for needle in [
             "id=\"create-form\"",
@@ -1357,6 +1386,7 @@ mod tests {
             ("js/events.js", EVENTS_JS),
             ("js/ui.js", UI_JS),
             ("js/create.js", CREATE_JS),
+            ("js/provenance.js", PROVENANCE_JS),
             ("seeding-policy.js", SEEDING_POLICY_JS),
             ("watch-history.js", WATCH_HISTORY_JS),
             ("rss.js", RSS_JS),
@@ -1470,6 +1500,7 @@ mod tests {
             ("/watch-history.js", "application/javascript; charset=utf-8"),
             ("/rss.js", "application/javascript; charset=utf-8"),
             ("/js/create.js", "application/javascript; charset=utf-8"),
+            ("/js/provenance.js", "application/javascript; charset=utf-8"),
             (
                 "/vendor/tabulator/tabulator_midnight.min.css",
                 "text/css; charset=utf-8",

@@ -11,6 +11,20 @@ date or duration estimates.
 
 ### Added
 
+- Torrent details now expose source comment, creator, creation date, and
+  encoding when present. A separate operator annotation can be set or cleared
+  without changing source metadata or retained original bytes, and annotation
+  changes are recorded in durable audit history.
+- Deterministic full-identity magnet generation with display name, webseeds,
+  BEP 53 selections, and all/primary-tier/no-tracker policies. Private tracker
+  URLs require explicit consent. Copy Magnet actions are available in torrent
+  details and the torrent action menu.
+- Exact single `.torrent` export remains available, and a new batch tar archive
+  includes retained originals plus a per-item manifest that identifies
+  unavailable magnet-only, older, or missing records without reconstruction.
+- ADR-0084 documents provenance fields, annotation audit separation, magnet
+  ordering, tracker policy, private consent, and portable export behavior.
+
 - Local torrent creation from the native API and Web UI. Operators can create
   v1, pure BEP 52 v2, or hybrid metainfo from a file or directory inside a
   configured storage root, with configurable piece length, ordered tracker

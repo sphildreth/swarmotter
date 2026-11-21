@@ -221,6 +221,28 @@ pub trait DaemonOps: Send + Sync + 'static {
     ) -> Result<()>;
     /// Update labels/categories.
     async fn set_labels(&self, hash: &TorrentKey, labels: Vec<String>) -> Result<()>;
+    /// Set or clear an operator annotation without changing source metadata.
+    async fn set_torrent_annotation(
+        &self,
+        _hash: &TorrentKey,
+        _annotation: Option<String>,
+    ) -> Result<TorrentSummary> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
+    /// Generate a deterministic full-identity magnet for one torrent.
+    async fn torrent_magnet(
+        &self,
+        _hash: &TorrentKey,
+        _tracker_policy: swarmotter_core::magnet::MagnetTrackerPolicy,
+        _include_private_trackers: bool,
+    ) -> Result<String> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
+    /// Build a tar archive of retained original metainfo with a per-item
+    /// manifest. Missing originals are reported, never reconstructed.
+    async fn export_metainfo_archive(&self, _hashes: Vec<TorrentKey>) -> Result<Vec<u8>> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
     /// Set per-torrent bandwidth limits (bytes/sec; 0 = unlimited). Applies
     /// live to a running engine/seeder.
     async fn set_torrent_limits(

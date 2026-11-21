@@ -1846,6 +1846,7 @@ mod tests {
             comment: None,
             created_by: None,
             creation_date: None,
+            encoding: None,
             is_multi_file: false,
             v2: Some(V2TorrentMeta {
                 meta_version: 2,

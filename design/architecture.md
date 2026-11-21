@@ -292,6 +292,21 @@ hash as the completed verified piece map; queue/seeder reconciliation then
 starts the contained seeder. A duplicate or registration error still returns the
 export and reports the seed error (ADR-0083).
 
+## Provenance, deterministic magnets, and portable export
+
+Source comment, creator, creation date, and encoding are parsed from metainfo and
+stored with the torrent record. Operator annotations are separate fields with
+durable update timestamp/actor; state-store history emits an annotation audit
+event when the annotation changes, and the original metainfo BLOB is never
+rewritten.
+
+Magnet generation uses the full identity model and produces deterministic
+ordering with percent-escaped query values. Tracker policy is all/primary-tier/
+none; private tracker URLs require explicit consent. The existing authenticated
+single-export endpoint remains the only source-document download. Batch export
+builds a tar archive containing a JSON manifest and retained original bytes only;
+each missing original is an explicit `unavailable` entry (ADR-0084).
+
 ## RSS intake and durable history
 
 RSS subscriptions are configuration entries, but accepted magnets and torrent

@@ -525,7 +525,8 @@ pub(crate) fn save_changed_records_and_events(
         let hash = durable_torrent_key(torrent)?;
         let current_state = torrent.state.as_str();
         let observed_at = unix_timestamp();
-        let (previous_state, previous_reason) = prior_lifecycle(&transaction, &hash, torrent)?;
+        let (previous_state, previous_reason, previous_annotation) =
+            prior_lifecycle(&transaction, &hash, torrent)?;
         let (torrent_json, raw_info) = encode_torrent(torrent)?;
         crate::persistence_metrics::SERIALIZED_BYTES
             .fetch_add(torrent_json.len() as u64, Ordering::Relaxed);
@@ -555,6 +556,7 @@ pub(crate) fn save_changed_records_and_events(
             &hash,
             previous_state.as_deref(),
             previous_reason.as_deref(),
+            previous_annotation.as_deref(),
             torrent,
         )?;
         write_canonical_info(&transaction, &hash, raw_info.as_deref())?;
@@ -1513,7 +1515,8 @@ fn write_state_transaction(
         let hash = durable_torrent_key(torrent)?;
         let current_state = torrent.state.as_str();
         let observed_at = unix_timestamp();
-        let (previous_state, previous_reason) = prior_lifecycle(transaction, &hash, torrent)?;
+        let (previous_state, previous_reason, previous_annotation) =
+            prior_lifecycle(transaction, &hash, torrent)?;
         let (torrent_json, raw_info) = encode_torrent(torrent)?;
         transaction
             .execute(
@@ -1547,6 +1550,7 @@ fn write_state_transaction(
             &hash,
             previous_state.as_deref(),
             previous_reason.as_deref(),
+            previous_annotation.as_deref(),
             torrent,
         )?;
         write_canonical_info(transaction, &hash, raw_info.as_deref())?;
@@ -1668,15 +1672,18 @@ fn prior_lifecycle(
     tx: &Transaction<'_>,
     hash: &str,
     torrent: &Torrent,
-) -> Result<(Option<String>, Option<String>)> {
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
     // Read the previous reason only when a paused-to-paused recheck could
-    // change it without an intervening durable "checking" generation.
+    // change it without an intervening durable "checking" generation. Read the
+    // previous annotation so an operator edit produces a durable audit event
+    // even when lifecycle state is unchanged.
     tx.query_row(
         "SELECT lifecycle_state, CASE WHEN ?2 AND lifecycle_state='paused'
-         THEN json_extract(CAST(torrent_json AS TEXT), '$.pause_reason') END
+         THEN json_extract(CAST(torrent_json AS TEXT), '$.pause_reason') END,
+         json_extract(CAST(torrent_json AS TEXT), '$.annotation')
          FROM torrent_records WHERE info_hash=?1",
         params![hash, torrent.current_pause_reason().is_some()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
     .optional()
     .map(Option::unwrap_or_default)
@@ -1688,6 +1695,7 @@ fn write_history(
     hash: &str,
     previous_state: Option<&str>,
     previous_reason: Option<&str>,
+    previous_annotation: Option<&str>,
     torrent: &Torrent,
 ) -> Result<bool> {
     let current_state = torrent.state.as_str();
@@ -1715,11 +1723,16 @@ fn write_history(
                 CoreError::Storage(format!("write durable library history: {error}"))
             })?;
     }
+    let annotation_changed = previous_annotation != torrent.annotation.as_deref();
     let action = match event_kind {
-        Some("registered") => "torrent_registered",
-        Some(_) => "torrent_state_changed",
-        None if pause_reason.as_str() != previous_reason => "torrent_pause_reason_changed",
-        None => return Ok(false),
+        Some("registered") => Some("torrent_registered"),
+        Some(_) => Some("torrent_state_changed"),
+        None if pause_reason.as_str() != previous_reason => Some("torrent_pause_reason_changed"),
+        None if annotation_changed => Some("torrent_annotation_changed"),
+        None => None,
+    };
+    let Some(action) = action else {
+        return Ok(false);
     };
     write_audit_event(
         transaction,
@@ -1730,6 +1743,9 @@ fn write_history(
             "previous_state": previous_state,
             "current_state": current_state,
             "pause_reason": pause_reason,
+            "annotation_changed": annotation_changed,
+            "annotation_updated_at": torrent.annotation_updated_at,
+            "annotation_updated_by": torrent.annotation_updated_by,
         }),
     )?;
     Ok(true)

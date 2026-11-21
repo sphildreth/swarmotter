@@ -195,6 +195,15 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             get(handlers::torrents::export_metainfo),
         )
         .route(
+            "/torrents/{hash}/magnet",
+            get(handlers::torrents::get_magnet),
+        )
+        .route(
+            "/torrents/{hash}/annotation",
+            put(handlers::torrents::set_annotation),
+        )
+        .route("/torrents/export", post(handlers::torrents::export_archive))
+        .route(
             "/torrents/{hash}",
             get(handlers::torrents::get_torrent).delete(handlers::torrents::remove_torrent),
         )

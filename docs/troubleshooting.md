@@ -484,3 +484,19 @@ export but returns a seed error for in-place seeding. If seeding reports a
 duplicate, the torrent already exists in the library and the generated export
 is still returned. Hashing is bounded by the root's
 `max_concurrent_rechecks`; active verification can make creation wait.
+
+## Magnet, annotation, and export problems
+
+Copy Magnet can return a private-consent error. That is intentional: a private
+torrent does not expose its tracker URLs until the operator confirms inclusion
+or chooses the no-tracker policy.
+
+Annotation saves do not change the source comment or original `.torrent` bytes.
+If the data appears unchanged after editing, check whether you are looking at
+`Source comment` versus `Operator annotation`; they are separate fields.
+
+Single export and batch export include only retained original documents. A
+`metainfo unavailable` or manifest `unavailable` entry means the torrent came
+from a magnet or predates original-byte retention. SwarmOtter does not
+reconstruct a source document from canonical `info` bytes. Re-add a locally
+supplied `.torrent` if you need to establish a new retained original.

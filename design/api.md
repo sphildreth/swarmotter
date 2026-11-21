@@ -349,6 +349,21 @@ limits, verifies v1 and BEP 52 hashes, revalidates the source snapshot, and
 requires the generated document to round-trip through the normal parser
 (ADR-0083).
 
+## Provenance, magnet, and export API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/torrents/:hash/magnet` | Deterministic full-identity magnet with `all`, `primary_tier`, or `none` tracker policy and explicit private-tracker consent. |
+| PUT | `/torrents/:hash/annotation` | Separate operator annotation with durable update timestamp/actor; source comment and original bytes are untouched. |
+| POST | `/torrents/export` | Authenticated tar archive of retained originals plus `manifest.json`; unavailable items are listed individually. |
+
+Torrent details expose source `comment`, `creator`, `creation_date`, `encoding`,
+and separate annotation fields. A magnet that supplied only an information
+dictionary leaves outer source fields null. Magnet ordering is deterministic:
+identity topics, display name, BEP 53 selection, tracker tiers, webseeds.
+Private trackers require consent. Batch export never reconstructs metadata and
+never substitutes canonical `info` bytes for an original document (ADR-0084).
+
 ## RSS subscription API
 
 | Method | Path | Description |

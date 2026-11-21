@@ -3,6 +3,7 @@
 import { state, TORRENT_QUERY_STORAGE_KEY, TORRENT_DEFAULT_PER_PAGE, TORRENT_MAX_PER_PAGE, TORRENT_SORT_OPTIONS, TORRENT_TABLE_TO_QUERY_SORT, TORRENT_QUERY_TO_TABLE_SORT, TORRENT_ACTIONS, EVENT_KINDS, MAX_LOG_LINES, watchHistoryUi } from "./state.js";
 import * as ui from "./ui.js";
 import * as requests from "./api.js";
+import { copyTorrentMagnet, downloadTorrentMetainfo } from "./provenance.js";
 const { $, $$, showToast, showError, finiteNumber, fmtCount, fmtBytes, fmtRate, fmtRatio, fmtPercentFromFraction, fmtPercent, fmtProgress, fmtUnixSeconds, renderProgressCell, renderHealth, renderHealthSummary, fmtScore, renderStatus, renderKv, renderCheckList, escapeHtml, cssToken, log, setToastDisplaySeconds } = ui;
 const { api, apiFetch, responseErrorMessage, saveApiToken } = requests;
 
@@ -155,6 +156,12 @@ export function renderDetailsSummary(t) {
       ["Upload cap", fmtBytes(t.upload_limit || 0)],
       ["Queue position", fmtCount(t.queue_position)],
       ["Labels", (t.labels || []).join(", ")],
+      ["Source comment", t.comment || ""],
+      ["Created by", t.created_by || ""],
+      ["Creation date", t.creation_date ? fmtUnixSeconds(t.creation_date) : ""],
+      ["Source encoding", t.encoding || ""],
+      ["Operator annotation", t.annotation || ""],
+      ["Annotation updated", t.annotation_updated_at ? `${fmtUnixSeconds(t.annotation_updated_at)} (${t.annotation_updated_by || "unknown"})` : ""],
     ])}
   `;
 }
@@ -288,6 +295,7 @@ export function renderDetailsControls(t) {
   if (!t) return;
   $("#details-move-path").value = t.download_dir || "";
   $("#details-labels").value = (t.labels || []).join(", ");
+  $("#details-annotation").value = t.annotation || "";
   $("#details-download-limit").value = String(finiteNumber(t.download_limit) ?? 0);
   $("#details-upload-limit").value = String(finiteNumber(t.upload_limit) ?? 0);
   SwarmOtterSeedingPolicy.render(document, t);
@@ -713,6 +721,39 @@ $("#details-move-btn").addEventListener("click", async event => {
 $("#details-labels-btn").addEventListener("click", event => {
   const labels = $("#details-labels").value.split(",").map(label => label.trim()).filter(Boolean);
   runDetailsCommand(event.currentTarget, "/labels", "Torrent labels saved", { labels });
+});
+
+$("#details-magnet-btn").addEventListener("click", event => {
+  if (!state.currentHash) return;
+  const policy = $("#details-magnet-policy").value;
+  copyTorrentMagnet(state.currentHash, $("#details-title").textContent, policy);
+});
+
+$("#details-export-btn").addEventListener("click", event => {
+  if (!state.currentHash) return;
+  downloadTorrentMetainfo(state.currentHash, $("#details-title").textContent);
+});
+
+$("#details-annotation-btn").addEventListener("click", async event => {
+  if (!state.currentHash) return;
+  const hash = state.currentHash;
+  const button = event.currentTarget;
+  button.disabled = true;
+  try {
+    await api(`/torrents/${hash}/annotation`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ annotation: $("#details-annotation").value }),
+    });
+    if (!detailsRequestIsCurrent(hash)) return;
+    showToast("Torrent annotation saved", "", "success");
+    await openDetails(hash);
+    refreshTorrentsHandler();
+  } catch (error) {
+    if (detailsRequestIsCurrent(hash)) showError("Save annotation failed", error);
+  } finally {
+    button.disabled = false;
+  }
 });
 
 $("#details-profile-save-btn").addEventListener("click", async event => {

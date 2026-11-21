@@ -134,7 +134,7 @@ candidates.
 | Anonymous mode | Roadmap P1 | ❌ | ✅ | ✅ | ✅ | ❌ | Partial |
 | Torrent metadata display (comment, creator, date) | Roadmap P1 | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
 | Magnet link generation from added torrents | Roadmap P1 | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
-| Torrent file export | Partial (native exact-original metainfo API; Web UI/batch export remains roadmap) | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
+| Torrent file export | ✅ (exact original, Web UI, batch archive, magnet generation) | ✅ | ✅ | ✅ | ✅ | Partial | Partial |
 | Categories/tags/policy groups | Partial (labels and named profiles) | Partial | ✅ | Plugin | ✅ | ❌ | Partial |
 | Large-library UI operations | ✅ (server-side query, pagination, and efficient table workflows) | Partial | Partial | Partial | Partial | ❌ | Partial |
 | Bulk import/export and backup | Roadmap P2 | Partial | Partial | Partial | Migration tooling | Session files | Session files |

@@ -3,6 +3,7 @@
 import { state, TORRENT_QUERY_STORAGE_KEY, TORRENT_DEFAULT_PER_PAGE, TORRENT_MAX_PER_PAGE, TORRENT_SORT_OPTIONS, TORRENT_TABLE_TO_QUERY_SORT, TORRENT_QUERY_TO_TABLE_SORT, TORRENT_ACTIONS, EVENT_KINDS, MAX_LOG_LINES, watchHistoryUi } from "./state.js";
 import * as ui from "./ui.js";
 import * as requests from "./api.js";
+import { copyTorrentMagnet, downloadMetainfoArchive } from "./provenance.js";
 const { $, $$, showToast, showError, finiteNumber, fmtCount, fmtBytes, fmtRate, fmtRatio, fmtPercentFromFraction, fmtPercent, fmtProgress, fmtUnixSeconds, renderProgressCell, renderHealth, renderHealthSummary, healthLabelName, fmtScore, renderStatus, renderKv, renderCheckList, escapeHtml, cssToken, log, setToastDisplaySeconds } = ui;
 const { api, apiFetch, responseErrorMessage, saveApiToken } = requests;
 
@@ -880,6 +881,10 @@ export async function handleTorrentAction(act, hash, name) {
     }
     if (act === "pause") await api(`/torrents/${hash}/pause`, { method: "POST" });
     else if (act === "resume") await api(`/torrents/${hash}/resume`, { method: "POST" });
+    else if (act === "magnet") {
+      await copyTorrentMagnet(hash, name);
+      return;
+    }
     else if (act === "recheck") await api(`/torrents/${hash}/recheck`, { method: "POST" });
     else if (act === "remove") {
       const removal = await chooseTorrentRemoval(name);
@@ -1115,6 +1120,40 @@ $("#clear-torrent-view-btn").addEventListener("click", clearTorrentQueryView);
 $("#select-all-torrents-btn").addEventListener("click", selectAllVisibleTorrents);
 $("#deselect-all-torrents-btn").addEventListener("click", deselectAllTorrents);
 $("#remove-selected-torrents-btn").addEventListener("click", removeSelectedTorrents);
+$("#export-selected-torrents-btn").addEventListener("click", () => {
+  downloadMetainfoArchive(Array.from(state.selectedTorrents.keys()));
+});
+
+const torrentContextMenu = $("#torrent-context-menu");
+function hideTorrentContextMenu() {
+  torrentContextMenu?.classList.add("hidden");
+}
+$("#torrent-table").addEventListener("contextmenu", event => {
+  if (!torrentContextMenu || !isTorrentTableReady()) return;
+  const row = state.torrentTable.getRows().find(candidate => candidate.getElement()?.contains(event.target));
+  if (!row) return;
+  event.preventDefault();
+  const data = row.getData();
+  torrentContextMenu.dataset.hash = data.info_hash;
+  torrentContextMenu.dataset.name = torrentDisplayName(data);
+  torrentContextMenu.style.left = `${event.clientX}px`;
+  torrentContextMenu.style.top = `${event.clientY}px`;
+  torrentContextMenu.classList.remove("hidden");
+});
+torrentContextMenu?.addEventListener("click", event => {
+  const button = event.target.closest("button[data-context-action]");
+  if (!button) return;
+  const hash = torrentContextMenu.dataset.hash;
+  const name = torrentContextMenu.dataset.name || "";
+  hideTorrentContextMenu();
+  if (button.dataset.contextAction === "magnet") copyTorrentMagnet(hash, name);
+  else if (button.dataset.contextAction === "details") handleTorrentAction("details", hash, name);
+});
+document.addEventListener("click", hideTorrentContextMenu);
+document.addEventListener("scroll", hideTorrentContextMenu, true);
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape") hideTorrentContextMenu();
+});
 for (const [act, id] of [
   ["pause", "pause-selected-torrents-btn"],
   ["resume", "resume-selected-torrents-btn"],

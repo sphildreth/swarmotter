@@ -203,6 +203,14 @@ fn torrent_durable_fingerprint(t: &Torrent, meta_structural: u64, meta_full: u64
     for label in &t.labels {
         hash.update_field(label.as_bytes());
     }
+    hash.update_optional_field(t.annotation.as_deref().map(str::as_bytes));
+    if let Some(updated_at) = t.annotation_updated_at {
+        hash.update(&[1]);
+        hash.update(&updated_at.to_le_bytes());
+    } else {
+        hash.update(&[0]);
+    }
+    hash.update_optional_field(t.annotation_updated_by.as_deref().map(str::as_bytes));
     hash.update_optional_field(t.download_dir.as_deref().map(str::as_bytes));
     hash.update(&t.date_added.to_le_bytes());
     if let Some(date_completed) = t.date_completed {

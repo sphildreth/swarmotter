@@ -74,6 +74,10 @@ pub struct TorrentMeta {
     pub comment: Option<String>,
     pub created_by: Option<String>,
     pub creation_date: Option<u64>,
+    /// Optional metainfo string-encoding declaration. Absent for information
+    /// dictionaries that do not carry an outer `encoding` field.
+    #[serde(default)]
+    pub encoding: Option<String>,
     pub is_multi_file: bool,
     /// BEP 52-specific file-tree and piece-layer metadata, when present.
     #[serde(default)]
@@ -777,6 +781,9 @@ fn parse_v1_torrent_root(root: &[(Vec<u8>, Value)], info_bytes: &[u8]) -> Result
     let comment = get_str(root, b"comment").map(|s| s.to_string());
     let created_by = get_str(root, b"created by").map(|s| s.to_string());
     let creation_date = get_int(root, b"creation date").map(|i| i as u64);
+    let encoding = get_str(root, b"encoding")
+        .or_else(|| get_str(info, b"encoding"))
+        .map(str::to_string);
 
     let meta = TorrentMeta {
         info_hash,
@@ -793,6 +800,7 @@ fn parse_v1_torrent_root(root: &[(Vec<u8>, Value)], info_bytes: &[u8]) -> Result
         comment,
         created_by,
         creation_date,
+        encoding,
         is_multi_file,
         v2: None,
         raw_info: Some(info_bytes.to_vec()),
@@ -838,6 +846,9 @@ fn parse_v2_torrent_root(
     let comment = get_str(root, b"comment").map(str::to_string);
     let created_by = get_str(root, b"created by").map(str::to_string);
     let creation_date = get_int(root, b"creation date").map(|value| value as u64);
+    let encoding = get_str(root, b"encoding")
+        .or_else(|| get_str(info, b"encoding"))
+        .map(str::to_string);
     let meta = TorrentMeta {
         // Do not derive a non-standard SHA-1 and label it as a v1 identity.
         // Pure-v2 metadata uses the separate SHA-256 data plane.
@@ -855,6 +866,7 @@ fn parse_v2_torrent_root(
         comment,
         created_by,
         creation_date,
+        encoding,
         is_multi_file: v2.files.len() != 1,
         v2: Some(v2),
         raw_info: Some(info_bytes.to_vec()),

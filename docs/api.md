@@ -164,6 +164,9 @@ the process-wide connection-limit authority.
 | POST | `/torrents/bulk` | Add multiple magnets and/or base64 `.torrent` payloads. |
 | POST | `/torrents/create` | Create metainfo from a local file/directory and optionally seed it immediately. |
 | GET | `/torrents/create/roots` | List configured storage roots allowed to contain creation sources. |
+| GET | `/torrents/:hash/magnet` | Generate a deterministic full-identity magnet with tracker policy and optional private-tracker consent. |
+| PUT | `/torrents/:hash/annotation` | Set or clear the operator annotation without changing source metadata. |
+| POST | `/torrents/export` | Download a tar archive of retained originals with a per-item manifest. |
 | GET | `/torrents/:hash` | Torrent details. |
 | GET | `/torrents/:hash/metainfo` | Return the retained, byte-exact original `.torrent` document when one exists. |
 | GET | `/torrents/:hash/stats` | Per-torrent counters and live engine diagnostics. |
@@ -350,6 +353,51 @@ Creation streams hashes under the selected storage root's
 unreadable data, and sources that change during hashing. Generated metainfo is
 bounded by the normal 16 MiB metadata limit and must round-trip through the
 standard parser before it is returned.
+
+## Provenance, magnets, and portable export
+
+Torrent details include available source `comment`, `created_by`,
+`creation_date`, and `encoding` values. A magnet that supplied only an
+information dictionary leaves outer fields `null`. The separate
+`annotation`, `annotation_updated_at`, and `annotation_updated_by` fields are
+operator-authored and never alter the source comment, identity, or original
+bytes. Annotation changes are recorded in durable audit events when the state
+store is available.
+
+Generate a magnet:
+
+```text
+GET /api/v1/torrents/:hash/magnet?tracker_policy=all&include_private_trackers=false
+```
+
+`tracker_policy` is `all`, `primary_tier`, or `none`. The response contains
+`magnet`, `tracker_policy`, and `include_private_trackers`. Magnets include full
+v1 and v2 identities as applicable, percent-escaped display name, webseeds, and
+BEP 53 `so` when the wanted file set is a strict subset. A private torrent
+returns an error until the caller passes `include_private_trackers=true` or
+chooses `none`.
+
+Update an annotation:
+
+```json
+PUT /api/v1/torrents/:hash/annotation
+{ "annotation": "operator note" }
+```
+
+`annotation: null` clears it. The response is the updated torrent summary.
+
+Batch export:
+
+```json
+POST /api/v1/torrents/export
+{ "hashes": ["<locator>", "..."] }
+```
+
+The response is `application/x-tar` with `manifest.json`. Each requested item is
+`included` with its archive filename or `unavailable` with a reason. Only
+retained original `.torrent` bytes are archived; magnet-only, older, and
+missing records are never reconstructed. Authorization is the same native API
+authentication as single export.
 
 ## Policy profiles
 

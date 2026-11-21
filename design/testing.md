@@ -471,6 +471,7 @@ The deployment test starts the built daemon with its Compose environment,
 restarts a disposable VPN namespace owner, and verifies the daemon rejoins it
 and answers through the published port. Archive checks exercise custom state
 mounts, SQLite WAL recovery, paired RSS history verification, local torrent
-creation and immediate local-peer seeding, and restarting the writer after a
+creation and immediate local-peer seeding, provenance/magnet/annotation behavior,
+mixed metainfo archive export, and restarting the writer after a
 backup failure. The parallel worker tests cover bounded HAVE delivery and
 resume checkpoints while a peer round is open.

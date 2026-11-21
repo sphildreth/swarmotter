@@ -41,6 +41,22 @@ Creation hashing participates in the selected root's
 `max_concurrent_rechecks` limit. If the source changes during hashing, the UI
 shows an error and publishes nothing.
 
+## Provenance, magnets, and export
+
+Torrent Details shows available source comment, creator, creation date, and
+encoding. The operator annotation is a separate field and can be edited without
+changing the source comment or retained `.torrent` bytes. The annotation save
+also appears in the durable audit/state history when available.
+
+**Copy Magnet** is available in Torrent Details and in the torrent row
+right-click context menu. It uses the selected tracker policy in Details: all
+trackers, primary tier only, or no trackers. Private torrents ask for explicit consent before private
+tracker URLs are copied. **Export .torrent** downloads the retained original
+bytes only; magnet-only or legacy records report that no original is available.
+The torrent list's **Export Metainfo** action downloads a tar archive for the
+selected torrents with a per-item manifest that identifies unavailable
+originals individually.
+
 ## Add torrents
 
 The Web UI supports:

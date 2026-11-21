@@ -2026,6 +2026,7 @@ pub(super) fn pure_v2_swarm_meta_with_piece_length(
         comment: None,
         created_by: None,
         creation_date: None,
+        encoding: None,
         is_multi_file: true,
         v2: Some(V2TorrentMeta {
             meta_version: 2,

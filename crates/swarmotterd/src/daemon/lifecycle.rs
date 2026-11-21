@@ -964,6 +964,28 @@ impl DaemonOps for DaemonRuntime {
         Ok(())
     }
 
+    async fn set_torrent_annotation(
+        &self,
+        hash: &TorrentKey,
+        annotation: Option<String>,
+    ) -> Result<TorrentSummary> {
+        self.set_torrent_annotation(hash, annotation).await
+    }
+
+    async fn torrent_magnet(
+        &self,
+        hash: &TorrentKey,
+        tracker_policy: swarmotter_core::magnet::MagnetTrackerPolicy,
+        include_private_trackers: bool,
+    ) -> Result<String> {
+        self.torrent_magnet(hash, tracker_policy, include_private_trackers)
+            .await
+    }
+
+    async fn export_metainfo_archive(&self, hashes: Vec<TorrentKey>) -> Result<Vec<u8>> {
+        self.export_metainfo_archive(hashes).await
+    }
+
     async fn set_torrent_limits(
         &self,
         hash: &TorrentKey,

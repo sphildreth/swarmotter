@@ -1095,3 +1095,26 @@ table.health-subscores td {
   text-align: left;
   font-size: 0.85rem;
 }
+
+.context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 11rem;
+  padding: 0.25rem;
+  background: var(--panel, #1b1f24);
+  border: 1px solid var(--border, #3a424c);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.context-menu button {
+  display: block;
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  background: transparent;
+  border: 0;
+}
+.context-menu button:hover,
+.context-menu button:focus-visible {
+  background: var(--accent-soft, rgba(120, 180, 255, 0.18));
+}

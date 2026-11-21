@@ -66,6 +66,7 @@
           <button id="resume-selected-torrents-btn" type="button" class="secondary" disabled>Resume Selected</button>
           <button id="recheck-selected-torrents-btn" type="button" class="secondary" disabled>Recheck Selected</button>
           <button id="restart-selected-torrents-btn" type="button" class="secondary" disabled>Restart Selected</button>
+          <button id="export-selected-torrents-btn" type="button" class="secondary" disabled>Export Metainfo</button>
           <button id="remove-selected-torrents-btn" type="button" class="danger" disabled>Remove Selected</button>
           <span id="selection-summary" class="muted selection-summary">0 selected</span>
         </div>
@@ -233,6 +234,11 @@
           <button id="details-move-btn" type="button">Move Data</button>
           <label class="settings-field"><span>Labels (comma-separated)</span><input id="details-labels" type="text"></label>
           <button id="details-labels-btn" type="button">Save Labels</button>
+          <label class="settings-field"><span>Magnet tracker policy</span><select id="details-magnet-policy"><option value="all">All trackers</option><option value="primary_tier">Primary tier only</option><option value="none">No trackers</option></select></label>
+          <button id="details-magnet-btn" type="button" class="secondary">Copy Magnet</button>
+          <button id="details-export-btn" type="button" class="secondary">Export .torrent</button>
+          <label class="settings-field settings-wide"><span>Operator annotation (separate from source comment)</span><textarea id="details-annotation" rows="3" spellcheck="false"></textarea></label>
+          <button id="details-annotation-btn" type="button">Save Annotation</button>
           <label class="settings-field"><span>Policy profile</span><select id="details-profile"><option value="">Use label or global defaults</option></select></label>
           <button id="details-profile-save-btn" type="button">Save Profile</button>
           <label class="settings-field"><span>Peer encryption</span><select id="details-encryption-mode"><option value="">Inherit profile or global mode</option><option value="disabled">Disabled (plaintext only)</option><option value="preferred">Preferred</option><option value="required">Required</option></select></label>
@@ -664,6 +670,11 @@
       </div>
     </section>
   </main>
+
+  <div id="torrent-context-menu" class="context-menu hidden" role="menu" aria-label="Torrent actions">
+    <button type="button" role="menuitem" data-context-action="magnet">Copy Magnet</button>
+    <button type="button" role="menuitem" data-context-action="details">Details</button>
+  </div>
 
   <dialog id="remove-torrent-dialog" aria-labelledby="remove-torrent-title">
     <form method="dialog" class="confirm-dialog">

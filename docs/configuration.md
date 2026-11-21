@@ -887,6 +887,15 @@ socket is opened and inbound peers before service; peer-ID-prefix rules run
 after the BitTorrent handshake. Neither rule type replaces the required
 network-containment path.
 
+### Provenance and annotation fields
+
+Source `comment`, `created by`, `creation date`, and `encoding` are read from
+metainfo and persisted with the library record. They are display-only source
+facts. The operator annotation is stored separately with its last update time
+and actor, and annotation changes are written to durable audit history. None of
+these fields is inserted into a generated magnet except the torrent display
+name, and none changes the retained original `.torrent` bytes.
+
 ### Torrent creation source roots
 
 Local torrent creation accepts source paths only inside a configured storage

@@ -25,3 +25,4 @@ book/
 deploy/.env
 deploy/gluetun.env
 __pycache__/
+.hamstik.toml

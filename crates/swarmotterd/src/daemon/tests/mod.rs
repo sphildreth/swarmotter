@@ -262,6 +262,7 @@ mod metadata_identity;
 mod peer_engine;
 mod persistence;
 mod profiles;
+mod provenance;
 mod queue;
 mod recheck_control;
 mod reconcile;
