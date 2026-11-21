@@ -49,5 +49,5 @@ torrent network configuration explicitly allows and enforces it.
 Use [Getting Started](getting-started.md) for a local run, then read
 [Configuration](configuration.md) for the common `br0`, VPN, and container
 configurations. Use [API Reference](api.md) for scripting and integration
-work. RSS subscriptions are configured in [Configuration](configuration.md#rss)
+work, or the [CLI Reference](cli.md) for SSH and job automation. RSS subscriptions are configured in [Configuration](configuration.md#rss)
 and operated from the Watch view or the `/api/v1/rss` endpoints.

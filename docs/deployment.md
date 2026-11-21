@@ -319,6 +319,10 @@ cd deploy
 ./update-swarmotter.sh
 ```
 
+Release tarballs include both `swarmotterd` and `swarmotterctl`; Linux packages
+install them at `/usr/bin/swarmotterd` and `/usr/bin/swarmotterctl`. The client
+uses the API only and does not need access to daemon state or payload paths.
+
 The helper is intended to run as a normal user with Docker access and sudo
 rights. Root-owned `0600` `.env` and `gluetun.env` files are supported; the
 helper uses sudo only where needed to read or update deployment secrets and

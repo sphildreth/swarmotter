@@ -97,6 +97,21 @@ Open:
 http://127.0.0.1:9091/
 ```
 
+## Script with swarmotterctl
+
+Release tarballs and packages include `swarmotterctl`. Point it at the daemon and
+use a token file for authenticated remote access:
+
+```bash
+export SWARMOTTER_API_URL=http://127.0.0.1:9091
+swarmotterctl list
+swarmotterctl --json list --state downloading | jq '.data.rows'
+```
+
+For remote HTTPS, set `SWARMOTTER_API_TOKEN_FILE` to a `0600` file and use the
+daemon's certificate-valid endpoint. See [CLI Reference](cli.md) for commands,
+JSON schema, exit codes, and scripting examples.
+
 ## Add content
 
 Use the Web UI to add a magnet link, choose a `.torrent` file, or drag a

@@ -292,6 +292,14 @@ hash as the completed verified piece map; queue/seeder reconciliation then
 starts the contained seeder. A duplicate or registration error still returns the
 export and reports the seed error (ADR-0083).
 
+## API-backed CLI
+
+`swarmotterctl` is a separate control-plane binary with no torrent data-plane or
+private-state access. It uses HTTP/1 over the native API, validated TLS for
+remote endpoints, file/environment credentials, server-side query pagination,
+and a stable human/JSON output and exit-code contract. All lifecycle and
+destructive semantics remain daemon-owned (ADR-0086).
+
 ## Cleanup preview, trash, and retention
 
 Cleanup selection is recomputed at execution time: configured roots, current

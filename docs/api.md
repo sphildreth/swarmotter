@@ -5,6 +5,10 @@ API as external automation.
 
 ## Response format
 
+The native API is also consumed by `swarmotterctl`; see [CLI Reference](cli.md)
+for endpoint/credential setup, machine-readable output, exit codes, and
+scripting examples.
+
 All responses use a common envelope:
 
 ```json

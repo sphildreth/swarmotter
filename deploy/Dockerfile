@@ -12,11 +12,13 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --locked --release --bin swarmotterd \
-    && cp /src/target/release/swarmotterd /tmp/swarmotterd
+    cargo build --locked --release --bin swarmotterd --bin swarmotterctl \
+    && cp /src/target/release/swarmotterd /tmp/swarmotterd \
+    && cp /src/target/release/swarmotterctl /tmp/swarmotterctl
 
 FROM scratch AS binary
 COPY --from=builder /tmp/swarmotterd /swarmotterd
+COPY --from=builder /tmp/swarmotterctl /swarmotterctl
 
 FROM debian:bookworm-slim AS runtime-base
 
@@ -56,6 +58,8 @@ CMD ["--config", "/etc/swarmotter/swarmotter.toml"]
 FROM runtime-base AS runtime-prebuilt
 ARG TARGETARCH
 COPY --chown=root:root image-binaries/linux-${TARGETARCH}/swarmotterd /usr/local/bin/swarmotterd
+COPY --chown=root:root image-binaries/linux-${TARGETARCH}/swarmotterctl /usr/local/bin/swarmotterctl
 
 FROM runtime-base AS runtime
 COPY --from=builder --chown=root:root /tmp/swarmotterd /usr/local/bin/swarmotterd
+COPY --from=builder --chown=root:root /tmp/swarmotterctl /usr/local/bin/swarmotterctl

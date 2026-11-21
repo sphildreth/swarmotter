@@ -11,6 +11,14 @@ date or duration estimates.
 
 ### Added
 
+- `swarmotterctl`, an API-backed CLI for add, list/filter/sort, details, health,
+  pause/resume/start/stop, remove, recheck, reannounce, and per-torrent limits.
+  It provides human output and a versioned JSON document with stable exit codes
+  for authentication, validation, missing-item, and connection failures.
+- `swarmotterctl` is included in release tarballs, Linux packages, and container
+  images, with local/remote endpoint and credential configuration, pagination,
+  secret-handling, and scripting documentation.
+
 - Cleanup preview and local trash workflows for whole torrents and stale
   partials. Preview lists exact paths, ownership, actions, retention-rule
   decisions, qualification times, and blockers without changing files, queue

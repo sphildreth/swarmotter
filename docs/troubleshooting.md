@@ -517,3 +517,23 @@ file deliberately and retry; the trash entry remains intact. Entries listed as
 `incomplete` came from an interrupted move under `.staging/<id>`. Inspect or purge
 them; they are not restorable without a complete manifest. Purging is permanent
 and removes the trash copy, so confirm the entry is no longer needed.
+
+## swarmotterctl failures
+
+`swarmotterctl` distinguishes failure classes by exit code and, with `--json`,
+emits a versioned error document on stdout:
+
+- `3`: authentication/authorization — check the token file/environment or daemon
+  `api.require_auth` settings.
+- `4`: missing torrent/resource — list or query again; the item may have been
+  removed.
+- `5`: connection/DNS/TLS/timeout — check `SWARMOTTER_API_URL`, the listener,
+  reverse proxy, and certificate trust.
+- `6`: validation or rejected request — inspect the error code/message and the
+  API contract.
+- `2`: local usage/configuration, including an invalid URL or missing token file.
+
+The CLI never prints the token. Do not place a token in a command argument; use
+`SWARMOTTER_API_TOKEN_FILE` or `--token-file`. For large libraries use
+`--per-page` or `--all`; the client uses server-side pagination rather than
+reading daemon-private state.

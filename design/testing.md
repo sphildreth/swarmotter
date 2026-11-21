@@ -473,6 +473,7 @@ and answers through the published port. Archive checks exercise custom state
 mounts, SQLite WAL recovery, paired RSS history verification, local torrent
 creation and immediate local-peer seeding, provenance/magnet/annotation behavior,
 mixed metainfo archive export, trash preview/apply/restore/purge and retention
-rules, and restarting the writer after a
+rules, API-backed CLI add/inspect/operate flows in human and JSON modes, and
+restarting the writer after a
 backup failure. The parallel worker tests cover bounded HAVE delivery and
 resume checkpoints while a peer round is open.

@@ -349,6 +349,18 @@ limits, verifies v1 and BEP 52 hashes, revalidates the source snapshot, and
 requires the generated document to round-trip through the normal parser
 (ADR-0083).
 
+## CLI consumer contract
+
+`swarmotterctl` is a separate API-only client. It supports add (magnet/file),
+list with server-side filters/sorting/pagination, details, health, lifecycle
+actions, remove, recheck, reannounce, and limits. Human output goes to stdout and
+diagnostics to stderr. `--json` emits one versioned document with
+`format_version: 1`, `command`, `success`, `data`, and `error`. Exit codes
+classify success, daemon/IO, usage/config, auth, missing item, connection, and
+validation failures. Endpoint/token resolution is environment/file based; raw
+tokens are never command-line arguments. Large lists use server pagination and
+`--all` walks pages explicitly (ADR-0086).
+
 ## Cleanup, trash, and retention API
 
 | Method | Path | Description |

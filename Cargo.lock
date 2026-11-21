@@ -1525,6 +1525,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "swarmotterctl"
+version = "2.5.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "swarmotter-api",
+ "swarmotter-core",
+ "swarmotterd",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "url",
+ "webpki-roots",
+]
+
+[[package]]
 name = "swarmotterd"
 version = "2.5.0"
 dependencies = [

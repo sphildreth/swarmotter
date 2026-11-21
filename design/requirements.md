@@ -42,6 +42,15 @@ time or duration estimates.
   aliases. Verified completion and removal evidence is written to the main
   database in the same transaction as the library change, applied to history
   idempotently, and recovered with the paired backup (ADR-0082).
+- **API-backed CLI:** a separate `swarmotterctl` binary controls a running
+  daemon through the native API for add, list with server-side filters/sorting/
+  pagination, details, health, pause/resume/start/stop, remove, recheck,
+  reannounce, and per-torrent limits. It provides human output and versioned
+  JSON on stdout, separates human diagnostics to stderr, uses stable exit codes
+  for auth/validation/missing/connection failures, resolves endpoint and token
+  from documented environment/file configuration without exposing secrets, and
+  never reads daemon-private state or opens torrent data-plane sockets
+  (ADR-0086).
 - **Cleanup preview, trash, and retention safety:** preview exact payload paths,
   owning torrents, intended actions, selection reasons, applicable retention
   rule, qualification time, and blockers without changing files, queue state, or
@@ -137,6 +146,11 @@ for `v1.0.0` only when every item in the `v1.0.0` completion checklist (see
 `design/PRD.md`) is complete and:
 
 - All required torrent input methods work.
+- CLI acceptance covers local and remote endpoint/credential configuration,
+  magnet/file add, filtered/sorted/paginated list, details/health, lifecycle
+  operations, remove, limits, human and JSON modes, stdout/stderr separation,
+  stable exit codes, secret redaction, packaging, and local-daemon integration
+  in both output modes.
 - Cleanup/trash acceptance covers dry-run isolation, exact path/rule/blocker
   previews, shared/symlink/root/path revalidation, whole-record and stale-partial
   moves, ready/incomplete staging visibility, no-overwrite restore conflicts,
