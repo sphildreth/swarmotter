@@ -292,6 +292,22 @@ hash as the completed verified piece map; queue/seeder reconciliation then
 starts the contained seeder. A duplicate or registration error still returns the
 export and reports the seed error (ADR-0083).
 
+## Versioned OpenAPI and interactive documentation
+
+The API crate owns a route catalog that generates an OpenAPI 3.1 document served
+at `/api/openapi.json`. A test parses `routes.rs` and compares actual registered
+path/method pairs to the catalog; a deliberate drift fixture must fail. The
+document embeds representative JSON Schemas and examples for shared envelopes,
+torrents, creation, provenance, RSS, trash, and compatibility responses. Live
+local-daemon exchanges from native, qBittorrent, and Transmission surfaces are
+validated against those schemas.
+
+`/api/docs` serves a self-contained, dependency-free explorer. It fetches the
+same-origin document, uses normal API token authentication, marks
+state-changing operations, and loads no external scripts, CDNs, analytics, or
+remote styles. Documentation routes are public; invoked operations retain all
+normal auth/origin/compatibility controls (ADR-0087).
+
 ## API-backed CLI
 
 `swarmotterctl` is a separate control-plane binary with no torrent data-plane or

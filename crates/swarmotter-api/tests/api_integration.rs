@@ -2157,6 +2157,60 @@ async fn provenance_routes_require_api_auth() {
 }
 
 #[tokio::test]
+async fn openapi_document_and_explorer_are_public_and_version_matched() {
+    let app = swarmotter_api::app_router(fake_daemon::fake_state());
+    let docs = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/docs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(docs.status(), StatusCode::OK);
+    assert_eq!(
+        docs.headers().get("content-type").unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let body = axum::body::to_bytes(docs.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("/api/openapi.json"));
+    assert!(html.contains("State-changing operation"));
+
+    let spec_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spec_response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(spec_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(spec["openapi"], "3.1.0");
+    assert!(spec["paths"]["/api/v1/torrents/query"]["get"].is_object());
+    assert!(spec["paths"]["/api/v2/torrents/info"]["get"].is_object());
+    assert!(
+        spec["paths"]["/transmission/rpc"]["post"]["x-swarmotter-supported-rpc-methods"]
+            .as_array()
+            .is_some_and(|methods| methods.iter().any(|method| method == "session-get"))
+    );
+    assert!(
+        spec["paths"]["/api/v1/torrents/{hash}/metainfo"]["get"]["responses"]["200"]["content"]
+            ["application/x-bittorrent"]
+            .is_object()
+    );
+}
+
+#[tokio::test]
 async fn rss_routes_require_api_auth_and_return_subscription_status() {
     let mut cfg = Config::default();
     cfg.api.require_auth = true;

@@ -3,6 +3,54 @@
 SwarmOtter exposes a native REST API under `/api/v1`. The Web UI uses the same
 API as external automation.
 
+## Discovery, OpenAPI, and compatibility parity
+
+The running daemon publishes a version-matched OpenAPI 3.1 document:
+
+```text
+GET /api/openapi.json
+```
+
+A self-contained interactive explorer is available at:
+
+```text
+GET /api/docs
+```
+
+The explorer uses the same daemon origin and normal API authentication. Enter the
+API token in its password field; it is sent as `X-SwarmOtter-Auth` and is not put
+into examples or URLs. State-changing operations are visibly marked. The
+documentation routes are public because they contain no secrets, but every
+operation they invoke remains subject to authentication, compatibility enablement,
+and browser-origin checks.
+
+The OpenAPI document includes native `/api/v1` operations, request/response
+schemas, envelopes and errors, binary metainfo upload/export, paginated queries,
+event-stream operations, and state-changing markers. The qBittorrent `/api/v2`
+and Transmission RPC operations are documented as explicit supported subsets:
+
+- qBittorrent paths not listed in the document are not implemented and must not
+  be inferred from another client.
+- Transmission RPC exposes `x-swarmotter-supported-rpc-methods`. Unsupported
+  methods return the adapter's JSON-RPC method-not-found response.
+- Compatibility rows include `x-swarmotter-compatibility` parity limits.
+
+The route catalog is checked against the registered router source in CI, a
+deliberate drift fixture must fail, and representative examples plus live
+native/qBittorrent/Transmission exchanges are validated against the emitted JSON
+Schemas. See [CLI Reference](cli.md) for the API-backed command-line client.
+
+When adding or changing an API operation, update the route catalog/operation
+metadata in `crates/swarmotter-api/src/openapi.rs`, run the OpenAPI route check
+and contract tests, and update this operator reference and the compatibility
+parity notes. The document version comes from the daemon package version, so a
+running build always serves its own version. The check commands are:
+
+```bash
+cargo test -p swarmotter-api openapi::tests
+cargo test -p swarmotterctl --test openapi_contract
+```
+
 ## Response format
 
 The native API is also consumed by `swarmotterctl`; see [CLI Reference](cli.md)

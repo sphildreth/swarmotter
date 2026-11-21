@@ -126,6 +126,10 @@ pub fn app_router_with_body_limit(state: SharedState, max_request_body_bytes: us
         .layer(from_fn_with_state(state.clone(), browser_origin_guard));
 
     Router::new()
+        // Public, version-matched API documentation. Operations still use the
+        // normal same-origin API authentication when executed.
+        .route("/api/docs", get(handlers::docs::docs_page))
+        .route("/api/openapi.json", get(handlers::docs::openapi_json))
         // Public health route that neither mutates nor reveals torrent data.
         .route("/health", get(handlers::health::root_health))
         .route("/live", get(handlers::health::live))

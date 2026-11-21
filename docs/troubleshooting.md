@@ -537,3 +537,21 @@ The CLI never prints the token. Do not place a token in a command argument; use
 `SWARMOTTER_API_TOKEN_FILE` or `--token-file`. For large libraries use
 `--per-page` or `--all`; the client uses server-side pagination rather than
 reading daemon-private state.
+
+## OpenAPI and API explorer problems
+
+`/api/openapi.json` and `/api/docs` are public documentation routes, but the
+explorer's requests still require the daemon's normal authentication when
+`api.require_auth = true`. If a Try request returns 401, enter the API token in
+the explorer header; it is sent as `X-SwarmOtter-Auth` and is not stored in the
+document.
+
+The explorer intentionally lists only supported operations. A qBittorrent method
+or Transmission RPC method absent from the document is not implemented; do not
+infer support from another client. Transmission support is listed in
+`x-swarmotter-supported-rpc-methods`, and qBittorrent parity limits are in
+`x-swarmotter-compatibility`.
+
+If `/api/openapi.json` is unavailable, check that the daemon build is current and
+that the control-plane listener is reachable. The document is generated from the
+same route catalog checked against the router in CI.

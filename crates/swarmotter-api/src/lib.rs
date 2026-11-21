@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#![recursion_limit = "512"]
 
 //! SwarmOtter API layer.
 //!
@@ -14,6 +15,7 @@ pub(crate) mod encoding;
 pub mod envelope;
 pub mod error;
 pub mod handlers;
+pub mod openapi;
 pub mod routes;
 pub mod state;
 

@@ -11,6 +11,17 @@ date or duration estimates.
 
 ### Added
 
+- A version-matched OpenAPI 3.1 document at `/api/openapi.json` and a
+  dependency-free interactive explorer at `/api/docs`. The document covers
+  native `/api/v1`, explicit qBittorrent and Transmission compatibility subsets,
+  envelopes/errors, binary metainfo operations, paginated queries, events, and
+  state-changing markers.
+- Route-catalog drift checks, emitted JSON Schema validation, a deliberate
+  drift fixture, and live local-daemon exchange validation across native,
+  qBittorrent, and Transmission surfaces.
+- ADR-0087 and API/CLI/troubleshooting documentation for discovery,
+  authentication, compatibility parity, and the OpenAPI update process.
+
 - `swarmotterctl`, an API-backed CLI for add, list/filter/sort, details, health,
   pause/resume/start/stop, remove, recheck, reannounce, and per-torrent limits.
   It provides human output and a versioned JSON document with stable exit codes

@@ -349,6 +349,20 @@ limits, verifies v1 and BEP 52 hashes, revalidates the source snapshot, and
 requires the generated document to round-trip through the normal parser
 (ADR-0083).
 
+## OpenAPI and interactive documentation
+
+`GET /api/openapi.json` serves the version-matched OpenAPI 3.1 document.
+`GET /api/docs` serves a self-contained explorer that consumes the same document,
+uses normal same-origin API authentication, and marks state-changing operations.
+The document is generated from a route catalog checked against `routes.rs`; a
+deliberate drift fixture fails CI. Native routes, request/response schemas,
+envelopes/errors, binary metainfo, pagination, and events are documented.
+qBittorrent and Transmission are documented as supported subsets with explicit
+parity extensions (`x-swarmotter-compatibility`,
+`x-swarmotter-supported-rpc-methods`). Representative examples and live
+native/qBittorrent/Transmission exchanges are validated against emitted JSON
+Schemas (ADR-0087).
+
 ## CLI consumer contract
 
 `swarmotterctl` is a separate API-only client. It supports add (magnet/file),

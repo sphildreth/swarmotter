@@ -82,6 +82,13 @@ Lists use the server-side query endpoint. `--page` and `--per-page` request one
 page (maximum 500). `--all` fetches every server page and combines the rows for
 local display or JSON piping.
 
+## API discovery
+
+The daemon serves the version-matched OpenAPI document at `/api/openapi.json`
+and a self-contained explorer at `/api/docs`. The explorer uses normal
+same-origin authentication and marks state-changing operations; the CLI remains
+the preferred automation surface.
+
 ## JSON mode
 
 `--json` writes one document to stdout:

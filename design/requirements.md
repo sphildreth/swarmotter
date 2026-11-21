@@ -42,6 +42,13 @@ time or duration estimates.
   aliases. Verified completion and removal evidence is written to the main
   database in the same transaction as the library change, applied to history
   idempotently, and recovered with the paired backup (ADR-0082).
+- **Versioned API discovery and compatibility contracts:** publish a
+  version-matched OpenAPI 3.1 document and interactive explorer for native
+  `/api/v1`, document explicit supported qBittorrent and Transmission subsets
+  with parity limits, include representative JSON Schemas/examples, mark
+  state-changing operations, and check the route catalog against registered
+  routes with a deliberate drift fixture. Validate emitted schemas and live
+  local-daemon exchanges across all three surfaces (ADR-0087).
 - **API-backed CLI:** a separate `swarmotterctl` binary controls a running
   daemon through the native API for add, list with server-side filters/sorting/
   pagination, details, health, pause/resume/start/stop, remove, recheck,
@@ -146,6 +153,11 @@ for `v1.0.0` only when every item in the `v1.0.0` completion checklist (see
 `design/PRD.md`) is complete and:
 
 - All required torrent input methods work.
+- API-discovery acceptance covers version-matched OpenAPI 3.1, native route and
+  schema documentation, qBittorrent/Transmission parity limits, `/api/docs`
+  authentication/origin behavior, machine-readable artifacts, route drift
+  checks, deliberate drift failure, and live schema validation for success and
+  error exchanges across all three surfaces.
 - CLI acceptance covers local and remote endpoint/credential configuration,
   magnet/file add, filtered/sorted/paginated list, details/health, lifecycle
   operations, remove, limits, human and JSON modes, stdout/stderr separation,

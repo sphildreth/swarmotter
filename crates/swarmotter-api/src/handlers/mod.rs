@@ -5,6 +5,7 @@
 pub mod autopilot;
 pub mod creation;
 pub mod diagnostics;
+pub mod docs;
 pub mod events;
 pub mod files;
 pub mod health;
