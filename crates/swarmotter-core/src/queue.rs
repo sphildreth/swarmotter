@@ -106,6 +106,8 @@ pub struct QueueState<K = InfoHash> {
     pub bypass: Vec<K>,
 
     #[serde(skip, default)]
+    order_revision: u64,
+    #[serde(skip, default)]
     order_set: HashSet<K>,
     #[serde(skip, default)]
     bypass_set: HashSet<K>,
@@ -119,6 +121,7 @@ impl<K> Default for QueueState<K> {
             limits: QueueLimits::default(),
             order: Vec::new(),
             bypass: Vec::new(),
+            order_revision: 0,
             order_set: HashSet::new(),
             bypass_set: HashSet::new(),
             order_index: HashMap::new(),
@@ -147,6 +150,7 @@ where
             limits: restored.limits,
             order: restored.order.unwrap_or_default(),
             bypass: restored.bypass.unwrap_or_default(),
+            order_revision: 0,
             order_set: HashSet::new(),
             bypass_set: HashSet::new(),
             order_index: HashMap::new(),
@@ -165,6 +169,7 @@ where
             limits,
             order: Vec::new(),
             bypass: Vec::new(),
+            order_revision: 0,
             order_set: HashSet::new(),
             bypass_set: HashSet::new(),
             order_index: HashMap::new(),
@@ -173,7 +178,12 @@ where
         state
     }
 
+    pub fn order_revision(&self) -> u64 {
+        self.order_revision
+    }
+
     fn rebuild_membership_sets(&mut self) {
+        self.order_revision = crate::next_list_revision();
         self.order_set.clear();
         self.order_index.clear();
         let mut order = Vec::with_capacity(self.order.len());
@@ -228,6 +238,7 @@ where
             if self.order_set.insert(key) {
                 let pos = self.order.len();
                 self.order.push(key);
+                self.order_revision = crate::next_list_revision();
                 self.order_index.insert(key, pos);
             }
         }
@@ -239,6 +250,7 @@ where
         if self.order_set.insert(key) {
             let pos = self.order.len();
             self.order.push(key);
+            self.order_revision = crate::next_list_revision();
             self.order_index.insert(key, pos);
         }
     }
@@ -293,6 +305,7 @@ where
         if let Some(i) = self.order_index_for(key) {
             if i > 0 {
                 self.order.swap(i, i - 1);
+                self.order_revision = crate::next_list_revision();
                 self.order_index.insert(self.order[i], i);
                 self.order_index.insert(self.order[i - 1], i - 1);
             }
@@ -304,6 +317,7 @@ where
         if let Some(i) = self.order_index_for(key) {
             if i + 1 < self.order.len() {
                 self.order.swap(i, i + 1);
+                self.order_revision = crate::next_list_revision();
                 self.order_index.insert(self.order[i], i);
                 self.order_index.insert(self.order[i + 1], i + 1);
             }

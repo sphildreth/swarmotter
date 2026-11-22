@@ -154,6 +154,12 @@ impl AddTorrentOptions {
 pub trait DaemonOps: Send + Sync + 'static {
     /// List all torrents.
     async fn list_torrents(&self) -> Vec<TorrentSummary>;
+    async fn query_torrent_page(
+        &self,
+        query: crate::handlers::torrents::TorrentListQuery,
+    ) -> crate::handlers::torrents::TorrentListResponse {
+        query.apply(self.list_torrents().await)
+    }
     /// Get a single torrent's summary.
     async fn get_torrent(&self, hash: &TorrentKey) -> Option<TorrentSummary>;
     /// Return the exact original full `.torrent` document retained for an

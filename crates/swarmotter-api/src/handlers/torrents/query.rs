@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use std::borrow::Borrow;
 
 const DEFAULT_TORRENT_LIST_PAGE_SIZE: usize = 200;
 const MAX_TORRENT_LIST_PAGE_SIZE: usize = 500;
-#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TorrentListSort {
     #[default]
@@ -38,7 +39,7 @@ pub enum TorrentListDirection {
     Desc,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TorrentListGroupBy {
     State,
@@ -48,7 +49,7 @@ pub enum TorrentListGroupBy {
     Performance,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
 pub struct TorrentListQuery {
     #[serde(default)]
     pub q: Option<String>,
@@ -82,7 +83,7 @@ pub struct TorrentListQuery {
     pub group_by: Option<TorrentListGroupBy>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TorrentListResponse {
     pub rows: Vec<TorrentSummary>,
     pub total: usize,
@@ -96,7 +97,7 @@ pub struct TorrentListResponse {
     pub groups: Vec<TorrentListGroup>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct TorrentListCounts {
     pub states: BTreeMap<String, usize>,
     pub health: BTreeMap<String, usize>,
@@ -105,7 +106,7 @@ pub struct TorrentListCounts {
     pub performance: BTreeMap<String, usize>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TorrentListGroup {
     pub key: String,
     pub label: String,
@@ -123,46 +124,52 @@ pub async fn query_torrents(
     State(state): State<SharedState>,
     Query(query): Query<TorrentListQuery>,
 ) -> Response {
-    let all_rows = state.daemon.list_torrents().await;
-    let total = all_rows.len();
-    let rows = filter_torrent_rows(all_rows, &query);
-    let filtered = rows.len();
-    let counts = torrent_list_counts(&rows);
-    let groups = torrent_list_groups(&rows, query.group_by);
-    let sort = query.sort.unwrap_or_default();
-    let dir = query.dir.unwrap_or_default();
-
-    let page = query.page.unwrap_or(1).max(1);
-    let per_page = query
-        .per_page
-        .unwrap_or(DEFAULT_TORRENT_LIST_PAGE_SIZE)
-        .min(MAX_TORRENT_LIST_PAGE_SIZE);
-    let page_count = if per_page == 0 {
-        0
-    } else {
-        filtered.div_ceil(per_page)
-    };
-    let start = page.saturating_sub(1).saturating_mul(per_page);
-    let rows = sorted_torrent_page(rows, sort, dir, start, per_page);
-
-    into_response(Ok(TorrentListResponse {
-        rows,
-        total,
-        filtered,
-        page,
-        per_page,
-        page_count,
-        sort,
-        dir,
-        counts,
-        groups,
-    }))
+    into_response(Ok(state.daemon.query_torrent_page(query).await))
 }
 
-pub(super) fn filter_torrent_rows(
-    rows: Vec<TorrentSummary>,
+impl TorrentListQuery {
+    pub fn apply<T: Borrow<TorrentSummary>>(&self, all_rows: Vec<T>) -> TorrentListResponse {
+        let query = self;
+        let total = all_rows.len();
+        let rows = filter_torrent_rows(all_rows, query);
+        let filtered = rows.len();
+        let counts = torrent_list_counts(&rows);
+        let groups = torrent_list_groups(&rows, query.group_by);
+        let sort = query.sort.unwrap_or_default();
+        let dir = query.dir.unwrap_or_default();
+
+        let page = query.page.unwrap_or(1).max(1);
+        let per_page = query
+            .per_page
+            .unwrap_or(DEFAULT_TORRENT_LIST_PAGE_SIZE)
+            .min(MAX_TORRENT_LIST_PAGE_SIZE);
+        let page_count = if per_page == 0 {
+            0
+        } else {
+            filtered.div_ceil(per_page)
+        };
+        let start = page.saturating_sub(1).saturating_mul(per_page);
+        let rows = sorted_torrent_page(rows, sort, dir, start, per_page);
+
+        TorrentListResponse {
+            rows: rows.iter().map(|row| row.borrow().clone()).collect(),
+            total,
+            filtered,
+            page,
+            per_page,
+            page_count,
+            sort,
+            dir,
+            counts,
+            groups,
+        }
+    }
+}
+
+pub(super) fn filter_torrent_rows<T: Borrow<TorrentSummary>>(
+    rows: Vec<T>,
     query: &TorrentListQuery,
-) -> Vec<TorrentSummary> {
+) -> Vec<T> {
     let q = query.q.as_deref().map(normalize_filter_text);
     let states = token_set(query.state.as_deref());
     let health = token_set(query.health.as_deref());
@@ -172,6 +179,7 @@ pub(super) fn filter_torrent_rows(
 
     rows.into_iter()
         .filter(|row| {
+            let row = row.borrow();
             if let Some(q) = &q {
                 if !torrent_matches_search(row, q) {
                     return false;
@@ -219,17 +227,18 @@ pub(super) fn filter_torrent_rows(
         .collect()
 }
 
-pub(super) fn sorted_torrent_page(
-    mut rows: Vec<TorrentSummary>,
+pub(super) fn sorted_torrent_page<T: Borrow<TorrentSummary>>(
+    mut rows: Vec<T>,
     sort: TorrentListSort,
     dir: TorrentListDirection,
     start: usize,
     size: usize,
-) -> Vec<TorrentSummary> {
+) -> Vec<T> {
     if size == 0 || start >= rows.len() {
         return Vec::new();
     }
-    let compare = |a: &TorrentSummary, b: &TorrentSummary| {
+    let compare = |a: &T, b: &T| {
+        let (a, b) = (a.borrow(), b.borrow());
         let order = compare_torrent_rows(a, b, sort)
             .then_with(|| compare_strings(&a.name, &b.name))
             .then_with(|| a.info_hash.cmp(&b.info_hash));
@@ -283,9 +292,10 @@ pub(super) fn compare_torrent_rows(
     }
 }
 
-pub(super) fn torrent_list_counts(rows: &[TorrentSummary]) -> TorrentListCounts {
+pub(super) fn torrent_list_counts<T: Borrow<TorrentSummary>>(rows: &[T]) -> TorrentListCounts {
     let mut counts = TorrentListCounts::default();
     for row in rows {
+        let row = row.borrow();
         increment_count(&mut counts.states, row.state.as_str());
         increment_count(&mut counts.health, health_label_key(&row.health.label));
         for label in label_keys(row) {
@@ -299,8 +309,8 @@ pub(super) fn torrent_list_counts(rows: &[TorrentSummary]) -> TorrentListCounts 
     counts
 }
 
-pub(super) fn torrent_list_groups(
-    rows: &[TorrentSummary],
+pub(super) fn torrent_list_groups<T: Borrow<TorrentSummary>>(
+    rows: &[T],
     group_by: Option<TorrentListGroupBy>,
 ) -> Vec<TorrentListGroup> {
     let Some(group_by) = group_by else {
@@ -308,6 +318,7 @@ pub(super) fn torrent_list_groups(
     };
     let mut groups = BTreeMap::new();
     for row in rows {
+        let row = row.borrow();
         match group_by {
             TorrentListGroupBy::State => increment_count(&mut groups, row.state.as_str()),
             TorrentListGroupBy::Health => {

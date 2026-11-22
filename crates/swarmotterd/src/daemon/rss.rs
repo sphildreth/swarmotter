@@ -22,7 +22,7 @@ use swarmotter_core::rss::{
 };
 use swarmotter_core::torrent::Torrent;
 
-use crate::rss_store::{PendingEventKind, PendingLibraryEvent, RssStore};
+use crate::rss_store::{DuplicateLookup, PendingEventKind, PendingLibraryEvent, RssStore};
 
 const RSS_OUTBOX_BATCH: usize = 512;
 const RSS_RETRY_BATCH: usize = 32;
@@ -65,7 +65,13 @@ impl DaemonRuntime {
         })
         .await
         .map_err(|error| CoreError::Storage(format!("open RSS history task: {error}")))??;
-        *self.rss_store.write().await = Some((path, store.clone()));
+        let mut cached = self.rss_store.write().await;
+        if let Some((cached_path, initialized)) = cached.as_ref() {
+            if cached_path == &path {
+                return Ok(initialized.clone());
+            }
+        }
+        *cached = Some((path, store.clone()));
         Ok(store)
     }
 
@@ -105,29 +111,39 @@ impl DaemonRuntime {
     /// record disappears. Selfish removal and every explicit removal path call
     /// this helper.
     pub(super) async fn queue_rss_removal(&self, torrent: &Torrent) {
-        let was_completed = torrent.date_completed.is_some()
+        for event in Self::rss_removal_events(torrent) {
+            self.queue_rss_event(event).await;
+        }
+    }
+
+    pub(super) fn rss_removal_events(torrent: &Torrent) -> Vec<PendingLibraryEvent> {
+        let completed = torrent.date_completed.is_some()
             || matches!(
                 torrent.state,
                 TorrentState::Completed | TorrentState::Seeding
             )
             || torrent.progress.is_complete();
-        if was_completed {
-            self.queue_rss_completion(torrent).await;
-        }
-        let canonical = torrent.key().to_locator();
-        let aliases = torrent
+        let key = torrent.key().to_locator();
+        let aliases: Vec<_> = torrent
             .keys()
             .into_iter()
             .map(TorrentKey::to_locator)
-            .collect::<Vec<_>>();
-        self.queue_rss_event(PendingLibraryEvent::removal(
-            canonical,
-            aliases,
-            torrent.meta.name.clone(),
-            was_completed,
-            now(),
-        ))
-        .await;
+            .collect();
+        let name = torrent.meta.name.clone();
+        let timestamp = now();
+        let mut events = Vec::with_capacity(if completed { 2 } else { 1 });
+        if completed {
+            events.push(PendingLibraryEvent::completion(
+                key.clone(),
+                aliases.clone(),
+                name.clone(),
+                timestamp,
+            ));
+        }
+        events.push(PendingLibraryEvent::removal(
+            key, aliases, name, completed, timestamp,
+        ));
+        events
     }
 
     /// Capture a verified completion transition once. The event is persisted
@@ -454,36 +470,14 @@ impl DaemonRuntime {
         }
 
         let conditional_not_modified = response.status == 304;
-        if conditional_not_modified {
-            state.last_success_at = Some(started_at);
-            state.next_attempt_at = None;
-            state.last_error = None;
-            state.consecutive_failures = 0;
-            if response.etag.is_some() {
-                state.etag = response.etag;
-            }
-            if response.last_modified.is_some() {
-                state.last_modified = response.last_modified;
-            }
-            let state_to_save = state.clone();
-            let store_for_save = store.clone();
-            tokio::task::spawn_blocking(move || store_for_save.save_feed_state(&state_to_save))
-                .await
-                .map_err(|error| {
-                    CoreError::Storage(format!("save RSS feed state task: {error}"))
-                })??;
-            return Ok(RssPollResult {
-                subscription_id: subscription.id.clone(),
-                success: true,
-                baseline_established: state.baseline_established,
-                conditional_not_modified: true,
-                decisions: Vec::new(),
-                imported: Vec::new(),
-                error: None,
-            });
-        }
-
-        let feed = match parse_feed(&response.body, config.max_feed_bytes, config.max_entries) {
+        // A 304 advances the poll clock but still has durable attachment retries
+        // to process. Only fresh feed entries need parsing.
+        let feed = if conditional_not_modified {
+            Ok(Default::default())
+        } else {
+            parse_feed(&response.body, config.max_feed_bytes, config.max_entries)
+        };
+        let feed = match feed {
             Ok(feed) => feed,
             Err(error) => {
                 let failures = state.consecutive_failures.saturating_add(1);
@@ -519,7 +513,6 @@ impl DaemonRuntime {
         let effective_import_current = import_current
             || (establishing_baseline
                 && subscription.import_mode == swarmotter_core::rss::RssImportMode::CurrentMatches);
-        let pending_completions = self.pending_completion_events().await;
         let mut decisions = Vec::new();
         let mut imported = Vec::new();
         let mut seen_entries = HashSet::new();
@@ -539,6 +532,16 @@ impl DaemonRuntime {
                         CoreError::Storage(format!("read RSS listing task: {error}"))
                     })??
             };
+            // A changed feed may still contain a failed listing. Respect the
+            // same deadline and retry budget as retries from the stored feed.
+            if !import_current
+                && existing.as_ref().is_some_and(|listing| {
+                    matches!(listing.action(), RssAction::Failed | RssAction::Deferred)
+                        && listing.next_attempt_at.is_none_or(|at| at > started_at)
+                })
+            {
+                continue;
+            }
             let decision = self
                 .process_rss_entry(
                     config,
@@ -550,10 +553,9 @@ impl DaemonRuntime {
                     establishing_baseline,
                     effective_import_current,
                     false,
-                    &pending_completions,
                     &mut imported,
                 )
-                .await;
+                .await?;
             decisions.push(decision);
         }
 
@@ -580,10 +582,9 @@ impl DaemonRuntime {
                     false,
                     false,
                     true,
-                    &pending_completions,
                     &mut imported,
                 )
-                .await;
+                .await?;
             decisions.push(decision);
         }
 
@@ -591,7 +592,7 @@ impl DaemonRuntime {
         state.next_attempt_at = None;
         state.last_error = None;
         state.consecutive_failures = 0;
-        state.baseline_established = true;
+        state.baseline_established |= !conditional_not_modified;
         if response.etag.is_some() {
             state.etag = response.etag;
         } else if response.status == 200 {
@@ -619,29 +620,49 @@ impl DaemonRuntime {
         Ok(RssPollResult {
             subscription_id: subscription.id.clone(),
             success: true,
-            baseline_established: true,
-            conditional_not_modified: false,
+            baseline_established: state.baseline_established,
+            conditional_not_modified,
             decisions,
             imported,
             error: None,
         })
     }
 
-    async fn pending_completion_events(&self) -> Vec<PendingLibraryEvent> {
-        let Some(path) = self.state_path.clone() else {
-            return Vec::new();
-        };
-        // Loading checkpoints the state store and removes SQLite sidecars. Hold
-        // the state-write lane so this read cannot race a concurrent save.
+    /// Read pending and applied completion evidence in the same state-write
+    /// lane as the outbox consumer so no completion can disappear between reads.
+    async fn rss_history_duplicate(
+        &self,
+        store: &RssStore,
+        aliases: &[String],
+    ) -> Result<Option<DuplicateLookup>> {
         let _state_guard = self.state_write_lock.lock().await;
-        tokio::task::spawn_blocking(move || crate::state_store::load_outbox_events(&path, 512))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|event| event.kind == PendingEventKind::Completed || event.was_completed)
-            .collect()
+        let queued = self.rss_pending_events.lock().await.iter().any(|event| {
+            (event.kind == PendingEventKind::Completed || event.was_completed)
+                && aliases
+                    .iter()
+                    .any(|key| key == &event.canonical_key || event.aliases.contains(key))
+        });
+        if queued {
+            return Ok(Some(DuplicateLookup::Completed));
+        }
+        let path = self.state_path.clone();
+        let store = store.clone();
+        let aliases = aliases.to_vec();
+        tokio::task::spawn_blocking(move || {
+            if store.completed_alias(&aliases)?.is_some() {
+                return Ok(Some(DuplicateLookup::Completed));
+            }
+            if let Some(path) = path {
+                if crate::state_store::pending_completion_matches(&path, &aliases)? {
+                    return Ok(Some(DuplicateLookup::Completed));
+                }
+            }
+            Ok(store
+                .imported_alias(&aliases)?
+                .map(|_| DuplicateLookup::ImportedElsewhere))
+        })
+        .await
+        .map_err(|error| CoreError::Storage(format!("check RSS duplicate task: {error}")))?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -656,9 +677,8 @@ impl DaemonRuntime {
         establishing_baseline: bool,
         import_current: bool,
         retrying: bool,
-        pending_completions: &[PendingLibraryEvent],
         imported: &mut Vec<String>,
-    ) -> RssDecision {
+    ) -> Result<RssDecision> {
         let now_value = now();
         let action;
         let reason;
@@ -681,15 +701,15 @@ impl DaemonRuntime {
                     decided_at: Some(existing.last_decision_at),
                 };
                 self.touch_rss_listing(store, &subscription.id, entry, entry_key, now_value)
-                    .await;
-                return decision;
+                    .await?;
+                return Ok(decision);
             }
             if existing.imported_at.is_some() || existing.completed_at.is_some() {
-                let completed_in_store = store
-                    .completed_alias(&existing.torrent_keys)
-                    .ok()
-                    .flatten()
-                    .is_some();
+                let completed_in_store = matches!(
+                    self.rss_history_duplicate(store, &existing.torrent_keys)
+                        .await?,
+                    Some(DuplicateLookup::Completed)
+                );
                 let (action, reason) = if existing.completed_at.is_some() || completed_in_store {
                     (
                         RssAction::PreviouslyCompleted,
@@ -802,15 +822,7 @@ impl DaemonRuntime {
             .await;
         if resolved.aliases.is_empty() {
             if resolved.transient_failure {
-                let retry_at = retry_backoff_seconds(
-                    existing
-                        .map(|listing| listing.retry_count.saturating_add(1))
-                        .unwrap_or(1),
-                    config.retry_base_seconds,
-                    config.retry_max_seconds,
-                    config.max_retries,
-                )
-                .map(|seconds| now_value.saturating_add(seconds));
+                let retry_at = next_listing_retry(config, existing, now_value);
                 return self
                     .record_rss_decision(
                         store,
@@ -858,59 +870,38 @@ impl DaemonRuntime {
         }
         torrent_keys = resolved.aliases.clone();
 
-        if let Some(canonical) = store.completed_alias(&torrent_keys).ok().flatten() {
-            return self
-                .record_rss_decision(
-                    store,
-                    subscription,
-                    entry,
-                    entry_key,
-                    existing,
-                    RssAction::PreviouslyCompleted,
-                    &format!(
-                        "verified completion recorded for torrent identity {canonical}; no second add"
-                    ),
-                    &torrent_keys,
-                    now_value,
-                    None,
-                    false,
-                    false,
-                )
-                .await;
-        }
-        if let Some(event) = pending_completions.iter().find(|event| {
-            event
-                .identities()
-                .iter()
-                .any(|identity| torrent_keys.iter().any(|alias| alias.as_str() == *identity))
-        }) {
-            return self
-                .record_rss_decision(
-                    store,
-                    subscription,
-                    entry,
-                    entry_key,
-                    existing,
-                    RssAction::PreviouslyCompleted,
-                    &format!(
-                        "pending verified-completion event for {}; no second add",
-                        event.canonical_key
-                    ),
-                    &torrent_keys,
-                    now_value,
-                    None,
-                    false,
-                    false,
-                )
-                .await;
-        }
-        if let Some(key) = self.first_live_library_key(&torrent_keys).await {
-            let completed = self.library_key_is_complete(key).await;
-            if completed {
-                if let Some(torrent) = self.registry.lock().await.get(&key).cloned() {
+        // Fetch attachments concurrently, then serialize the final checks,
+        // intake and durable attribution across feeds.
+        let _import_guard = self.rss_import_lock.lock().await;
+        let live = self.first_live_library_key(&torrent_keys).await;
+        let duplicate = self.rss_history_duplicate(store, &torrent_keys).await;
+        let mut retry_at = None;
+        let skip = match (duplicate, live) {
+            (Err(error), _) => {
+                retry_at = next_listing_retry(config, existing, now_value);
+                Some((RssAction::Deferred, format!("RSS duplicate history unavailable: {error}")))
+            }
+            (Ok(Some(DuplicateLookup::Completed)), _) => Some((
+                RssAction::PreviouslyCompleted,
+                "verified completion recorded for this torrent identity; no second add".into(),
+            )),
+            (Ok(_), Some(key)) if self.library_key_is_complete(key).await => {
+                let torrent = self.registry.lock().await.get(&key).cloned();
+                if let Some(torrent) = torrent {
                     self.queue_rss_completion(&torrent).await;
                 }
+                Some((RssAction::PreviouslyCompleted, "live library already contains this completed torrent; no second add".into()))
             }
+            (Ok(_), Some(_)) => Some((
+                RssAction::AlreadyPresent,
+                "live library already contains this torrent; its paused or incomplete state is preserved".into(),
+            )),
+            (Ok(Some(DuplicateLookup::ImportedElsewhere)), None) => Some((
+                RssAction::AlreadyPresent, "another RSS subscription already imported this torrent".into(),
+            )),
+            (Ok(None), None) => None,
+        };
+        if let Some((action, reason)) = skip {
             return self
                 .record_rss_decision(
                     store,
@@ -918,78 +909,11 @@ impl DaemonRuntime {
                     entry,
                     entry_key,
                     existing,
-                    if completed {
-                        RssAction::PreviouslyCompleted
-                    } else {
-                        RssAction::AlreadyPresent
-                    },
-                    if completed {
-                        "live library already contains this completed torrent; no second add"
-                    } else {
-                        "live library already contains this torrent; its paused or incomplete state is preserved"
-                    },
+                    action,
+                    &reason,
                     &torrent_keys,
                     now_value,
-                    None,
-                    false,
-                    false,
-                )
-                .await;
-        }
-        if store.imported_alias(&torrent_keys).ok().flatten().is_some() {
-            return self
-                .record_rss_decision(
-                    store,
-                    subscription,
-                    entry,
-                    entry_key,
-                    existing,
-                    RssAction::AlreadyPresent,
-                    "another RSS subscription already imported this torrent",
-                    &torrent_keys,
-                    now_value,
-                    None,
-                    false,
-                    false,
-                )
-                .await;
-        }
-
-        // Intake is serialized across subscriptions; duplicate detection is
-        // repeated after acquiring the lock because another feed may have won
-        // the race while this poll was fetching.
-        let _import_guard = self.rss_import_lock.lock().await;
-        if let Some(canonical) = store.completed_alias(&torrent_keys).ok().flatten() {
-            return self
-                .record_rss_decision(
-                    store,
-                    subscription,
-                    entry,
-                    entry_key,
-                    existing,
-                    RssAction::PreviouslyCompleted,
-                    &format!("verified completion recorded by a concurrent poll for {canonical}"),
-                    &torrent_keys,
-                    now_value,
-                    None,
-                    false,
-                    false,
-                )
-                .await;
-        }
-        if self.first_live_library_key(&torrent_keys).await.is_some() {
-            return self
-                .record_rss_decision(
-                    store,
-                    subscription,
-                    entry,
-                    entry_key,
-                    existing,
-                    RssAction::AlreadyPresent,
-                    "concurrent intake already registered this torrent",
-                    &torrent_keys,
-                    now_value,
-                    None,
+                    retry_at,
                     false,
                     false,
                 )
@@ -1041,15 +965,7 @@ impl DaemonRuntime {
                     "transient {} failure: {error}; eligible for retry with backoff",
                     error.code()
                 );
-                let retry_at = retry_backoff_seconds(
-                    existing
-                        .map(|listing| listing.retry_count.saturating_add(1))
-                        .unwrap_or(1),
-                    config.retry_base_seconds,
-                    config.retry_max_seconds,
-                    config.max_retries,
-                )
-                .map(|seconds| now_value.saturating_add(seconds));
+                let retry_at = next_listing_retry(config, existing, now_value);
                 return self
                     .record_rss_decision(
                         store,
@@ -1205,15 +1121,16 @@ impl DaemonRuntime {
         entry: &RssEntry,
         entry_key: &str,
         now_value: u64,
-    ) {
+    ) -> Result<()> {
         let store = store.clone();
         let subscription_id = subscription_id.to_string();
         let entry = entry.clone();
         let entry_key = entry_key.to_string();
-        let _ = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             store.touch_listing(&subscription_id, &entry, &entry_key, now_value)
         })
-        .await;
+        .await
+        .map_err(|error| CoreError::Storage(format!("touch RSS listing task: {error}")))?
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1231,16 +1148,16 @@ impl DaemonRuntime {
         retry_at: Option<u64>,
         dismissed: bool,
         imported: bool,
-    ) -> RssDecision {
+    ) -> Result<RssDecision> {
         let same = existing.is_some_and(|listing| {
             listing.action() == action && listing.reason == reason && listing.dismissed == dismissed
         });
         let transient = matches!(action, RssAction::Failed | RssAction::Deferred);
         if same && !transient && !imported {
             self.touch_rss_listing(store, &subscription.id, entry, entry_key, now_value)
-                .await;
+                .await?;
             let existing = existing.expect("existing listing checked above");
-            return RssDecision {
+            return Ok(RssDecision {
                 entry_key: entry_key.to_string(),
                 title: entry.title.clone(),
                 link: entry.link.clone(),
@@ -1251,7 +1168,7 @@ impl DaemonRuntime {
                 torrent_keys: torrent_keys.to_vec(),
                 decision_id: None,
                 decided_at: Some(existing.last_decision_at),
-            };
+            });
         }
         let store = store.clone();
         let subscription_id = subscription.id.clone();
@@ -1259,7 +1176,7 @@ impl DaemonRuntime {
         let decision_entry_key = entry_key.to_string();
         let decision_reason = reason.to_string();
         let keys = torrent_keys.to_vec();
-        let result = tokio::task::spawn_blocking(move || {
+        let decision_id = tokio::task::spawn_blocking(move || {
             store.record_decision(
                 &subscription_id,
                 &decision_entry,
@@ -1273,19 +1190,9 @@ impl DaemonRuntime {
                 imported,
             )
         })
-        .await;
-        let decision_id = match result {
-            Ok(Ok(id)) => Some(id),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "failed to persist RSS decision");
-                None
-            }
-            Err(error) => {
-                tracing::warn!(%error, "RSS decision task failed");
-                None
-            }
-        };
-        RssDecision {
+        .await
+        .map_err(|error| CoreError::Storage(format!("write RSS decision task: {error}")))??;
+        Ok(RssDecision {
             entry_key: entry_key.to_string(),
             title: entry.title.clone(),
             link: entry.link.clone(),
@@ -1294,9 +1201,9 @@ impl DaemonRuntime {
             action,
             reason: reason.to_string(),
             torrent_keys: torrent_keys.to_vec(),
-            decision_id,
+            decision_id: Some(decision_id),
             decided_at: Some(now_value),
-        }
+        })
     }
 
     async fn reconsider_rss_listings(
@@ -1313,7 +1220,6 @@ impl DaemonRuntime {
                 .map_err(|error| {
                     CoreError::Storage(format!("read RSS reconsider set task: {error}"))
                 })??;
-        let pending_completions = self.pending_completion_events().await;
         let mut decisions = Vec::new();
         let mut imported = Vec::new();
         for listing in listings {
@@ -1329,10 +1235,9 @@ impl DaemonRuntime {
                     true,
                     true,
                     true,
-                    &pending_completions,
                     &mut imported,
                 )
-                .await;
+                .await?;
             decisions.push(decision);
         }
         Ok(RssPollResult {
@@ -1414,7 +1319,6 @@ impl DaemonRuntime {
             });
         }
         let feed = parse_feed(&response.body, config.max_feed_bytes, config.max_entries)?;
-        let pending_completions = self.pending_completion_events().await;
         let mut decisions = Vec::new();
         for entry in &feed.entries {
             let entry_key = entry.identity();
@@ -1437,9 +1341,8 @@ impl DaemonRuntime {
                     &entry_key,
                     existing.as_ref(),
                     state.baseline_established,
-                    &pending_completions,
                 )
-                .await,
+                .await?,
             );
         }
         Ok(RssPreview {
@@ -1461,14 +1364,11 @@ impl DaemonRuntime {
         entry_key: &str,
         existing: Option<&crate::rss_store::StoredListing>,
         baseline_established: bool,
-        pending_completions: &[PendingLibraryEvent],
-    ) -> RssDecision {
-        let action;
-        let reason;
+    ) -> Result<RssDecision> {
         let mut torrent_keys = Vec::new();
         if let Some(existing) = existing {
             if existing.dismissed {
-                return RssDecision {
+                return Ok(RssDecision {
                     entry_key: entry_key.to_string(),
                     title: entry.title.clone(),
                     link: entry.link.clone(),
@@ -1479,23 +1379,22 @@ impl DaemonRuntime {
                     torrent_keys: existing.torrent_keys.clone(),
                     decision_id: None,
                     decided_at: None,
-                };
+                });
             }
             if existing.imported_at.is_some() || existing.completed_at.is_some() {
                 let action = if existing.completed_at.is_some()
-                    || store
-                        .completed_alias(&existing.torrent_keys)
-                        .ok()
-                        .flatten()
-                        .is_some()
-                {
+                    || matches!(
+                        self.rss_history_duplicate(store, &existing.torrent_keys)
+                            .await?,
+                        Some(DuplicateLookup::Completed)
+                    ) {
                     RssAction::PreviouslyCompleted
                 } else if self.library_has_aliases(&existing.torrent_keys).await {
                     RssAction::AlreadyPresent
                 } else {
                     RssAction::Dismissed
                 };
-                return RssDecision {
+                return Ok(RssDecision {
                     entry_key: entry_key.to_string(),
                     title: entry.title.clone(),
                     link: entry.link.clone(),
@@ -1506,12 +1405,12 @@ impl DaemonRuntime {
                     torrent_keys: existing.torrent_keys.clone(),
                     decision_id: None,
                     decided_at: None,
-                };
+                });
             }
         }
         let rule = subscription.rules.evaluate(entry);
         if !rule.included {
-            return RssDecision {
+            return Ok(RssDecision {
                 entry_key: entry_key.to_string(),
                 title: entry.title.clone(),
                 link: entry.link.clone(),
@@ -1522,12 +1421,12 @@ impl DaemonRuntime {
                 torrent_keys,
                 decision_id: None,
                 decided_at: None,
-            };
+            });
         }
         if !baseline_established
             && subscription.import_mode == swarmotter_core::rss::RssImportMode::NewOnly
         {
-            return RssDecision {
+            return Ok(RssDecision {
                 entry_key: entry_key.to_string(),
                 title: entry.title.clone(),
                 link: entry.link.clone(),
@@ -1538,11 +1437,11 @@ impl DaemonRuntime {
                 torrent_keys,
                 decision_id: None,
                 decided_at: None,
-            };
+            });
         }
         let (offers, page_links) = entry_offers(entry);
         if offers.is_empty() {
-            return RssDecision {
+            return Ok(RssDecision {
                 entry_key: entry_key.to_string(),
                 title: entry.title.clone(),
                 link: entry.link.clone(),
@@ -1560,7 +1459,7 @@ impl DaemonRuntime {
                 torrent_keys,
                 decision_id: None,
                 decided_at: None,
-            };
+            });
         }
         let resolved = self
             .resolve_rss_offers(
@@ -1570,7 +1469,7 @@ impl DaemonRuntime {
             )
             .await;
         if resolved.aliases.is_empty() {
-            return RssDecision {
+            return Ok(RssDecision {
                 entry_key: entry_key.to_string(),
                 title: entry.title.clone(),
                 link: entry.link.clone(),
@@ -1584,39 +1483,41 @@ impl DaemonRuntime {
                 torrent_keys,
                 decision_id: None,
                 decided_at: None,
-            };
+            });
         }
         torrent_keys = resolved.aliases.clone();
-        if let Some(canonical) = store.completed_alias(&torrent_keys).ok().flatten() {
-            action = RssAction::PreviouslyCompleted;
-            reason = format!("verified completion recorded for {canonical}; would skip");
-        } else if pending_completions.iter().any(|event| {
-            event
-                .identities()
-                .iter()
-                .any(|identity| torrent_keys.iter().any(|alias| alias.as_str() == *identity))
-        }) {
-            action = RssAction::PreviouslyCompleted;
-            reason = "pending verified-completion event; would skip".into();
-        } else if self.first_live_library_key(&torrent_keys).await.is_some() {
-            action = RssAction::AlreadyPresent;
-            reason = "already present in the live library; would preserve its state".into();
-        } else {
-            action = RssAction::Import;
-            reason = "would import through the configured intake profile".into();
-        }
-        RssDecision {
+        let live = self.first_live_library_key(&torrent_keys).await;
+        let duplicate = self.rss_history_duplicate(store, &torrent_keys).await?;
+        let (action, reason) = match (duplicate, live) {
+            (Some(DuplicateLookup::Completed), _) => (
+                RssAction::PreviouslyCompleted,
+                "verified completion recorded for this torrent identity; would skip",
+            ),
+            (_, Some(key)) if self.library_key_is_complete(key).await => (
+                RssAction::PreviouslyCompleted,
+                "live library already contains this completed torrent; would skip",
+            ),
+            (Some(DuplicateLookup::ImportedElsewhere), _) | (_, Some(_)) => (
+                RssAction::AlreadyPresent,
+                "already present or imported by another feed; would preserve its state",
+            ),
+            (None, None) => (
+                RssAction::Import,
+                "would import through the configured intake profile",
+            ),
+        };
+        Ok(RssDecision {
             entry_key: entry_key.to_string(),
             title: entry.title.clone(),
             link: entry.link.clone(),
             categories: entry.categories.clone(),
             pub_date: entry.pub_date.clone(),
             action,
-            reason,
+            reason: reason.into(),
             torrent_keys,
             decision_id: None,
             decided_at: None,
-        }
+        })
     }
 
     pub(super) async fn rss_status(&self) -> Vec<RssSubscriptionStatus> {
@@ -1778,6 +1679,21 @@ impl DaemonRuntime {
             let _ = self.persist_state().await;
         }
     }
+}
+
+fn next_listing_retry(
+    config: &RssConfig,
+    existing: Option<&crate::rss_store::StoredListing>,
+    now: u64,
+) -> Option<u64> {
+    let failures = existing.map_or(1, |listing| listing.retry_count.saturating_add(1));
+    retry_backoff_seconds(
+        failures,
+        config.retry_base_seconds,
+        config.retry_max_seconds,
+        config.max_retries,
+    )
+    .map(|seconds| now.saturating_add(seconds))
 }
 
 fn rss_error_is_transient(error: &CoreError) -> bool {

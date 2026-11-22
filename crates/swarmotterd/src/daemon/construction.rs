@@ -105,6 +105,7 @@ impl DaemonRuntime {
         let (health_report_tx, health_report_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             registry: Arc::new(Mutex::new(TorrentRegistry::default())),
+            library_queries: Default::default(),
             queue: Arc::new(Mutex::new(QueueState::new(config.queue.clone()))),
             config: Arc::new(RwLock::new(config)),
             peer_filter: Arc::new(RwLock::new(peer_filter)),

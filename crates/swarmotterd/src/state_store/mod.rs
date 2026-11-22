@@ -401,13 +401,8 @@ pub fn load_original_metainfo(path: &Path, key: TorrentKey) -> Result<Option<Vec
                         ))
                     })?
             };
-            // A read-only WAL-mode connection can recreate the `-wal`/`-shm`
-            // sidecar files even though no writes occurred. Remove them so the
-            // lookup leaves the durable state directory in the same clean state
-            // the save path established. Callers must hold the daemon state
-            // write lock to prevent a concurrent save from relying on a live
-            // WAL file.
-            remove_sqlite_sidecars(path)?;
+            // WAL and shared-memory files belong to SQLite. Even an idle
+            // reader can still hold file descriptors to this generation.
             let Some(bytes) = original else {
                 return Ok(None);
             };
@@ -758,8 +753,10 @@ fn save_sqlite_generation(
     verify_existing_sqlite_state_for_migration(path, true)?;
     let mut connection = open_sqlite(path)?;
     migrate_schema(&mut connection)?;
-    write_state_to_connection(&mut connection, state, original_metainfo.as_ref(), events)?;
-    checkpoint_and_sync(connection, path)
+    // FULL synchronous commit makes the generation durable in WAL. A reader
+    // holding the previous snapshot can delay a checkpoint, but cannot undo
+    // this commit. Offline file snapshots explicitly checkpoint before copying.
+    write_state_to_connection(&mut connection, state, original_metainfo.as_ref(), events)
 }
 
 fn write_new_sqlite_generation(
@@ -1768,6 +1765,29 @@ fn append_outbox_events(
     Ok(())
 }
 
+/// Check every pending completion, including hybrid aliases, without loading
+/// the outbox into memory or advancing the consumer's batch cursor.
+pub(crate) fn pending_completion_matches(path: &Path, aliases: &[String]) -> Result<bool> {
+    if classify_state_file(path)? != StateFileKind::Sqlite {
+        return Ok(false);
+    }
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| CoreError::Storage(format!("open RSS completion outbox: {error}")))?;
+    let aliases = serde_json::to_string(aliases)
+        .map_err(|error| CoreError::Storage(format!("encode RSS lookup aliases: {error}")))?;
+    connection
+        .query_row(
+            "WITH wanted AS (SELECT value FROM json_each(?1))
+             SELECT EXISTS(SELECT 1 FROM rss_outbox
+               WHERE (kind = 'completed' OR was_completed != 0)
+                 AND (canonical_key IN wanted OR EXISTS (
+                    SELECT 1 FROM json_each(CAST(aliases_json AS TEXT)) WHERE value IN wanted)))",
+            params![aliases],
+            |row| row.get(0),
+        )
+        .map_err(|error| CoreError::Storage(format!("check RSS completion outbox: {error}")))
+}
+
 /// Read a bounded batch of unacknowledged RSS outbox events.
 pub(crate) fn load_outbox_events(
     path: &Path,
@@ -1815,9 +1835,7 @@ pub(crate) fn load_outbox_events(
         });
     }
     drop(statement);
-    // A changed-record save intentionally leaves a WAL. Checkpoint and remove
-    // sidecars under the daemon state-write lane so a read leaves a complete,
-    // backup-ready generation and cannot race a concurrent writer.
+    // Checkpoint under the daemon state-write lane before returning the generation.
     checkpoint_and_sync(connection, path)?;
     Ok(events)
 }
@@ -2252,7 +2270,8 @@ fn checkpoint_and_sync(connection: Connection, path: &Path) -> Result<()> {
     connection
         .close()
         .map_err(|(_, error)| CoreError::Storage(format!("close SQLite state store: {error}")))?;
-    remove_sqlite_sidecars(path)?;
+    // SQLite removes its own journals when the final writable connection
+    // closes. Unlinking them here could split readers across two WAL indexes.
     File::open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| CoreError::Storage(format!("sync SQLite state store: {error}")))?;

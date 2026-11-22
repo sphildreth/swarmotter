@@ -46,3 +46,11 @@ pub use magnet::Magnet;
 pub use meta::TorrentMeta;
 pub use models::*;
 pub use v2::{v2_file_root, v2_hash_pair, v2_leaf_hash, v2_piece_root, V2Piece, V2PieceLayout};
+
+/// Process-local identity for a changed registry or queue projection, including
+/// generations constructed independently during library restore.
+pub(crate) fn next_list_revision() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REVISION: AtomicU64 = AtomicU64::new(1);
+    REVISION.fetch_add(1, Ordering::Relaxed)
+}

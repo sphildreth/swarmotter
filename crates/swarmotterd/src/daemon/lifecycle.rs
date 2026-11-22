@@ -286,28 +286,18 @@ impl DaemonRuntime {
 #[async_trait]
 impl DaemonOps for DaemonRuntime {
     async fn list_torrents(&self) -> Vec<TorrentSummary> {
-        let config = self.config.read().await.clone();
-        let positions: HashMap<TorrentKey, usize> = self
-            .queue
-            .lock()
+        self.library_snapshot()
             .await
-            .order
             .iter()
-            .enumerate()
-            .map(|(i, hash)| (*hash, i + 1))
-            .collect();
-        let _lifecycle = self.seeder_lifecycle_lock.lock().await;
-        self.registry.lock().await.list_summaries(|t, mut summary| {
-            summary.queue_position = positions.get(&t.key()).copied();
-            let policy = Self::effective_policy_with_config(&config, t);
-            summary.effective_ratio_limit = (!policy.seed_forever.value)
-                .then_some(policy.ratio_limit.value)
-                .flatten();
-            summary.effective_idle_limit = (!policy.seed_forever.value)
-                .then_some(policy.idle_limit.value)
-                .flatten();
-            summary
-        })
+            .map(|row| row.as_ref().clone())
+            .collect()
+    }
+
+    async fn query_torrent_page(
+        &self,
+        query: swarmotter_api::handlers::torrents::TorrentListQuery,
+    ) -> swarmotter_api::handlers::torrents::TorrentListResponse {
+        self.library_page(query).await
     }
 
     async fn get_torrent(&self, hash: &TorrentKey) -> Option<TorrentSummary> {

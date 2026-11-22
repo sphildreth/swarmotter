@@ -333,22 +333,28 @@ pulling, or restarting. For an upgrade it pulls the image and validates its
 configuration first. It then stops the running daemon, archives the deployment
 files and state into `~/swarmotter-backups`, and restores the active state
 file and its SQLite sidecars in a private directory for verification. This
-also covers a state file placed on a custom persistent mount. When RSS is
-configured, the paired `<state file>.rss.sqlite` history database and its
-SQLite sidecars are archived in the same generation and validated for SQLite
-integrity and required RSS tables. A backup with an absent history database is
-still valid for installations that never enabled RSS. Restore the main state
-file and RSS history database together; using an older history database with a
-newer library can reintroduce a completed torrent because completion evidence
-would be stale.
+also covers databases on separate persistent mounts. The updater resolves
+`SWARMOTTER_RSS__HISTORY_FILE`, then `rss.history_file` in TOML, then the
+default sibling `<state file>.rss.sqlite`. An explicit history database must
+exist and pass verification. An absent default database is valid for an
+installation that has never created RSS history.
+
 Keep `verify-state-backup.py` next to the updater and install Python 3.11
 or later with SQLite support on the host. A failed backup stops the upgrade
-and restarts the original daemon. After verification the updater changes
-`SWARMOTTER_IMAGE` and recreates the Compose stack so Docker attaches networks before
-Gluetun installs VPN routes, validates the health endpoint, image labels, and
-contained egress from the SwarmOtter container, and keeps a local rollback
-image tag. Failed validation also prints service status and recent container
-logs before rollback.
+and restarts the original daemon if it was running. After verification the
+updater changes `SWARMOTTER_IMAGE`, recreates the Compose stack, and checks
+the running image, the health endpoint, and contained egress.
+
+If validation fails and automatic rollback is enabled, the updater stops
+the stack and saves the failed generation's library, RSS history and SQLite
+sidecars in a private `*.failed-state.tar.gz` beside the original backup.
+It verifies the original checksum and database contents, restores both
+pre-upgrade databases and sidecars, starts the locally tagged previous image,
+and checks its health. Library and RSS changes made after the upgrade began
+are available in the failed-generation archive. Payload files stay in place.
+If state recovery fails, the stack stays stopped and the error identifies
+the recovery files. An upgrade that required rollback exits with failure
+even after the previous version becomes healthy.
 
 Pass an explicit image or tag only when pinning a specific release or
 performing a rollback:

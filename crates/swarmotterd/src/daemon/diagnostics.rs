@@ -1018,11 +1018,9 @@ pub(super) fn torrent_selection_complete(
                     .is_some_and(|piece| !wanted(piece.file_index))
         }));
     }
-    for piece in 0..torrent.meta.piece_count() {
-        let selected = swarmotter_core::storage::piece_file_ranges(&torrent.meta, piece)?
-            .iter()
-            .any(|slice| wanted(slice.file_index));
-        if selected && !have.has(piece) {
+    let layout = swarmotter_core::storage::FileLayout::from_meta(&torrent.meta)?;
+    for (file, mut pieces) in layout.file_piece_ranges(&torrent.meta) {
+        if wanted(file) && pieces.any(|piece| !have.has(piece)) {
             return Ok(false);
         }
     }

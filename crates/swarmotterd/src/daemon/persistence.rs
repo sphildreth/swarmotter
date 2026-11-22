@@ -8,6 +8,22 @@ enum PersistenceMode {
     Full,
 }
 
+// Project a removal into the checkpoint without exposing uncommitted records
+// or queue positions to API readers or other state writers.
+#[derive(Clone, Copy)]
+enum RemovalCheckpoint<'a> {
+    None,
+    PreparePayload(&'a HashSet<TorrentKey>),
+    Remove(&'a HashSet<TorrentKey>),
+}
+
+fn mark_payload_removal(torrent: &mut Torrent) {
+    torrent.state = TorrentState::StorageError;
+    torrent.error = Some(
+        "Payload deletion in progress or interrupted. Retry Remove with data to finish.".into(),
+    );
+}
+
 fn torrent_piece_count(torrent: &Torrent) -> usize {
     torrent
         .meta
@@ -769,7 +785,7 @@ impl DaemonRuntime {
                 .incremental_persistence_ready
                 .load(std::sync::atomic::Ordering::Relaxed)
         {
-            self.persist_full_state_locked(path, original_metainfo, events)
+            self.persist_full_state_locked(path, original_metainfo, events, RemovalCheckpoint::None)
                 .await
         } else {
             self.persist_changed_state_locked(path, events).await
@@ -836,6 +852,7 @@ impl DaemonRuntime {
         path: PathBuf,
         original_metainfo: Option<crate::state_store::OriginalMetainfo>,
         events: Vec<crate::rss_store::PendingLibraryEvent>,
+        removal: RemovalCheckpoint<'_>,
     ) -> Result<()> {
         let scan_started = Instant::now();
         let (mut torrents, queue, mut fingerprint_updates, queue_fingerprint_value) = {
@@ -845,6 +862,15 @@ impl DaemonRuntime {
             let mut torrents = Vec::with_capacity(reg.torrents.len());
             let mut fingerprint_updates = Vec::with_capacity(reg.torrents.len());
             for (hash, torrent) in &reg.torrents {
+                if matches!(removal, RemovalCheckpoint::Remove(keys) if keys.contains(hash)) {
+                    continue;
+                }
+                let mut staged = torrent.clone();
+                if matches!(removal, RemovalCheckpoint::PreparePayload(keys) if keys.contains(hash))
+                {
+                    mark_payload_removal(&mut staged);
+                }
+                let torrent = &staged;
                 let meta_cheap = meta_identity_fingerprint(torrent);
                 let meta_full = match meta_fps.get(hash) {
                     Some((cheap, full)) if *cheap == meta_cheap => *full,
@@ -858,9 +884,12 @@ impl DaemonRuntime {
                     *hash,
                     torrent_durable_fingerprint(torrent, meta_cheap, meta_full),
                 ));
-                torrents.push(torrent.clone());
+                torrents.push(staged);
             }
-            let queue = self.queue.lock().await.clone();
+            let mut queue = self.queue.lock().await.clone();
+            if let RemovalCheckpoint::Remove(keys) = removal {
+                queue.remove_many(keys.iter().copied());
+            }
             let queue_fingerprint_value = queue_fingerprint(&queue);
             (
                 torrents,
@@ -1018,7 +1047,7 @@ impl DaemonRuntime {
                 })??;
         let events = std::mem::take(&mut *self.rss_pending_events.lock().await);
         let persisted = self
-            .persist_full_state_locked(path.clone(), None, events)
+            .persist_full_state_locked(path.clone(), None, events, RemovalCheckpoint::None)
             .await;
         if let Err(error) = persisted {
             let rollback_path = path.clone();
@@ -1334,34 +1363,45 @@ impl DaemonRuntime {
         hashes: Vec<TorrentKey>,
         delete_data: bool,
     ) -> Result<Vec<TorrentKey>> {
-        let mut unique_hashes = Vec::with_capacity(hashes.len());
-        let mut seen = HashSet::with_capacity(hashes.len());
-        for hash in hashes {
-            if seen.insert(hash) {
-                unique_hashes.push(hash);
-            }
-        }
+        let runtime = self.clone();
+        // A disconnected API client must not cancel between SQLite commit,
+        // publishing the live generation, and releasing the storage paths.
+        tokio::spawn(async move { runtime.remove_torrent_records(hashes, delete_data).await })
+            .await
+            .map_err(|e| CoreError::Internal(format!("torrent removal task: {e}")))?
+    }
 
+    async fn remove_torrent_records(
+        &self,
+        hashes: Vec<TorrentKey>,
+        delete_data: bool,
+    ) -> Result<Vec<TorrentKey>> {
+        let ownership = self.storage_ownership_lock.lock().await;
+        let mut keys = HashSet::with_capacity(hashes.len());
         let targets = {
-            let reg = self.registry.lock().await;
-            let mut canonical = HashSet::with_capacity(unique_hashes.len());
-            unique_hashes
+            let registry = self.registry.lock().await;
+            hashes
                 .into_iter()
                 .filter_map(|hash| {
-                    reg.canonical_key(&hash)
-                        .and_then(|key| reg.get(&key).cloned().map(|torrent| (key, torrent)))
+                    let key = registry.canonical_key(&hash)?;
+                    if !keys.insert(key) {
+                        return None;
+                    }
+                    registry.get(&key).cloned().map(|torrent| (key, torrent))
                 })
-                .filter(|(hash, _)| canonical.insert(*hash))
                 .collect::<Vec<_>>()
         };
         if targets.is_empty() {
             return Ok(Vec::new());
         }
-        let cfg = self.config.read().await.clone();
-        for (hash, _) in &targets {
-            self.force_stop_engine(hash).await;
-        }
         if delete_data {
+            // Make a retryable, stopped record durable before unlinking any file.
+            self.commit_removal_checkpoint(&targets, &keys, true)
+                .await?;
+            for (hash, _) in &targets {
+                self.force_stop_engine(hash).await;
+            }
+            let cfg = self.config.read().await.clone();
             for (hash, torrent) in &targets {
                 let complete_dir = self.resolve_download_dir(torrent).await;
                 let active_dir = self.resolve_incomplete_dir_for(torrent).await;
@@ -1395,19 +1435,13 @@ impl DaemonRuntime {
                 }
             }
         }
-        for (_, torrent) in &targets {
-            self.queue_rss_removal(torrent).await;
-        }
-        {
-            let mut reg = self.registry.lock().await;
+        self.commit_removal_checkpoint(&targets, &keys, false)
+            .await?;
+        if !delete_data {
             for (hash, _) in &targets {
-                reg.remove(hash);
+                self.force_stop_engine(hash).await;
             }
         }
-        self.queue
-            .lock()
-            .await
-            .remove_many(targets.iter().map(|(hash, _)| *hash));
         {
             let mut rate_samples = self.rate_samples.write().await;
             let mut decisions = self.autopilot_decisions.write().await;
@@ -1422,7 +1456,7 @@ impl DaemonRuntime {
                 peer_permit_pools.remove(hash);
             }
         }
-        self.persist_state_full().await?;
+        drop(ownership);
         self.reconcile_queue().await;
         let removed_hashes = targets
             .into_iter()
@@ -1433,6 +1467,63 @@ impl DaemonRuntime {
             .collect();
         self.publish_event(stats_updated_event());
         Ok(removed_hashes)
+    }
+
+    pub(super) async fn commit_removal_checkpoint(
+        &self,
+        targets: &[(TorrentKey, Torrent)],
+        keys: &HashSet<TorrentKey>,
+        prepare_payload: bool,
+    ) -> Result<()> {
+        let writer = self.state_write_lock.lock().await;
+        if let Some(path) = self.state_path.clone() {
+            let pending = std::mem::take(&mut *self.rss_pending_events.lock().await);
+            let mut events = pending.clone();
+            let stage = if prepare_payload {
+                RemovalCheckpoint::PreparePayload(keys)
+            } else {
+                events.extend(
+                    targets
+                        .iter()
+                        .flat_map(|(_, torrent)| Self::rss_removal_events(torrent)),
+                );
+                RemovalCheckpoint::Remove(keys)
+            };
+            if let Err(error) = self
+                .persist_full_state_locked(path, None, events, stage)
+                .await
+            {
+                // Only restore events that preceded the failed transaction.
+                let mut queued = self.rss_pending_events.lock().await;
+                let mut prior = pending;
+                prior.append(&mut queued);
+                *queued = prior;
+                return Err(error);
+            }
+        } else if !prepare_payload && self.config.read().await.rss.history_file.is_some() {
+            for (_, torrent) in targets {
+                self.queue_rss_removal(torrent).await;
+            }
+        }
+        let mut registry = self.registry.lock().await;
+        if prepare_payload {
+            for key in keys {
+                if let Some(torrent) = registry.get_mut(key) {
+                    mark_payload_removal(torrent);
+                }
+            }
+        } else {
+            for key in keys {
+                registry.remove(key);
+            }
+            self.queue.lock().await.remove_many(keys.iter().copied());
+        }
+        drop(registry);
+        drop(writer);
+        if !prepare_payload {
+            self.wake_rss_outbox();
+        }
+        Ok(())
     }
 
     /// Resolve the download directory for a torrent: per-torrent override,
@@ -1939,7 +2030,7 @@ impl DaemonRuntime {
 
         let events = std::mem::take(&mut *self.rss_pending_events.lock().await);
         let persisted = if let Some(path) = state_path.as_ref() {
-            self.persist_full_state_locked(path.clone(), None, events)
+            self.persist_full_state_locked(path.clone(), None, events, RemovalCheckpoint::None)
                 .await
         } else {
             Ok(())

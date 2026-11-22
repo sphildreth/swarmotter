@@ -23,7 +23,7 @@ pub use layout::{FileLayout, FileSlice, StorageLayout};
 pub use metrics::{StorageIoMetrics, StorageThroughput};
 pub use resume::{FastResume, PieceBitfield};
 
-use crate::error::{CoreError, Result};
+use crate::error::Result;
 use crate::meta::TorrentMeta;
 
 /// A piece bitset tracking which pieces have been verified on disk.
@@ -106,24 +106,7 @@ pub fn piece_file_ranges(meta: &TorrentMeta, piece_index: usize) -> Result<Vec<F
     let Some((start, end)) = meta.piece_byte_range(piece_index as u64) else {
         return Ok(Vec::new());
     };
-    let mut out = Vec::new();
-    let mut offset = 0u64;
-    for (file_index, file) in meta.files.iter().enumerate() {
-        let file_end = offset.checked_add(file.length).ok_or_else(|| {
-            CoreError::MalformedTorrent(format!("file offset overflow at file index {file_index}"))
-        })?;
-        if file_end > start && offset < end {
-            let slice_start = offset.max(start) - offset;
-            let slice_end = file_end.min(end) - offset;
-            out.push(FileSlice {
-                file_index,
-                offset_in_file: slice_start,
-                length: slice_end - slice_start,
-            });
-        }
-        offset = file_end;
-    }
-    Ok(out)
+    Ok(FileLayout::from_meta(meta)?.slices(start, end))
 }
 
 /// Verify a piece's SHA-1 hash against the metadata.
@@ -141,6 +124,7 @@ pub fn verify_piece(meta: &TorrentMeta, index: usize, data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::CoreError;
     use crate::meta::{build_single_file_torrent, parse_torrent, MetaFile};
 
     #[test]

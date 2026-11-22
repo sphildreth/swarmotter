@@ -523,16 +523,30 @@ async fn local_swarm_downloads_from_webseed_url_list() {
     let webseed_url = format!("http://{addr}/payload.bin");
     let server = tokio::spawn(run_webseed_server(listener, Arc::new(content.clone())));
 
+    // Serve the same stale payload at four URLs, filling one piece's whole
+    // per-round retry budget. The fifth mirror has the correct bytes.
+    let stale = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stale_addr = stale.local_addr().unwrap();
+    let stale_urls = (0..4)
+        .map(|i| format!("http://{stale_addr}/stale-{i}.bin"))
+        .collect::<Vec<_>>();
+    let urls = stale_urls
+        .iter()
+        .chain([&webseed_url])
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let stale_server = tokio::spawn(run_webseed_server(stale, Arc::new(vec![0; content.len()])));
+
     let torrent_bytes = build_single_file_torrent_with_webseeds(
         "payload.bin",
         &content,
         piece_length,
         None,
         false,
-        &[&webseed_url],
+        &urls,
     );
     let meta = parse_torrent(&torrent_bytes).unwrap();
-    assert_eq!(meta.webseeds, vec![webseed_url]);
+    assert_eq!(meta.webseeds, urls);
 
     let dir = unique_dir("webseed-download");
     let binder = Arc::new(LoopbackBinder);
@@ -561,12 +575,28 @@ async fn local_swarm_downloads_from_webseed_url_list() {
         "not all webseed pieces verified"
     );
     assert_eq!(final_state.downloaded, meta.total_length);
+    for url in &stale_urls {
+        let rejected = &final_state.webseeds[url];
+        assert!(rejected.attempts > 0);
+        assert_eq!(rejected.bytes_verified, 0);
+        assert!(rejected.last_success.is_none());
+        assert!(rejected
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("hash mismatch"));
+    }
+    assert_eq!(
+        final_state.webseeds[&webseed_url].bytes_verified,
+        meta.total_length
+    );
 
     let storage = StorageIo::new(Arc::new(meta.clone()), dir.clone());
     let written = std::fs::read(storage.file_path(0).unwrap()).unwrap();
     assert_eq!(written, content);
     assert!(!storage.resume_path().exists());
 
+    stale_server.abort();
     server.abort();
     std::fs::remove_dir_all(&dir).ok();
 }

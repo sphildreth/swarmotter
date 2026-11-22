@@ -227,6 +227,18 @@ to avoid blocking each other indefinitely. Separate accesses release their
 guards before acquiring the other lock; persistence releases both before
 serialization and database writes.
 
+Paginated library queries share an immutable snapshot. Record mutations
+invalidate the changed rows. Changes to queue order or inherited seeding policy
+invalidate the associated projections. Filtering and sorting run after releasing
+the lifecycle and registry locks. A repeated query can reuse its page and
+facet counts until the snapshot changes.
+
+Removal checkpoints the projected registry, queue and RSS removal evidence
+before publishing the new generation. For explicit payload deletion, the daemon
+first checkpoints a stopped, retryable record. If unlinking or the final
+checkpoint fails, that record remains available to finish the operation. A
+disconnected API caller does not cancel a removal between these steps.
+
 Resolving magnet metadata establishes its piece space. The engine marks the
 first correctly sized empty map as provisional until storage supplies verified
 progress. Persistence recovers a malformed in-memory update from a compatible

@@ -365,3 +365,71 @@ async fn paused_add_is_queued_without_reconcile_start() {
     assert!(runtime.engine_handles.read().await.is_empty());
     assert!(!runtime.queue_reconcile.lock().await.scheduled);
 }
+
+#[tokio::test]
+async fn paginated_queries_reuse_rows_and_follow_mutations_queue_and_policy() {
+    use swarmotter_api::handlers::torrents::{TorrentListQuery, TorrentListSort};
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::new(Config::default(), health);
+    let mut keys = Vec::new();
+    for name in ["first", "second"] {
+        let meta = swarmotter_core::meta::parse_torrent(
+            &swarmotter_core::meta::build_single_file_torrent(name, b"fixture", 4, None, false),
+        )
+        .unwrap();
+        let torrent = Torrent::new(meta, 1);
+        keys.push(torrent.key());
+        runtime.registry.lock().await.add(torrent).unwrap();
+    }
+    runtime.queue.lock().await.add_many(keys.iter().copied());
+    let query = TorrentListQuery {
+        sort: Some(TorrentListSort::Queue),
+        per_page: Some(1),
+        ..Default::default()
+    };
+    let original = runtime.library_snapshot().await;
+    assert!(Arc::ptr_eq(&original, &runtime.library_snapshot().await));
+    assert_eq!(
+        runtime.query_torrent_page(query.clone()).await.rows[0].info_hash,
+        keys[0]
+    );
+    runtime
+        .registry
+        .lock()
+        .await
+        .get_mut(&keys[0])
+        .unwrap()
+        .labels
+        .push("changed".into());
+    let changed = runtime.library_snapshot().await;
+    let second_row = |rows: &[Arc<TorrentSummary>]| {
+        rows.iter()
+            .find(|r| r.info_hash == keys[1])
+            .unwrap()
+            .clone()
+    };
+    assert!(Arc::ptr_eq(&second_row(&original), &second_row(&changed)));
+    assert_eq!(
+        runtime
+            .query_torrent_page(query.clone())
+            .await
+            .counts
+            .labels["changed"],
+        1
+    );
+    runtime.queue.lock().await.move_to_top(&keys[1]);
+    let page = runtime.query_torrent_page(query.clone()).await;
+    assert_eq!(page.rows[0].info_hash, keys[1]);
+    assert_eq!(page.rows[0].queue_position, Some(1));
+    runtime.config.write().await.seeding.global_ratio_limit = Some(2.5);
+    assert_eq!(
+        runtime.query_torrent_page(query.clone()).await.rows[0].effective_ratio_limit,
+        Some(2.5)
+    );
+    runtime.registry.lock().await.remove(&keys[1]);
+    assert_eq!(runtime.query_torrent_page(query).await.total, 1);
+}

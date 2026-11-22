@@ -2036,3 +2036,84 @@ async fn removal_after_incremental_saves_deletes_the_durable_record() {
     drop(runtime);
     std::fs::remove_dir_all(root).ok();
 }
+
+#[tokio::test]
+async fn failed_removal_preserves_payload_queue_and_record_across_restart() {
+    for delete_data in [false, true] {
+        let root = unique_dir("durable-removal");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = root.join("library.sqlite");
+        let mut cfg = Config::default();
+        cfg.storage.download_dir = Some(root.display().to_string());
+        cfg.queue.auto_start = false;
+        let health = NetworkHealth::blocked(
+            NetworkContainmentMode::Disabled,
+            swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+            "disabled",
+        );
+        let runtime = || {
+            DaemonRuntime::with_paths_broker_and_state(
+                cfg.clone(),
+                health.clone(),
+                None,
+                None,
+                Some(state.clone()),
+                EventBroker::default(),
+            )
+        };
+        let daemon = runtime();
+        let bytes = swarmotter_core::meta::build_single_file_torrent(
+            "keep-file",
+            b"contents",
+            4,
+            None,
+            false,
+        );
+        let key = daemon.add_torrent_file(bytes, None).await.unwrap();
+        let payload = root.join("keep-file");
+        std::fs::write(&payload, b"contents").unwrap();
+        // Abort the generation rather than relying on SQLite busy timeouts.
+        let db = rusqlite::Connection::open(&state).unwrap();
+        db.execute_batch("CREATE TRIGGER reject_generation BEFORE UPDATE ON queue_state BEGIN SELECT RAISE(ABORT, 'test checkpoint failure'); END;").unwrap();
+        assert!(daemon.remove_torrent(&key, delete_data).await.is_err());
+        assert_eq!(std::fs::read(&payload).unwrap(), b"contents");
+        assert!(daemon.get_torrent(&key).await.is_some());
+        assert_eq!(daemon.queue.lock().await.position(&key), Some(1));
+        assert!(crate::state_store::load_outbox_events(&state, 10)
+            .unwrap()
+            .is_empty());
+        db.execute_batch("DROP TRIGGER reject_generation").unwrap();
+        drop(db);
+        let recovered = runtime();
+        assert_eq!(recovered.restore_persisted_state().await.unwrap(), 1);
+        let recovered = if delete_data {
+            let db = rusqlite::Connection::open(&state).unwrap();
+            db.execute_batch("CREATE TRIGGER reject_deletion BEFORE DELETE ON torrent_records BEGIN SELECT RAISE(ABORT, 'test final checkpoint failure'); END;").unwrap();
+            assert!(recovered.remove_torrent(&key, true).await.is_err());
+            assert!(!payload.exists());
+            assert_eq!(
+                recovered.get_torrent(&key).await.unwrap().state,
+                TorrentState::StorageError
+            );
+            db.execute_batch("DROP TRIGGER reject_deletion").unwrap();
+            drop(db);
+            let restarted = runtime();
+            assert_eq!(restarted.restore_persisted_state().await.unwrap(), 1);
+            assert_eq!(
+                restarted.get_torrent(&key).await.unwrap().state,
+                TorrentState::StorageError
+            );
+            restarted
+        } else {
+            recovered
+        };
+        recovered.remove_torrent(&key, delete_data).await.unwrap();
+        assert!(recovered.get_torrent(&key).await.is_none());
+        assert_eq!(payload.exists(), !delete_data);
+        assert!(crate::state_store::load(&state)
+            .unwrap()
+            .unwrap()
+            .torrents
+            .is_empty());
+    }
+}

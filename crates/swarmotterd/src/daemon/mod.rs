@@ -11,6 +11,7 @@
 mod construction;
 mod containment;
 pub(crate) mod diagnostics;
+mod library_query;
 mod lifecycle;
 mod persistence;
 mod reliability;
@@ -209,6 +210,7 @@ type RssStoreCache = Arc<RwLock<Option<(PathBuf, Arc<crate::rss_store::RssStore>
 #[derive(Clone)]
 pub struct DaemonRuntime {
     pub registry: Arc<Mutex<TorrentRegistry>>,
+    library_queries: Arc<Mutex<library_query::LibraryQueries>>,
     pub config: Arc<RwLock<Config>>,
     /// One compiled immutable peer-admission policy shared by every active
     /// engine, magnet metadata fetch, and inbound listener generation.

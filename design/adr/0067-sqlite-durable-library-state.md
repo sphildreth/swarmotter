@@ -42,9 +42,12 @@ truncation is not a valid library or persistence key.
   64 for pure v2). Schema changes require an explicit migration or an explicit
   startup error.
 - Use a short-lived connection on the daemon's existing serialized state-write
-  lane. Enable foreign keys, WAL, full synchronous durability, and explicit
-  checkpoints before creating a rollback snapshot or closing a write
-  generation. The main database file is mode `0600` on Unix.
+  lane. Enable foreign keys and WAL with full synchronous durability. Commit
+  is the publication boundary for an existing database. Readers can hold an
+  older snapshot while the committed changes remain in the WAL. Checkpoint
+  explicitly before copying a standalone rollback snapshot or renaming a new
+  database. SQLite manages live WAL and shared-memory sidecars. The main
+  database file is mode `0600` on Unix.
 - Retain canonical exact bencoded `info` bytes separately from the exact
   original full `.torrent` input. The former supports identity validation and
   magnet recovery; the latter is the only value that may later be exported as
