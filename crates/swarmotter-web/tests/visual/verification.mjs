@@ -112,6 +112,27 @@ export async function verifyInteractions(page, { requests, faults, streams, libr
   await page.waitForFunction(() => document.querySelectorAll(".name-cell").length === 8);
   await click('#smart-filters [data-state=""]');
   await page.waitForSelector(".name-cell[data-inspect='" + library[0].info_hash + "']");
+  const sizeHeader = page.locator(".tabulator-col[tabulator-field=total_length]");
+  assert(await sizeHeader.isVisible());
+  await click("#column-toggle");
+  await click("#column-toggle");
+  assert(await sizeHeader.isVisible(), "Size stays visible with advanced columns off");
+  await hit(page, "/torrents/query", "GET", () => click("#torrent-next-page-btn"));
+  const lengths = library.map(row => row.total_length);
+  for (const [dir, expected] of [["desc", Math.max(...lengths)], ["asc", Math.min(...lengths)]]) {
+    const response = page.waitForResponse(r => {
+      const url = new URL(r.url());
+      return url.pathname === "/api/v1/torrents/query" && url.searchParams.get("sort") === "size"
+        && url.searchParams.get("dir") === dir && url.searchParams.get("page") === "1";
+    });
+    await sizeHeader.click();
+    const { data } = await (await response).json();
+    assert.equal(data.rows[0].total_length, expected);
+    const eligible = library.filter(row => row.total_length === expected).map(row => row.info_hash);
+    await page.waitForFunction(ids => ids.includes(document.querySelector(".name-cell")?.dataset.inspect), eligible);
+    assert.match(await page.locator(".tabulator-row .tabulator-cell[tabulator-field=total_length]").first().innerText(), /GiB/);
+  }
+  pass("Size is visible by default and sorts across pages, largest first then smallest");
   await hit(page, "/torrents/query", "GET", () =>
     click(".tabulator-col[tabulator-field=name] .tabulator-col-title"),
   );

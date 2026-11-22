@@ -274,6 +274,8 @@ that clears it. The persisted `seeding` object has nullable `ratio_limit` and
 globals; explicit zero is an immediate target. `seed_forever: true` makes both
 effective fields `null` without erasing stored overrides.
 
+The `needs_metadata` flag indicates that a magnet has not resolved its payload size. Display its size as pending while this flag is true. With `sort=size`, both directions put pending sizes last before pagination.
+
 Rows also include an explicit `identity` object with `kind` (`v1`, `v2`, or
 `hybrid`) and the applicable full hash values. `unknown` is retained only for a
 legacy record that predates the additive identity field. The longstanding

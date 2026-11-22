@@ -276,6 +276,7 @@ impl Torrent {
             state: self.state,
             pause_reason: self.current_pause_reason(),
             error: self.error.clone(),
+            needs_metadata: self.needs_metadata,
             total_length: self.meta.total_length,
             bytes_completed: self.bytes_completed(),
             uploaded: self.uploaded,

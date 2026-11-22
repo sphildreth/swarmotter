@@ -239,7 +239,7 @@ export function setTorrentPage(page) {
 }
 
 export function normalizeTorrentRow(t) {
-  const total = finiteNumber(t.total_length);
+  const total = t.needs_metadata ? null : finiteNumber(t.total_length);
   const completed = finiteNumber(t.bytes_completed);
   const progress = completed === null || total === null || total <= 0
     ? null
@@ -249,6 +249,7 @@ export function normalizeTorrentRow(t) {
     ...t,
     info_hash: String(t.info_hash || ""),
     name: torrentDisplayName(t),
+    total_length: total,
     progress_percent: progress === null ? 0 : progress,
     health_label: healthLabelName(rawHealthLabel),
     health_score: finiteNumber(t?.health?.score) ?? 0,
@@ -338,14 +339,15 @@ export function torrentTableColumns() {
     {
       title: "Size",
       field: "total_length",
-      visible: false,
+      headerSortStartingDir: "desc",
+      sorterParams: { alignEmptyValues: "bottom" },
       width: 87,
       hozAlign: "right",
       sorter: "number",
       headerFilter: "input",
       headerFilterPlaceholder: "> 0",
       headerFilterFunc: numericHeaderFilter,
-      formatter: cell => fmtBytes(cell.getValue()),
+      formatter: cell => cell.getValue() === null ? "Pending" : fmtBytes(cell.getValue()),
     },
     {
       title: "Progress",
@@ -1283,10 +1285,8 @@ function renderLibraryRail(query) {
 $("#advanced-columns").addEventListener("change", event => {
   const enabled = event.target.checked;
   $("#torrent-table").classList.toggle("advanced", enabled);
-  for (const field of ["total_length","_actions"]) {
-    const column = state.torrentTable?.getColumn(field);
-    if (column) enabled ? column.show() : column.hide();
-  }
+  const column = state.torrentTable?.getColumn("_actions");
+  if (column) enabled ? column.show() : column.hide();
   state.torrentTable?.redraw(true);
 });
 $("#torrent-label-filter").addEventListener("change", applyTorrentSearchFilter);
@@ -1345,7 +1345,7 @@ $("#saved-links").addEventListener("click",event=>{
 });
 $("#library-order").addEventListener("change",event=>{
   state.torrentQueryState.sort=normalizeTorrentSort(event.target.value);
-  state.torrentQueryState.dir="asc";
+  state.torrentQueryState.dir=state.torrentQueryState.sort === "size" ? "desc" : "asc";
   state.torrentQueryState.page=1;
   refreshTorrents();
 });

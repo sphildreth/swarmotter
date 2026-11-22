@@ -239,6 +239,10 @@ pub(super) fn sorted_torrent_page<T: Borrow<TorrentSummary>>(
     }
     let compare = |a: &T, b: &T| {
         let (a, b) = (a.borrow(), b.borrow());
+        // An unresolved magnet has no comparable payload size in either direction.
+        if sort == TorrentListSort::Size && a.needs_metadata != b.needs_metadata {
+            return a.needs_metadata.cmp(&b.needs_metadata);
+        }
         let order = compare_torrent_rows(a, b, sort)
             .then_with(|| compare_strings(&a.name, &b.name))
             .then_with(|| a.info_hash.cmp(&b.info_hash));

@@ -26,6 +26,8 @@ must remain same-origin, and reverse proxies must preserve the public `Host`.
 
 Torrents opens at the root URL. Use the header to switch between Torrents, Add, Network, Settings, Watch and Logs. The health button opens Doctor. The transfer strip follows the library-wide statistics and the current network policy on every view. The rate charts collect history while this browser is open. An em dash marks an unavailable observation. At smaller widths use **Sections** and **Inspector** to open the side panes. Escape closes an open pane.
 
+Click **Size** beside **Name** to see the largest torrent first across all pages of the current view. Click again for smallest first. Magnets awaiting metadata show **Pending** after the known sizes. Sorting changes the display order only.
+
 Click a torrent name to inspect it. Its checkbox controls bulk selection. **Full torrent details** opens the file priorities, tracker and peer diagnostics, policy, queue, storage and lifecycle controls. **View** exposes column filters, optional columns, page size and the existing saved query. The plus beside **Saved Views** saves a named query in this browser. Use Ctrl+K or Command+K to focus the active workspace search.
 
 ## Create torrents

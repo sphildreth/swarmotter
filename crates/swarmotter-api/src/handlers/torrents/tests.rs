@@ -36,6 +36,7 @@ fn summary_with(
         state,
         pause_reason: None,
         error: None,
+        needs_metadata: false,
         total_length: 1000,
         bytes_completed: 500,
         uploaded: 0,
@@ -580,6 +581,33 @@ fn sort_torrent_rows_desc_reverses() {
     );
     assert_eq!(rows[0].name, "beta");
     assert_eq!(rows[1].name, "alpha");
+}
+
+#[test]
+fn size_sort_pages_by_payload_bytes_and_keeps_unresolved_magnets_last() {
+    let rows: Vec<_> = [
+        ("pending", 23, true),
+        ("tiny", 0, false),
+        ("large", 1 << 40, false),
+    ]
+    .into_iter()
+    .map(|(name, length, needs_metadata)| {
+        let mut row = minimal_summary();
+        row.name = name.into();
+        row.total_length = length;
+        row.needs_metadata = needs_metadata;
+        row
+    })
+    .collect();
+    for (dir, expected) in [
+        (TorrentListDirection::Desc, ["large", "tiny", "pending"]),
+        (TorrentListDirection::Asc, ["tiny", "large", "pending"]),
+    ] {
+        for (offset, name) in expected.into_iter().enumerate() {
+            let page = sorted_torrent_page(rows.clone(), TorrentListSort::Size, dir, offset, 1);
+            assert_eq!(page[0].name, name);
+        }
+    }
 }
 
 #[test]
