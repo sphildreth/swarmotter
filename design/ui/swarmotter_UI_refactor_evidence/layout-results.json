@@ -1,0 +1,372 @@
+{
+  "canonical": {
+    "torrents": {
+      "HEADER": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "nav active": [
+        230,
+        11.5,
+        84,
+        33
+      ],
+      "telemetry": [
+        9,
+        69,
+        1654,
+        66
+      ],
+      "pane rail torrent-rail": [
+        9,
+        147,
+        251,
+        781
+      ],
+      "pane center": [
+        271,
+        147,
+        991,
+        781
+      ],
+      "torrent-heading": [
+        272,
+        148,
+        989,
+        50
+      ],
+      "table-foot": [
+        272,
+        867,
+        989,
+        60
+      ],
+      "pane inspector": [
+        1273,
+        147,
+        390,
+        781
+      ]
+    },
+    "add": {
+      "HEADER": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "nav active": [
+        323,
+        11.5,
+        65,
+        33
+      ],
+      "telemetry": [
+        9,
+        69,
+        1654,
+        66
+      ],
+      "pane rail": [
+        10,
+        145,
+        247,
+        772
+      ],
+      "pane center": [
+        268,
+        145,
+        973,
+        772
+      ],
+      "page-head": [
+        283,
+        161,
+        943,
+        49
+      ],
+      "pane inspector": [
+        1252,
+        145,
+        410,
+        772
+      ]
+    },
+    "network": {
+      "HEADER": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "nav active": [
+        397,
+        11.5,
+        88,
+        33
+      ],
+      "telemetry": [
+        9,
+        69,
+        1654,
+        66
+      ],
+      "pane rail": [
+        10,
+        145,
+        247,
+        772
+      ],
+      "pane center": [
+        268,
+        145,
+        973,
+        772
+      ],
+      "page-head": [
+        283,
+        161,
+        943,
+        49
+      ],
+      "pane inspector": [
+        1252,
+        145,
+        410,
+        772
+      ]
+    },
+    "settings": {
+      "HEADER": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "nav active": [
+        494,
+        11.5,
+        91,
+        33
+      ],
+      "telemetry": [
+        9,
+        69,
+        1654,
+        66
+      ],
+      "pane rail settings-nav": [
+        10,
+        145,
+        247,
+        772
+      ],
+      "pane center": [
+        268,
+        145,
+        973,
+        772
+      ],
+      "page-head": [
+        283,
+        161,
+        943,
+        49
+      ],
+      "pane inspector": [
+        1252,
+        145,
+        410,
+        772
+      ]
+    },
+    "watch": {
+      "HEADER": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "nav active": [
+        594,
+        11.5,
+        81,
+        33
+      ],
+      "telemetry": [
+        9,
+        69,
+        1654,
+        66
+      ],
+      "pane rail": [
+        10,
+        145,
+        247,
+        772
+      ],
+      "pane center": [
+        268,
+        145,
+        973,
+        772
+      ],
+      "page-head": [
+        283,
+        161,
+        943,
+        49
+      ],
+      "pane inspector": [
+        1252,
+        145,
+        410,
+        772
+      ],
+      "ins-footer": [
+        1253,
+        852,
+        408,
+        64
+      ]
+    },
+    "logs": {
+      "HEADER": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "nav active": [
+        679,
+        11.5,
+        67,
+        33
+      ],
+      "telemetry": [
+        9,
+        69,
+        1654,
+        66
+      ],
+      "pane rail": [
+        10,
+        145,
+        247,
+        772
+      ],
+      "pane center": [
+        268,
+        145,
+        973,
+        772
+      ],
+      "page-head": [
+        283,
+        161,
+        943,
+        49
+      ],
+      "pane inspector": [
+        1252,
+        145,
+        410,
+        772
+      ],
+      "ins-footer": [
+        1253,
+        862,
+        408,
+        54
+      ]
+    }
+  },
+  "responsive": [
+    {
+      "view": "torrents",
+      "width": 1280,
+      "height": 800,
+      "documentWidth": 1280,
+      "inspectorReachable": true
+    },
+    {
+      "view": "add",
+      "width": 1280,
+      "height": 800,
+      "documentWidth": 1280,
+      "inspectorReachable": true
+    },
+    {
+      "view": "network",
+      "width": 1280,
+      "height": 800,
+      "documentWidth": 1280,
+      "inspectorReachable": true
+    },
+    {
+      "view": "settings",
+      "width": 1280,
+      "height": 800,
+      "documentWidth": 1280,
+      "inspectorReachable": true
+    },
+    {
+      "view": "watch",
+      "width": 1280,
+      "height": 800,
+      "documentWidth": 1280,
+      "inspectorReachable": true
+    },
+    {
+      "view": "logs",
+      "width": 1280,
+      "height": 800,
+      "documentWidth": 1280,
+      "inspectorReachable": true
+    },
+    {
+      "view": "torrents",
+      "width": 390,
+      "height": 844,
+      "documentWidth": 390,
+      "inspectorReachable": true
+    },
+    {
+      "view": "add",
+      "width": 390,
+      "height": 844,
+      "documentWidth": 390,
+      "inspectorReachable": true
+    },
+    {
+      "view": "network",
+      "width": 390,
+      "height": 844,
+      "documentWidth": 390,
+      "inspectorReachable": true
+    },
+    {
+      "view": "settings",
+      "width": 390,
+      "height": 844,
+      "documentWidth": 390,
+      "inspectorReachable": true
+    },
+    {
+      "view": "watch",
+      "width": 390,
+      "height": 844,
+      "documentWidth": 390,
+      "inspectorReachable": true
+    },
+    {
+      "view": "logs",
+      "width": 390,
+      "height": 844,
+      "documentWidth": 390,
+      "inspectorReachable": true
+    }
+  ]
+}

@@ -1,0 +1,252 @@
+{
+  "origin": "http://127.0.0.1:9091",
+  "chromium": "156.0.8078.4",
+  "at": "2026-11-22T00:45:23.267Z",
+  "deviceScaleFactor": 1,
+  "viewport": {
+    "width": 1672,
+    "height": 941
+  },
+  "panes": {
+    "torrents": {
+      "HEADER": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "telemetry": [
+        9,
+        69,
+        1654,
+        66
+      ],
+      "pane rail torrent-rail": [
+        9,
+        147,
+        251,
+        781
+      ],
+      "pane center": [
+        271,
+        147,
+        991,
+        781
+      ],
+      "pane inspector": [
+        1273,
+        147,
+        390,
+        781
+      ]
+    },
+    "add": {
+      "HEADER": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "telemetry": [
+        9,
+        69,
+        1654,
+        66
+      ],
+      "pane rail": [
+        10,
+        145,
+        247,
+        772
+      ],
+      "pane center": [
+        268,
+        145,
+        973,
+        772
+      ],
+      "pane inspector": [
+        1252,
+        145,
+        410,
+        772
+      ]
+    },
+    "network": {
+      "HEADER": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "telemetry": [
+        9,
+        69,
+        1654,
+        66
+      ],
+      "pane rail": [
+        10,
+        145,
+        247,
+        772
+      ],
+      "pane center": [
+        268,
+        145,
+        973,
+        772
+      ],
+      "pane inspector": [
+        1252,
+        145,
+        410,
+        772
+      ]
+    },
+    "settings": {
+      "HEADER": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "telemetry": [
+        9,
+        69,
+        1654,
+        66
+      ],
+      "pane rail settings-nav": [
+        10,
+        145,
+        247,
+        772
+      ],
+      "pane center": [
+        268,
+        145,
+        973,
+        772
+      ],
+      "pane inspector": [
+        1252,
+        145,
+        410,
+        772
+      ]
+    },
+    "watch": {
+      "HEADER": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "telemetry": [
+        9,
+        69,
+        1654,
+        66
+      ],
+      "pane rail": [
+        10,
+        145,
+        247,
+        772
+      ],
+      "pane center": [
+        268,
+        145,
+        973,
+        772
+      ],
+      "pane inspector": [
+        1252,
+        145,
+        410,
+        772
+      ]
+    },
+    "logs": {
+      "HEADER": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "telemetry": [
+        9,
+        69,
+        1654,
+        66
+      ],
+      "pane rail": [
+        10,
+        145,
+        247,
+        772
+      ],
+      "pane center": [
+        268,
+        145,
+        973,
+        772
+      ],
+      "pane inspector": [
+        1252,
+        145,
+        410,
+        772
+      ]
+    }
+  },
+  "observedPaths": [
+    "/",
+    "/api/v1/doctor",
+    "/api/v1/events",
+    "/api/v1/logs/recent",
+    "/api/v1/network/diagnostics",
+    "/api/v1/network/health",
+    "/api/v1/peer-filter",
+    "/api/v1/profiles",
+    "/api/v1/rss",
+    "/api/v1/settings",
+    "/api/v1/stats",
+    "/api/v1/torrents/query",
+    "/api/v1/trash",
+    "/api/v1/watch/status",
+    "/app.js",
+    "/fonts/inter-bold.woff2",
+    "/fonts/inter-medium.woff2",
+    "/fonts/inter-regular.woff2",
+    "/fonts/inter-semibold.woff2",
+    "/fonts/noto-sans-mono.woff2",
+    "/js/api.js",
+    "/js/create.js",
+    "/js/details.js",
+    "/js/events.js",
+    "/js/intake.js",
+    "/js/log-explorer.js",
+    "/js/provenance.js",
+    "/js/rss-id.js",
+    "/js/settings.js",
+    "/js/state.js",
+    "/js/torrent-inspector.js",
+    "/js/torrents.js",
+    "/js/trash.js",
+    "/js/ui.js",
+    "/js/workspace.js",
+    "/rss.js",
+    "/seeding-policy.js",
+    "/style.css",
+    "/swarmotter-icon-64x64.png",
+    "/theme-bootstrap.js",
+    "/vendor/tabulator/tabulator.min.js",
+    "/vendor/tabulator/tabulator_midnight.min.css",
+    "/watch-history.js",
+    "/workspace.css"
+  ],
+  "writes": [],
+  "errors": []
+}

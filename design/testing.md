@@ -152,6 +152,11 @@ feature completion and acceptance criteria, not by time estimates.
   ES-module route matrix covers `/app.js` and every `/js/*.js` feature module,
   asserting HTTP 200, JavaScript content type, the shared `script-src 'self'`
   CSP, and the intentionally unchanged entry-script cache policy.
+- Exercise the six operational workspaces in Chromium using the production assets,
+  a deterministic loopback API fixture and a separate disposable embedded daemon.
+  Compare the native desktop captures against the approved PNGs, check the shared
+  telemetry across routes and test pane access at narrower widths.
+  [Commands, browser versions and comparison artifacts](ui/swarmotter_UI_refactor_evidence/VALIDATION_REPORT.md)
 - Import torrent from watch folder.
 - Pause/resume/remove lifecycle.
 - Recheck lifecycle.

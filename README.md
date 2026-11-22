@@ -24,9 +24,15 @@
 </p>
 
 <p align="center">
-  <a href="assets/screenshots/v1.2.0/output.gif" title="Click for Screenshots">
-    <img src="assets/screenshots/v1.2.0/output.png" alt="Static screenshot of the SwarmOtter Web UI torrent table" width="50%" title="Click for Screenshots">
+  <a href="assets/screenshots/web-ui-tour.gif">
+    <picture>
+      <source media="(prefers-reduced-motion: reduce)" srcset="assets/screenshots/web-ui-torrents.png">
+      <img src="assets/screenshots/web-ui-tour.gif" alt="SwarmOtter shows a Debian ISO finishing its download and starting to seed, then tours Add, Network, Settings, Watch, and Logs." width="100%">
+    </picture>
   </a>
+  <br>
+  <em>Simulated transfers of Linux ISOs and Blender Open Movies</em>
+  &middot; <a href="assets/screenshots/web-ui-torrents.png">View the still screenshot</a>
 </p>
 
 ---

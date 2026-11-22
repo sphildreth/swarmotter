@@ -84,6 +84,7 @@ function renderResult(result) {
 
 export async function createTorrent() {
   const button = $("#create-btn");
+  if (button?.disabled) return;
   if (button) button.disabled = true;
   try {
     const payload = {

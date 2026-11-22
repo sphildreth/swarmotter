@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { glyph, downloadText, setText } from "./workspace.js";
 import { state, TORRENT_QUERY_STORAGE_KEY, TORRENT_DEFAULT_PER_PAGE, TORRENT_MAX_PER_PAGE, TORRENT_SORT_OPTIONS, TORRENT_TABLE_TO_QUERY_SORT, TORRENT_QUERY_TO_TABLE_SORT, TORRENT_ACTIONS, EVENT_KINDS, MAX_LOG_LINES, watchHistoryUi } from "./state.js";
 import * as ui from "./ui.js";
 import * as requests from "./api.js";
@@ -11,13 +12,46 @@ let settingsDependencies = {
 };
 export function setSettingsDependencies(dependencies) { settingsDependencies = { ...settingsDependencies, ...dependencies }; }
 
-export async function refreshSettings() {
+let savedFields = new Map();
+let lastSave = null;
+let saving = false;
+let loadingSettings = 0;
+function fieldSnapshot() {
+  const fields = Array.from($("#settings-editor")?.elements || []).filter(el =>
+    ["INPUT","SELECT","TEXTAREA"].includes(el.tagName) && !el.readOnly && !el.disabled && el.id !== "toast-seconds");
+  return new Map(fields.map((el,i) => [el.id || `${el.dataset.field || el.type}-${i}`,el.type === "checkbox" ? el.checked : el.value]));
+}
+function changedFields() {
+  const now = fieldSnapshot();
+  return Array.from(new Set([...now.keys(), ...savedFields.keys()])).filter(key => now.get(key) !== savedFields.get(key));
+}
+function updateConfigStatus() {
+  if (!$("#config-health") || !state.fullConfigSnapshot) return;
+  const changes = changedFields();
+  const invalid = $$("#settings-editor input:invalid,#settings-editor textarea:invalid,#settings-editor select:invalid").length;
+  setText("#pending-fields", changes.length ? `${changes.length} unsaved` : "No pending changes");
+  $("#config-health").innerHTML = glyph(invalid || changes.length ? "alert" : "circle-check") + `<b>${invalid ? "Check configuration" : changes.length ? "Unsaved changes" : "Configuration loaded"}</b><small>${changes.length} unsaved fields · ${invalid} validation errors</small>`;
+  $("#config-instance").innerHTML = renderKv([["Daemon","swarmotterd"],["Configured address",state.fullConfigSnapshot.api?.bind_address],["Configuration",lastSave?.config_path || "Daemon configuration"],["Last saved",lastSave?.at || "Not saved this session"]]);
+  $("#config-impact").innerHTML = renderKv([["Unsaved fields",changes.length],["Restart needed",lastSave ? lastSave.restart_required ? "Yes" : "No" : "Awaiting save"],["Validation errors",invalid]]);
+  setText("#api-status", "API reachable");
+  $("#api-status").className="chip ok";
+  $("#auth-state").className="chip "+($("#cfg-api-require-auth").checked ? "ok" : "warn");
+  setText("#auth-state",$("#cfg-api-require-auth").checked ? "Required" : "Not required");
+  setText("#auth-note",$("#cfg-api-require-auth").checked ? "Clients must present a valid access token." : "Authentication is disabled in this configuration. Enable it before exposing the API outside localhost.");
+  $("#save-settings-btn").disabled = saving;
+}
+export async function refreshSettings({ discard = false } = {}) {
+  if (saving || (!discard && state.fullConfigSnapshot && changedFields().length)) return false;
+  const generation = ++loadingSettings;
+
   try {
     const cfg = await api("/settings");
+    if (generation !== loadingSettings || (state.fullConfigSnapshot && !discard && changedFields().length)) return false;
     state.fullConfigSnapshot = cfg;
     renderSettingsEditor(cfg);
     await refreshPeerFilterStatus();
-  } catch (e) { log("settings error: " + e.message); }
+    return true;
+  } catch (e) { setText("#config-health","Configuration unavailable · "+e.message);setText("#api-status","Unavailable");$("#api-status").className="chip"; showError("Load settings failed",e); return false; }
 }
 
 export async function refreshPeerFilterStatus() {
@@ -219,6 +253,8 @@ export function renderSettingsEditor(cfg) {
   renderWatchFolderEditors(cfg.watch || []);
   setSettingsValue("toast-seconds", String(Math.round(state.toastDisplayMs / 1000)));
   activateSettingsPanel(state.activeSettingsPanel, { focus: false });
+  savedFields = fieldSnapshot();
+  updateConfigStatus();
 }
 
 export function renderPeerFilterStatus(status, error = null) {
@@ -345,6 +381,7 @@ export function activateSettingsPanel(panelName, options = {}) {
     const active = button.dataset.settingsTarget === target;
     button.classList.toggle("active", active);
     button.setAttribute("aria-current", active ? "page" : "false");
+    button.setAttribute("aria-pressed", String(active));
   });
   if (options.focus) {
     const panel = $(`[data-settings-panel="${target}"]`);
@@ -355,6 +392,7 @@ export function activateSettingsPanel(panelName, options = {}) {
 export function collectSettingsConfig() {
   const authToken = settingsOptionalString("cfg-api-auth-token");
   return {
+    ...state.fullConfigSnapshot,
     api: {
       bind_address: settingsString("cfg-api-bind-address"),
       auth_token: authToken,
@@ -616,6 +654,7 @@ export function watchOptionalString(row, field) {
 
 $("#settings-editor").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (saving || !state.fullConfigSnapshot) return;
   const form = event.currentTarget;
   if (!form.checkValidity()) {
     const invalid = form.querySelector(":invalid");
@@ -626,14 +665,17 @@ $("#settings-editor").addEventListener("submit", async (event) => {
   }
   const status = $("#settings-save-status");
   try {
+    saving = true;
+    $("#save-settings-btn").disabled = true;
     const nextConfig = collectSettingsConfig();
+    form.inert = true;
     const { result, persistenceError } = await replaceSettingsWithRuntimeFallback(nextConfig);
     if (persistenceError) {
-      await refreshSettings();
       renderRuntimeSettingsFallbackStatus(persistenceError);
       showToast("Runtime settings applied", "Full configuration was not persisted; non-runtime fields were not changed.", "warning");
     } else {
       if (nextConfig.api.auth_token) saveApiToken(nextConfig.api.auth_token);
+      lastSave = {...result, at: new Date().toLocaleString()};
       state.fullConfigSnapshot = result.config;
       renderSettingsEditor(result.config);
       await refreshPeerFilterStatus();
@@ -651,12 +693,12 @@ $("#settings-editor").addEventListener("submit", async (event) => {
       }])}`;
     }
     showError("Save configuration failed", e);
-  }
+  } finally { form.inert = false; saving = false; updateConfigStatus(); }
 });
 
 $("#reload-settings-btn").addEventListener("click", async () => {
-  await refreshSettings();
-  showToast("Settings reloaded", "", "info");
+  if (changedFields().length && !window.confirm("Discard unsaved configuration edits and reload?")) return;
+  if (await refreshSettings({discard:true})) showToast("Settings reloaded", "", "info");
 });
 
 $("#reset-downloads-btn").addEventListener("click", async () => {
@@ -799,4 +841,18 @@ $$(".settings-nav-item").forEach(button => {
   button.addEventListener("click", () => {
     activateSettingsPanel(button.dataset.settingsTarget, { focus: true });
   });
+});
+
+$("#settings-editor")?.addEventListener("input",updateConfigStatus);
+$("#settings-editor")?.addEventListener("click",event => {
+  const section=event.target.closest("[data-open-setting]");
+  if (section) activateSettingsPanel(section.dataset.openSetting,{focus:true});
+  queueMicrotask(updateConfigStatus);
+});
+$("#review-config")?.addEventListener("click",() => {
+  const changes = changedFields();
+  $("#settings-save-status").innerHTML = "<h3>Pending edits</h3>" + (changes.length ? "<ul>"+changes.map(key=>"<li>"+escapeHtml(key.replace(/^cfg-/,"").replaceAll("-"," "))+"</li>").join("")+"</ul>" : "<small>No pending edits.</small>");
+});
+$("#export-config")?.addEventListener("click",() => {
+  if (state.fullConfigSnapshot) downloadText(JSON.stringify(state.fullConfigSnapshot,null,2),"swarmotter-config.json","application/json");
 });

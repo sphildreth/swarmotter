@@ -1,0 +1,1064 @@
+{
+  "torrents": {
+    "navigation": {
+      "box": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "mean_absolute_rgb_error": 7.347,
+      "different_pixels": 83259,
+      "pixels": 98648
+    },
+    "telemetry": {
+      "box": [
+        9,
+        69,
+        1663,
+        135
+      ],
+      "mean_absolute_rgb_error": 12.89,
+      "different_pixels": 106730,
+      "pixels": 109164
+    },
+    "rail": {
+      "box": [
+        9,
+        147,
+        260,
+        928
+      ],
+      "mean_absolute_rgb_error": 12.854,
+      "different_pixels": 188998,
+      "pixels": 196031
+    },
+    "toolbar": {
+      "box": [
+        271,
+        147,
+        1262,
+        266
+      ],
+      "mean_absolute_rgb_error": 8.036,
+      "different_pixels": 109864,
+      "pixels": 117929
+    },
+    "main": {
+      "box": [
+        271,
+        266,
+        1262,
+        868
+      ],
+      "mean_absolute_rgb_error": 19.951,
+      "different_pixels": 588652,
+      "pixels": 596582
+    },
+    "inspector": {
+      "box": [
+        1273,
+        147,
+        1663,
+        928
+      ],
+      "mean_absolute_rgb_error": 20.674,
+      "different_pixels": 298367,
+      "pixels": 304590
+    },
+    "bottom": {
+      "box": [
+        271,
+        868,
+        1262,
+        928
+      ],
+      "mean_absolute_rgb_error": 5.694,
+      "different_pixels": 58700,
+      "pixels": 59460
+    },
+    "samples": [
+      {
+        "xy": [
+          1000,
+          25
+        ],
+        "reference": [
+          13,
+          15,
+          18
+        ],
+        "actual": [
+          13,
+          15,
+          18
+        ]
+      },
+      {
+        "xy": [
+          1050,
+          85
+        ],
+        "reference": [
+          17,
+          22,
+          26
+        ],
+        "actual": [
+          17,
+          22,
+          25
+        ]
+      },
+      {
+        "xy": [
+          1050,
+          115
+        ],
+        "reference": [
+          16,
+          20,
+          23
+        ],
+        "actual": [
+          17,
+          21,
+          24
+        ]
+      },
+      {
+        "xy": [
+          810,
+          180
+        ],
+        "reference": [
+          17,
+          20,
+          23
+        ],
+        "actual": [
+          16,
+          19,
+          22
+        ]
+      },
+      {
+        "xy": [
+          3,
+          750
+        ],
+        "reference": [
+          8,
+          10,
+          13
+        ],
+        "actual": [
+          9,
+          12,
+          15
+        ]
+      },
+      {
+        "xy": [
+          1350,
+          900
+        ],
+        "reference": [
+          15,
+          20,
+          24
+        ],
+        "actual": [
+          18,
+          27,
+          33
+        ]
+      }
+    ]
+  },
+  "add": {
+    "navigation": {
+      "box": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "mean_absolute_rgb_error": 7.155,
+      "different_pixels": 80695,
+      "pixels": 98648
+    },
+    "telemetry": {
+      "box": [
+        9,
+        69,
+        1663,
+        135
+      ],
+      "mean_absolute_rgb_error": 12.89,
+      "different_pixels": 106730,
+      "pixels": 109164
+    },
+    "rail": {
+      "box": [
+        10,
+        145,
+        257,
+        917
+      ],
+      "mean_absolute_rgb_error": 5.75,
+      "different_pixels": 40151,
+      "pixels": 190684
+    },
+    "toolbar": {
+      "box": [
+        268,
+        145,
+        1241,
+        222
+      ],
+      "mean_absolute_rgb_error": 5.398,
+      "different_pixels": 8433,
+      "pixels": 74921
+    },
+    "main": {
+      "box": [
+        268,
+        222,
+        1241,
+        857
+      ],
+      "mean_absolute_rgb_error": 4.991,
+      "different_pixels": 128976,
+      "pixels": 617855
+    },
+    "inspector": {
+      "box": [
+        1252,
+        145,
+        1663,
+        917
+      ],
+      "mean_absolute_rgb_error": 10.852,
+      "different_pixels": 84284,
+      "pixels": 317292
+    },
+    "bottom": {
+      "box": [
+        268,
+        857,
+        1241,
+        917
+      ],
+      "mean_absolute_rgb_error": 5.027,
+      "different_pixels": 43710,
+      "pixels": 58380
+    },
+    "samples": [
+      {
+        "xy": [
+          1000,
+          25
+        ],
+        "reference": [
+          13,
+          15,
+          18
+        ],
+        "actual": [
+          13,
+          15,
+          18
+        ]
+      },
+      {
+        "xy": [
+          1050,
+          85
+        ],
+        "reference": [
+          17,
+          22,
+          26
+        ],
+        "actual": [
+          17,
+          22,
+          25
+        ]
+      },
+      {
+        "xy": [
+          1050,
+          115
+        ],
+        "reference": [
+          16,
+          20,
+          23
+        ],
+        "actual": [
+          17,
+          21,
+          24
+        ]
+      },
+      {
+        "xy": [
+          810,
+          180
+        ],
+        "reference": [
+          17,
+          24,
+          28
+        ],
+        "actual": [
+          17,
+          24,
+          28
+        ]
+      },
+      {
+        "xy": [
+          3,
+          750
+        ],
+        "reference": [
+          11,
+          14,
+          16
+        ],
+        "actual": [
+          11,
+          14,
+          16
+        ]
+      },
+      {
+        "xy": [
+          1350,
+          900
+        ],
+        "reference": [
+          13,
+          19,
+          23
+        ],
+        "actual": [
+          13,
+          19,
+          23
+        ]
+      }
+    ]
+  },
+  "network": {
+    "navigation": {
+      "box": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "mean_absolute_rgb_error": 7.273,
+      "different_pixels": 80868,
+      "pixels": 98648
+    },
+    "telemetry": {
+      "box": [
+        9,
+        69,
+        1663,
+        135
+      ],
+      "mean_absolute_rgb_error": 12.89,
+      "different_pixels": 106730,
+      "pixels": 109164
+    },
+    "rail": {
+      "box": [
+        10,
+        145,
+        257,
+        917
+      ],
+      "mean_absolute_rgb_error": 6.147,
+      "different_pixels": 41238,
+      "pixels": 190684
+    },
+    "toolbar": {
+      "box": [
+        268,
+        145,
+        1241,
+        222
+      ],
+      "mean_absolute_rgb_error": 6.91,
+      "different_pixels": 12820,
+      "pixels": 74921
+    },
+    "main": {
+      "box": [
+        268,
+        222,
+        1241,
+        857
+      ],
+      "mean_absolute_rgb_error": 6.194,
+      "different_pixels": 149565,
+      "pixels": 617855
+    },
+    "inspector": {
+      "box": [
+        1252,
+        145,
+        1663,
+        917
+      ],
+      "mean_absolute_rgb_error": 9.23,
+      "different_pixels": 100694,
+      "pixels": 317292
+    },
+    "bottom": {
+      "box": [
+        268,
+        857,
+        1241,
+        917
+      ],
+      "mean_absolute_rgb_error": 0.0,
+      "different_pixels": 0,
+      "pixels": 58380
+    },
+    "samples": [
+      {
+        "xy": [
+          1000,
+          25
+        ],
+        "reference": [
+          13,
+          15,
+          18
+        ],
+        "actual": [
+          13,
+          15,
+          18
+        ]
+      },
+      {
+        "xy": [
+          1050,
+          85
+        ],
+        "reference": [
+          17,
+          22,
+          26
+        ],
+        "actual": [
+          17,
+          22,
+          25
+        ]
+      },
+      {
+        "xy": [
+          1050,
+          115
+        ],
+        "reference": [
+          16,
+          20,
+          23
+        ],
+        "actual": [
+          17,
+          21,
+          24
+        ]
+      },
+      {
+        "xy": [
+          810,
+          180
+        ],
+        "reference": [
+          17,
+          24,
+          28
+        ],
+        "actual": [
+          17,
+          24,
+          28
+        ]
+      },
+      {
+        "xy": [
+          3,
+          750
+        ],
+        "reference": [
+          11,
+          14,
+          16
+        ],
+        "actual": [
+          11,
+          14,
+          16
+        ]
+      },
+      {
+        "xy": [
+          1350,
+          900
+        ],
+        "reference": [
+          13,
+          19,
+          23
+        ],
+        "actual": [
+          13,
+          19,
+          23
+        ]
+      }
+    ]
+  },
+  "settings": {
+    "navigation": {
+      "box": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "mean_absolute_rgb_error": 7.264,
+      "different_pixels": 81073,
+      "pixels": 98648
+    },
+    "telemetry": {
+      "box": [
+        9,
+        69,
+        1663,
+        135
+      ],
+      "mean_absolute_rgb_error": 12.89,
+      "different_pixels": 106730,
+      "pixels": 109164
+    },
+    "rail": {
+      "box": [
+        10,
+        145,
+        257,
+        917
+      ],
+      "mean_absolute_rgb_error": 7.514,
+      "different_pixels": 25769,
+      "pixels": 190684
+    },
+    "toolbar": {
+      "box": [
+        268,
+        145,
+        1241,
+        222
+      ],
+      "mean_absolute_rgb_error": 5.05,
+      "different_pixels": 11213,
+      "pixels": 74921
+    },
+    "main": {
+      "box": [
+        268,
+        222,
+        1241,
+        857
+      ],
+      "mean_absolute_rgb_error": 6.845,
+      "different_pixels": 208586,
+      "pixels": 617855
+    },
+    "inspector": {
+      "box": [
+        1252,
+        145,
+        1663,
+        917
+      ],
+      "mean_absolute_rgb_error": 10.952,
+      "different_pixels": 146682,
+      "pixels": 317292
+    },
+    "bottom": {
+      "box": [
+        268,
+        857,
+        1241,
+        917
+      ],
+      "mean_absolute_rgb_error": 10.288,
+      "different_pixels": 47900,
+      "pixels": 58380
+    },
+    "samples": [
+      {
+        "xy": [
+          1000,
+          25
+        ],
+        "reference": [
+          13,
+          15,
+          18
+        ],
+        "actual": [
+          13,
+          15,
+          18
+        ]
+      },
+      {
+        "xy": [
+          1050,
+          85
+        ],
+        "reference": [
+          17,
+          22,
+          26
+        ],
+        "actual": [
+          17,
+          22,
+          25
+        ]
+      },
+      {
+        "xy": [
+          1050,
+          115
+        ],
+        "reference": [
+          16,
+          20,
+          23
+        ],
+        "actual": [
+          17,
+          21,
+          24
+        ]
+      },
+      {
+        "xy": [
+          810,
+          180
+        ],
+        "reference": [
+          17,
+          24,
+          28
+        ],
+        "actual": [
+          17,
+          24,
+          28
+        ]
+      },
+      {
+        "xy": [
+          3,
+          750
+        ],
+        "reference": [
+          11,
+          14,
+          16
+        ],
+        "actual": [
+          11,
+          14,
+          16
+        ]
+      },
+      {
+        "xy": [
+          1350,
+          900
+        ],
+        "reference": [
+          13,
+          19,
+          23
+        ],
+        "actual": [
+          13,
+          19,
+          23
+        ]
+      }
+    ]
+  },
+  "watch": {
+    "navigation": {
+      "box": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "mean_absolute_rgb_error": 7.044,
+      "different_pixels": 81277,
+      "pixels": 98648
+    },
+    "telemetry": {
+      "box": [
+        9,
+        69,
+        1663,
+        135
+      ],
+      "mean_absolute_rgb_error": 12.89,
+      "different_pixels": 106730,
+      "pixels": 109164
+    },
+    "rail": {
+      "box": [
+        10,
+        145,
+        257,
+        917
+      ],
+      "mean_absolute_rgb_error": 4.428,
+      "different_pixels": 33348,
+      "pixels": 190684
+    },
+    "toolbar": {
+      "box": [
+        268,
+        145,
+        1241,
+        222
+      ],
+      "mean_absolute_rgb_error": 8.25,
+      "different_pixels": 14222,
+      "pixels": 74921
+    },
+    "main": {
+      "box": [
+        268,
+        222,
+        1241,
+        857
+      ],
+      "mean_absolute_rgb_error": 4.952,
+      "different_pixels": 245254,
+      "pixels": 617855
+    },
+    "inspector": {
+      "box": [
+        1252,
+        145,
+        1663,
+        917
+      ],
+      "mean_absolute_rgb_error": 8.787,
+      "different_pixels": 96778,
+      "pixels": 317292
+    },
+    "bottom": {
+      "box": [
+        268,
+        857,
+        1241,
+        917
+      ],
+      "mean_absolute_rgb_error": 4.316,
+      "different_pixels": 45473,
+      "pixels": 58380
+    },
+    "samples": [
+      {
+        "xy": [
+          1000,
+          25
+        ],
+        "reference": [
+          13,
+          15,
+          18
+        ],
+        "actual": [
+          13,
+          15,
+          18
+        ]
+      },
+      {
+        "xy": [
+          1050,
+          85
+        ],
+        "reference": [
+          17,
+          22,
+          26
+        ],
+        "actual": [
+          17,
+          22,
+          25
+        ]
+      },
+      {
+        "xy": [
+          1050,
+          115
+        ],
+        "reference": [
+          16,
+          20,
+          23
+        ],
+        "actual": [
+          17,
+          21,
+          24
+        ]
+      },
+      {
+        "xy": [
+          810,
+          180
+        ],
+        "reference": [
+          17,
+          24,
+          28
+        ],
+        "actual": [
+          17,
+          24,
+          28
+        ]
+      },
+      {
+        "xy": [
+          3,
+          750
+        ],
+        "reference": [
+          11,
+          14,
+          16
+        ],
+        "actual": [
+          11,
+          14,
+          16
+        ]
+      },
+      {
+        "xy": [
+          1350,
+          900
+        ],
+        "reference": [
+          18,
+          26,
+          32
+        ],
+        "actual": [
+          18,
+          27,
+          33
+        ]
+      }
+    ]
+  },
+  "logs": {
+    "navigation": {
+      "box": [
+        0,
+        0,
+        1672,
+        59
+      ],
+      "mean_absolute_rgb_error": 7.013,
+      "different_pixels": 81309,
+      "pixels": 98648
+    },
+    "telemetry": {
+      "box": [
+        9,
+        69,
+        1663,
+        135
+      ],
+      "mean_absolute_rgb_error": 12.89,
+      "different_pixels": 106730,
+      "pixels": 109164
+    },
+    "rail": {
+      "box": [
+        10,
+        145,
+        257,
+        917
+      ],
+      "mean_absolute_rgb_error": 5.522,
+      "different_pixels": 37828,
+      "pixels": 190684
+    },
+    "toolbar": {
+      "box": [
+        268,
+        145,
+        1241,
+        222
+      ],
+      "mean_absolute_rgb_error": 6.602,
+      "different_pixels": 13177,
+      "pixels": 74921
+    },
+    "main": {
+      "box": [
+        268,
+        222,
+        1241,
+        857
+      ],
+      "mean_absolute_rgb_error": 8.679,
+      "different_pixels": 568826,
+      "pixels": 617855
+    },
+    "inspector": {
+      "box": [
+        1252,
+        145,
+        1663,
+        917
+      ],
+      "mean_absolute_rgb_error": 11.192,
+      "different_pixels": 181665,
+      "pixels": 317292
+    },
+    "bottom": {
+      "box": [
+        268,
+        857,
+        1241,
+        917
+      ],
+      "mean_absolute_rgb_error": 4.872,
+      "different_pixels": 8292,
+      "pixels": 58380
+    },
+    "samples": [
+      {
+        "xy": [
+          1000,
+          25
+        ],
+        "reference": [
+          13,
+          15,
+          18
+        ],
+        "actual": [
+          13,
+          15,
+          18
+        ]
+      },
+      {
+        "xy": [
+          1050,
+          85
+        ],
+        "reference": [
+          17,
+          22,
+          26
+        ],
+        "actual": [
+          17,
+          22,
+          25
+        ]
+      },
+      {
+        "xy": [
+          1050,
+          115
+        ],
+        "reference": [
+          16,
+          20,
+          23
+        ],
+        "actual": [
+          17,
+          21,
+          24
+        ]
+      },
+      {
+        "xy": [
+          810,
+          180
+        ],
+        "reference": [
+          17,
+          24,
+          28
+        ],
+        "actual": [
+          17,
+          24,
+          28
+        ]
+      },
+      {
+        "xy": [
+          3,
+          750
+        ],
+        "reference": [
+          11,
+          14,
+          16
+        ],
+        "actual": [
+          11,
+          14,
+          16
+        ]
+      },
+      {
+        "xy": [
+          1350,
+          900
+        ],
+        "reference": [
+          46,
+          194,
+          176
+        ],
+        "actual": [
+          46,
+          190,
+          173
+        ]
+      }
+    ]
+  }
+}

@@ -464,3 +464,8 @@ Persistence doctor counters report cumulative lock wait, snapshot/scan, SQLite
 write, total/maximum operation latency, errors, and serialized record bytes.
 
 Startup readiness, verified peer completion notifications, incremental retention, and Compose recovery follow [ADR-0080](adr/0080-library-and-container-recovery.md).
+
+
+### Embedded browser workspaces
+
+The application shell, navigation, telemetry history and workspace primitives are shared by the six primary views. The router embeds the ES modules, vendored grid, font subsets and CSS in the daemon. The controls use the same authenticated v1 API as other clients. Browser-only fixture services live under Web UI tests. See [ADR-0089](adr/0089-shared-operational-workspaces.md).

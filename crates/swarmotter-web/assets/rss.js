@@ -5,7 +5,13 @@ import { api } from "./js/api.js";
 import { uniqueRssId } from "./js/rss-id.js";
 import { $, escapeHtml, fmtCount, fmtUnixSeconds, renderKv, renderStatus, showError, showToast, log } from "./js/ui.js";
 
+import { badge, glyph, selectPanel, titleCase, setText, metric } from "./js/workspace.js";
+
+let subscriptions = [], feedId = null, watchStatus = null, refreshGeneration = 0;
+let feedsLoaded = false;
+const runningActions = new Set();
 let editingId = null;
+let originalDraft = null;
 let selectedId = null;
 let decisionsBefore = null;
 let editingLabels = [];
@@ -43,49 +49,64 @@ function actionStatus(action) {
   return "warning";
 }
 
+const feedActions = [["poll","Poll now"],["import-current","Import current"],["decisions","Decision history"],["reconsider","Reconsider older"],["retry","Retry dismissed"],["delete","Delete subscription"]];
 function renderSubscriptionRow(sub) {
-  const counts = sub.counts || {};
-  const baseline = sub.poll_in_progress
-    ? "polling"
-    : sub.baseline_established
-      ? "baseline ready"
-      : "baseline pending";
-  return `<article class="rss-subscription" data-rss-id="${escapeHtml(sub.id)}">
-    <div class="rss-subscription-head">
-      <div>
-        <h4>${escapeHtml(sub.name)}</h4>
-        <div class="muted">${escapeHtml(sub.id)}</div>
-      </div>
-      <div class="rss-subscription-status">
-        ${renderStatus(sub.enabled ? "ok" : "warning")} ${sub.enabled ? "enabled" : "paused"}
-        <span class="muted">every ${fmtCount(sub.poll_interval_seconds)}s</span>
-      </div>
-    </div>
-    <div class="rss-subscription-meta">
-      <div><span class="muted">Feed</span><br>${escapeHtml(sub.url)}</div>
-      <div><span class="muted">Baseline</span><br>${renderStatus(sub.poll_in_progress ? "warning" : sub.baseline_established ? "ok" : "warning")} ${baseline}</div>
-      <div><span class="muted">Counts</span><br>${fmtCount(counts.imported)} imported · ${fmtCount(counts.previously_completed)} completed${counts.failed ? ` · ${fmtCount(counts.failed)} failed` : ""}</div>
-      <div><span class="muted">Last success</span><br>${escapeHtml(sub.last_success_at ? fmtUnixSeconds(sub.last_success_at) : "never")}${sub.latest_error ? `<div class="muted">${escapeHtml(sub.latest_error)}</div>` : ""}</div>
-    </div>
-    <div class="rss-subscription-actions">
-      <button type="button" data-rss-action="preview" data-rss-id="${escapeHtml(sub.id)}">Preview</button>
-      <button type="button" data-rss-action="edit" data-rss-id="${escapeHtml(sub.id)}">Edit</button>
-      <button type="button" data-rss-action="poll" data-rss-id="${escapeHtml(sub.id)}">Poll</button>
-      <button type="button" data-rss-action="import-current" data-rss-id="${escapeHtml(sub.id)}">Import current</button>
-      <button type="button" data-rss-action="decisions" data-rss-id="${escapeHtml(sub.id)}">Decisions</button>
-      <button type="button" data-rss-action="reconsider" data-rss-id="${escapeHtml(sub.id)}">Reconsider older</button>
-      <button type="button" data-rss-action="retry" data-rss-id="${escapeHtml(sub.id)}">Retry dismissed</button>
-      <button type="button" class="danger" data-rss-action="delete" data-rss-id="${escapeHtml(sub.id)}">Delete</button>
-    </div>
-  </article>`;
+  const id = escapeHtml(sub.id);
+  return `<article class="feed-grid feed-row" data-active="${feedId===sub.id}">
+  <button class="feed-name" data-feed="${id}">${glyph("rss")}<span><b>${escapeHtml(sub.name)}</b><small>${escapeHtml(sub.url)}</small></span></button>
+  <small>${escapeHtml((sub.labels || []).join(", "))}</small><small>${sub.poll_interval_seconds/60} min</small>
+  <span>${badge(sub.enabled?"Active":"Paused",sub.enabled?"ok":"")}</span>
+  <details class="options"><summary aria-label="Actions for ${escapeHtml(sub.name)}">${glyph("more")}</summary><div class="options-panel">${feedActions.map(([action,name])=>`<button type="button" data-rss-action="${action}" data-rss-id="${id}">${name}</button>`).join("")}</div></details></article>`;
 }
-
+function renderFeedList() {
+  const search = ($("#feed-search")?.value || "").trim().toLowerCase();
+  const visible = subscriptions.filter(sub => (sub.name+" "+sub.url).toLowerCase().includes(search));
+  $("#rss-subscriptions").innerHTML = visible.map(renderSubscriptionRow).join("") || `<p class="empty">${subscriptions.length ? "No matching subscriptions." : "No subscriptions yet."}</p>`;
+  setText("#feed-count",`${visible.length} shown · ${subscriptions.filter(sub=>sub.enabled).length} active across all subscriptions`);
+}
+function renderFeedInspector() {
+  const sub = subscriptions.find(row=>row.id===feedId);
+  for(const id of ["edit-subscription","feed-preview-action","preview-subscription"]) $("#"+id).disabled=!sub;
+  if(!sub) { $("#feed-inspector").innerHTML='<p class="empty">Select a subscription to inspect its rules and activity.</p>';return; }
+  const ruleChips = ["include","exclude"].flatMap(key=>(sub.rules?.[key]||[]).map(rule=>badge((key==="include"?"+":"−")+[rule.title,rule.category].filter(Boolean).join(" | "),key==="include"?"ok":"warn")));
+  $("#feed-inspector").innerHTML = `<div class="inspector-head">${glyph("rss")}<div><strong>${escapeHtml(sub.name)}</strong><small>RSS subscription inspector</small></div>${badge(sub.enabled?"Active":"Paused",sub.enabled?"ok":"")}</div>
+  <div class="ins-section"><h3>Subscription</h3>${[["Feed URL",sub.url],["Poll interval",sub.poll_interval_seconds+" seconds"],["First poll behavior",sub.import_mode==="new_only"?"New entries only":"Import current matches"],["Intake profile",sub.profile || "Default"]].map(([k,v])=>`<label class="stack-field">${k}<input readonly value="${escapeHtml(v)}"></label>`).join("")}</div>
+  <div class="ins-section"><h3>Matching rules</h3>${ruleChips.join(" ") || "No matching rules."}</div>
+  <div class="ins-section"><h3>Activity</h3>${renderKv([["Last polled",fmtUnixSeconds(sub.last_poll_at)||"Never"],["Last success",fmtUnixSeconds(sub.last_success_at)||"Never"],["Baseline",sub.baseline_established?"Established":"Pending"],["Items reviewed",sub.counts?.listings],["Imported",sub.counts?.imported],["Filtered",sub.counts?.filtered],["Latest error",sub.latest_error || "—"]])}</div>
+  <details class="ins-section"><summary>Subscription details</summary>${renderKv([["Identifier",sub.id],...Object.entries(sub.counts || {}).map(([key,value])=>[titleCase(key),value])])}</details>`;
+}
+function selectFeed(id) {
+  if (feedId !== id) {
+    feedId=id;
+    setText("#rss-preview",id ? "Choose Preview feed to inspect intake decisions." : "Add a subscription to preview feed decisions.");
+    setText("#feed-preview-note","Proposed actions for the selected subscription");
+    setText("#rss-decisions","Open Decision history for this subscription.");
+    decisionsBefore=null;
+    selectedId=null;
+  }
+  renderFeedList();
+  renderFeedInspector();
+}
+export function updateWatchMetrics(status) {
+  if (status !== undefined) watchStatus=status;
+  const active=subscriptions.filter(row=>row.enabled).length;
+  const folders=watchStatus?.folders;
+  const polled=subscriptions.reduce((n,s)=>Math.max(n,s.last_poll_at || 0),0);
+  const imported=subscriptions.reduce((n,s)=>n+(s.counts?.imported || 0),0);
+  $("#watch-metrics").innerHTML=metric("RSS subscriptions",feedsLoaded ? subscriptions.length : null, feedsLoaded ? `${active} active feeds` : "Awaiting feed status") +
+    metric("Watch folders",folders?.length,folders ? folders.reduce((n,f)=>n+(f.pending_torrent_files||0),0)+" pending .torrent files" : "Status unavailable") +
+    metric("Last feed poll",polled ? new Date(polled*1000).toLocaleTimeString() : "—","Across subscriptions") +
+    metric("Feed imports",feedsLoaded ? imported : null,"Recorded by subscriptions");
+  setText("#watch-note",subscriptions.some(s=>s.latest_error) ? "A feed reported a polling error." : `${active} subscriptions enabled for automatic polling.`);
+}
 function renderRss(statuses) {
-  const list = $("#rss-subscriptions");
-  if (!list) return;
-  list.innerHTML = statuses.length === 0
-    ? `<p class="muted">No RSS subscriptions configured.</p>`
-    : `<div class="rss-subscription-list">${statuses.map(renderSubscriptionRow).join("")}</div>`;
+  subscriptions=statuses;
+  feedsLoaded = true;
+  setText("#rail-feeds",statuses.length);
+  selectFeed(statuses.some(s=>s.id===feedId) ? feedId : statuses[0]?.id || null);
+  updateWatchMetrics();
+}
+function populateEditor(statuses) {
   const template = statuses.find(sub => sub.id === editingId);
   if (template && $("#rss-form")) {
     $("#rss-id").value = template.id;
@@ -100,24 +121,20 @@ function renderRss(statuses) {
     $("#rss-rules").value = ruleLines(template.rules);
     editingLabels = Array.isArray(template.labels) ? template.labels : [];
     $("#rss-save-btn").textContent = "Save changes";
+    originalDraft = JSON.stringify(subscriptionPayload());
   }
 }
 
-function renderPreview(preview) {
-  const target = $("#rss-preview");
+function renderPreview(preview, draft = false) {
+  const target = $(draft ? "#rss-draft-preview" : "#rss-preview");
   if (!target) return;
-  target.innerHTML = `
-    <h3>Preview: ${escapeHtml(preview.feed_title || preview.subscription_id)}</h3>
-    <p class="muted">Preview performed no library changes and did not mark entries seen. ${preview.conditional_not_modified ? "Feed reported not modified." : ""}</p>
-    ${preview.decisions.length === 0 ? `<p class="muted">No listings in this feed.</p>` : `
-      <table><thead><tr><th>Listing</th><th>Action</th><th>Reason</th><th>Torrent identity</th></tr></thead>
-      <tbody>${preview.decisions.map(row => `<tr>
-        <td>${escapeHtml(row.title)}<div class="muted">${escapeHtml(row.entry_key)}</div></td>
-        <td>${renderStatus(actionStatus(row.action))} ${escapeHtml(row.action)}</td>
-        <td>${escapeHtml(row.reason)}</td>
-        <td>${escapeHtml((row.torrent_keys || []).join(", "))}</td>
-      </tr>`).join("")}</tbody></table>`}`;
-  target.scrollIntoView?.({ behavior: "smooth", block: "start" });
+  if (!draft && preview.subscription_id !== feedId) return;
+  target.hidden = false;
+  const note = preview.conditional_not_modified ? "Feed reported not modified." : "Preview performed no library changes and did not mark entries seen.";
+  if (!draft) setText("#feed-preview-note",note);
+  target.innerHTML = (draft ? `<small>${escapeHtml(note)}</small>` : "") +
+    (preview.decisions || []).map(row=>`<div class="preview-row">${glyph("file")}<div><strong>${escapeHtml(row.title)}</strong><small>${escapeHtml(row.reason)}</small><details><summary>Entry details</summary>${escapeHtml(row.entry_key)} · ${escapeHtml((row.torrent_keys || []).join(", "))}</details></div>${badge(titleCase(row.action),row.action==="import"?"ok":"")}</div>`).join("");
+  if (draft) target.scrollIntoView({block:"nearest"});
 }
 
 function renderDecisions(page, append = false) {
@@ -148,11 +165,17 @@ function renderDecisions(page, append = false) {
 }
 
 export async function refreshRss() {
+  const generation=++refreshGeneration;
   try {
     const statuses = await api("/rss");
-    renderRss(statuses);
+    if(generation===refreshGeneration) renderRss(statuses);
     return statuses;
   } catch (error) {
+    if (generation!==refreshGeneration) return [];
+    feedsLoaded=false;updateWatchMetrics();
+    setText("#rail-feeds","—");
+    setText("#rss-subscriptions","Subscriptions unavailable · "+error.message);
+    setText("#watch-note","Feed status unavailable");
     log("rss error: " + error.message);
     return [];
   }
@@ -181,7 +204,8 @@ async function previewCurrentSubscription() {
   if (editingId) {
     payload.id = editingId;
     if (!payload.url) {
-      renderPreview(await api(`/rss/${encodeURIComponent(editingId)}/preview`));
+      if (JSON.stringify(payload) !== originalDraft) throw Error("Enter the feed URL to preview unsaved changes. The stored address may contain redacted credentials.");
+      renderPreview(await api(`/rss/${encodeURIComponent(editingId)}/preview`), true);
       return;
     }
   } else {
@@ -197,7 +221,7 @@ async function previewCurrentSubscription() {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
-    }),
+    }), true,
   );
 }
 
@@ -231,6 +255,8 @@ export async function saveRssSubscription(event) {
       showToast("RSS subscription created", payload.name, "success");
     }
     resetRssForm();
+    if(saved?.id) feedId=saved.id;
+    selectPanel("watch-pane","feeds");
     await refreshRss();
     if (saved?.id) {
       try {
@@ -246,6 +272,7 @@ export async function saveRssSubscription(event) {
 
 export function resetRssForm() {
   editingId = null;
+  $("#rss-draft-preview").hidden = true;
   editingLabels = [];
   const form = $("#rss-form");
   if (!form) return;
@@ -260,11 +287,16 @@ export function resetRssForm() {
 }
 
 async function runAction(action, id) {
+  const key = ["poll","import-current","reconsider","retry"].includes(action) ? id+"/intake" : id+"/"+action;
+  if (runningActions.has(key)) return;
+  runningActions.add(key);
   try {
     if (action === "edit") {
+      $("#rss-draft-preview").hidden = true;
       editingId = id;
       const statuses = await api("/rss");
-      renderRss(statuses);
+      populateEditor(statuses);
+      selectPanel("watch-pane","edit");
       $("#rss-form-card")?.scrollIntoView?.({ behavior: "smooth", block: "start" });
       $("#rss-name")?.focus?.();
       return;
@@ -277,6 +309,7 @@ async function runAction(action, id) {
       return;
     }
     if (action === "preview") {
+      selectPanel("watch-pane","feeds");
       renderPreview(await api(`/rss/${encodeURIComponent(id)}/preview`));
       return;
     }
@@ -306,18 +339,21 @@ async function runAction(action, id) {
       return;
     }
     if (action === "decisions") {
+      selectPanel("watch-pane","decisions");
       selectedId = id;
       decisionsBefore = null;
-      renderDecisions(await api(`/rss/${encodeURIComponent(id)}/decisions?limit=100`));
+      const page = await api(`/rss/${encodeURIComponent(id)}/decisions?limit=100`);
+      if (selectedId === id) renderDecisions(page);
     }
   } catch (error) {
     showError("RSS action failed", error);
-  }
+  } finally { runningActions.delete(key); }
 }
 
 $("#rss-subscriptions")?.addEventListener("click", event => {
   const button = event.target.closest("button[data-rss-action]");
   if (!button) return;
+  selectFeed(button.dataset.rssId);
   runAction(button.dataset.rssAction, button.dataset.rssId);
 });
 
@@ -334,8 +370,35 @@ $("#rss-decisions")?.addEventListener("click", async event => {
   if (event.target.id !== "rss-more-decisions") return;
   if (!selectedId || !decisionsBefore) return;
   try {
-    renderDecisions(await api(`/rss/${encodeURIComponent(selectedId)}/decisions?limit=100&before=${decisionsBefore}`), true);
+    const id = selectedId;
+    const cursor = decisionsBefore;
+    const page = await api(`/rss/${encodeURIComponent(id)}/decisions?limit=100&before=${cursor}`);
+    if (selectedId === id && decisionsBefore === cursor) renderDecisions(page,true);
   } catch (error) {
     showError("RSS decision history failed", error);
   }
 });
+
+$("#view-watch")?.addEventListener("click", event=>{
+  const button=event.target.closest("button");
+  if(!button) return;
+  if(button.dataset.feed) selectFeed(button.dataset.feed);
+  const pane=button.dataset.watchPane;
+  if(pane==="defaults") {
+    document.querySelector('.nav[data-view="settings"]').click();
+    document.querySelector('[data-settings-target="watch"]').click();
+  } else if(pane==="decisions" && feedId) runAction("decisions",feedId);
+  else if(pane) selectPanel("watch-pane",pane);
+  if(button.id==="new-subscription") {resetRssForm();selectPanel("watch-pane","edit");$("#rss-name").focus();}
+  if(button.id==="edit-subscription" && feedId) runAction("edit",feedId);
+  if(["preview-subscription","feed-preview-action"].includes(button.id) && feedId) runAction("preview",feedId);
+});
+$("#feed-search")?.addEventListener("input",renderFeedList);
+
+
+export async function inspectSubscription(id) {
+  const statuses = await refreshRss();
+  if (!statuses.some(sub => sub.id === id)) {showToast("Subscription unavailable",id,"warning");return;}
+  selectPanel("watch-pane","feeds");
+  selectFeed(id);
+}

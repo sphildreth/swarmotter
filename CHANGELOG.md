@@ -20,11 +20,14 @@ date or duration estimates.
 - RSS **Preview feed** now previews the current unsaved form through the new
   draft preview endpoint, scrolls to the preview results, and saving a
   subscription automatically displays its preview.
-- Saved RSS subscriptions now render as cards with visible Preview, Edit, and
-  Delete controls instead of a wide table whose action column could be
-  off-screen. Editing scrolls the configuration form into view.
+- Watch keeps subscription actions reachable from the feed list and inspector. Editing opens the subscription form.
 
 ### Changed
+
+- The six Web UI workspaces share a live transfer strip and responsive side panes.
+  Torrents separates inspection from bulk selection and supports named browser-local views.
+  Add can inspect a magnet URI before import. Logs supports bounded pause, filtering,
+  selected-event inspection and filtered export.
 
 - RSS naming no longer asks operators to choose an API/history key in the
   primary form. Configuration files and API clients may still provide explicit

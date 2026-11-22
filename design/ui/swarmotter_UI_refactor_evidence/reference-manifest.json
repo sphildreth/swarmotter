@@ -1,0 +1,121 @@
+{
+  "README.md": {
+    "sha256": "7bc3d82af7ccb68f17b22d51bea5ef2465496a8419cb619f7d7d02b8133dffaf"
+  },
+  "add.html": {
+    "sha256": "26186c7b562ec73f944c5a0af27c4d3525d55d1ded4cf696dfadccab2c9494a2"
+  },
+  "brandmark.png": {
+    "sha256": "891ff396c225b7747d96c170d2ad04bd705fccc10476c6fe70599717f8b0977b",
+    "dimensions": [
+      128,
+      128
+    ]
+  },
+  "logs.html": {
+    "sha256": "cb6bdcaa2c3c9acbb5f7e76340f2e2d418785b8b31f480f059829fdf93b95ec6"
+  },
+  "master-shell-add.png": {
+    "sha256": "e94e4ae0597286a99180f222213fa274d1f2a5d00694242c2e0df3e1dd127315",
+    "dimensions": [
+      1672,
+      145
+    ]
+  },
+  "master-shell-logs.png": {
+    "sha256": "508459a248eabd64506859faa2bbf85a75f0542c5703a43b4d825323577770e7",
+    "dimensions": [
+      1672,
+      145
+    ]
+  },
+  "master-shell-network.png": {
+    "sha256": "843ad35f7670862f5b53ac5e480d2bcc195baf37ad9ea05d8b331f08c1e7eaf9",
+    "dimensions": [
+      1672,
+      145
+    ]
+  },
+  "master-shell-settings.png": {
+    "sha256": "cc5c002c43e762b60742e8fd65a6a2027e362c94da47aae4c27e0a17f17895a3",
+    "dimensions": [
+      1672,
+      145
+    ]
+  },
+  "master-shell-watch.png": {
+    "sha256": "464ea528d968195cdca3245f0230f3e9ad250158ea1062f052c5e158d6d4f5cd",
+    "dimensions": [
+      1672,
+      145
+    ]
+  },
+  "network.html": {
+    "sha256": "be64118c7b9c080f384b3f82cdebbab124917739f47a65b5a7c3c1da5442b425"
+  },
+  "settings.html": {
+    "sha256": "85c4b9aa789e9c49a0ae7a3f19e20258d781e748000706e77c174115cd542162"
+  },
+  "style.css": {
+    "sha256": "e8cda9199fb5336ba4dd94527aa50832f016779092635bd1eeec0e72942d8743"
+  },
+  "swarmotter_add_MASTER_aligned.png": {
+    "sha256": "fc0a4fd4ff7645044e4c7a965d9deebab54e64cf1544a7cb765ff1da0b102d5c",
+    "dimensions": [
+      1672,
+      941
+    ]
+  },
+  "swarmotter_logs_MASTER_aligned.png": {
+    "sha256": "f775aaf47f864476bdfbbb06e830590c8c2a63c04f26f98e58a9f5329be41903",
+    "dimensions": [
+      1672,
+      941
+    ]
+  },
+  "swarmotter_network_MASTER_aligned.png": {
+    "sha256": "0f27f24080e7b124b4433e12186f6e1d8741146833a56a0bf17103507790a196",
+    "dimensions": [
+      1672,
+      941
+    ]
+  },
+  "swarmotter_settings_MASTER_aligned.png": {
+    "sha256": "0c26d7d362235850f0cf4bac87419897e4a85b21706f716600405515fd13c26f",
+    "dimensions": [
+      1672,
+      941
+    ]
+  },
+  "swarmotter_six_screen_master_comparison.png": {
+    "sha256": "fbbd06f3d4909f3650d30fc13eb1c5c0f2ce4331b8d79db3ab3cb0d964438728",
+    "dimensions": [
+      2605,
+      1144
+    ]
+  },
+  "swarmotter_watch_MASTER_aligned.png": {
+    "sha256": "cd40ced481d517054027b3263633495343cd9f10b6fcb6bf36572aa30fa312ec",
+    "dimensions": [
+      1672,
+      941
+    ]
+  },
+  "torrents_MASTER_reference.png": {
+    "sha256": "331d67cc6a513b9ec5ae2e1ce708d64f765c44196425c7d8c7a735c30de65bed",
+    "dimensions": [
+      1672,
+      941
+    ]
+  },
+  "torrents_vs_add_MASTER_alignment.png": {
+    "sha256": "77fa4fb9225bd8437e8799f6cacf964922eb4631debcdf77525897f445e65a62",
+    "dimensions": [
+      3380,
+      1017
+    ]
+  },
+  "watch.html": {
+    "sha256": "55cc905ff14b7decf9c86442726a70be74df7ecc3febf3f01d75f25dcd441cc2"
+  }
+}

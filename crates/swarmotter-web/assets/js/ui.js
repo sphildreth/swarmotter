@@ -117,7 +117,7 @@ export function fmtBytes(n) {
   n = finiteNumber(n);
   if (n === null) return "";
   if (n <= 0) return "0 B";
-  const u = ["B","KB","MB","GB","TB"];
+  const u = ["B","KiB","MiB","GiB","TiB"];
   let i = 0;
   while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
   return n.toFixed(i === 0 ? 0 : 1) + " " + u[i];
@@ -155,7 +155,7 @@ export function renderProgressCell(bytesCompleted, totalLength) {
   const total = finiteNumber(totalLength);
   if (completed === null || total === null || total <= 0) return "";
   const safeCompleted = Math.min(completed, total);
-  return `<progress value="${safeCompleted}" max="${total}"></progress> ${fmtProgress(safeCompleted, total)}`;
+  return `<span class="progress-cell">${fmtProgress(safeCompleted, total).replace(".0%", "%")}<progress value="${safeCompleted}" max="${total}"></progress></span>`;
 }
 
 export function healthLabelName(label) {

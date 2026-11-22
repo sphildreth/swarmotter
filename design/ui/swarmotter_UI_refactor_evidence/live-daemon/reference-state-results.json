@@ -1,0 +1,30 @@
+{
+  "document_origin": "http://127.0.0.1:9091",
+  "api": "isolated in-memory fixture",
+  "captures": {
+    "add": {
+      "sha256": "f09cb36fc700459c0109a3356fab847ba7bc93f8c9729eb8ea47ba614c8cc52b",
+      "matches_recorded_capture": true
+    },
+    "logs": {
+      "sha256": "136164425f4cacb136455e9bb95b08af86f6c5400dccbbd99943355be0f5120e",
+      "matches_recorded_capture": true
+    },
+    "network": {
+      "sha256": "6ad830294a53952bb025431a93f69332101d997a09e85913f6dc3a657251117d",
+      "matches_recorded_capture": true
+    },
+    "settings": {
+      "sha256": "a4f2c74fa44a7468784e631d8733fd446bf9a7c748143e84460df03550655739",
+      "matches_recorded_capture": true
+    },
+    "torrents": {
+      "sha256": "d13dbf50247e9c24ef8c99943f204915a47121073274b04b46c055f62a7734e1",
+      "matches_recorded_capture": true
+    },
+    "watch": {
+      "sha256": "14a41f39f1b02dd21da5107b433ee77fef82ba62e54e4995d19ad736f70d19fa",
+      "matches_recorded_capture": true
+    }
+  }
+}

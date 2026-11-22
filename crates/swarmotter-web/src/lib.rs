@@ -73,8 +73,7 @@ const MASKABLE_ICON_512: &[u8] =
     include_bytes!("../../../assets/graphics/web/maskable-icon-512x512.png");
 const MSTILE_150: &[u8] = include_bytes!("../../../assets/graphics/web/mstile-150x150.png");
 const SITE_WEBMANIFEST: &[u8] = include_bytes!("../../../assets/graphics/web/site.webmanifest");
-const HEADER_LOGO: &[u8] =
-    include_bytes!("../../../assets/graphics/icons/swarmotter-icon-64x64.png");
+const HEADER_LOGO: &[u8] = include_bytes!("../assets/brandmark.png");
 
 /// Build the web UI router, mounted at `/` (excluding `/api`).
 pub fn web_router() -> Router {
@@ -88,6 +87,10 @@ pub fn web_router() -> Router {
         .route("/js/details.js", get(details_js))
         .route("/js/settings.js", get(settings_js))
         .route("/js/events.js", get(events_js))
+        .route("/js/workspace.js", get(workspace_js))
+        .route("/js/torrent-inspector.js", get(torrent_inspector_js))
+        .route("/js/intake.js", get(intake_js))
+        .route("/js/log-explorer.js", get(log_explorer_js))
         .route("/js/ui.js", get(ui_js))
         .route("/js/create.js", get(create_js))
         .route("/js/provenance.js", get(provenance_js))
@@ -97,6 +100,61 @@ pub fn web_router() -> Router {
         .route("/rss.js", get(rss_js))
         .route("/watch-history.js", get(watch_history_js))
         .route("/theme-bootstrap.js", get(theme_bootstrap_js))
+        .route(
+            "/fonts/inter-regular.woff2",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "font/woff2")],
+                    &include_bytes!("../assets/fonts/inter-regular.woff2")[..],
+                )
+            }),
+        )
+        .route(
+            "/fonts/inter-bold.woff2",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "font/woff2")],
+                    &include_bytes!("../assets/fonts/inter-bold.woff2")[..],
+                )
+            }),
+        )
+        .route(
+            "/fonts/noto-sans-mono.woff2",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "font/woff2")],
+                    &include_bytes!("../assets/fonts/noto-sans-mono.woff2")[..],
+                )
+            }),
+        )
+        .route(
+            "/fonts/LICENSE.txt",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                    include_str!("../assets/fonts/LICENSE.txt"),
+                )
+            }),
+        )
+        .route(
+            "/fonts/inter-medium.woff2",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "font/woff2")],
+                    &include_bytes!("../assets/fonts/inter-medium.woff2")[..],
+                )
+            }),
+        )
+        .route(
+            "/fonts/inter-semibold.woff2",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "font/woff2")],
+                    &include_bytes!("../assets/fonts/inter-semibold.woff2")[..],
+                )
+            }),
+        )
+        .route("/workspace.css", get(workspace_css))
         .route("/style.css", get(style_css))
         .route("/vendor/tabulator/tabulator.min.js", get(tabulator_js))
         .route(
@@ -168,6 +226,30 @@ async fn trash_js() -> Response {
         TRASH_JS,
     )
         .into_response()
+}
+
+async fn workspace_js() -> Response {
+    javascript(include_str!("../assets/js/workspace.js"))
+}
+
+async fn torrent_inspector_js() -> Response {
+    javascript(include_str!("../assets/js/torrent-inspector.js"))
+}
+
+async fn workspace_css() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_str!("../assets/workspace.css"),
+    )
+        .into_response()
+}
+
+async fn intake_js() -> Response {
+    javascript(include_str!("../assets/js/intake.js"))
+}
+
+async fn log_explorer_js() -> Response {
+    javascript(include_str!("../assets/js/log-explorer.js"))
 }
 
 async fn ui_js() -> Response {
@@ -609,7 +691,7 @@ mod tests {
             );
         }
         for needle in [
-            "layout: \"fitDataStretch\"",
+            "layout: \"fitColumns\"",
             "movableColumns: true",
             "initialSort: [{ column: \"name\", dir: \"asc\" }]",
             "headerFilter: \"input\"",
@@ -846,12 +928,12 @@ mod tests {
             "id=\"view-doctor\"",
             "class=\"view-grid\"",
             "class=\"settings-layout\"",
-            "class=\"settings-header\"",
-            "class=\"settings-shell\"",
-            "class=\"settings-nav\"",
+            "class=\"page-head\"",
+            "class=\"pane center\"",
+            "class=\"pane rail settings-nav\"",
             "data-settings-target=\"api\"",
             "data-settings-panel=\"api\"",
-            "class=\"watch-layout\"",
+            "id=\"watch-metrics\"",
         ] {
             assert!(
                 INDEX_HTML.contains(needle),
@@ -1043,11 +1125,11 @@ mod tests {
             "uniqueRssId(",
             "previewCurrentSubscription(",
             "/rss/preview",
-            "rss-subscription-list",
-            "rss-subscription-actions",
+            "renderFeedList(",
+            "data-rss-action=",
             "import { refreshRss } from \"./rss.js\"",
-            "data-rss-action=\"import-current\"",
-            "data-rss-action=\"reconsider\"",
+            "[\"import-current\",",
+            "[\"reconsider\",",
         ] {
             assert!(
                 INDEX_HTML.contains(needle)
@@ -1575,6 +1657,13 @@ mod tests {
             ),
             ("/watch-history.js", "application/javascript; charset=utf-8"),
             ("/rss.js", "application/javascript; charset=utf-8"),
+            ("/workspace.css", "text/css; charset=utf-8"),
+            ("/fonts/inter-regular.woff2", "font/woff2"),
+            ("/fonts/inter-medium.woff2", "font/woff2"),
+            ("/fonts/inter-semibold.woff2", "font/woff2"),
+            ("/fonts/inter-bold.woff2", "font/woff2"),
+            ("/fonts/noto-sans-mono.woff2", "font/woff2"),
+            ("/fonts/LICENSE.txt", "text/plain; charset=utf-8"),
             ("/js/rss-id.js", "application/javascript; charset=utf-8"),
             ("/js/create.js", "application/javascript; charset=utf-8"),
             ("/js/provenance.js", "application/javascript; charset=utf-8"),
@@ -1614,6 +1703,10 @@ mod tests {
             "/js/details.js",
             "/js/settings.js",
             "/js/events.js",
+            "/js/workspace.js",
+            "/js/torrent-inspector.js",
+            "/js/intake.js",
+            "/js/log-explorer.js",
             "/js/ui.js",
         ] {
             let response = app

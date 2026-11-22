@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
+import { addLog, replaceLogTail, logTailRevision, setConnection, hasLogSnapshot, showLogView } from "./log-explorer.js";
+import { updateWatchMetrics } from "../rss.js";
+import { badge, glyph, metric, titleCase, selectPanel, setText } from "./workspace.js";
 import { state, TORRENT_QUERY_STORAGE_KEY, TORRENT_DEFAULT_PER_PAGE, TORRENT_MAX_PER_PAGE, TORRENT_SORT_OPTIONS, TORRENT_TABLE_TO_QUERY_SORT, TORRENT_QUERY_TO_TABLE_SORT, TORRENT_ACTIONS, EVENT_KINDS, MAX_LOG_LINES, watchHistoryUi } from "./state.js";
 import * as ui from "./ui.js";
 import * as requests from "./api.js";
@@ -9,13 +12,16 @@ const { api, apiFetch, responseErrorMessage, saveApiToken } = requests;
 let eventsDependencies = { refreshSettings: async () => {} };
 export function setEventsDependencies(dependencies) { eventsDependencies = { ...eventsDependencies, ...dependencies }; }
 
+let networkGeneration = 0;
 export async function refreshNetwork() {
+  const request = ++networkGeneration;
   try {
     const [d, healthPayload] = await Promise.all([
       api("/network/diagnostics"),
       api("/network/health"),
     ]);
-    const h = d.health || {};
+    if (request !== networkGeneration) return null;
+    const h = d.health || healthPayload || {};
     const portMapping = healthPayload?.port_mapping || d.port_mapping || {};
     const portTest = healthPayload?.port_test || d.port_test || {};
     $("#network-summary").innerHTML = `
@@ -36,6 +42,7 @@ export async function refreshNetwork() {
     $("#network-config").innerHTML = `
       <h3>Configuration</h3>
       ${renderKv([
+        ["Mode", titleCase(h.mode)],
         ["Required interface", h.required_interface || "not set"],
         ["Required IPv4", h.required_source_ipv4 || "not set"],
         ["Required IPv6", h.required_source_ipv6 || "not set"],
@@ -43,6 +50,7 @@ export async function refreshNetwork() {
         ["Torrent IPv6", String(!!d.torrent_allow_ipv6)],
         ["Fail closed", String(!!h.fail_closed)],
       ])}`;
+    renderNetworkOverview(d, h, portMapping, portTest);
     renderPortMapping(portMapping);
     renderPortTest(portTest);
     $("#network-interfaces").innerHTML = `
@@ -60,10 +68,69 @@ export async function refreshNetwork() {
       ${renderCheckList(d.containment_matrix || [])}
       <h3>Checks</h3>
       ${renderCheckList(d.checks || [])}`;
-  } catch (e) { log("network error: " + e.message); }
+    return d;
+  } catch (e) {
+    if (request !== networkGeneration) return null;
+    for (const id of ["network-metrics","network-check-list","network-config","network-nics","network-reach","network-originality","network-interfaces","network-port-test","network-port-mapping","network-health","network-summary","network-checks"]) setText("#"+id, "Unavailable · "+e.message);
+    setText("#network-warning",e.message);
+    $("#network-warning").dataset.tone = "unknown";
+    setText("#net-indicator","Unavailable");
+    $("#net-indicator").className = "chip";
+    setText("#network-note","Network data unavailable");
+    log("network error: " + e.message);
+    return null;
+  }
 }
 
+function renderNetworkOverview(d, h, mapping, test) {
+  const allowed = h.traffic_allowed;
+  setText("#rail-matrix",h.mode === "disabled" ? "Off" : titleCase(h.mode));
+  setText("#rail-interfaces",d.interfaces?.length);
+  const status = allowed === true ? "Online" : allowed === false ? "Blocked" : "Unknown";
+  const disabled = h.mode === "disabled";
+  const healthy = h.mode === "strict" && h.status === "healthy" && allowed === true;
+  const tone = healthy ? "ok" : disabled ? "warn" : allowed === false ? "error" : "unknown";
+  const indicator = disabled ? "Warning" : titleCase(h.status);
+  $("#network-metrics").innerHTML = metric("Network status",status,allowed === true ? "Peer traffic allowed" : h.detail) +
+    metric("Listening port",d.listen_port,"Router mapping "+portMappingStateLabel(mapping).toLowerCase()) +
+    metric("Peer transport",d.utp_enabled ? "TCP + µTP" : "TCP",d.utp_prefer_tcp ? "TCP preferred" : "Transport policy") +
+    metric("Containment mode",titleCase(h.mode),"Fail closed: "+String(h.fail_closed ?? "unknown"));
+  $("#network-metrics .metric-card strong")?.classList.add(allowed ? "positive" : "warning");
+  if (disabled) $("#network-metrics .metric-card:last-child strong")?.classList.add("warning");
+  setText("#net-indicator",indicator);
+  $("#net-indicator").className = "chip " + tone;
+  $("#network-warning").dataset.tone = tone;
+  const headline = disabled ? "Not enforcing containment" : titleCase(h.status);
+  $("#network-warning").innerHTML = glyph(healthy ? "shield" : "warning") + `<div><b>${escapeHtml(headline)}</b><small>${escapeHtml(h.detail)}</small></div>`;
+  $("#network-note").innerHTML = `<b>Containment ${escapeHtml(h.mode || "unknown")}</b>${escapeHtml(h.detail)}`;
+  const checks = d.containment_matrix || [];
+  $("#network-check-list").innerHTML = checks.slice(0,4).map(c => `<div class="check-row">${glyph(c.level==="ok" ? "circle-check" : "warning")}<div><b>${escapeHtml(c.label)}</b><small>${escapeHtml(c.detail)}</small></div>${badge(disabled ? "Disabled" : levelLabel(c.level),disabled || c.level!=="ok" ? "warn" : "ok")}</div>`).join("") || "No containment checks reported.";
+  $("#network-checks").innerHTML = "<h3>DNS &amp; IPv6 diagnostics</h3>" + renderCheckList(d.checks);
+  $("#network-nics").innerHTML = "<h3>Network interfaces</h3>" + (d.interfaces || []).map(n => `<div class="nic">${badge(titleCase(n.status),n.status==="up"?"ok":"")}<b>${escapeHtml(n.name)}</b><small>${escapeHtml((n.addresses || []).join(", "))}</small></div>`).join("");
+  $("#network-reach").innerHTML = "<h3>Port reachability</h3>" + renderKv([["TCP listen port",d.listen_port],["Router mapping",portMappingStateLabel(mapping)],["External port",mapping.external_port ?? "Not mapped"],["Last test",fmtUnixSeconds(test.checked_at) || "Not tested"]]) +
+    `<button class="btn" id="overview-port-test" ${test.enabled && test.endpoint_configured ? "" : "disabled"}>${glyph("activity")} Run port test</button>`;
+  $("#overview-port-test")?.addEventListener("click",async event => {
+    await runPortTest(event.currentTarget);
+    selectPanel("monitor","reach");
+  });
+}
+$("#view-network")?.addEventListener("click", async event => {
+  const button=event.target.closest("button");
+  if (!button) return;
+  if (button.dataset.monitor) selectPanel("monitor",button.dataset.monitor);
+  if (button.id === "network-matrix") selectPanel("monitor","matrix");
+  if (["network-refresh","network-run"].includes(button.id)) {
+    button.disabled = true;
+    button.setAttribute("aria-busy","true");
+    try {
+      const report = await refreshNetwork();
+      if (report && button.id === "network-run") selectPanel("monitor","checks");
+    } finally { button.disabled=false; button.removeAttribute("aria-busy"); }
+  }
+});
+
 export function portMappingStateLabel(status = {}) {
+  if (status.enabled == null) return "Unknown";
   if (!status.enabled) return "Disabled";
   switch (status.state) {
     case "active": return "Active";
@@ -127,6 +194,7 @@ export async function refreshPortMapping(button = null) {
 }
 
 export function portTestStateLabel(status = {}) {
+  if (status.enabled == null) return "Unknown";
   if (!status.enabled) return "Disabled";
   switch (status.state) {
     case "open": return "Open";
@@ -189,16 +257,24 @@ export async function refreshWatch() {
     const status = await api("/watch/status");
     renderWatch(status);
     return status;
-  } catch (e) { log("watch error: " + e.message); }
+  } catch (e) {
+    updateWatchMetrics(null);
+    $("#watch-scan-btn").disabled = true;
+    for (const id of ["watch-config","watch-scan-result","watch-history"]) setText("#"+id,"Watch status unavailable · "+e.message);
+    log("watch error: " + e.message);
+  }
 }
 
 export function renderWatch(status, scanDetail = "") {
+  updateWatchMetrics(status);
   const folders = status?.folders || [];
   const imports = status?.recent_imports || [];
+  setText("#rail-folders",folders.length);
+  setText("#rail-history",imports.length);
   const pending = folders.reduce((sum, folder) => sum + (finiteNumber(folder.pending_torrent_files) || 0), 0);
   const scanButton = $("#watch-scan-btn");
   if (scanButton) {
-    scanButton.disabled = folders.length === 0;
+    scanButton.disabled = folders.length === 0 || scanning;
     scanButton.title = folders.length === 0 ? "No watch folders configured" : "";
   }
   $("#watch-config").innerHTML = `
@@ -254,7 +330,13 @@ export function renderWatchFolderRow(folder) {
     </tr>`;
 }
 
-$("#watch-scan-btn").addEventListener("click", async () => {
+let scanning = false;
+$("#watch-scan-btn").addEventListener("click", async event => {
+  const button = event.currentTarget;
+  if (scanning) return;
+  scanning = true;
+  button.disabled = true;
+  button.setAttribute("aria-busy","true");
   try {
     const before = await api("/watch/status");
     const beforeCount = (before.recent_imports || []).length;
@@ -262,30 +344,27 @@ $("#watch-scan-btn").addEventListener("click", async () => {
     const after = await api("/watch/status");
     const imported = Math.max(0, (after.recent_imports || []).length - beforeCount);
     const detail = `${imported} import result${imported === 1 ? "" : "s"} recorded`;
+    scanning = false;
     renderWatch(after, detail);
     showToast("Watch scan complete", detail, "success");
-  } catch (e) { showError("Watch scan failed", e); }
+  } catch (e) { button.disabled = false; showError("Watch scan failed", e); }
+  finally { scanning = false; button.removeAttribute("aria-busy"); }
 });
 
 // --- Logs ---
-export async function refreshLogs() {
-  try {
-    const snapshot = await api("/logs/recent?lines=200");
-    renderLogSnapshot(snapshot);
-    connectEventStream();
-  } catch (e) { log("events error: " + e.message); }
+let loadingTail;
+export async function refreshLogs({force = false} = {}) {
+  showLogView();
+  connectEventStream();
+  if (hasLogSnapshot() && !force) return;
+  const revision = logTailRevision();
+  if (!loadingTail) loadingTail = api("/logs/recent?lines=200").then(snapshot => { if (revision === logTailRevision()) renderLogSnapshot(snapshot); })
+    .catch(e => {setText("#log-source","Log tail unavailable · "+e.message);})
+    .finally(()=>{loadingTail=null;});
+  await loadingTail;
 }
-
-$("#refresh-logs-btn").addEventListener("click", refreshLogs);
-
-export function renderLogSnapshot(snapshot) {
-  const lines = snapshot?.lines || [];
-  const source = snapshot?.path
-    ? `${snapshot.path}${snapshot.truncated ? " (tail)" : ""}`
-    : "live event stream";
-  $("#log-source").textContent = snapshot?.enabled ? source : `${source} unavailable`;
-  $("#log-stream").textContent = lines.length ? lines.join("\n") : "[no recent log lines]";
-}
+$("#refresh-logs-btn").addEventListener("click", () => refreshLogs({force:true}));
+export function renderLogSnapshot(snapshot) { replaceLogTail(snapshot); }
 
 export function connectEventStream() {
   if (state.logEventStreamController) return;
@@ -301,7 +380,7 @@ export async function readEventStream() {
       signal: controller.signal,
     });
     if (!res.ok || !res.body) throw new Error(await responseErrorMessage(res));
-    appendLogLine("[event stream connected]");
+    setConnection("Connected");
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -310,6 +389,7 @@ export async function readEventStream() {
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       buffer = drainEventStreamBuffer(buffer);
+      if (buffer.length > 1048576) throw Error("Event exceeds browser buffer limit");
     }
   } catch (e) {
     if (!controller.signal.aborted) {
@@ -320,20 +400,22 @@ export async function readEventStream() {
       }
     }
   } finally {
+    controller.abort();
     if (state.logEventStreamController === controller) {
       state.logEventStreamController = null;
+      setConnection("Disconnected");
       if (!$("#view-logs").classList.contains("hidden")) {
-        window.setTimeout(connectEventStream, 10000);
+        window.setTimeout(() => { if (!$("#view-logs").classList.contains("hidden")) connectEventStream(); }, 10000);
       }
     }
   }
 }
 
 export function drainEventStreamBuffer(buffer) {
-  let sep;
-  while ((sep = buffer.indexOf("\n\n")) >= 0) {
-    const raw = buffer.slice(0, sep);
-    buffer = buffer.slice(sep + 2);
+  let separator;
+  while ((separator = /\r?\n\r?\n/.exec(buffer))) {
+    const raw = buffer.slice(0, separator.index);
+    buffer = buffer.slice(separator.index + separator[0].length);
     dispatchEventStreamBlock(raw);
   }
   return buffer;
@@ -356,24 +438,14 @@ export function appendEventLine(kind, raw) {
   const payload = event?.payload && Object.keys(event.payload).length
     ? " " + JSON.stringify(event.payload)
     : "";
-  appendLogLine(`[event] ${kind}${hash}${payload}`);
+  addLog(`[event] ${kind}${hash}${payload}`,event);
   if (kind === "daemon_health_changed") refreshDoctorBadge();
   if ((kind === "network_status_changed" || kind === "port_mapping_changed" || kind === "port_test_changed") && !$("#view-network").classList.contains("hidden")) refreshNetwork();
   if ((kind === "watch_folder_imported" || kind === "watch_folder_failed") && !$("#view-watch").classList.contains("hidden")) refreshWatch();
   if (kind === "settings_changed" && !$("#view-settings").classList.contains("hidden")) eventsDependencies.refreshSettings();
 }
 
-export function appendLogLine(line) {
-  const el = $("#log-stream");
-  if (!el) return;
-  const current = el.textContent && !el.textContent.startsWith("[no recent")
-    ? el.textContent.split("\n")
-    : [];
-  current.push(line);
-  while (current.length > MAX_LOG_LINES) current.shift();
-  el.textContent = current.join("\n");
-  el.scrollTop = el.scrollHeight;
-}
+export function appendLogLine(line) { addLog(line); }
 
 // --- Doctor ---
 export async function refreshDoctor() {

@@ -22,6 +22,12 @@ the UI then uses the same-origin API without a token prompt. Every client that
 can reach an unauthenticated listener can control SwarmOtter. Browser requests
 must remain same-origin, and reverse proxies must preserve the public `Host`.
 
+## Workspaces
+
+Torrents opens at the root URL. Use the header to switch between Torrents, Add, Network, Settings, Watch and Logs. The health button opens Doctor. The transfer strip follows the library-wide statistics and the current network policy on every view. The rate charts collect history while this browser is open. An em dash marks an unavailable observation. At smaller widths use **Sections** and **Inspector** to open the side panes. Escape closes an open pane.
+
+Click a torrent name to inspect it. Its checkbox controls bulk selection. **Full torrent details** opens the file priorities, tracker and peer diagnostics, policy, queue, storage and lifecycle controls. **View** exposes column filters, optional columns, page size and the existing saved query. The plus beside **Saved Views** saves a named query in this browser. Use Ctrl+K or Command+K to focus the active workspace search.
+
 ## Create torrents
 
 The Add view includes **Create Torrent** for local files and directories inside
@@ -105,7 +111,7 @@ POST /api/v1/torrents/file
 
 The app refreshes the torrent list after successful upload.
 
-Selecting **Metadata preview** adds a `.torrent` in a paused state, or lets a
+**Inspect link** displays the name, declared size, exact topic and tracker URLs supplied in the magnet. Inspection is local and creates no queue entry. Selecting the metadata-only intake option and committing an import adds a `.torrent` in a paused state, or lets a
 magnet fetch and verify only its metadata through the contained daemon path.
 Once a magnet preview has its file list, Torrent Details shows the captured
 intake policy and the payload gate. Choose file priorities as needed, then use
@@ -415,13 +421,12 @@ interface name in its current network namespace. See
 
 ## RSS subscriptions
 
-The Watch view includes RSS subscription controls below the watch-folder cards.
+Watch opens on RSS subscriptions. The rail also contains watch folders, scan history, decision history and cleanup.
 Add a feed with a name, URL, polling interval, optional intake profile, start
 behavior, first-poll mode, and rule lines. The stable subscription identifier
 is generated from the name automatically (with a numeric suffix on collision)
 and is not shown as an input. Editing a subscription keeps its identifier and
-history; the generated identifier remains visible under the subscription name
-for API use. Rule lines use
+history; the inspector exposes the identifier under **Subscription details** for API use. Rule lines use
 `+title|category` for includes and `-title|category` for excludes; `*` and `?`
 are wildcards and an omitted field is blank. The operator can pause automatic
 polling without deleting history.
@@ -431,8 +436,8 @@ saved (using an unsaved draft request), then scrolls to the preview card. It
 shows each listing's proposed action, reason, and resolved torrent identities,
 performs no library change, and does not mark entries seen. Saving a
 subscription also refreshes and reveals its preview automatically. The
-subscription row's **Preview** action previews the saved configuration. **Poll** runs the configured first-poll behavior; **Import current**
-explicitly imports current matches. The subscription row shows the baseline
+inspector’s **Preview decisions** action previews the saved configuration. Enter the feed URL to preview edited rules when its stored address is redacted. **Poll** runs the configured first-poll behavior; **Import current**
+explicitly imports current matches. The subscription inspector shows the baseline
 state, last success, latest error, imported/completed counts, and any retryable
 failures. **Decisions** loads paginated per-feed history, **Reconsider older** re-runs
 current rules against stored listings that were never imported, and **Retry
@@ -449,6 +454,8 @@ Operational diagnostics in the UI come from:
 - `GET /api/v1/logs/recent` for live-tail style log snapshots.
 - `GET /api/v1/doctor` for a consolidated operational check summary.
 - `GET /api/v1/version` for the application version shown in the Doctor view.
+
+Logs combines the recent daemon-file tail with authenticated server-sent events. Selecting a row opens its full text and available attributes. The list holds up to 500 entries. **Pause stream** freezes the display while the browser continues receiving events. **Clear view** clears the browser view. **Refresh tail** reads the daemon file again. Export and Copy visible entries use the current filters. Copy event uses the selected entry. The browser reconnects after a stream interruption. The daemon’s event broker has no replay cursor.
 
 The Watch history table has a separate stable Outcome column: `imported`,
 `duplicate`, `permanent failure`, or `transient failure`. Duplicate means the

@@ -13,14 +13,72 @@
   <link rel="manifest" href="/site.webmanifest">
   <link rel="stylesheet" href="/vendor/tabulator/tabulator_midnight.min.css">
   <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/workspace.css">
 </head>
 <body>
+<svg aria-hidden="true" class="symbol-library" xmlns="http://www.w3.org/2000/svg"><defs>
+<symbol id="ico-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06-2 2-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21h-2v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06-2-2 .06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H7v-2h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06 2-2 .06.06a1.65 1.65 0 0 0 1.82.33 1.65 1.65 0 0 0 1-1.51V5h2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06 2 2-.06.06A1.65 1.65 0 0 0 19.4 11a1.65 1.65 0 0 0 1.51 1H21v2h-.09A1.65 1.65 0 0 0 19.4 15Z" transform="translate(-2 -2)"></path></symbol>
+<symbol id="ico-key" viewBox="0 0 24 24"><circle cx="8" cy="15" r="4"></circle><path d="M11 12 20 3l2 2-2 2-2-2-2 2 2 2-2 2"></path></symbol>
+<symbol id="ico-sliders" viewBox="0 0 24 24"><path d="M4 7h16M4 17h16"></path><circle cx="9" cy="7" fill="#0d151a" r="3"></circle><circle cx="15" cy="17" fill="#0d151a" r="3"></circle></symbol>
+<symbol id="ico-bolt" viewBox="0 0 24 24"><path d="m13 2-9 12h7l-1 8 10-12h-7l0-8Z"></path></symbol>
+<symbol id="ico-drive" viewBox="0 0 24 24"><rect height="14" rx="2" width="18" x="3" y="5"></rect><path d="M3 14h18M7 17h.01M11 17h.01"></path></symbol>
+<symbol id="ico-network" viewBox="0 0 24 24"><rect height="6" rx="1" width="6" x="9" y="3"></rect><rect height="6" rx="1" width="6" x="2" y="16"></rect><rect height="6" rx="1" width="6" x="16" y="16"></rect><path d="M12 9v3M5 16v-4h14v4"></path></symbol>
+<symbol id="ico-download" viewBox="0 0 24 24"><path d="M12 3v13m-5-5 5 5 5-5M4 17v4h16v-4"></path></symbol>
+<symbol id="ico-chart" viewBox="0 0 24 24"><path d="M3 19V5m0 14h18M6 15l5-5 4 3 6-7"></path></symbol>
+<symbol id="ico-list" viewBox="0 0 24 24"><path d="M9 6h12M9 12h12M9 18h12M4 6h.01M4 12h.01M4 18h.01"></path></symbol>
+<symbol id="ico-tag" viewBox="0 0 24 24"><path d="M20 13 12 21 3 12V4h8Z"></path><circle cx="7" cy="8" r="1"></circle></symbol>
+<symbol id="ico-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5 5-5 5 5M4 16v4h16v-4"></path></symbol>
+<symbol id="ico-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z"></path><path d="m9 12 2 2 4-4"></path></symbol>
+<symbol id="ico-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7Z"></path></symbol>
+<symbol id="ico-terminal" viewBox="0 0 24 24"><rect height="18" rx="3" width="20" x="2" y="3"></rect><path d="m6 8 4 4-4 4m6 0h5"></path></symbol>
+<symbol id="ico-alert" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M12 8v5m0 3h.01"></path></symbol>
+<symbol id="ico-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"></path><path d="M6.5 8A7 7 0 0 1 19 7l1 5M4 12l1 5a7 7 0 0 0 12.5-1"></path></symbol>
+<symbol id="ico-check" viewBox="0 0 24 24"><path d="m5 12 5 5L20 7"></path></symbol>
+<symbol id="ico-circle-check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="m8 12 3 3 5-6"></path></symbol>
+<symbol id="ico-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M12 11v5m0-8h.01"></path></symbol>
+<symbol id="ico-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"></path></symbol>
+<symbol id="ico-warning" viewBox="0 0 24 24"><path d="M10.3 3.7 1.9 18.3a2 2 0 0 0 1.7 3h16.8a2 2 0 0 0 1.7-3L13.7 3.7a2 2 0 0 0-3.4 0Z"></path><path d="M12 9v4m0 4h.01"></path></symbol>
+<symbol id="ico-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M3 12h18M12 3a16 16 0 0 1 0 18M12 3a16 16 0 0 0 0 18"></path></symbol>
+<symbol id="ico-eye" viewBox="0 0 24 24"><path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12Z"></path><circle cx="12" cy="12" r="3"></circle></symbol>
+<symbol id="ico-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 8L9 4l-3 8H2"></path></symbol>
+<symbol id="ico-rss" viewBox="0 0 24 24"><path d="M4 17a3 3 0 0 1 3 3M4 10c6 0 10 4 10 10M4 4c9 0 16 7 16 16"></path><circle cx="5" cy="19" fill="currentColor" r="2" stroke="none"></circle></symbol>
+<symbol id="ico-pause" viewBox="0 0 24 24"><rect height="16" rx="1" width="4" x="6" y="4"></rect><rect height="16" rx="1" width="4" x="14" y="4"></rect></symbol>
+<symbol id="ico-trash" viewBox="0 0 24 24"><path d="M4 7h16m-14 0 1 14h10l1-14M9 7V4h6v3M10 11v6m4-6v6"></path></symbol>
+<symbol id="ico-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></symbol>
+<symbol id="ico-copy" viewBox="0 0 24 24"><rect height="13" rx="2" width="13" x="8" y="8"></rect><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"></path></symbol>
+<symbol id="ico-external" viewBox="0 0 24 24"><path d="M14 3h7v7M21 3l-9 9"></path><path d="M20 14v6H4V4h6"></path></symbol>
+<symbol id="ico-wifi" viewBox="0 0 24 24"><path d="M2 8a15 15 0 0 1 20 0M5 12a11 11 0 0 1 14 0M8.5 16a6 6 0 0 1 7 0"></path><circle cx="12" cy="20" fill="currentColor" r="1" stroke="none"></circle></symbol>
+<symbol id="ico-server" viewBox="0 0 24 24"><rect height="8" rx="1" width="18" x="3" y="3"></rect><rect height="8" rx="1" width="18" x="3" y="13"></rect><path d="M7 7h.01M7 17h.01"></path></symbol>
+<symbol id="ico-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"></path></symbol>
+<symbol id="ico-layers" viewBox="0 0 24 24"><path d="m12 3 9 5-9 5-9-5 9-5Zm-9 9 9 5 9-5M3 16l9 5 9-5"></path></symbol>
+<symbol id="ico-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7-7l-2 2M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7 7l2-2"></path></symbol>
+<symbol id="ico-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"></path></symbol>
+<symbol id="ico-file" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"></path><path d="M14 2v6h6M8 13h8m-8 4h8"></path></symbol>
+<symbol id="ico-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l4 2"></path></symbol>
+<symbol id="ico-more" viewBox="0 0 24 24"><circle cx="5" cy="12" fill="currentColor" r="1.6" stroke="none"></circle><circle cx="12" cy="12" fill="currentColor" r="1.6" stroke="none"></circle><circle cx="19" cy="12" fill="currentColor" r="1.6" stroke="none"></circle></symbol>
+<symbol id="ico-down" viewBox="0 0 24 24"><path d="M12 3v17m-7-7 7 7 7-7"></path></symbol>
+<symbol id="ico-up" viewBox="0 0 24 24"><path d="M12 21V4m-7 7 7-7 7 7"></path></symbol>
+<symbol id="ico-gauge" viewBox="0 0 24 24"><path d="M3 18a11 11 0 1 1 18 0M12 15l5-7"></path></symbol>
+<symbol id="ico-movie" viewBox="0 0 24 24"><path d="M2 9h20v12H2zM2 9l-1-5 20-4 1 5ZM6 3l3 4m4-5 3 4"></path></symbol>
+<symbol id="ico-monitor" viewBox="0 0 24 24"><path d="M2 4h20v14H2zM8 22h8m-4-4v4"></path></symbol>
+<symbol id="ico-music" viewBox="0 0 24 24"><path d="M8 17V5l13-3v13M8 17a3 3 0 1 1-3-3h3m13 1a3 3 0 1 1-3-3h3"></path></symbol>
+<symbol id="ico-play" viewBox="0 0 24 24"><path d="m6 4 14 8-14 8z"></path></symbol>
+<symbol id="ico-box" viewBox="0 0 24 24"><path d="m12 2 9 5v10l-9 5-9-5V7zM3 7l9 5 9-5m-9 5v10"></path></symbol>
+<symbol id="ico-bookmark" viewBox="0 0 24 24"><path d="M5 3h14v19l-7-5-7 5z"></path></symbol>
+<symbol id="ico-close" viewBox="0 0 24 24"><path d="m5 5 14 14M5 19 19 5"></path></symbol>
+<symbol id="ico-back" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"></path></symbol>
+<symbol id="ico-storage" viewBox="0 0 24 24"><path d="m5 3-3 11v6h20v-6L19 3zM2 14h20M6 17h2m8 0h2"></path></symbol>
+<symbol id="ico-circled-down" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M12 6v12m-5-5 5 5 5-5"></path></symbol>
+<symbol id="ico-circled-pause" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><path d="M9 7v10m6-10v10"></path></symbol>
+<symbol id="ico-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="4"></ellipse><path d="M3 5v14c0 5 18 5 18 0V5M3 10c0 5 18 5 18 0M3 15c0 5 18 5 18 0"></path></symbol>
+</defs></svg>
   <header>
     <div class="brand">
-      <img src="/swarmotter-icon-64x64.png" alt="Logo">
+      <img src="/swarmotter-icon-64x64.png" alt="">
+      <strong>Swarmotter</strong>
     </div>
-    <nav>
-      <button data-view="torrents" class="nav active">Torrents</button>
+    <nav aria-label="Primary navigation">
+      <button data-view="torrents" aria-current="page" class="nav active">Torrents</button>
       <button data-view="add" class="nav">Add</button>
       <button data-view="network" class="nav">Network</button>
       <button data-view="settings" class="nav">Settings</button>
@@ -45,6 +103,8 @@
       <button id="health-badge" class="badge nav" data-view="doctor" type="button">checking</button>
     </div>
   </header>
+  <div class="telemetry-scroll"><div id="telemetry" aria-label="Daemon telemetry">
+    <div class="metric connection"><i id="network-dot"></i><div>Network: <strong id="tele-network">Loading</strong><small>Containment: <span id="tele-mode">—</span></small></div></div><div class="metric rate down"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-down"></use></svg><b id="tele-down">—</b><svg class="spark" viewBox="0 0 100 26" aria-hidden="true" id="spark-down"></svg></div><div class="metric rate up"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-up"></use></svg><b id="tele-up">—</b><svg class="spark" viewBox="0 0 100 26" aria-hidden="true" id="spark-up"></svg></div><div class="metric"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-database"></use></svg><div><small>Torrents</small><b id="tele-count">—</b></div></div><div class="metric"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-circled-down"></use></svg><div><small>Downloading</small><b id="tele-downloads">—</b></div></div><div class="metric"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-circled-pause"></use></svg><div><small>Paused</small><b id="tele-paused">—</b></div></div><div class="metric"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-circle-check"></use></svg><div><small>Seeding</small><b id="tele-seeds">—</b></div></div><div class="metric"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-storage"></use></svg><div><small>Total Size</small><b id="tele-size">—</b></div></div><div class="metric"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-gauge"></use></svg><div><small>Total Ratio</small><b id="tele-ratio">—</b></div></div></div></div>
 
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="false"></div>
 
@@ -52,28 +112,28 @@
     <div>Drop .torrent file to add</div>
   </div>
 
+  <div id="compact-controls" aria-label="Workspace panes"><button class="btn" data-reveal="sections" aria-expanded="false">Sections</button><button class="btn" data-reveal="inspector" aria-expanded="false">Inspector</button></div>
   <main>
     <!-- Torrents view -->
-    <section id="view-torrents" class="view">
-      <div class="toolbar">
-        <label for="search" class="sr-only">Filter torrents</label>
-        <input id="search" type="search" placeholder="Filter torrents..." aria-label="Filter torrents">
-        <button id="clear-torrent-filters-btn" type="button" class="secondary" disabled>Clear Filters</button>
-        <div class="bulk-actions" aria-label="Torrent selection actions">
-          <button id="select-all-torrents-btn" type="button" class="secondary">Select All</button>
-          <button id="deselect-all-torrents-btn" type="button" class="secondary" disabled>Deselect All</button>
-          <button id="pause-selected-torrents-btn" type="button" class="secondary" disabled>Pause Selected</button>
-          <button id="resume-selected-torrents-btn" type="button" class="secondary" disabled>Resume Selected</button>
-          <button id="recheck-selected-torrents-btn" type="button" class="secondary" disabled>Recheck Selected</button>
-          <button id="restart-selected-torrents-btn" type="button" class="secondary" disabled>Restart Selected</button>
-          <button id="export-selected-torrents-btn" type="button" class="secondary" disabled>Export Metainfo</button>
-          <button id="remove-selected-torrents-btn" type="button" class="danger" disabled>Remove Selected</button>
-          <span id="selection-summary" class="muted selection-summary">0 selected</span>
-        </div>
-        <span id="stats-summary" class="muted"></span>
-      </div>
-      <div class="toolbar torrent-query-controls">
-        <label class="torrent-query-field">
+    <section id="view-torrents" class="view workspace">
+<aside class="pane rail torrent-rail">
+<div class="rail-head"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-list"></use></svg><b>Smart Filters</b></div>
+<div id="smart-filters"></div>
+<div class="rail-head"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-bookmark"></use></svg><b>Saved Views</b><button type="button" id="name-view" class="btn icon-only" aria-label="Save a named view"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-plus"></use></svg></button></div>
+<div id="saved-links"></div>
+<div class="rail-head"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-tag"></use></svg><b>Labels</b></div>
+<div id="torrent-labels"></div></aside>
+<div class="pane center">
+<div class="torrent-heading"><h1>Torrents</h1><span id="stats-summary"></span>
+<label class="search-box"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-search"></use></svg><input type="search" id="search" aria-label="Search torrents" placeholder="Search torrents…"><kbd>Ctrl K</kbd></label></div>
+<div class="torrent-tools" aria-label="Torrent selection actions">
+<button type="button" id="go-add" class="btn solid" ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-plus"></use></svg>Add</button>
+<button type="button" id="resume-selected-torrents-btn" class="btn " disabled aria-label="Resume Selected"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-play"></use></svg>Start</button>
+<button type="button" id="pause-selected-torrents-btn" class="btn " disabled aria-label="Pause Selected"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-pause"></use></svg>Pause</button>
+<button type="button" id="recheck-selected-torrents-btn" class="btn " disabled aria-label="Recheck Selected"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-refresh"></use></svg>Recheck</button>
+<button type="button" id="remove-selected-torrents-btn" class="btn danger" disabled aria-label="Remove Selected"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-trash"></use></svg>Remove</button><details class="options"><summary><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-sliders"></use></svg>View <svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-chevron"></use></svg></summary>
+<div class="options-panel">
+<label class="torrent-query-field">
           <span>State</span>
           <select id="torrent-state-filter">
             <option value="">All states</option>
@@ -124,38 +184,78 @@
           <span>Per page</span>
           <input id="torrent-per-page" type="number" min="1" max="500" value="200">
         </label>
-        <div class="torrent-pagination">
-          <button id="torrent-prev-page-btn" type="button" class="secondary" disabled>Prev</button>
-          <span id="torrent-page-summary" class="muted">Page 0/0</span>
-          <button id="torrent-next-page-btn" type="button" class="secondary" disabled>Next</button>
-        </div>
-        <button id="save-torrent-view-btn" type="button" class="secondary">Save View</button>
-        <button id="load-torrent-view-btn" type="button" class="secondary">Load View</button>
-        <button id="clear-torrent-view-btn" type="button" class="secondary">Clear View</button>
-        <span id="query-summary" class="muted"></span>
-      </div>
-      <div id="torrent-table" class="torrent-table" aria-label="Torrent list"></div>
-    </section>
+        <label>Label<input id="torrent-label-filter"></label>
+<button class="secondary" disabled="" id="clear-torrent-filters-btn" type="button">Clear Filters</button>
+<button class="secondary" id="save-torrent-view-btn" type="button">Save View</button>
+<button class="secondary" id="load-torrent-view-btn" type="button">Load View</button>
+<button class="secondary" id="clear-torrent-view-btn" type="button">Clear View</button>
+<button class="secondary" disabled="" id="restart-selected-torrents-btn" type="button">Restart Selected</button>
+<button class="secondary" disabled="" id="export-selected-torrents-btn" type="button">Export Metainfo</button>
+<button class="secondary" id="select-all-torrents-btn" type="button">Select All</button>
+<button class="secondary" disabled="" id="deselect-all-torrents-btn" type="button">Deselect All</button>
+<label><input type="checkbox" id="advanced-columns"> Column filters, size and actions</label><label>Library order<select id="library-order"><option value="name">Name</option><option value="queue">Queue position</option><option value="added">Date added</option><option value="completed">Date completed</option></select></label><button id="remove-named-view" type="button">Delete a named view</button><span id="query-summary"></span></div></details><button type="button" id="column-toggle" class="btn " aria-label="Toggle extended table columns"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-list"></use></svg></button><button type="button" id="torrent-settings" class="btn " aria-label="Torrent settings"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-settings"></use></svg></button></div>
+<div id="torrent-table" class="torrent-table" aria-label="Torrent list"></div>
+<div class="table-foot"><span id="selection-summary">0 selected</span>
+<button type="button" id="torrent-prev-page-btn" class="btn " aria-label="Previous page"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-back"></use></svg></button><span id="torrent-page-summary"></span>
+<button type="button" id="torrent-next-page-btn" class="btn " aria-label="Next page"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-right"></use></svg></button></div></div>
+<aside class="pane inspector">
+<div id="torrent-inspect">
+<div class="inspector-head"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-file"></use></svg><strong>Torrent inspector</strong></div><p class="empty">Select a torrent to inspect its transfer and storage details.</p></div></aside>
+</section>
 
     <!-- Add view -->
-    <section id="view-add" class="view hidden">
-      <h2>Add Torrent</h2>
-      <div class="card">
-        <h3>Add Magnet</h3>
-        <label for="magnet-input">Magnet link</label>
-        <textarea id="magnet-input" rows="3" placeholder="magnet:?xt=urn:btih:..."></textarea>
-        <label for="magnet-dir">Download directory (optional)</label>
-        <input id="magnet-dir" type="text">
-        <label for="magnet-profile">Policy profile</label>
-        <select id="magnet-profile"><option value="">Use label or global defaults</option></select>
-        <label for="magnet-labels">Labels (comma-separated)</label>
-        <input id="magnet-labels" type="text">
-        <label class="settings-check"><input id="magnet-paused" type="checkbox"><span>Add paused (otherwise use profile/global start behavior)</span></label>
-        <label class="settings-check"><input id="magnet-preview" type="checkbox"><span>Metadata preview (fetch the file list, then wait for Start before payload transfer)</span></label>
-        <button id="add-magnet-btn">Add Magnet</button>
-      </div>
-      <div class="card">
-        <h3>Create Torrent</h3>
+    <section id="view-add" class="view workspace hidden">
+<aside class="pane rail">
+<div class="rail-head"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-layers"></use></svg><b>Add methods</b></div>
+<div class="rail-group">
+<h3>Import</h3>
+<button type="button" class="rail-link" data-method="magnet" aria-pressed="true"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-link"></use></svg><span>Magnet link</span></button>
+<button type="button" class="rail-link" data-method="file" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-upload"></use></svg><span>Torrent file</span></button>
+<button type="button" class="rail-link" data-method="create" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-layers"></use></svg><span>Create torrent</span></button></div>
+<div class="rail-group">
+<h3>Recent imports</h3>
+<div id="recent-imports"></div></div>
+<div class="rail-note"><b>Magnet links</b>Paste a magnet URI into the import field.</div></aside>
+<div class="pane center">
+<div class="page-head">
+<div><h1>Add torrent</h1><p>Import a magnet link, upload a .torrent file, or create one from local files.</p></div>
+<div class="page-actions">
+<button type="button" id="commit-import" class="btn solid" ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-plus"></use></svg>Add to queue</button></div></div>
+<div class="tabrow">
+<button data-method="magnet" aria-pressed="true"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-link"></use></svg>Magnet link</button>
+<button data-method="file" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-upload"></use></svg>Torrent file</button>
+<button data-method="create" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-layers"></use></svg>Create torrent</button></div>
+<div data-method="magnet">
+<div class="panel import-form">
+<label class="block-head" for="magnet-input"><strong>Magnet URI</strong><small>Required</small></label><div class="uri-field"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-link"></use></svg><input id="magnet-input" type="text" placeholder="magnet:?xt=urn:btih:…" spellcheck="false"><button type="button" id="copy-input" class="btn icon-only" aria-label="Copy magnet URI"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-copy"></use></svg></button></div><small>Inspect the link before adding it to the queue.</small>
+<div class="two-fields">
+<label>Download directory<input id="magnet-dir" placeholder="Use configured directory"></label>
+<label>Policy profile<select id="magnet-profile"><option value="">Use label or global defaults</option></select></label>
+<label for="magnet-labels">Labels<span class="label-input"><span id="label-chips" aria-hidden="true"></span><input id="magnet-labels" placeholder="Comma-separated labels"></span></label>
+<label>Queue priority<input id="import-priority" readonly value="Managed by the queue"></label></div>
+<div class="block-head"><strong>Start behavior</strong><small>Inherits selected profile unless overridden</small></div>
+<div class="import-checks">
+<label><input name="magnet-start" id="magnet-inherit" type="radio" checked> Use profile or global default</label>
+<label><input id="magnet-preview" type="checkbox"> Queue for metadata only</label>
+<label><input name="magnet-start" id="magnet-paused" type="radio"> Add paused</label>
+<label><input name="magnet-start" id="magnet-start" type="radio"> Start immediately</label></div></div>
+<div class="import-actions"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-shield"></use></svg>
+<div><strong id="import-status">Magnet intake</strong><small>Review the destination and start behavior before adding.</small></div>
+<button type="button" id="inspect-magnet" class="btn " ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-eye"></use></svg>Inspect link</button>
+<button type="button" id="add-magnet-btn" class="btn solid" ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-plus"></use></svg>Add torrent</button></div></div>
+<div class="panel alternate-form" data-method="file" hidden>
+<h3>Upload .torrent</h3>
+        <label for="torrent-file">Torrent file</label>
+        <input id="torrent-file" type="file" accept=".torrent">
+        <label for="file-profile">Policy profile</label>
+        <select id="file-profile"><option value="">Use label or global defaults</option></select>
+        <label for="file-labels">Labels (comma-separated)</label>
+        <input id="file-labels" type="text">
+        <label class="settings-check"><input id="file-paused" type="checkbox"><span>Add paused (otherwise use profile/global start behavior)</span></label>
+        <label class="settings-check"><input id="file-preview" type="checkbox"><span>Preview before starting payload transfer</span></label>
+        <button id="add-file-btn">Upload</button></div>
+<div class="panel alternate-form" data-method="create" hidden>
+<h3>Create Torrent</h3>
         <p class="muted">Create v1, pure v2, or hybrid metainfo from a local file or directory. The source must live inside a configured storage root. Hashing is bounded by storage-root recheck controls and verifies every source piece before export or seeding.</p>
         <form id="create-form">
           <label for="create-source">Source file or directory</label>
@@ -182,21 +282,18 @@
             <button id="create-reset-btn" type="button" class="secondary">Reset</button>
           </div>
         </form>
-        <div id="create-result" aria-live="polite"><p class="muted">Generate metainfo from a file or directory inside a configured storage root.</p></div>
-      </div>
-      <div class="card">
-        <h3>Upload .torrent</h3>
-        <label for="torrent-file">Torrent file</label>
-        <input id="torrent-file" type="file" accept=".torrent">
-        <label for="file-profile">Policy profile</label>
-        <select id="file-profile"><option value="">Use label or global defaults</option></select>
-        <label for="file-labels">Labels (comma-separated)</label>
-        <input id="file-labels" type="text">
-        <label class="settings-check"><input id="file-paused" type="checkbox"><span>Add paused (otherwise use profile/global start behavior)</span></label>
-        <label class="settings-check"><input id="file-preview" type="checkbox"><span>Preview before starting payload transfer</span></label>
-        <button id="add-file-btn">Upload</button>
-      </div>
-    </section>
+        <div id="create-result" aria-live="polite"><p class="muted">Generate metainfo from a file or directory inside a configured storage root.</p></div></div>
+<div class="other-methods">
+<h3>Other ways to add</h3>
+<div class="two-fields">
+<button class="method-card" data-switch-method="file"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-upload"></use></svg><span><b>Upload .torrent</b><small>Drop a torrent file or browse your device.</small><em>Browse files →</em></span></button>
+<button class="method-card" data-switch-method="create"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-layers"></use></svg><span><b>Create .torrent</b><small>Build v1, v2, or hybrid metainfo from local data.</small><em>Create torrent →</em></span></button></div></div></div>
+<aside class="pane inspector">
+<div class="inspector-head"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-file"></use></svg>
+<div><strong>Import preview</strong><small>Metadata inspection</small></div><span class="chip">Local</span></div>
+<div id="import-preview"></div>
+<div class="note">Link inspection reads the supplied URI. Queued metadata retrieval requires an explicit import.</div></aside>
+</section>
 
     <!-- Details view -->
     <section id="view-details" class="view hidden">
@@ -294,84 +391,116 @@
     </section>
 
     <!-- Network view -->
-    <section id="view-network" class="view hidden">
-      <h2>Network Containment</h2>
-      <div class="view-grid network-layout">
-        <div id="network-summary" class="card">
-          <h3>Network summary</h3>
-          <p class="muted">Container-bound state appears here.</p>
-        </div>
-        <div id="network-health" class="card">
-          <h3>Health payload</h3>
-          <pre class="health-payload">Waiting for data...</pre>
-        </div>
-        <div id="network-config" class="card">
-          <h3>Configuration</h3>
-          <p class="muted">Configured interface and bind targets populate here.</p>
-        </div>
-        <div id="network-port-mapping" class="card">
-          <h3>Router port mapping</h3>
-          <p class="muted">No router mapping status is available.</p>
-        </div>
-        <div id="network-port-test" class="card">
-          <h3>Listen-port reachability</h3>
-          <p class="muted">No reachability test has run.</p>
-        </div>
-        <div id="network-interfaces" class="card">
-          <h3>Interfaces</h3>
-          <p class="muted">Observed routing interfaces populate here.</p>
-        </div>
-        <div id="network-originality" class="card">
-          <h3>Containment checks</h3>
-          <p class="muted">DNS and address checks populate here.</p>
-        </div>
-      </div>
-    </section>
+    <section id="view-network" class="view workspace hidden">
+<aside class="pane rail">
+<div class="rail-head"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-network"></use></svg><b>Network</b></div>
+<div class="rail-group">
+<h3>Monitor</h3>
+<button type="button" class="rail-link" data-monitor="overview" aria-pressed="true"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-activity"></use></svg><span>Overview</span></button>
+<button type="button" class="rail-link" data-monitor="matrix" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-shield"></use></svg><span>Containment</span><small id="rail-matrix"></small></button>
+<button type="button" class="rail-link" data-monitor="interfaces" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-network"></use></svg><span>Interfaces</span><small id="rail-interfaces"></small></button>
+<button type="button" class="rail-link" data-monitor="mapping" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-globe"></use></svg><span>Router mapping</span></button>
+<button type="button" class="rail-link" data-monitor="reach" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-chart"></use></svg><span>Reachability tests</span></button></div>
+<div class="rail-group">
+<h3>Diagnostics</h3>
+<button type="button" class="rail-link" data-monitor="summary" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-wifi"></use></svg><span>Peer transports</span></button>
+<button type="button" class="rail-link" data-monitor="checks" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-server"></use></svg><span>DNS & IPv6</span></button>
+<button type="button" class="rail-link" data-monitor="raw" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-terminal"></use></svg><span>Raw health payload</span></button></div>
+<div id="network-note" class="rail-note">Waiting for network health</div></aside>
+<div class="pane center">
+<div class="page-head">
+<div><h1>Network overview</h1><p>Connectivity, peer transport, routing, and containment health.</p></div>
+<div class="page-actions">
+<button type="button" id="network-run" class="btn solid" ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-activity"></use></svg>Run diagnostics</button>
+<button type="button" id="network-refresh" class="btn " ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-refresh"></use></svg>Refresh</button></div></div>
+<div id="network-metrics" class="metric-grid"></div>
+<div data-monitor="overview" class="panel">
+<div class="block-head">
+<div>
+<h3>Network throughput</h3><small>Live transfer rates · last 15 minutes</small></div>
+<div class="legend">Download <span>Upload</span></div></div>
+<div id="throughput-chart"><small>Waiting for transfer samples</small></div>
+<div class="axis-x"><span>15m ago</span><span>12m</span><span>9m</span><span>6m</span><span>3m</span><span>Now</span></div></div>
+<div data-monitor="overview" class="panel">
+<div class="block-head">
+<div>
+<h3>Containment checks</h3><small>Paths covered by the network policy</small></div>
+<button type="button" id="network-matrix" class="btn quiet" ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-right"></use></svg>View full matrix</button></div>
+<div id="network-check-list" class="check-list"></div></div>
+<div id="network-originality" data-monitor="matrix" class="panel" hidden></div>
+<div id="network-interfaces" data-monitor="interfaces" class="panel" hidden></div>
+<div id="network-port-mapping" data-monitor="mapping" class="panel" hidden></div>
+<div id="network-port-test" data-monitor="reach" class="panel" hidden></div>
+<div id="network-summary" data-monitor="summary" class="panel" hidden></div>
+<div id="network-health" data-monitor="raw" class="panel" hidden></div>
+<div id="network-checks" data-monitor="checks" class="panel" hidden></div></div>
+<aside class="pane inspector">
+<div class="inspector-head"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-shield"></use></svg>
+<div><strong>Containment inspector</strong><small>Current runtime configuration</small></div><span id="net-indicator" class="chip">Loading</span></div>
+<div id="network-warning" class="note"></div>
+<div class="ins-section" id="network-config"></div>
+<div class="ins-section" id="network-reach"></div>
+<div class="ins-section" id="network-nics"></div></aside>
+</section>
 
     <!-- Settings view -->
-    <section id="view-settings" class="view hidden">
-      <form id="settings-editor" class="settings-layout">
-        <div class="settings-header">
-          <h2>Settings</h2>
-          <div class="settings-actions" aria-label="Settings actions">
-            <button id="save-settings-btn" type="submit">Save Settings</button>
-            <button id="reload-settings-btn" type="button" class="secondary">Reload</button>
-            <button id="reset-downloads-btn" type="button" class="danger">Reset</button>
-          </div>
-        </div>
-
-        <div class="settings-shell">
-          <nav class="settings-nav" aria-label="Settings sections">
-            <button type="button" class="settings-nav-item active" data-settings-target="api">API</button>
-            <button type="button" class="settings-nav-item" data-settings-target="compatibility">Compatibility</button>
-            <button type="button" class="settings-nav-item" data-settings-target="autopilot">Autopilot</button>
-            <button type="button" class="settings-nav-item" data-settings-target="storage">Storage</button>
-            <button type="button" class="settings-nav-item" data-settings-target="network">Network</button>
-            <button type="button" class="settings-nav-item" data-settings-target="torrent">Torrent</button>
-            <button type="button" class="settings-nav-item" data-settings-target="bandwidth">Bandwidth</button>
-            <button type="button" class="settings-nav-item" data-settings-target="queue">Queue</button>
-            <button type="button" class="settings-nav-item" data-settings-target="profiles">Policy profiles</button>
-            <button type="button" class="settings-nav-item" data-settings-target="seeding">Seeding</button>
-            <button type="button" class="settings-nav-item" data-settings-target="dht">DHT</button>
-            <button type="button" class="settings-nav-item" data-settings-target="pex">PEX</button>
-            <button type="button" class="settings-nav-item" data-settings-target="peer-filter">Peer admission</button>
-            <button type="button" class="settings-nav-item" data-settings-target="watch">Watch folders</button>
-            <button type="button" class="settings-nav-item" data-settings-target="logging">Logging</button>
-            <button type="button" class="settings-nav-item" data-settings-target="interface">Notifications</button>
-          </nav>
-
-          <div class="settings-detail">
-        <div id="settings-api" class="card settings-panel active" data-settings-panel="api" tabindex="-1">
-          <h3>API</h3>
-          <div class="settings-form-grid">
-            <label class="settings-field"><span>Bind address</span><input id="cfg-api-bind-address" type="text" required></label>
-            <label class="settings-field"><span>New auth token</span><input id="cfg-api-auth-token" type="password" autocomplete="new-password"></label>
-            <label class="settings-field"><span>Max request body bytes</span><input id="cfg-api-max-request-body-bytes" type="number" min="1" step="1" required></label>
-            <label class="settings-check"><input id="cfg-api-require-auth" type="checkbox"><span>Require auth</span></label>
-          </div>
-        </div>
-
-        <div id="settings-compatibility" class="card settings-panel" data-settings-panel="compatibility" tabindex="-1" hidden>
+    <section id="view-settings" class="view workspace hidden">
+<aside class="pane rail settings-nav">
+<div class="rail-head"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-settings"></use></svg><b>Settings</b></div>
+<div class="rail-group">
+<h3>Application</h3>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="api" aria-pressed="true"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-key"></use></svg><span>API &amp; access</span></button>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="compatibility" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-sliders"></use></svg><span>Compatibility</span></button>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="autopilot" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-bolt"></use></svg><span>Autopilot</span></button>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="storage" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-drive"></use></svg><span>Storage</span></button>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="network" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-network"></use></svg><span>Network</span></button></div>
+<div class="rail-group">
+<h3>Transfers</h3>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="torrent" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-download"></use></svg><span>Torrent</span></button>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="bandwidth" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-chart"></use></svg><span>Bandwidth</span></button>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="queue" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-list"></use></svg><span>Queue</span></button>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="profiles" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-tag"></use></svg><span>Policy profiles</span></button>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="seeding" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-upload"></use></svg><span>Seeding</span></button></div>
+<div class="rail-group">
+<h3>Integrations &amp; advanced</h3>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="dht" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-network"></use></svg><span>DHT</span></button>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="pex" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-network"></use></svg><span>PEX</span></button>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="peer-filter" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-shield"></use></svg><span>Peer admission</span></button>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="watch" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-folder"></use></svg><span>Watch folders</span></button>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="logging" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-terminal"></use></svg><span>Logging</span></button>
+<button type="button" class="settings-nav-item rail-link" data-settings-target="interface" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-alert"></use></svg><span>Notifications</span></button></div></aside>
+<div class="pane center">
+<div class="page-head">
+<div><h1>Settings</h1><p>Configure Swarmotter behavior, defaults, and access controls.</p></div>
+<div class="page-actions">
+<button type="button" id="reload-settings-btn" class="btn " ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-refresh"></use></svg>Reload</button>
+<button id="save-settings-btn" type="submit" form="settings-editor" class="btn solid" disabled><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-check"></use></svg>Save settings</button></div></div><form id="settings-editor" class="settings-layout" novalidate>
+<div id="settings-api" class="settings-panel active" data-settings-panel="api" tabindex="-1">
+<div class="section-title"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-key"></use></svg>
+<div><h2>API &amp; access</h2><small>Control the local API endpoint and authentication behavior</small></div><span class="chip" id="pending-fields">Loading</span></div>
+<div class="panel">
+<div class="block-head">
+<div>
+<h3>API endpoint</h3><small>Where the Swarmotter control API and web interface listen</small></div><span class="chip" id="api-status">Loading</span></div>
+<div class="two-fields">
+<label>Bind address<input id="cfg-api-bind-address" required></label>
+<label>Maximum request body size (bytes)<input id="cfg-api-max-request-body-bytes" type="number" min="1" step="1" required></label></div><p class="form-help">Address changes require a daemon restart.</p></div>
+<div class="panel">
+<div class="block-head">
+<div>
+<h3>Authentication</h3><small>Secure access for the API and local integrations</small></div><span class="chip" id="auth-state">Loading</span></div>
+<label class="switch-row"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-shield"></use></svg><span><b>Require API authentication</b><small>Reject requests that do not present an access token</small></span><input id="cfg-api-require-auth" type="checkbox" role="switch"></label>
+<div class="two-fields">
+<label>Replacement authentication token<input id="cfg-api-auth-token" type="password" autocomplete="new-password" placeholder="Leave blank to keep the existing token"></label>
+<label>Token lifetime<input readonly value="Until rotated"></label></div><p id="auth-note" class="warn-line"></p></div>
+<div class="panel">
+<div class="block-head">
+<div>
+<h3>Web interface</h3><small>Browser-facing behavior and protection</small></div></div>
+<div class="switch-row"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-globe"></use></svg><span><b>Configured API bind</b><small>The web interface uses the API listener and its authentication policy.</small></span></div>
+<div class="switch-row"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-terminal"></use></svg><span><b>Daemon logging</b><small>Configure severity, structured output and file logging.</small></span>
+<button type="button" data-open-setting="logging" class="btn">Logging</button></div></div></div>
+<div id="settings-compatibility" class="card settings-panel" data-settings-panel="compatibility" tabindex="-1" hidden>
           <h3>Compatibility</h3>
           <label class="settings-check"><input id="cfg-compat-transmission-enabled" type="checkbox"><span>Transmission RPC API</span></label>
           <label class="settings-check"><input id="cfg-compat-qbittorrent-enabled" type="checkbox"><span>qBittorrent WebUI API</span></label>
@@ -585,38 +714,62 @@
           </div>
         </div>
 
-        <div id="settings-save-status" class="card settings-wide">
-          <h3>Save status</h3>
-          <p class="muted">No save operation yet.</p>
-        </div>
-          </div>
-        </div>
-      </form>
-    </section>
+</form></div>
+<aside class="pane inspector">
+<div class="inspector-head"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-info"></use></svg>
+<div><strong>Configuration status</strong><small>Runtime and save operations</small></div></div>
+<div class="config-health" id="config-health">Loading configuration…</div>
+<div class="ins-section">
+<h3>Running instance</h3>
+<div id="config-instance"></div></div>
+<div class="ins-section">
+<h3>Change impact</h3>
+<div id="config-impact"></div>
+<button type="button" id="review-config" class="btn " ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-eye"></use></svg>Review changes</button></div>
+<div class="ins-section">
+<h3>Configuration actions</h3>
+<button type="button" id="export-config" class="btn quiet" ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-download"></use></svg>Export loaded configuration</button>
+<button type="button" id="reset-downloads-btn" class="btn danger" ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-refresh"></use></svg>Reset downloads and logs</button></div>
+<div id="settings-save-status" class="ins-section">
+<h3>Save status</h3><small>No save operation yet.</small></div></aside>
+</section>
 
     <!-- Watch view -->
-    <section id="view-watch" class="view hidden">
-      <h2>Watch Folders &amp; RSS</h2>
-      <div class="watch-layout">
-        <div id="watch-config" class="card">
-          <h3>Watch config</h3>
-          <p class="muted">Watch folder configuration and defaults go here.</p>
-        </div>
-        <div id="watch-scan-result" class="card">
-          <h3>Scan result</h3>
-          <p class="muted">Run a scan to populate details.</p>
-        </div>
-        <div id="watch-history" class="card">
-          <h3>Scan history</h3>
-          <p class="muted">Recent paths and status stream here.</p>
-        </div>
-        <button id="watch-scan-btn" disabled>Scan Now</button>
-        <div id="rss-config" class="card settings-wide">
-          <h3>RSS subscriptions</h3>
-          <p class="muted">Feeds are fetched only through the contained network path. Use Preview, Edit, or Delete on each saved subscription below. Preview explains every decision before anything is added; the first successful poll establishes the baseline for new-entries-only mode.</p>
-          <div id="rss-subscriptions"><p class="muted">Loading RSS subscriptions…</p></div>
-        </div>
-        <div id="rss-form-card" class="card settings-wide">
+    <section id="view-watch" class="view workspace hidden">
+<aside class="pane rail">
+<div class="rail-head"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-rss"></use></svg><b>Automation</b></div>
+<div class="rail-group">
+<h3>Watch sources</h3>
+<button type="button" class="rail-link" data-watch-pane="feeds" aria-pressed="true"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-rss"></use></svg><span>RSS subscriptions</span><small id="rail-feeds"></small></button>
+<button type="button" class="rail-link" data-watch-pane="folders" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-folder"></use></svg><span>Watch folders</span><small id="rail-folders"></small></button>
+<button type="button" class="rail-link" data-watch-pane="history" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-clock"></use></svg><span>Scan history</span><small id="rail-history"></small></button>
+<button type="button" class="rail-link" data-watch-pane="decisions" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-check"></use></svg><span>Decision history</span></button></div>
+<div class="rail-group">
+<h3>Maintenance</h3>
+<button type="button" class="rail-link" data-watch-pane="trash" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-trash"></use></svg><span>Cleanup &amp; trash</span></button>
+<button type="button" class="rail-link" data-watch-pane="defaults" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-settings"></use></svg><span>Automation defaults</span></button></div>
+<div id="watch-note" class="rail-note">Loading automation status…</div></aside>
+<div class="pane center">
+<div class="page-head">
+<div><h1>Watch &amp; automation</h1><p>Automatically discover and import content from trusted feeds and folders.</p></div>
+<div class="page-actions">
+<button id="watch-scan-btn" disabled type="button" class="btn"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-refresh"></use></svg>Scan now</button>
+<button type="button" id="new-subscription" class="btn solid" ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-plus"></use></svg>Add subscription</button></div></div>
+<div class="metric-grid" id="watch-metrics"></div>
+<div class="panel" id="rss-config" data-watch-pane="feeds">
+<div class="block-head">
+<div>
+<h3>RSS subscriptions</h3><small>Monitor feeds, adjust rules, and preview intake decisions</small></div><input id="feed-search" type="search" placeholder="Filter subscriptions…" aria-label="Filter subscriptions"></div>
+<div class="feed-grid feed-labels"><span>Feed</span><span>Labels</span><span>Poll every</span><span>Status</span></div>
+<div id="rss-subscriptions"></div><small id="feed-count"></small></div>
+<div class="panel" data-watch-pane="feeds">
+<div class="block-head">
+<div>
+<h3>Feed preview</h3><small id="feed-preview-note">Proposed actions for the selected subscription</small></div>
+<button type="button" id="feed-preview-action" class="btn quiet" ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-eye"></use></svg>Preview feed</button></div>
+<div id="rss-preview">Add a subscription to preview feed decisions.</div></div>
+<div data-watch-pane="edit" hidden>
+<div id="rss-form-card" class="card settings-wide">
           <h3>Add or edit subscription</h3>
           <form id="rss-form">
             <div class="settings-form-grid">
@@ -637,16 +790,10 @@
               <button id="rss-reset-btn" type="button" class="secondary">Reset form</button>
             </div>
           </form>
+        </div><div id="rss-draft-preview" class="panel" aria-live="polite" hidden></div>
         </div>
-        <div id="rss-preview" class="card settings-wide">
-          <h3>RSS preview</h3>
-          <p class="muted">Preview a feed to see each listing's proposed action and reason. Preview does not add torrents or mark entries seen.</p>
-        </div>
-        <div id="rss-decisions" class="card settings-wide">
-          <h3>Decision history</h3>
-          <p class="muted">Select Decisions on a subscription to load paginated history.</p>
-        </div>
-        <div id="trash-config" class="card settings-wide">
+<div data-watch-pane="trash" hidden>
+<div id="trash-config" class="card settings-wide">
           <h3>Cleanup &amp; Trash</h3>
           <p id="trash-summary" class="muted">Loading trash status…</p>
           <div class="settings-card-heading">
@@ -670,18 +817,62 @@
           <div id="trash-entries"><p class="muted">Loading entries…</p></div>
         </div>
       </div>
-    </section>
+<div data-watch-pane="folders" hidden>
+<div id="watch-config" class="panel"></div>
+<div id="watch-scan-result" class="panel"></div></div>
+<div data-watch-pane="history" hidden>
+<div id="watch-history" class="panel"></div></div>
+<div data-watch-pane="decisions" hidden>
+<div id="rss-decisions" class="panel">
+<h3>Decision history</h3><small>Select a subscription to load its history.</small></div></div></div>
+<aside class="pane inspector">
+<div id="feed-inspector"></div>
+<div class="ins-footer">
+<button type="button" id="edit-subscription" class="btn " ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-settings"></use></svg>Edit subscription</button>
+<button type="button" id="preview-subscription" class="btn solid" ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-eye"></use></svg>Preview decisions</button></div></aside>
+</section>
 
     <!-- Logs view -->
-    <section id="view-logs" class="view hidden">
-      <h2>Logs &amp; Errors</h2>
-      <div id="log-controls" class="card">
-        <h3>Stream controls</h3>
-        <button id="refresh-logs-btn">Refresh Logs</button>
-        <span id="log-source" class="muted"></span>
-      </div>
-      <pre id="log-stream" aria-live="polite"></pre>
-    </section>
+    <section id="view-logs" class="view workspace hidden">
+<aside class="pane rail">
+<div class="rail-head"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-terminal"></use></svg><b>Log explorer</b></div>
+<div class="rail-group">
+<h3>Streams</h3>
+<button type="button" class="rail-link" data-log-filter="all" aria-pressed="true"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-activity"></use></svg><span>All activity</span></button>
+<button type="button" class="rail-link" data-log-filter="daemon" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-terminal"></use></svg><span>Daemon logs</span></button>
+<button type="button" class="rail-link" data-log-filter="automation" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-rss"></use></svg><span>Automation</span></button>
+<button type="button" class="rail-link" data-log-filter="network" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-network"></use></svg><span>Network</span></button>
+<button type="button" class="rail-link" data-log-filter="problems" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-alert"></use></svg><span>Errors &amp; warnings</span></button></div>
+<div class="rail-group">
+<h3>Severity</h3>
+<button type="button" class="rail-link" data-log-filter="INFO" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-check"></use></svg><span>Info</span></button>
+<button type="button" class="rail-link" data-log-filter="WARN" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-warning"></use></svg><span>Warning</span></button>
+<button type="button" class="rail-link" data-log-filter="ERROR" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-alert"></use></svg><span>Error</span></button>
+<button type="button" class="rail-link" data-log-filter="DEBUG" aria-pressed="false"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-terminal"></use></svg><span>Debug</span></button></div>
+<div class="rail-note"><b id="log-connection">Disconnected</b>Server-sent events</div></aside>
+<div class="pane center">
+<div class="page-head">
+<div><h1>Logs &amp; events</h1><p>Search live daemon logs, inspect events, and export diagnostics.</p></div>
+<div class="page-actions">
+<button type="button" id="pause-logs" class="btn " ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-pause"></use></svg>Pause stream</button>
+<button type="button" id="export-logs" class="btn " ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-download"></use></svg>Export logs</button>
+<button type="button" id="clear-logs" class="btn quiet" ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-trash"></use></svg>Clear view</button></div></div>
+<div id="log-controls" class="logbar">
+<label class="search-box"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-search"></use></svg><input type="search" id="log-search" placeholder="Search messages, components, paths…" aria-label="Search logs"><kbd>Ctrl K</kbd></label><select id="log-level" aria-label="Log level"><option value="">All levels</option><option value="INFO">INFO</option><option value="WARN">WARN</option><option value="ERROR">ERROR</option><option value="DEBUG">DEBUG</option><option value="TRACE">TRACE</option></select><select id="log-component" aria-label="Log component"><option value="">All components</option></select><select id="log-time" aria-label="Time range"><option value="">All times</option><option value="24">Last 24 hours</option><option value="1">Last hour</option></select><span id="live-tag" class="chip">Offline</span></div>
+<div class="log-main">
+<div class="log-grid log-labels"><span>Time</span><span>Level</span><span>Component</span><span>Message</span></div>
+<div id="log-stream" aria-label="Log entries"></div>
+<div class="log-foot"><span id="log-showing">Waiting for logs</span><small id="log-state"></small></div></div>
+<div class="log-foot bottom-log"><span id="log-source"></span>
+<button type="button" id="refresh-logs-btn" class="btn quiet" ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-refresh"></use></svg>Refresh tail</button>
+<button type="button" id="copy-logs" class="btn " ><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-copy"></use></svg>Copy visible entries</button></div></div>
+<aside class="pane inspector">
+<div class="inspector-head"><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-alert"></use></svg>
+<div><strong>Event inspector</strong><small id="event-subtitle">Selected log entry</small></div><span id="event-level"></span></div>
+<div id="event-inspector"><p class="empty">Select a row to inspect the full event.</p></div>
+<div class="ins-footer">
+<button type="button" id="copy-event" class="btn solid" disabled><svg class="glyph" aria-hidden="true" viewBox="0 0 24 24"><use href="#ico-copy"></use></svg>Copy event</button></div></aside>
+</section>
 
     <!-- Doctor view -->
     <section id="view-doctor" class="view hidden">

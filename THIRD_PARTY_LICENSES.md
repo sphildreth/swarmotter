@@ -69,6 +69,8 @@ foundational dependency stack rationale.
 | `assets/mermaid.min.js` | Bundled by mdbook-mermaid 0.17.0 | MIT | Browser runtime for rendered Mermaid diagrams in the published user guide |
 | `assets/mermaid-init.js` | Bundled by mdbook-mermaid 0.17.0 | MPL-2.0 | Theme-aware Mermaid initialization script for mdBook |
 | `crates/swarmotter-web/assets/vendor/tabulator` | 6.5.0 | MIT | Vendored browser grid used by the Web UI torrent list for sorting, column filtering, and table refresh behavior |
+| Inter workspace fonts | 4.001 | SIL OFL-1.1 | Locally served Latin WOFF2 subsets of Regular, Medium, SemiBold and Bold. The license and copyright notice accompany the fonts in `crates/swarmotter-web/assets/fonts/LICENSE.txt`. |
+| Noto Sans Mono | 2.014 | SIL OFL-1.1 | Embedded Latin WOFF2 subset for logs, structured data and URI fields. The copyright and license accompany Inter in the workspace font license. |
 
 ## Operating-system runtime dependencies
 

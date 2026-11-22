@@ -41,6 +41,9 @@ export const TORRENT_TABLE_TO_QUERY_SORT = {
   rate_up: "up_rate",
   ratio: "ratio",
   active_peers: "peers",
+  queue_position: "queue",
+  date_added: "added",
+  date_completed: "completed",
 };
 export const TORRENT_QUERY_TO_TABLE_SORT = {
   name: "name",
@@ -53,12 +56,13 @@ export const TORRENT_QUERY_TO_TABLE_SORT = {
   up_rate: "rate_up",
   ratio: "ratio",
   peers: "active_peers",
-  added: "name",
-  completed: "name",
-  queue: "name",
+  added: "date_added",
+  completed: "date_completed",
+  queue: "queue_position",
 };
 
 export const EVENT_KINDS = [
+  "events_dropped",
   "torrent_added",
   "torrent_changed",
   "torrent_removed",
