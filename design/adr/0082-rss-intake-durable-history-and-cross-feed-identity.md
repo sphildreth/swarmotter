@@ -26,9 +26,9 @@ torrents, and remain recoverable with the main database.
   behavior, first-poll mode, labels, and include/exclude rules. The native API
   and Watch UI edit them through the daemon's full configuration transaction.
   A subscription id is immutable; renaming is delete plus create.
-- Feed XML is parsed by a bounded, dependency-free RSS 2.0 reader. Input size
-  and item count are capped. A document without a channel/item shape is an
-  error, not an empty successful feed. Listing identity is the feed GUID when
+- Feed XML is parsed by a bounded, dependency-free RSS 2.0 and Atom 1.0 reader. Input size
+  and item count are capped. A document without a recognized item or Atom entry is an
+  error, not an empty successful feed. Listing identity is the RSS GUID or Atom entry ID when
   present, then the documented fallback link, first enclosure URL,
   `title|pubDate`, and finally title. Repeated unchanged polls update discovery
   timestamps but do not create additional listing rows.
@@ -106,9 +106,19 @@ torrents, and remain recoverable with the main database.
 - The transactional outbox adds a second database to recovery and backup scope.
   A missing or corrupt history database defers automatic RSS intake rather than
   silently re-adding completed content.
-- Support for suffixless torrent URLs depends on a torrent media type or a
-  documented download/torrent URL marker. A plain details page is reported as
-  page-only and is not fetched as arbitrary HTML.
+- A suffixless download endpoint is recognized by a path segment or an explicit
+  download action. Hostnames alone cannot identify torrent files.
+- TorrentDownload and LimeTorrents publish an expected v1 info hash alongside
+  a public detail link. Only these origin-checked formats permit a single
+  contained HTTPS detail request, capped at 512 KiB with redirects disabled.
+  A magnet anchor must match the advertised hash. Other detail pages are
+  recorded as page-only. This scope keeps unrelated pages, recommendations and
+  account workflows outside automatic intake.
+- Version 2 of the RSS history schema repairs older failed or unsupported
+  baseline rows when retained decisions establish their original exclusion.
+  Scheduled polling preserves this state until explicit operator action.
+  Other LimeTorrents listings whose old attachment failed on a downgrade can
+  use the verified page magnet when they next appear in the feed.
 - Feed and attachment parsing remain bounded and local. No search, indexer, or
   external discovery service is introduced.
 - Future RSS changes must preserve the fail-closed contained client, rule

@@ -229,6 +229,93 @@ fn xml_escape(value: &str) -> String {
 }
 
 #[tokio::test]
+async fn atom_new_only_imports_a_new_magnet_once_and_preserves_the_original_baseline() {
+    use swarmotter_core::rss::RssAction;
+    let root = unique_dir("atom-baseline");
+    let state_path = root.join("state.json");
+    let (base, responses, server) = fixture_server().await;
+    let runtime = start_runtime(
+        rss_config(
+            &root,
+            &state_path,
+            vec![subscription(
+                "atom",
+                format!("{base}/atom"),
+                RssRuleSet::default(),
+                RssImportMode::NewOnly,
+            )],
+        ),
+        &state_path,
+    );
+    let make_entry = |id: &str, hash: &str| {
+        format!(
+            r#"<entry><id>{id}</id><title>{id}</title><link rel="enclosure" href="magnet:?xt=urn:btih:{hash}&amp;dn={id}"/></entry>"#
+        )
+    };
+    let original = make_entry("original", &"01".repeat(20));
+    let added_hash = "02".repeat(20);
+    let added = make_entry("new", &added_hash);
+    for (etag, entries, expected_adds) in [
+        ("v1", original.clone(), 0),
+        ("v2", format!("{original}{added}"), 1),
+        ("v3", format!("{added}{original}"), 0),
+    ] {
+        let atom = format!(r#"<feed xmlns="http://www.w3.org/2005/Atom">{entries}</feed>"#);
+        responses
+            .lock()
+            .await
+            .insert("/atom".into(), FixtureResponse::xml(atom, etag));
+        let preview = runtime.preview_rss_subscription("atom").await.unwrap();
+        assert!(preview
+            .decisions
+            .iter()
+            .any(|d| d.entry_key == "guid:original" && d.action == RssAction::Baseline));
+        let result = runtime
+            .poll_rss_subscription("atom", false, false)
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.imported.len(), expected_adds);
+        assert!(result
+            .decisions
+            .iter()
+            .any(|d| d.entry_key == "guid:original" && d.action == RssAction::Baseline));
+    }
+    let store = runtime.rss_history_store().await.unwrap();
+    let listing = store.listing("atom", "guid:new").unwrap().unwrap();
+    assert!(listing.imported_at.is_some());
+    assert_eq!(
+        listing.torrent_keys.as_slice(),
+        std::slice::from_ref(&added_hash)
+    );
+    assert!(runtime
+        .registry
+        .lock()
+        .await
+        .get(&TorrentKey::from_locator(&added_hash).unwrap())
+        .is_some());
+    // Model a v1 database with a baseline overwritten by an attachment failure.
+    let connection = rusqlite::Connection::open(store.path()).unwrap();
+    connection.execute_batch("UPDATE listings SET status='failed',next_attempt_at=123 WHERE entry_key='guid:original'; PRAGMA user_version=1;").unwrap();
+    drop(connection);
+    store.initialize().unwrap();
+    assert_eq!(
+        store
+            .listing("atom", "guid:original")
+            .unwrap()
+            .unwrap()
+            .action(),
+        RssAction::Baseline
+    );
+    assert!(store
+        .pending_retries("atom", u32::MAX.into(), 10)
+        .unwrap()
+        .is_empty());
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn rss_end_to_end_imports_match_explains_exclusion_and_skips_after_selfish_removal_restart() {
     let root = unique_dir("rss-e2e");
     let state_path = root.join("state.json");

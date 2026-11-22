@@ -7,9 +7,21 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
-## [Unreleased]
+## [3.1.0] - [2026-11-22]
+
+### Added
+
+- RSS subscriptions accept Atom 1.0 magnet and torrent enclosures. Public
+  TorrentDownload and LimeTorrents listings can import a same-origin HTTPS
+  detail-page magnet after verifying its info hash against the feed.
 
 ### Fixed
+
+- Updated the URL parser to 2.5.9 for RUSTSEC-2026-0592.
+- RSS intake distinguishes detail pages from torrent files on hosts with
+  “torrent” in the name. Scheduled polls keep first-poll `new_only` entries
+  excluded. The upgrade restores that exclusion for older failed entries with
+  a recorded baseline decision.
 
 - Single and bulk removal publish library and queue changes after the SQLite
   checkpoint succeeds. Payload deletion records a retryable stopped state

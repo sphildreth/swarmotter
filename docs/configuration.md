@@ -1091,18 +1091,21 @@ reordered entries and missing dates do not create new listing rows.
 Feed URLs must use HTTP or HTTPS and must not contain user information. Sensitive
 query values are redacted from status and logs. Torrent attachments are accepted
 from magnet URIs, `.torrent` links/enclosures, torrent-typed enclosures, and
-documented suffixless download/torrent URLs. A plain details page is reported as
-page-only rather than fetched as arbitrary HTML.
+suffixless download endpoints such as `/download` or `?action=download`.
+Atom 1.0 subscriptions use entry IDs, alternate links, enclosure links, and
+category terms. An Atom magnet enclosure works on any feed host.
 
-The operator example `https://www.limetorrents.fun/rss/17/` was checked against
-a representative live sample. It is RSS 2.0 with one item per release. The item
-`guid` is the details-page permalink (also used as `link` and `comments`), the
-category is plain text, and the torrent is supplied by an
-`application/x-bittorrent` enclosure such as
-`https://itorrents.org/torrent/<INFOHASH>.torrent?title=<release>`. The
-enclosure path ends in `.torrent`, so SwarmOtter imports it directly; the
-details `link` is page-only and is not fetched as HTML. No extra resolution step
-is required for this feed format.
+Two public listing formats also support detail-page magnets. On
+`torrentdownload.info`, the last path segment of the listing URL supplies the
+40-digit hexadecimal info hash. On `limetorrents.fun`, the iTorrents enclosure
+filename supplies it. For these formats the daemon fetches the same-origin
+HTTPS detail page through the contained client. It accepts a magnet anchor
+whose v1 info hash matches the listing. If that lookup fails, any advertised
+torrent attachment still goes through the normal contained attachment fetch
+and identity check. The detail request accepts at most 512 KiB or the configured
+attachment limit, whichever is smaller, and stops at redirects. Other
+human-facing pages require a usable link or enclosure in the feed. A login
+page alone cannot supply a torrent.
 
 The dedicated history database holds per-feed listings, decision history,
 identity attribution, poll state, and verified completions. It is backed up and

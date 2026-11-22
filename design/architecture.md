@@ -374,8 +374,9 @@ each missing original is an explicit `unavailable` entry (ADR-0084).
 
 RSS subscriptions are configuration entries, but accepted magnets and torrent
 attachments use the same durable add transaction as API, magnet, and watch
-intake. Feed XML is parsed by a bounded core reader; feed and attachment
-requests use the shared contained HTTP client (ADR-0082). Preview evaluates
+intake. The bounded core reader handles RSS and Atom. Feeds, attachments and
+the two supported hash-checked detail-page formats use the shared contained
+HTTP client (ADR-0082). Preview evaluates
 rules and duplicate state without writing. The first successful poll establishes
 the baseline, with explicit current-match import and retry/reconsider actions as
 separate operations.

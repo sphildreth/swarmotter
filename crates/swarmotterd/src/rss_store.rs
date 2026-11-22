@@ -23,7 +23,7 @@ use swarmotter_core::rss::{
     RssAction, RssCounts, RssDecision, RssDecisionPage, RssEntry, RssFeedState,
 };
 
-const RSS_SCHEMA_VERSION: u32 = 1;
+const RSS_SCHEMA_VERSION: u32 = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +290,35 @@ impl RssStore {
             transaction
                 .commit()
                 .map_err(|error| CoreError::Storage(format!("commit RSS schema: {error}")))?;
+        }
+        if version == 1 {
+            // Older pollers retried baseline entries on later polls. Restore
+            // their first-poll exclusion where the decision history proves it.
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    CoreError::Storage(format!("begin RSS baseline repair: {error}"))
+                })?;
+            transaction
+                .execute_batch(
+                    "UPDATE listings SET status = 'baseline', next_attempt_at = NULL,
+                    reason = 'first observed on the new-only baseline'
+                 WHERE imported_at IS NULL AND completed_at IS NULL AND dismissed = 0
+                   AND status IN ('failed', 'deferred', 'unsupported')
+                   AND (subscription_id, entry_key) IN (
+                      SELECT subscription_id, entry_key FROM decisions WHERE action = 'baseline'
+                   );
+                 UPDATE listings SET status = 'unsupported', next_attempt_at = NULL,
+                    retry_count = 0, reason = 'previous attachment failed; check the detail magnet on the next feed appearance'
+                 WHERE imported_at IS NULL AND completed_at IS NULL AND dismissed = 0
+                   AND status = 'failed' AND reason LIKE '%downgrade%'
+                   AND (link GLOB 'https://www.limetorrents.fun/*' OR link GLOB 'https://limetorrents.fun/*');
+                 PRAGMA user_version = 2;",
+                )
+                .map_err(|error| CoreError::Storage(format!("restore RSS baselines: {error}")))?;
+            transaction.commit().map_err(|error| {
+                CoreError::Storage(format!("commit RSS baseline repair: {error}"))
+            })?;
         }
         self.checkpoint(connection)
     }

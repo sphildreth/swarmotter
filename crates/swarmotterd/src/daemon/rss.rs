@@ -16,9 +16,9 @@ use futures_util::StreamExt;
 use swarmotter_core::hash::TorrentKey;
 use swarmotter_core::magnet::Magnet;
 use swarmotter_core::rss::{
-    entry_offers, parse_feed, redact_feed_url, redact_urls_in_text, retry_backoff_seconds,
-    RssAction, RssConfig, RssDecision, RssDecisionPage, RssEntry, RssFeedState, RssOffer,
-    RssPollResult, RssPreview, RssSubscription, RssSubscriptionStatus,
+    feed_entry_offers, matching_page_magnet, parse_feed, redact_feed_url, redact_urls_in_text,
+    retry_backoff_seconds, RssAction, RssConfig, RssDecision, RssDecisionPage, RssEntry,
+    RssFeedState, RssOffer, RssPollResult, RssPreview, RssSubscription, RssSubscriptionStatus,
 };
 use swarmotter_core::torrent::Torrent;
 
@@ -687,14 +687,19 @@ impl DaemonRuntime {
         let mut dismissed = false;
 
         if let Some(existing) = existing {
-            if existing.dismissed && !retrying {
+            let baseline = existing.action() == RssAction::Baseline && !import_current;
+            if (baseline || existing.dismissed) && !retrying {
                 let decision = RssDecision {
                     entry_key: entry_key.to_string(),
                     title: entry.title.clone(),
                     link: entry.link.clone(),
                     categories: entry.categories.clone(),
                     pub_date: entry.pub_date.clone(),
-                    action: RssAction::Dismissed,
+                    action: if baseline {
+                        RssAction::Baseline
+                    } else {
+                        RssAction::Dismissed
+                    },
                     reason: existing.reason.clone(),
                     torrent_keys: existing.torrent_keys.clone(),
                     decision_id: None,
@@ -785,7 +790,7 @@ impl DaemonRuntime {
                 .await;
         }
 
-        let (offers, page_links) = entry_offers(entry);
+        let (offers, page_links) = feed_entry_offers(&subscription.url, entry);
         if offers.is_empty() {
             let reason = if page_links.is_empty() {
                 "listing has no magnet or torrent attachment".to_string()
@@ -1020,6 +1025,10 @@ impl DaemonRuntime {
             Duration::from_secs(timeout_seconds),
         );
         let mut seen = HashSet::new();
+        let page_hash = offers.iter().find_map(|offer| match offer.kind {
+            swarmotter_core::rss::RssOfferKind::MagnetPage(hash) => Some(hash),
+            _ => None,
+        });
         for offer in offers {
             match offer.kind {
                 swarmotter_core::rss::RssOfferKind::Magnet => match Magnet::parse(&offer.url) {
@@ -1039,6 +1048,28 @@ impl DaemonRuntime {
                         .errors
                         .push(format!("malformed magnet {}: {error}", offer.url)),
                 },
+                swarmotter_core::rss::RssOfferKind::MagnetPage(hash) => {
+                    match client
+                        .get_rss_detail(&offer.url, max_bytes.min(512 * 1024))
+                        .await
+                    {
+                        Ok(body) => {
+                            if let Some((uri, identity)) = matching_page_magnet(&body, hash) {
+                                resolved.aliases =
+                                    swarmotter_core::rss::torrent_identity_aliases(&identity);
+                                resolved.magnet = Some(uri);
+                                return resolved;
+                            }
+                            resolved.errors.push("provider detail page had no magnet matching the advertised info hash".into());
+                        }
+                        Err(error) => {
+                            resolved.transient_failure |= rss_error_is_transient(&error);
+                            resolved
+                                .errors
+                                .push(format!("provider detail page: {error}"));
+                        }
+                    }
+                }
                 swarmotter_core::rss::RssOfferKind::Attachment => {
                     let response = match client.get_attachment(&offer.url, max_bytes).await {
                         Ok(response) => response,
@@ -1063,6 +1094,14 @@ impl DaemonRuntime {
                         }
                     }
                     match meta::parse_torrent(&response.body) {
+                        Ok(parsed)
+                            if page_hash.is_some()
+                                && parsed.identity.v1_info_hash() != page_hash =>
+                        {
+                            resolved.errors.push(
+                                "attachment info hash differed from the advertised identity".into(),
+                            );
+                        }
                         Ok(parsed) => {
                             for alias in
                                 swarmotter_core::rss::torrent_identity_aliases(&parsed.identity)
@@ -1367,14 +1406,18 @@ impl DaemonRuntime {
     ) -> Result<RssDecision> {
         let mut torrent_keys = Vec::new();
         if let Some(existing) = existing {
-            if existing.dismissed {
+            if existing.dismissed || existing.action() == RssAction::Baseline {
                 return Ok(RssDecision {
                     entry_key: entry_key.to_string(),
                     title: entry.title.clone(),
                     link: entry.link.clone(),
                     categories: entry.categories.clone(),
                     pub_date: entry.pub_date.clone(),
-                    action: RssAction::Dismissed,
+                    action: if existing.dismissed {
+                        RssAction::Dismissed
+                    } else {
+                        RssAction::Baseline
+                    },
                     reason: existing.reason.clone(),
                     torrent_keys: existing.torrent_keys.clone(),
                     decision_id: None,
@@ -1439,7 +1482,7 @@ impl DaemonRuntime {
                 decided_at: None,
             });
         }
-        let (offers, page_links) = entry_offers(entry);
+        let (offers, page_links) = feed_entry_offers(&subscription.url, entry);
         if offers.is_empty() {
             return Ok(RssDecision {
                 entry_key: entry_key.to_string(),
