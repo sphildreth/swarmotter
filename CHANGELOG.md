@@ -29,6 +29,7 @@ date or duration estimates.
   library checkpoints and metadata reads.
 - RSS import defers on unavailable duplicate history, recognizes pending
   completions throughout the outbox, and retries attachments on unchanged feeds.
+  Reading pending events no longer forces a competing checkpoint during restore.
   Retention prunes by indexed feed order and skips unchanged idle history.
 - Pure-v2 magnets honor immediate-start file selection. Bandwidth limits
   accumulate fractional credit. Webseeds verify pieces before counting bytes

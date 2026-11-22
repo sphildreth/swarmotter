@@ -62,6 +62,23 @@ fn state_write_uses_sqlite_and_round_trips() {
 }
 
 #[test]
+fn rss_outbox_reads_committed_events_while_a_writer_holds_the_database() {
+    let path = unique_path("outbox-concurrent-read");
+    save(&path, &single_torrent_state()).unwrap();
+    let writer = open_sqlite(&path).unwrap();
+    let insert = "INSERT INTO rss_outbox(kind, canonical_key, aliases_json, name, was_completed, occurred_at)
+                  VALUES ('completed', 'fixture', x'5b5d', 'fixture', 1, 1)";
+    writer.execute(insert, []).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer.execute(insert, []).unwrap();
+    assert_eq!(load_outbox_events(&path, 10).unwrap().len(), 1);
+    writer.execute_batch("COMMIT").unwrap();
+    assert_eq!(load_outbox_events(&path, 10).unwrap().len(), 2);
+    drop(writer);
+    remove_state(&path);
+}
+
+#[test]
 fn legacy_json_state_migrates_atomically_on_save() {
     let path = unique_path("legacy-migration");
     let mut state = single_torrent_state();

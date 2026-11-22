@@ -1796,7 +1796,13 @@ pub(crate) fn load_outbox_events(
     if classify_state_file(path)? != StateFileKind::Sqlite {
         return Ok(Vec::new());
     }
-    let connection = open_sqlite(path)?;
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| CoreError::Storage(format!("open RSS outbox for reading: {error}")))?;
+    connection
+        .busy_timeout(SQLITE_BUSY_TIMEOUT)
+        .map_err(|error| {
+            CoreError::Storage(format!("configure RSS outbox read timeout: {error}"))
+        })?;
     let mut statement = connection
         .prepare(
             "SELECT id, kind, canonical_key, aliases_json, name, was_completed, occurred_at
@@ -1834,9 +1840,6 @@ pub(crate) fn load_outbox_events(
             occurred_at: occurred_at.max(0) as u64,
         });
     }
-    drop(statement);
-    // Checkpoint under the daemon state-write lane before returning the generation.
-    checkpoint_and_sync(connection, path)?;
     Ok(events)
 }
 
