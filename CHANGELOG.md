@@ -7,7 +7,28 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
-## [Unreleased]
+## [3.0.0] - [2026-11-22]
+
+Version 3.0.0 marks the Web UI rewrite. Torrents, Add, Network, Settings,
+Watch, and Logs now share one navigation bar and live transfer strip.
+Existing API clients continue to use `/api/v1`.
+
+### Changed
+
+- Torrents opens on the library. Selecting a row opens its inspector, while
+  checkboxes choose the targets for bulk actions. Named views save library
+  queries in the browser.
+- Add can inspect the fields in a magnet link before registering a torrent.
+  Network shows transfer history and containment diagnostics. Settings groups
+  configuration by task and shows pending edits and restart requirements.
+- Watch brings feed rules, decision previews, and scan history into one
+  workspace. Logs lets operators pause the on-screen stream, inspect an
+  event, and export filtered entries.
+- On smaller screens, the navigation rail and inspector open on demand.
+  [Web UI guide](docs/web-ui.md)
+- RSS naming no longer asks operators to choose an API/history key in the
+  primary form. Configuration files and API clients may still provide explicit
+  ids.
 
 ### Fixed
 
@@ -21,17 +42,6 @@ date or duration estimates.
   draft preview endpoint, scrolls to the preview results, and saving a
   subscription automatically displays its preview.
 - Watch keeps subscription actions reachable from the feed list and inspector. Editing opens the subscription form.
-
-### Changed
-
-- The six Web UI workspaces share a live transfer strip and responsive side panes.
-  Torrents separates inspection from bulk selection and supports named browser-local views.
-  Add can inspect a magnet URI before import. Logs supports bounded pause, filtering,
-  selected-event inspection and filtered export.
-
-- RSS naming no longer asks operators to choose an API/history key in the
-  primary form. Configuration files and API clients may still provide explicit
-  ids.
 
 ### Added
 

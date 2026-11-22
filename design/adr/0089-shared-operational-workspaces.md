@@ -10,6 +10,10 @@ The approved desktop design puts the library, intake, network, configuration, au
 
 ## Decision
 
+Version 3.0.0 marks the change to the operator-facing Web UI workflows,
+including separate inspection and bulk selection in the library. The native
+API keeps its `/api/v1` namespace.
+
 Keep the existing Axum asset router, entry URLs, native forms, theme preference, Tabulator and same-origin authentication. A shared DOM shell owns navigation and telemetry. The browser samples global statistics and containment health through the existing control plane. Rate history is bounded and survives view switches. File sizes use binary units.
 
 Each primary workspace has a rail, working area and inspector. The library uses its own measured column widths. At compact widths, operators can open either side pane. Inspecting a torrent and selecting a bulk operation target have independent identities. Full torrent controls, diagnostic details, configuration sections, intake, and automation maintenance remain reachable from these workspaces.
