@@ -32,6 +32,8 @@ Existing API clients continue to use `/api/v1`.
 
 ### Fixed
 
+- Library saves wake the RSS history worker only when they commit an event.
+  This avoids a competing SQLite checkpoint when restoring a newly added magnet.
 - A clean installation no longer reports unconfigured watch folders as a
   doctor warning. Watch folders are optional; the check now reports `ok` with
   `not configured (optional)` until a folder is added.

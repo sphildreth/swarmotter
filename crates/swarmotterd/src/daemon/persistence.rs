@@ -742,15 +742,16 @@ impl DaemonRuntime {
         let result = self
             .persist_state_locked(path, original_metainfo, mode, events.clone())
             .await;
-        if result.is_err() && !events.is_empty() {
-            let mut pending = self.rss_pending_events.lock().await;
-            let mut restored = events;
-            restored.append(&mut pending);
-            *pending = restored;
-        }
         timer.finish(result.is_ok());
-        if result.is_ok() {
-            self.wake_rss_outbox();
+        if !events.is_empty() {
+            if result.is_ok() {
+                self.wake_rss_outbox();
+            } else {
+                let mut pending = self.rss_pending_events.lock().await;
+                let mut restored = events;
+                restored.append(&mut pending);
+                *pending = restored;
+            }
         }
         result
     }
