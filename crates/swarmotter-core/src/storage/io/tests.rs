@@ -70,6 +70,26 @@ async fn dedicated_resume_directory_uses_torrent_key_without_relocating_payload(
 }
 
 #[tokio::test]
+async fn in_place_completion_reports_a_buffered_payload_write_error() {
+    let bytes = build_single_file_torrent("payload.bin", b"data", 4, None, false);
+    let root = unique_dir("in-place-write-error");
+    let store = StorageIo::new(parse_torrent(&bytes).unwrap(), root.clone());
+    let writer = store.open_file_handle(0, true).await.unwrap();
+    // A read-only descriptor deterministically fails the background write.
+    // Tokio accepts the bytes into its buffer before it reports the error.
+    let path = store.file_path(0).unwrap();
+    writer.lock().await.file = fs::File::from_std(std::fs::File::open(path).unwrap());
+    store.write_piece(0, b"data").await.unwrap();
+
+    let result = store.finalize_partial_file_suffix().await;
+    assert!(
+        result.is_err(),
+        "completion discarded the pending write error"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn partial_file_suffix_finalizes_single_file_in_place() {
     let content = b"0123456789abcdef";
     let bytes = build_single_file_torrent("active.bin", content, 8, None, false);

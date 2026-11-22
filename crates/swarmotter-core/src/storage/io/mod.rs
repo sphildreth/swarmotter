@@ -1753,6 +1753,9 @@ impl StorageIo {
             if self.partial_file_suffix != destination.partial_file_suffix {
                 return self.rewrite_partial_file_suffix(destination).await;
             }
+            // Readers of the completed payload open independent handles. Wait
+            // for buffered writes and surface errors before handing it over.
+            self.flush_all_writable_handles().await?;
             return Ok(destination);
         }
         self.flush_all_writable_handles().await?;
@@ -1774,15 +1777,7 @@ impl StorageIo {
     /// fast-resume file because only payload names change. Completion calls
     /// this path when complete and incomplete roots are identical.
     pub async fn finalize_partial_file_suffix(&self) -> Result<Self> {
-        let destination = Self::new(Arc::clone(&self.meta), self.download_dir.clone())
-            .with_torrent_key(self.torrent_key)
-            .with_resume_dir(self.resume_dir.clone())
-            .with_cow_strategy(self.cow_strategy)
-            .with_metrics(self.metrics.clone());
-        if self.partial_file_suffix.is_none() {
-            return Ok(destination);
-        }
-        self.rewrite_partial_file_suffix(destination).await
+        self.move_to(self.download_dir.clone()).await
     }
 
     async fn rewrite_partial_file_suffix(&self, destination: Self) -> Result<Self> {
