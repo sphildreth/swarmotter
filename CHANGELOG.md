@@ -7,6 +7,14 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [Unreleased]
+
+### Fixed
+
+- Daemon startup recognizes the SQLite schema written by v2.5.0 and applies
+  the RSS outbox migration. Existing torrents, queue entries, and transfer
+  history carry over on upgrade.
+
 ## [3.0.0] - [2026-11-22]
 
 Version 3.0.0 marks the Web UI rewrite. Torrents, Add, Network, Settings,
