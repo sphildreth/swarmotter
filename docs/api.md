@@ -883,7 +883,7 @@ redact feed URL credentials and sensitive query values.
 | DELETE | `/rss/{id}` | Delete a subscription. History and verified completions remain durable. |
 | GET | `/rss/{id}/preview` | Fetch and explain current decisions without adding torrents or marking entries seen. |
 | POST | `/rss/{id}/poll?import_current=false&reconsider=false` | Poll on demand. Explicitly import current matches or re-evaluate stored older listings. |
-| POST | `/rss/{id}/retry` | Clear dismissal/failure state and retry. Body: `{ "entry_key": null }` for all eligible listings. |
+| POST | `/rss/{id}/retry` | Retry a single stored listing with `{ "entry_key": "guid:…" }`. An unknown key returns 404. Send `{ "entry_key": null }` to reconsider eligible listings across the subscription. |
 | GET | `/rss/{id}/decisions?limit=100&before=<id>` | Paginated decision history. |
 | DELETE | `/rss/history/completions` | Explicitly clear verified completion identities. |
 | GET | `/rss/diagnostics` | Report whether duplicate lookups use their indexes. |

@@ -316,6 +316,73 @@ async fn atom_new_only_imports_a_new_magnet_once_and_preserves_the_original_base
 }
 
 #[tokio::test]
+async fn selected_rss_retry_only_imports_its_entry_and_preserves_sibling_history() {
+    use swarmotter_core::rss::RssAction;
+    let root = unique_dir("rss-keyed-retry");
+    let state_path = root.join("state.json");
+    let (base, responses, server) = fixture_server().await;
+    let entries = (1..=3).map(|n| format!("<item><title>{n}</title><guid>{n}</guid><link>magnet:?xt=urn:btih:{n:040x}&amp;dn=</link></item>")).collect::<Vec<_>>().join("");
+    responses
+        .lock()
+        .await
+        .insert("/feed".into(), FixtureResponse::xml(feed(&entries), "v1"));
+    let runtime = start_runtime(
+        rss_config(
+            &root,
+            &state_path,
+            vec![subscription(
+                "feed",
+                format!("{base}/feed"),
+                RssRuleSet::default(),
+                RssImportMode::NewOnly,
+            )],
+        ),
+        &state_path,
+    );
+    let baseline = runtime
+        .poll_rss_subscription("feed", false, false)
+        .await
+        .unwrap();
+    assert_eq!(baseline.decisions.len(), 3);
+    assert!(baseline.imported.is_empty());
+    assert!(matches!(
+        runtime
+            .retry_rss_listing("feed", Some("guid:missing"))
+            .await,
+        Err(CoreError::NotFound(_))
+    ));
+    let added = runtime
+        .retry_rss_listing("feed", Some("guid:2"))
+        .await
+        .unwrap();
+    assert_eq!(added.imported, [format!("{:040x}", 2)]);
+    assert_eq!(added.decisions.len(), 1);
+    assert_eq!(added.decisions[0].entry_key, "guid:2");
+    let repeat = runtime
+        .retry_rss_listing("feed", Some("guid:2"))
+        .await
+        .unwrap();
+    assert!(repeat.imported.is_empty());
+    assert_eq!(repeat.decisions[0].action, RssAction::AlreadyPresent);
+    let store = runtime.rss_history_store().await.unwrap();
+    assert!(store
+        .listing("feed", "guid:2")
+        .unwrap()
+        .unwrap()
+        .imported_at
+        .is_some());
+    for key in ["guid:1", "guid:3"] {
+        assert_eq!(
+            store.listing("feed", key).unwrap().unwrap().action(),
+            RssAction::Baseline
+        );
+    }
+    assert_eq!(runtime.registry.lock().await.torrents.len(), 1);
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn rss_end_to_end_imports_match_explains_exclusion_and_skips_after_selfish_removal_restart() {
     let root = unique_dir("rss-e2e");
     let state_path = root.join("state.json");

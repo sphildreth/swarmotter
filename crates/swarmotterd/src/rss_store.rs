@@ -766,14 +766,16 @@ impl RssStore {
                 "UPDATE listings SET status = 'failed', reason = 'explicit retry requested',
                     dismissed = 0, retry_count = 0, next_attempt_at = ?3,
                     imported_at = CASE WHEN completed_at IS NULL THEN NULL ELSE imported_at END
-                 WHERE subscription_id = ?1 AND entry_key = ?2 AND completed_at IS NULL",
+                 WHERE subscription_id = ?1 AND entry_key = ?2 AND completed_at IS NULL
+                   AND (dismissed != 0 OR status IN ('dismissed', 'failed', 'deferred'))",
                 params![subscription_id, key, now as i64],
             ),
             None => connection.execute(
                 "UPDATE listings SET status = 'failed', reason = 'explicit retry requested',
                     dismissed = 0, retry_count = 0, next_attempt_at = ?2,
                     imported_at = CASE WHEN completed_at IS NULL THEN NULL ELSE imported_at END
-                 WHERE subscription_id = ?1 AND completed_at IS NULL",
+                 WHERE subscription_id = ?1 AND completed_at IS NULL
+                   AND (dismissed != 0 OR status IN ('dismissed', 'failed', 'deferred'))",
                 params![subscription_id, now as i64],
             ),
         }

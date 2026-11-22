@@ -12,6 +12,7 @@ COMPOSE_FILE="${SWARMOTTER_COMPOSE_FILE:-$DEPLOY_DIR/compose.yml}"
 ENV_FILE="${SWARMOTTER_ENV_FILE:-$DEPLOY_DIR/.env}"
 TARGET_REQUEST="${SWARMOTTER_TARGET_IMAGE:-$DEFAULT_TARGET}"
 TARGET_IMAGE=""
+LOCAL_IMAGE_ID="${SWARMOTTER_LOCAL_IMAGE_ID:-}"
 TARGET_VERSION=""
 LATEST_RELEASE_TAG=""
 FORCE_UPDATE="${SWARMOTTER_FORCE_UPDATE:-0}"
@@ -60,6 +61,7 @@ matches the latest release.
 
 Environment overrides:
   SWARMOTTER_TARGET_IMAGE
+  SWARMOTTER_LOCAL_IMAGE_ID=sha256:<full local image ID> (explicit image only)
   SWARMOTTER_FORCE_UPDATE=1
   SWARMOTTER_IMAGE_REPOSITORY
   SWARMOTTER_GITHUB_REPO
@@ -340,6 +342,12 @@ running_container_version() {
     printf '%s\n' "$version"
 }
 
+verify_local_image() {
+    [[ "$LOCAL_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] || die "expected a full local image ID"
+    [[ "$(docker_cmd image inspect -f '{{.Id}}' "$TARGET_IMAGE")" == "$LOCAL_IMAGE_ID" ]] ||
+        die "local image $TARGET_IMAGE does not match the supplied image ID"
+}
+
 skip_if_current() {
     local current_image current_version
 
@@ -352,6 +360,14 @@ skip_if_current() {
 
     if [[ "$FORCE_UPDATE" == "1" ]]; then
         log "Force enabled; continuing even if the installed version matches"
+        return 0
+    fi
+
+    if [[ -n "$LOCAL_IMAGE_ID" ]]; then
+        if [[ "$current_image" == "$TARGET_IMAGE" && "$(docker_cmd inspect -f '{{.Image}}' "$CONTAINER_NAME")" == "$LOCAL_IMAGE_ID" ]]; then
+            log "SwarmOtter is already running the selected local image"
+            exit 0
+        fi
         return 0
     fi
 
@@ -603,6 +619,11 @@ validate_container() {
     configured_image="$(docker_cmd inspect -f '{{.Config.Image}}' "$CONTAINER_NAME")"
     [[ "$configured_image" == "$TARGET_IMAGE" ]] || die "$CONTAINER_NAME uses $configured_image, expected $TARGET_IMAGE"
 
+    if [[ -n "$LOCAL_IMAGE_ID" && "$TARGET_IMAGE" != "$rollback_tag" ]]; then
+        [[ "$(docker_cmd inspect -f '{{.Image}}' "$CONTAINER_NAME")" == "$LOCAL_IMAGE_ID" ]] ||
+            die "running container does not use the validated local image ID"
+    fi
+
     version="$(docker_cmd inspect -f '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$CONTAINER_NAME")"
     revision="$(docker_cmd inspect -f '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$CONTAINER_NAME")"
     log "Running image label: version=$version revision=$revision"
@@ -679,7 +700,11 @@ main() {
     check_command tar
 
     select_docker_command
+    if [[ -n "$LOCAL_IMAGE_ID" && "$TARGET_REQUEST" != *:* ]]; then
+        die "a local image ID requires an explicit repository:tag"
+    fi
     resolve_target_image "$TARGET_REQUEST"
+    if [[ -n "$LOCAL_IMAGE_ID" ]]; then verify_local_image; fi
     previous_env_image="$(current_env_image || true)"
 
     log "Deploy directory: $DEPLOY_DIR"
@@ -694,8 +719,12 @@ main() {
     skip_if_current
     compose config >/dev/null
     tag_rollback_image
-    log "Pulling and validating target image"
-    docker_cmd pull "$TARGET_IMAGE"
+    if [[ -z "$LOCAL_IMAGE_ID" ]]; then
+        log "Pulling target image"
+        docker_cmd pull "$TARGET_IMAGE"
+    else
+        log "Using verified local image $LOCAL_IMAGE_ID"
+    fi
     preflight_target_image
     create_backup
 

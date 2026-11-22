@@ -27,6 +27,14 @@ use crate::rss_store::{DuplicateLookup, PendingEventKind, PendingLibraryEvent, R
 const RSS_OUTBOX_BATCH: usize = 512;
 const RSS_RETRY_BATCH: usize = 32;
 
+enum RssIntake<'a> {
+    Poll {
+        import_current: bool,
+        reconsider: bool,
+    },
+    Retry(Option<&'a str>),
+}
+
 #[derive(Debug, Default)]
 struct ResolvedOffer {
     aliases: Vec<String>,
@@ -316,6 +324,21 @@ impl DaemonRuntime {
         import_current: bool,
         reconsider: bool,
     ) -> Result<RssPollResult> {
+        self.run_rss_intake(
+            subscription_id,
+            RssIntake::Poll {
+                import_current,
+                reconsider,
+            },
+        )
+        .await
+    }
+
+    async fn run_rss_intake(
+        &self,
+        subscription_id: &str,
+        intake: RssIntake<'_>,
+    ) -> Result<RssPollResult> {
         let config = self.config.read().await.rss.clone();
         let subscription = config
             .subscription(subscription_id)
@@ -333,9 +356,19 @@ impl DaemonRuntime {
             .write()
             .await
             .insert(subscription.id.clone());
-        let result = self
-            .poll_rss_subscription_inner(&config, &subscription, import_current, reconsider)
-            .await;
+        let result = match intake {
+            RssIntake::Poll {
+                import_current,
+                reconsider,
+            } => {
+                self.poll_rss_subscription_inner(&config, &subscription, import_current, reconsider)
+                    .await
+            }
+            RssIntake::Retry(key) => {
+                self.retry_rss_listing_inner(&config, &subscription, key)
+                    .await
+            }
+        };
         self.rss_polls_in_progress
             .write()
             .await
@@ -1638,18 +1671,66 @@ impl DaemonRuntime {
         subscription_id: &str,
         entry_key: Option<&str>,
     ) -> Result<RssPollResult> {
+        self.run_rss_intake(subscription_id, RssIntake::Retry(entry_key))
+            .await
+    }
+
+    async fn retry_rss_listing_inner(
+        &self,
+        config: &RssConfig,
+        subscription: &RssSubscription,
+        entry_key: Option<&str>,
+    ) -> Result<RssPollResult> {
         let store = self.rss_history_store().await?;
-        let id = subscription_id.to_string();
-        let key = entry_key.map(str::to_string);
-        let now_value = now();
-        tokio::task::spawn_blocking({
+        let id = subscription.id.clone();
+        let key = entry_key.map(str::to_owned);
+        let selected = tokio::task::spawn_blocking({
             let store = store.clone();
-            move || store.clear_dismissal(&id, key.as_deref(), now_value)
+            move || -> Result<_> {
+                store.clear_dismissal(&id, key.as_deref(), now())?;
+                let Some(key) = key else {
+                    return Ok(None);
+                };
+                let listing = store
+                    .listing(&id, &key)?
+                    .ok_or_else(|| CoreError::NotFound("RSS listing".into()))?;
+                let baseline = store
+                    .feed_state(&id)?
+                    .is_some_and(|state| state.baseline_established);
+                Ok(Some((listing, baseline)))
+            }
         })
         .await
-        .map_err(|error| CoreError::Storage(format!("clear RSS dismissal task: {error}")))??;
-        self.poll_rss_subscription(subscription_id, false, true)
-            .await
+        .map_err(|error| CoreError::Storage(format!("prepare RSS retry: {error}")))??;
+        let Some((listing, baseline_established)) = selected else {
+            return self
+                .reconsider_rss_listings(config, subscription, &store)
+                .await;
+        };
+        let mut imported = Vec::new();
+        let decision = self
+            .process_rss_entry(
+                config,
+                subscription,
+                &store,
+                &listing.entry,
+                &listing.entry_key,
+                Some(&listing),
+                false,
+                true,
+                true,
+                &mut imported,
+            )
+            .await?;
+        Ok(RssPollResult {
+            subscription_id: subscription.id.clone(),
+            success: true,
+            baseline_established,
+            conditional_not_modified: false,
+            decisions: vec![decision],
+            imported,
+            error: None,
+        })
     }
 
     pub(super) async fn clear_rss_completions(&self) -> Result<usize> {

@@ -7,6 +7,22 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [3.1.1] - [2026-11-22]
+
+### Changed
+
+- The Compose updater can deploy a manually transferred candidate by its
+  full local image ID with the normal preflight, backup and rollback checks.
+
+### Fixed
+
+- Magnet intake treats an empty or whitespace-only optional display name as
+  omitted. TorrentDownload magnets can enter the queue using their info hash
+  until the daemon obtains the torrent name from metadata.
+- Retrying one RSS entry imports only the requested listing. The operation
+  shares its subscription’s poll lock and preserves existing import attribution
+  on repeated requests. An unknown entry returns a lookup error.
+
 ## [3.1.0] - [2026-11-22]
 
 ### Added
