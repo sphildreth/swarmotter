@@ -32,6 +32,8 @@ Existing API clients continue to use `/api/v1`.
 
 ### Fixed
 
+- Downloads completing in place now wait for buffered payload writes and report
+  write errors before marking the torrent complete.
 - Library saves wake the RSS history worker only when they commit an event.
   This avoids a competing SQLite checkpoint when restoring a newly added magnet.
 - A clean installation no longer reports unconfigured watch folders as a
