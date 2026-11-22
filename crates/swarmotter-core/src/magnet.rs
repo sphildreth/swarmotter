@@ -121,7 +121,7 @@ impl Magnet {
                     ExactTopic::V2(hash) => set_unique_v2(&mut v2, hash)?,
                     ExactTopic::Other => {}
                 },
-                "dn" => {
+                "dn" if !value.trim().is_empty() => {
                     display_name = Some(value.into_owned());
                 }
                 "tr" => {
@@ -640,6 +640,23 @@ mod tests {
         assert!(!m.requires_v2_data_plane());
         assert!(m.display_name.is_none());
         assert!(m.trackers.is_empty());
+    }
+
+    #[test]
+    fn empty_display_name_has_the_same_semantics_as_an_omitted_name() {
+        let base = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+        for suffix in ["&dn=", "&dn=%20%09"] {
+            let parsed = Magnet::parse(&format!("{base}{suffix}")).unwrap();
+            assert_eq!(parsed.display_name, None);
+            assert_eq!(parsed.identity, Magnet::parse(base).unwrap().identity);
+        }
+        assert_eq!(
+            Magnet::parse(&format!("{base}&dn=Fixture&dn="))
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Fixture")
+        );
     }
 
     #[test]

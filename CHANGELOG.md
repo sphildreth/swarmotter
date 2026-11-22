@@ -11,6 +11,9 @@ date or duration estimates.
 
 ### Fixed
 
+- Magnet intake treats an empty or whitespace-only optional display name as
+  omitted. TorrentDownload magnets can enter the queue using their info hash
+  until the daemon obtains the torrent name from metadata.
 - Retrying one RSS entry imports only the requested listing. The operation
   shares its subscription’s poll lock and preserves existing import attribution
   on repeated requests. An unknown entry returns a lookup error.

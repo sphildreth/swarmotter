@@ -321,7 +321,7 @@ async fn selected_rss_retry_only_imports_its_entry_and_preserves_sibling_history
     let root = unique_dir("rss-keyed-retry");
     let state_path = root.join("state.json");
     let (base, responses, server) = fixture_server().await;
-    let entries = (1..=3).map(|n| format!("<item><title>{n}</title><guid>{n}</guid><link>magnet:?xt=urn:btih:{n:040x}</link></item>")).collect::<Vec<_>>().join("");
+    let entries = (1..=3).map(|n| format!("<item><title>{n}</title><guid>{n}</guid><link>magnet:?xt=urn:btih:{n:040x}&amp;dn=</link></item>")).collect::<Vec<_>>().join("");
     responses
         .lock()
         .await
