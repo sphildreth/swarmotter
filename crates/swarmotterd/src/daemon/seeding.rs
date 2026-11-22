@@ -627,7 +627,22 @@ impl DaemonRuntime {
         state: Arc<Mutex<EngineState>>,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> Option<JoinHandle<()>> {
-        let tracker_tiers = tracker::announce_tiers(meta.announce.as_deref(), &meta.announce_list);
+        let disabled = self
+            .registry
+            .lock()
+            .await
+            .get(&hash)
+            .map(|torrent| torrent.disabled_trackers.clone())
+            .unwrap_or_default();
+        let tracker_tiers = tracker::announce_tiers(meta.announce.as_deref(), &meta.announce_list)
+            .into_iter()
+            .map(|tier| {
+                tier.into_iter()
+                    .filter(|url| !disabled.iter().any(|disabled| disabled == url))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|tier| !tier.is_empty())
+            .collect::<Vec<_>>();
         if tracker_tiers.is_empty() {
             return None;
         }
@@ -795,6 +810,11 @@ impl DaemonRuntime {
                                 last_error: None,
                                 last_message: Some("seeder announce ok".into()),
                                 last_announce: Some(announce_at),
+                                last_success: Some(announce_at),
+                                retries: 0,
+                                latency_ms: None,
+                                peers_returned: Some(response.peers.len() as u64),
+                                recent_errors: Vec::new(),
                             },
                         )
                     }
@@ -817,9 +837,14 @@ impl DaemonRuntime {
                                 seeders: response.seeders,
                                 leechers: response.leechers,
                                 downloads: 0,
-                                last_error: Some(error),
+                                last_error: Some(error.clone()),
                                 last_message: None,
                                 last_announce: Some(announce_at),
+                                last_success: None,
+                                retries: 1,
+                                latency_ms: None,
+                                peers_returned: None,
+                                recent_errors: vec![error],
                             },
                         )
                     }
@@ -840,9 +865,14 @@ impl DaemonRuntime {
                                 seeders: 0,
                                 leechers: 0,
                                 downloads: 0,
-                                last_error: Some(error),
+                                last_error: Some(error.clone()),
                                 last_message: None,
                                 last_announce: Some(announce_at),
+                                last_success: None,
+                                retries: 1,
+                                latency_ms: None,
+                                peers_returned: None,
+                                recent_errors: vec![error],
                             },
                         )
                     }
@@ -864,6 +894,11 @@ impl DaemonRuntime {
                                 last_error: Some("seeder announce timed out".into()),
                                 last_message: None,
                                 last_announce: Some(announce_at),
+                                last_success: None,
+                                retries: 1,
+                                latency_ms: None,
+                                peers_returned: None,
+                                recent_errors: vec!["seeder announce timed out".into()],
                             },
                         )
                     }
@@ -1198,13 +1233,14 @@ impl DaemonRuntime {
     /// itself because it does NOT await the engine task's own join handle
     /// (that would deadlock); the already-returning task is simply detached.
     pub(super) async fn selfish_remove_completed(&self, hash: TorrentKey) {
-        let name = self
-            .registry
-            .lock()
-            .await
-            .get(&hash)
+        let completed = self.registry.lock().await.get(&hash).cloned();
+        let name = completed
+            .as_ref()
             .map(|t| t.name().to_string())
             .unwrap_or_default();
+        if let Some(torrent) = completed.as_ref() {
+            self.queue_rss_removal(torrent).await;
+        }
         // Stop the inbound seeder (a separate task; safe to await).
         self.stop_seeder(&hash).await;
         // Clear live engine bookkeeping. We deliberately do NOT await the
@@ -1232,6 +1268,12 @@ impl DaemonRuntime {
         );
         self.publish_event(torrent_removed_event(hash, false));
         self.publish_event(stats_updated_event());
-        self.persist_state_best_effort("selfish_completion").await;
+        // A removal must stage the complete registry: the changed-record path
+        // intentionally only upserts surviving records and cannot delete a
+        // torrent row. The full transaction also carries the queued RSS
+        // completion/removal events and any pending queue change.
+        if let Err(error) = self.persist_state_full().await {
+            tracing::error!(%error, "failed to persist selfish completion removal");
+        }
     }
 }

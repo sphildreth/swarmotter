@@ -226,6 +226,126 @@ impl Magnet {
     }
 }
 
+/// Tracker inclusion policy for a generated magnet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MagnetTrackerPolicy {
+    /// Include the primary tracker and every announce-list tier.
+    #[default]
+    All,
+    /// Include only the primary announce-list tier (or the single announce).
+    PrimaryTier,
+    /// Include no tracker parameters.
+    None,
+}
+
+/// Generate a deterministic magnet for one torrent's source metadata.
+///
+/// Identity exact topics are emitted as full `btih` and/or `btmh` values.
+/// Tracker order is the metainfo announce-list order, with the primary
+/// announce value first when it is not already represented. Webseeds retain
+/// source order. A BEP 53 `so` selection is emitted only when the wanted file
+/// set is a strict subset of all files. A private torrent requires explicit
+/// consent before any tracker parameter is included.
+pub fn magnet_for_meta(
+    meta: &crate::meta::TorrentMeta,
+    selected_file_indices: &[usize],
+    tracker_policy: MagnetTrackerPolicy,
+    include_private_trackers: bool,
+) -> Result<String> {
+    if meta.private && tracker_policy != MagnetTrackerPolicy::None && !include_private_trackers {
+        return Err(CoreError::InvalidArgument(
+            "private torrent tracker URLs require explicit consent; choose the no-tracker policy or confirm inclusion"
+                .into(),
+        ));
+    }
+    let identity = match &meta.identity {
+        TorrentIdentity::Unknown if meta.info_hash != InfoHash::ZERO => {
+            TorrentIdentity::v1(meta.info_hash)
+        }
+        identity => identity.clone(),
+    };
+    if identity.primary_key().is_none() {
+        return Err(CoreError::InvalidArgument(
+            "torrent has no usable full identity for magnet generation".into(),
+        ));
+    }
+    let selected = if selected_file_indices.is_empty() {
+        return Err(CoreError::InvalidArgument(
+            "cannot generate a magnet with no wanted files".into(),
+        ));
+    } else if selected_file_indices.len() == meta.files.len()
+        && selected_file_indices
+            .iter()
+            .copied()
+            .eq(0..meta.files.len())
+    {
+        Vec::new()
+    } else {
+        let mut selected = selected_file_indices.to_vec();
+        selected.sort_unstable();
+        selected.dedup();
+        if selected.len() == meta.files.len() && selected.iter().copied().eq(0..meta.files.len()) {
+            Vec::new()
+        } else {
+            validate_select_only_file_indices(&selected, meta.files.len())
+                .map_err(CoreError::InvalidArgument)?;
+            selected
+        }
+    };
+    let trackers = match tracker_policy {
+        MagnetTrackerPolicy::None => Vec::new(),
+        MagnetTrackerPolicy::PrimaryTier => {
+            let mut trackers = meta.announce_list.first().cloned().unwrap_or_default();
+            if let Some(primary) = meta.announce.as_ref() {
+                if !trackers.contains(primary) {
+                    trackers.insert(0, primary.clone());
+                }
+            } else if trackers.is_empty() {
+                if let Some(primary) = meta.announce.as_ref() {
+                    trackers.push(primary.clone());
+                }
+            }
+            dedupe_preserving_order(trackers)
+        }
+        MagnetTrackerPolicy::All => {
+            let mut trackers = Vec::new();
+            if let Some(primary) = meta.announce.as_ref() {
+                trackers.push(primary.clone());
+            }
+            for tier in &meta.announce_list {
+                for tracker in tier {
+                    if !trackers.contains(tracker) {
+                        trackers.push(tracker.clone());
+                    }
+                }
+            }
+            trackers
+        }
+    };
+    let magnet = Magnet {
+        identity,
+        display_name: Some(meta.name.clone()),
+        trackers,
+        exact_length: Some(meta.total_length),
+        webseeds: meta.webseeds.clone(),
+        select_only_file_indices: selected,
+        direct_peers: Vec::new(),
+        raw: String::new(),
+    };
+    Ok(magnet.to_uri())
+}
+
+fn dedupe_preserving_order(values: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in values {
+        if !out.contains(&value) {
+            out.push(value);
+        }
+    }
+    out
+}
+
 /// Validate a persisted or manually-constructed BEP 53 selection once the
 /// authoritative file count is known.
 ///
@@ -479,22 +599,17 @@ fn url_encode(s: &str) -> String {
                     | b'~'
                     | b':'
                     | b'/'
-                    | b'?'
-                    | b'#'
                     | b'['
                     | b']'
                     | b'@'
                     | b'!'
                     | b'$'
-                    | b'&'
                     | b'\''
                     | b'('
                     | b')'
                     | b'*'
-                    | b'+'
                     | b','
                     | b';'
-                    | b'='
             )
         {
             out.push(b as char);
@@ -696,5 +811,68 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(magnet.identity, TorrentIdentity::Unknown);
+    }
+    #[test]
+    fn generated_magnet_is_deterministic_escaped_and_round_trips_selection() {
+        let files = vec![
+            (vec!["one file & more.txt".into()], 3u64),
+            (vec!["two.txt".into()], 4u64),
+        ];
+        let bytes = crate::meta::build_multi_file_torrent_with_webseeds(
+            "special & name",
+            &files,
+            &[b"one", b"two"],
+            8,
+            Some("https://primary.example/announce?x=1&y=2"),
+            &["https://seed.example/one file/"],
+        );
+        let mut meta = crate::meta::parse_torrent(&bytes).unwrap();
+        meta.announce_list = vec![
+            vec!["https://primary.example/announce?x=1&y=2".into()],
+            vec![
+                "https://backup.example/announce?token=a&b=c".into(),
+                "udp://tracker.example:1337/announce".into(),
+            ],
+        ];
+        let all = magnet_for_meta(&meta, &[1], MagnetTrackerPolicy::All, false).unwrap();
+        let again = magnet_for_meta(&meta, &[1], MagnetTrackerPolicy::All, false).unwrap();
+        assert_eq!(all, again);
+        let parsed = Magnet::parse(&all).unwrap();
+        assert_eq!(parsed.display_name.as_deref(), Some("special & name"));
+        assert_eq!(parsed.select_only_file_indices, vec![1]);
+        assert_eq!(parsed.webseeds, vec!["https://seed.example/one file/"]);
+        assert_eq!(parsed.trackers.len(), 3);
+        assert_eq!(
+            parsed.trackers[0],
+            "https://primary.example/announce?x=1&y=2"
+        );
+        assert!(all.contains("dn=special%20%26%20name"));
+
+        let primary =
+            magnet_for_meta(&meta, &[0, 1], MagnetTrackerPolicy::PrimaryTier, false).unwrap();
+        let parsed = Magnet::parse(&primary).unwrap();
+        assert_eq!(parsed.trackers.len(), 1);
+        assert!(parsed.select_only_file_indices.is_empty());
+
+        let none = magnet_for_meta(&meta, &[0], MagnetTrackerPolicy::None, false).unwrap();
+        assert!(Magnet::parse(&none).unwrap().trackers.is_empty());
+    }
+
+    #[test]
+    fn private_tracker_inclusion_requires_consent() {
+        let bytes = crate::meta::build_single_file_torrent(
+            "private.bin",
+            b"private payload",
+            8,
+            Some("https://private.example/announce"),
+            true,
+        );
+        let meta = crate::meta::parse_torrent(&bytes).unwrap();
+        let error = magnet_for_meta(&meta, &[0], MagnetTrackerPolicy::All, false).unwrap_err();
+        assert!(error.to_string().contains("explicit consent"));
+        let magnet = magnet_for_meta(&meta, &[0], MagnetTrackerPolicy::All, true).unwrap();
+        assert!(magnet.contains("private.example"));
+        let no_tracker = magnet_for_meta(&meta, &[0], MagnetTrackerPolicy::None, false).unwrap();
+        assert!(!no_tracker.contains("private.example"));
     }
 }

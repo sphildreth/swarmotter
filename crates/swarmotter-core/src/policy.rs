@@ -939,6 +939,32 @@ pub fn prioritize_tracker_urls(urls: &[String], rules: &[TrackerHostRule]) -> Ve
     candidates.into_iter().map(|(_, _, url)| url).collect()
 }
 
+/// Effective per-tracker policy after the first matching host rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackerPolicyDecision {
+    pub allowed: bool,
+    pub priority: QueuePriority,
+    pub rule_index: Option<usize>,
+}
+
+/// Resolve the effective allow/priority decision for one tracker URL.
+pub fn tracker_policy_decision(url: &str, rules: &[TrackerHostRule]) -> TrackerPolicyDecision {
+    let mut decision = TrackerPolicyDecision {
+        allowed: true,
+        priority: QueuePriority::Normal,
+        rule_index: None,
+    };
+    for (index, rule) in rules.iter().enumerate() {
+        if tracker_host_rule_matches(url, rule) {
+            decision.rule_index = Some(index);
+            decision.allowed = rule.enabled.unwrap_or(true);
+            decision.priority = rule.priority.unwrap_or(QueuePriority::Normal);
+            break;
+        }
+    }
+    decision
+}
+
 /// Return whether one tracker URL matches a host rule. Malformed URLs never
 /// match a policy rule; they remain visible to normal tracker diagnostics
 /// rather than being silently discarded.

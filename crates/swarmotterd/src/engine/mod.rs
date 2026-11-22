@@ -35,7 +35,7 @@ use swarmotter_core::config::{CowStrategy, PeerEncryptionMode};
 use swarmotter_core::error::{CoreError, Result};
 use swarmotter_core::hash::{InfoHash, PeerInfoHash, TorrentKey};
 use swarmotter_core::meta::TorrentMeta;
-use swarmotter_core::models::peer::EnginePeerHealth;
+use swarmotter_core::models::peer::{EnginePeerHealth, PeerSource};
 use swarmotter_core::models::stats::PeerSchedulerDiagnostics;
 use swarmotter_core::models::torrent::FilePriority;
 use swarmotter_core::models::tracker::{TrackerScrapeStatus, TrackerStatus};
@@ -252,6 +252,7 @@ struct TrackerAnnounceOutcome {
     message: Option<String>,
     failures: u32,
     tracker_results: HashMap<String, TrackerAnnounceSnapshot>,
+    tracker_peers: HashMap<String, Vec<PeerAddr>>,
     interval_seconds: Option<u64>,
 }
 
@@ -267,10 +268,28 @@ pub struct TrackerAnnounceSnapshot {
     pub last_error: Option<String>,
     pub last_message: Option<String>,
     pub last_announce: Option<u64>,
+    pub last_success: Option<u64>,
+    pub retries: u32,
+    pub latency_ms: Option<u64>,
+    pub peers_returned: Option<u64>,
+    pub recent_errors: Vec<String>,
 }
 
 /// Most recent scrape attempt plus the separately retained last-success
 /// counts. A failed attempt changes status/time/error without erasing counts.
+#[derive(Debug, Clone, Default)]
+pub struct WebseedSnapshot {
+    pub status: TrackerStatus,
+    pub bytes_verified: u64,
+    pub attempts: u64,
+    pub retries: u32,
+    pub last_success: Option<u64>,
+    pub last_attempt: Option<u64>,
+    pub last_error: Option<String>,
+    pub recent_errors: Vec<String>,
+    pub latency_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TrackerScrapeSnapshot {
     pub status: TrackerScrapeStatus,
@@ -309,6 +328,10 @@ pub struct EngineState {
     pub tracker_message: Option<String>,
     pub tracker_announces: HashMap<String, TrackerAnnounceSnapshot>,
     pub tracker_scrapes: HashMap<String, TrackerScrapeSnapshot>,
+    /// Per-peer discovery provenance observed by this engine.
+    pub peer_sources: HashMap<std::net::SocketAddr, std::collections::BTreeSet<PeerSource>>,
+    /// Per-webseed runtime evidence, bounded by the metainfo webseed list.
+    pub webseeds: HashMap<String, WebseedSnapshot>,
     pub last_announce: Option<u64>,
     pub tracker_interval_seconds: u64,
     pub peer_scheduler: PeerSchedulerDiagnostics,
@@ -350,7 +373,29 @@ pub struct EngineState {
     pub resolved_meta: Option<Arc<TorrentMeta>>,
 }
 
+/// Upper bound on retained peer-source entries for one torrent. Existing
+/// entries always accept additional sources; new entries stop at the cap so
+/// long-lived torrents cannot grow provenance memory without bound.
+const PEER_SOURCE_MAX_ENTRIES: usize = 50_000;
+
 impl EngineState {
+    /// Attach discovery provenance to one or more peers. Unknown provenance is
+    /// never synthesized; callers only record sources they actually observed.
+    pub fn record_peer_sources<I>(&mut self, peers: I, source: PeerSource)
+    where
+        I: IntoIterator<Item = super::engine::PeerAddr>,
+    {
+        for peer in peers {
+            let address = peer.socket_addr();
+            if let Some(sources) = self.peer_sources.get_mut(&address) {
+                sources.insert(source.clone());
+            } else if self.peer_sources.len() < PEER_SOURCE_MAX_ENTRIES {
+                self.peer_sources
+                    .insert(address, std::collections::BTreeSet::from([source.clone()]));
+            }
+        }
+    }
+
     fn publish_resolved_metadata(&mut self, meta: Arc<TorrentMeta>) -> Result<()> {
         self.piece_count = meta.data_piece_count()?;
         self.pieces_have = PieceBitfield::new(self.piece_count);
@@ -458,6 +503,7 @@ pub struct TorrentEngine {
     /// Live profile-scoped tracker host enablement and priority rules. They
     /// shape discovery only; every resulting request still uses the binder.
     tracker_host_rules: Vec<TrackerHostRule>,
+    disabled_trackers: Vec<String>,
     metadata_preflight: Option<MetadataPreflight>,
     storage_recheck_executor: Option<StorageRecheckExecutor>,
     /// Optional DHT runner for trackerless peer discovery (disabled for
@@ -689,6 +735,7 @@ impl TorrentEngine {
             metadata_only: false,
             intake_selection: None,
             tracker_host_rules: Vec::new(),
+            disabled_trackers: Vec::new(),
             metadata_preflight: None,
             storage_recheck_executor: None,
             dht: None,
@@ -903,6 +950,12 @@ impl TorrentEngine {
     /// eligibility, never the contained network path.
     pub fn with_tracker_host_rules(mut self, rules: Vec<TrackerHostRule>) -> Self {
         self.tracker_host_rules = rules;
+        self
+    }
+
+    /// Apply explicit per-torrent tracker URL disables.
+    pub fn with_disabled_trackers(mut self, disabled: Vec<String>) -> Self {
+        self.disabled_trackers = disabled;
         self
     }
 

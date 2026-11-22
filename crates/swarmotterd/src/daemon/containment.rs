@@ -226,6 +226,7 @@ impl DaemonRuntime {
 
         let mut sample_updates = Vec::new();
         let mut events = Vec::new();
+        let mut completed_for_rss = Vec::new();
         let mut reg = self.registry.lock().await;
         let calc = HealthCalculator::new();
         for (hash, s, engine_is_running, retry_suppressed) in &snapshots {
@@ -393,12 +394,16 @@ impl DaemonRuntime {
                 if t.state != previous_state {
                     events.push(torrent_event("torrent_changed", *hash, t.state));
                     if t.state == TorrentState::Completed {
+                        completed_for_rss.push(t.clone());
                         events.push(torrent_event("torrent_completed", *hash, t.state));
                     }
                 }
             }
         }
         drop(reg);
+        for torrent in completed_for_rss {
+            self.queue_rss_verified_completion(&torrent).await;
+        }
         for event in events {
             self.publish_event(event);
         }

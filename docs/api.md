@@ -3,7 +3,59 @@
 SwarmOtter exposes a native REST API under `/api/v1`. The Web UI uses the same
 API as external automation.
 
+## Discovery, OpenAPI, and compatibility parity
+
+The running daemon publishes a version-matched OpenAPI 3.1 document:
+
+```text
+GET /api/openapi.json
+```
+
+A self-contained interactive explorer is available at:
+
+```text
+GET /api/docs
+```
+
+The explorer uses the same daemon origin and normal API authentication. Enter the
+API token in its password field; it is sent as `X-SwarmOtter-Auth` and is not put
+into examples or URLs. State-changing operations are visibly marked. The
+documentation routes are public because they contain no secrets, but every
+operation they invoke remains subject to authentication, compatibility enablement,
+and browser-origin checks.
+
+The OpenAPI document includes native `/api/v1` operations, request/response
+schemas, envelopes and errors, binary metainfo upload/export, paginated queries,
+event-stream operations, and state-changing markers. The qBittorrent `/api/v2`
+and Transmission RPC operations are documented as explicit supported subsets:
+
+- qBittorrent paths not listed in the document are not implemented and must not
+  be inferred from another client.
+- Transmission RPC exposes `x-swarmotter-supported-rpc-methods`. Unsupported
+  methods return the adapter's JSON-RPC method-not-found response.
+- Compatibility rows include `x-swarmotter-compatibility` parity limits.
+
+The route catalog is checked against the registered router source in CI, a
+deliberate drift fixture must fail, and representative examples plus live
+native/qBittorrent/Transmission exchanges are validated against the emitted JSON
+Schemas. See [CLI Reference](cli.md) for the API-backed command-line client.
+
+When adding or changing an API operation, update the route catalog/operation
+metadata in `crates/swarmotter-api/src/openapi.rs`, run the OpenAPI route check
+and contract tests, and update this operator reference and the compatibility
+parity notes. The document version comes from the daemon package version, so a
+running build always serves its own version. The check commands are:
+
+```bash
+cargo test -p swarmotter-api openapi::tests
+cargo test -p swarmotterctl --test openapi_contract
+```
+
 ## Response format
+
+The native API is also consumed by `swarmotterctl`; see [CLI Reference](cli.md)
+for endpoint/credential setup, machine-readable output, exit codes, and
+scripting examples.
 
 All responses use a common envelope:
 
@@ -162,6 +214,16 @@ the process-wide connection-limit authority.
 | POST | `/torrents/magnet` | Add magnet JSON with storage, profile, preview, file-selection, structured exclusion, and active-file-suffix options. |
 | POST | `/torrents/file` | Upload raw `.torrent` body; query supports start, profile, label, preview, selection, active-root, and partial-suffix options. |
 | POST | `/torrents/bulk` | Add multiple magnets and/or base64 `.torrent` payloads. |
+| POST | `/torrents/create` | Create metainfo from a local file/directory and optionally seed it immediately. |
+| GET | `/torrents/create/roots` | List configured storage roots allowed to contain creation sources. |
+| GET | `/torrents/:hash/magnet` | Generate a deterministic full-identity magnet with tracker policy and optional private-tracker consent. |
+| PUT | `/torrents/:hash/annotation` | Set or clear the operator annotation without changing source metadata. |
+| POST | `/torrents/export` | Download a tar archive of retained originals with a per-item manifest. |
+| GET | `/trash` | Trash path, retention rules, ready entries, and incomplete staging entries. |
+| POST | `/trash/preview` | Dry-run cleanup preview by explicit hashes or retention rule. |
+| POST | `/trash/apply` | Revalidate and move eligible torrents or stale partials into trash. |
+| POST | `/trash/{id}/restore` | Restore a ready entry with `{ "collision_policy": "fail" }`. |
+| DELETE | `/trash/{id}` | Permanently purge a ready or staging trash entry. |
 | GET | `/torrents/:hash` | Torrent details. |
 | GET | `/torrents/:hash/metainfo` | Return the retained, byte-exact original `.torrent` document when one exists. |
 | GET | `/torrents/:hash/stats` | Per-torrent counters and live engine diagnostics. |
@@ -297,6 +359,133 @@ found error for magnet-only or pre-retention records.
 
 Strict fail-closed network blocking can still put the new torrent in
 `network_blocked` instead of `paused`.
+
+## Cleanup and trash
+
+Cleanup preview accepts:
+
+```json
+{
+  "hashes": ["<locator>"],
+  "rule": "old-paused",
+  "mode": "torrent"
+}
+```
+
+`mode` is `torrent` or `stale_partials`. An empty `hashes` list selects by the
+named retention rule; preview may include rule matches that are not yet
+qualified and reports `qualifies_at`, while apply moves only eligible/qualified
+items. Apply without explicit hashes or a rule is rejected. Preview never
+touches files, queue state, or metainfo.
+
+Preview rows list exact paths with role (`complete`, `active`, `resume`),
+existence, size, intended action, reason, and blocker. Shared payload paths,
+symlinks, root changes, and missing/changed source data are explicit blockers or
+skips. Stale-partial mode covers files marked unwanted in current metainfo and
+orphan files under a multi-file torrent's top-level directory.
+
+A ready entry contains a manifest, the serialized torrent record, optional exact
+original metainfo, and role-specific payload trees. Restore accepts only
+`collision_policy: "fail"`; existing destinations abort without overwriting or
+losing the trash copy. Whole-torrent restore re-registers the record and saves
+queue position. Payload-only restore restores selected stale files. Incomplete
+staging entries cannot be restored, but are visible and purgeable.
+
+## Torrent creation
+
+| Method | Path | Description |
+| --- | --- | --- |
+| POST | `/torrents/create` | Create metainfo from a local file or directory and optionally seed it. |
+| GET | `/torrents/create/roots` | List configured storage roots that may contain creation sources. |
+
+Request body:
+
+```json
+{
+  "source": "/data/downloads/distribution",
+  "name": "distribution",
+  "format": "hybrid",
+  "piece_length": 262144,
+  "tracker_tiers": [["https://tracker.example/announce"]],
+  "webseeds": [],
+  "private": false,
+  "seed": true
+}
+```
+
+`format` is `v1` (default), `v2`, or `hybrid`. `piece_length` is optional and
+defaults to `262144`; BEP 52 formats require a power-of-two piece length of at
+least 16384 bytes. `tracker_tiers` is ordered, and an empty list inserts no
+`announce`/`announce-list`. `webseeds` is optional and empty by default.
+`private` and `seed` default to false.
+
+`source` must resolve inside a configured local storage root:
+`storage.download_dir`, `storage.incomplete_dir`, `storage.temp_dir`, or a
+`storage.root_controls` path. The source and every recursive entry must be a
+regular file or directory; symlinks and special files are rejected. A
+directory's files are hashed in deterministic relative-path order. For
+immediate seeding, the torrent name must match the source basename so the
+torrent-relative file layout resolves to the existing files; custom names are
+available for export only.
+
+The response includes `name`, `format`, `total_length`, `piece_length`,
+`piece_count`, `file_count`, `private`, `torrent_keys`, `tracker_tiers`,
+`webseeds`, `metainfo_bytes`, and `metainfo_hex`. `metainfo_hex` is the exact
+generated `.torrent` document; decode it to obtain the export bytes. The Web UI
+turns it into a download. `seeded` reports whether registration started a
+contained seed, and `seed_error` reports a duplicate/registration problem while
+still returning the generated export.
+
+Creation streams hashes under the selected storage root's
+`max_concurrent_rechecks` permit. It rejects out-of-root paths, symlinks,
+unreadable data, and sources that change during hashing. Generated metainfo is
+bounded by the normal 16 MiB metadata limit and must round-trip through the
+standard parser before it is returned.
+
+## Provenance, magnets, and portable export
+
+Torrent details include available source `comment`, `created_by`,
+`creation_date`, and `encoding` values. A magnet that supplied only an
+information dictionary leaves outer fields `null`. The separate
+`annotation`, `annotation_updated_at`, and `annotation_updated_by` fields are
+operator-authored and never alter the source comment, identity, or original
+bytes. Annotation changes are recorded in durable audit events when the state
+store is available.
+
+Generate a magnet:
+
+```text
+GET /api/v1/torrents/:hash/magnet?tracker_policy=all&include_private_trackers=false
+```
+
+`tracker_policy` is `all`, `primary_tier`, or `none`. The response contains
+`magnet`, `tracker_policy`, and `include_private_trackers`. Magnets include full
+v1 and v2 identities as applicable, percent-escaped display name, webseeds, and
+BEP 53 `so` when the wanted file set is a strict subset. A private torrent
+returns an error until the caller passes `include_private_trackers=true` or
+chooses `none`.
+
+Update an annotation:
+
+```json
+PUT /api/v1/torrents/:hash/annotation
+{ "annotation": "operator note" }
+```
+
+`annotation: null` clears it. The response is the updated torrent summary.
+
+Batch export:
+
+```json
+POST /api/v1/torrents/export
+{ "hashes": ["<locator>", "..."] }
+```
+
+The response is `application/x-tar` with `manifest.json`. Each requested item is
+`included` with its archive filename or `unavailable` with a reason. Only
+retained original `.torrent` bytes are archived; magnet-only, older, and
+missing records are never reconstructed. Authorization is the same native API
+authentication as single export.
 
 ## Policy profiles
 
@@ -644,6 +833,76 @@ do not expose compatible mount metadata. Roles also identify configured
 resume/state/temporary/log placement roots. `cow_strategy_supported` is `null`
 when the host cannot determine support safely; an explicit unsupported NOCOW
 request fails before payload bytes are written.
+
+## Tracker, peer-source, and webseed diagnostics
+
+Tracker rows include effective policy and runtime evidence:
+
+- `effective_priority`: `low`, `normal`, or `high` after profile host rules.
+- `allowed`: false for profile-disabled or exact per-torrent disabled URLs.
+- `policy_source`: the selected policy layer or `torrent override`.
+- `last_success` and `last_attempt`, separate from each other.
+- `retries`, `latency_ms`, and `peers_returned` (null = never measured, `0` =
+  measured zero).
+- `sample_status`: `current`, `stale`, or `unavailable`.
+- `recent_errors`: bounded recent announce errors.
+
+Peer rows include `sources`: tracker URL, `dht`, `pex`, `direct`, `resume`, or
+empty when provenance is unknown. Multiple sources are retained.
+
+`GET /api/v1/torrents/:hash/webseeds` returns enabled webseeds with status,
+verified byte contribution, attempts, retries, last success/attempt, latency,
+last error, and bounded recent errors.
+
+Tracker maintenance endpoints:
+
+| Method | Path | Description |
+| --- | --- | --- |
+| POST | `/api/v1/torrents/:hash/trackers/retry` | Trigger a tracker reannounce now (`{ "url": ... }`). |
+| POST | `/api/v1/torrents/:hash/trackers/policy` | Enable/disable one exact tracker URL (`{ "url": ..., "enabled": bool }`). |
+| POST | `/api/v1/torrents/:hash/trackers/cleanup/preview` | List trackers at or above `{ "failure_threshold": N }`. |
+| POST | `/api/v1/torrents/:hash/trackers/cleanup` | Disable affected trackers; requires `confirm: true` after preview. |
+| GET | `/api/v1/torrents/:hash/trackers/diagnostics` | Copyable diagnostic text with redacted tracker/webseed credentials. |
+
+Cleanup preview must be reviewed before apply. Tracker disable is reversible
+through the policy endpoint. Diagnostics redact user information and sensitive
+query values; `swarmotterctl` and the Web UI use the same API contract. All
+announce/scrape/webseed traffic remains on the contained network path.
+
+## RSS subscriptions
+
+All routes require the normal native API authentication. Status responses
+redact feed URL credentials and sensitive query values.
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/rss` | List subscriptions with poll state, latest error, counts, and baseline state. |
+| POST | `/rss` | Create a subscription. |
+| POST | `/rss/preview` | Preview a full, unsaved subscription body without persisting it, adding torrents, or marking entries seen. |
+| PUT | `/rss/{id}` | Replace a subscription. A blank `url` preserves the configured URL; the id is immutable. |
+| DELETE | `/rss/{id}` | Delete a subscription. History and verified completions remain durable. |
+| GET | `/rss/{id}/preview` | Fetch and explain current decisions without adding torrents or marking entries seen. |
+| POST | `/rss/{id}/poll?import_current=false&reconsider=false` | Poll on demand. Explicitly import current matches or re-evaluate stored older listings. |
+| POST | `/rss/{id}/retry` | Clear dismissal/failure state and retry. Body: `{ "entry_key": null }` for all eligible listings. |
+| GET | `/rss/{id}/decisions?limit=100&before=<id>` | Paginated decision history. |
+| DELETE | `/rss/history/completions` | Explicitly clear verified completion identities. |
+| GET | `/rss/diagnostics` | Report whether duplicate lookups use their indexes. |
+
+The Web UI generates `id` from the subscription name; API clients must supply
+their own stable id. A subscription body uses `id`, `name`, `url`, `enabled`,
+`poll_interval_seconds`, `profile`, `start_behavior`, `import_mode`, `labels`,
+and `rules: { include: [...], exclude: [...] }`. A rule has optional `title` and
+`category` wildcard fields. `import_mode` is `new_only` (default) or
+`current_matches`.
+
+Every preview, poll, retry, and paginated decision row reports one of
+`import`, `already_present`, `previously_completed`, `filtered`, `dismissed`,
+`unsupported`, `failed`, `deferred`, `baseline`, with a human-readable reason
+and the full torrent identity aliases used for cross-feed deduplication.
+`success: false` on a poll leaves eligible work in durable retry state; it does
+not mark a torrent downloaded. Transient and server-indicated `Retry-After`
+delays are exposed through `next_attempt_at`. Automatic intake defers when history cannot be
+checked.
 
 ## Watch folders
 

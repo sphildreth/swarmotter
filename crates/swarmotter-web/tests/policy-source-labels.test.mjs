@@ -155,7 +155,7 @@ try {
   assert.match(policyHtml, /intake policy fixed at registration \(linux\)/);
   assert.match(policyHtml, /Structured intake rules/);
   assert.match(policyHtml, /suffix \.sfv/);
-  assert.match(policyHtml, /segment proof and ≤ 1\.0 KB/);
+  assert.match(policyHtml, /segment proof and ≤ 1\.0 KiB/);
   assert.match(policyHtml, /Incomplete content organization/);
   assert.match(policyHtml, /staging\/linux/);
   assert.match(policyHtml, /metadata preview — select files, then use Start/);

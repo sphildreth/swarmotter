@@ -199,7 +199,10 @@ fn fresh_sqlite_file_receives_versioned_schema_migration() {
         .unwrap();
     assert_eq!(version, SQLITE_SCHEMA_VERSION);
     assert_eq!(recorded, SQLITE_SCHEMA_VERSION);
-    assert_eq!(migrations, vec![SQLITE_SCHEMA_V1, SQLITE_SCHEMA_VERSION]);
+    assert_eq!(
+        migrations,
+        vec![SQLITE_SCHEMA_V1, SQLITE_SCHEMA_V2, SQLITE_SCHEMA_VERSION]
+    );
     assert_eq!(metric_history_exists, Some(1));
     drop(connection);
     remove_state(&path);
@@ -218,8 +221,9 @@ fn sqlite_v1_state_migrates_to_metric_history_schema_without_losing_state() {
     let connection = Connection::open(&path).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE torrent_metric_samples;
-             DELETE FROM schema_migrations WHERE version = 2;
+            "DROP TABLE rss_outbox;
+             DROP TABLE torrent_metric_samples;
+             DELETE FROM schema_migrations WHERE version >= 2;
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -246,7 +250,10 @@ fn sqlite_v1_state_migrates_to_metric_history_schema_without_losing_state() {
         })
         .unwrap();
     assert_eq!(version, SQLITE_SCHEMA_VERSION);
-    assert_eq!(migrations, vec![SQLITE_SCHEMA_V1, SQLITE_SCHEMA_VERSION]);
+    assert_eq!(
+        migrations,
+        vec![SQLITE_SCHEMA_V1, SQLITE_SCHEMA_V2, SQLITE_SCHEMA_VERSION]
+    );
     // A schema migration preserves v1 facts; it does not invent a sample
     // for a point in time that was never captured.
     assert_eq!(metric_history_rows, 0);
@@ -847,8 +854,9 @@ fn projection_rebuild_refuses_missing_legacy_and_corrupt_state_without_writing()
     let connection = Connection::open(&v1).unwrap();
     connection
         .execute_batch(
-            "DROP TABLE torrent_metric_samples;
-             DELETE FROM schema_migrations WHERE version = 2;
+            "DROP TABLE rss_outbox;
+             DROP TABLE torrent_metric_samples;
+             DELETE FROM schema_migrations WHERE version >= 2;
              PRAGMA user_version = 1;",
         )
         .unwrap();

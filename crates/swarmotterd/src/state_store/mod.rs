@@ -34,8 +34,9 @@ use swarmotter_core::queue::QueueState;
 use swarmotter_core::torrent::Torrent;
 
 const LEGACY_STATE_VERSION: u32 = 1;
-const SQLITE_SCHEMA_VERSION: u32 = 2;
+const SQLITE_SCHEMA_VERSION: u32 = 3;
 const SQLITE_SCHEMA_V1: u32 = 1;
+const SQLITE_SCHEMA_V2: u32 = 2;
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Rebuild operations intentionally process a bounded number of authoritative
@@ -351,7 +352,7 @@ pub fn rebuild_projections(path: &Path) -> Result<ProjectionRebuildReport> {
 /// normalized into BLOB rows when the core metadata model provides it; the
 /// BLOB records remain byte-exact and are never rebuilt by this module.
 pub fn save(path: &Path, state: &DaemonState) -> Result<()> {
-    save_with_original_metainfo(path, state, None)
+    save_with_original_metainfo_and_events(path, state, None, &[])
 }
 
 /// Read the byte-exact original `.torrent` document retained for a torrent.
@@ -432,20 +433,34 @@ pub fn load_original_metainfo(path: &Path, key: TorrentKey) -> Result<Option<Vec
 /// byte-exact original metainfo in the same SQLite transaction. The native
 /// export surface reads only this representation; it never synthesizes one
 /// from canonical metadata.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn save_with_original_metainfo(
     path: &Path,
     state: &DaemonState,
     original_metainfo: Option<OriginalMetainfo>,
 ) -> Result<()> {
+    save_with_original_metainfo_and_events(path, state, original_metainfo, &[])
+}
+
+/// Save state and atomically enqueue RSS history events in the same database
+/// transaction as the library change they describe.
+pub(crate) fn save_with_original_metainfo_and_events(
+    path: &Path,
+    state: &DaemonState,
+    original_metainfo: Option<OriginalMetainfo>,
+    events: &[crate::rss_store::PendingLibraryEvent],
+) -> Result<()> {
     match classify_state_file(path)? {
-        StateFileKind::Missing => write_new_sqlite_generation(path, state, original_metainfo),
+        StateFileKind::Missing => {
+            write_new_sqlite_generation(path, state, original_metainfo, events)
+        }
         StateFileKind::LegacyJson => {
             // Parse first so a corrupt or unsupported legacy document can
             // never be overwritten by a later in-memory snapshot.
             let _ = load_legacy_json(path)?;
-            write_new_sqlite_generation(path, state, original_metainfo)
+            write_new_sqlite_generation(path, state, original_metainfo, events)
         }
-        StateFileKind::Sqlite => save_sqlite_generation(path, state, original_metainfo),
+        StateFileKind::Sqlite => save_sqlite_generation(path, state, original_metainfo, events),
     }
 }
 
@@ -464,10 +479,23 @@ pub(crate) fn save_with_original_metainfo(
 /// is deliberately skipped so a save stays proportional to the changed set;
 /// WAL growth is bounded by SQLite autocheckpointing and the paired
 /// transaction paths checkpoint explicitly before capturing the state file.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn save_changed_records(
     path: &Path,
     torrents: &[Torrent],
     queue: Option<&QueueState<TorrentKey>>,
+) -> Result<()> {
+    save_changed_records_and_events(path, torrents, queue, &[])
+}
+
+/// Changed-record variant that also enqueues RSS history events in the same
+/// transaction (for example a verified completion discovered by a progress
+/// tick).
+pub(crate) fn save_changed_records_and_events(
+    path: &Path,
+    torrents: &[Torrent],
+    queue: Option<&QueueState<TorrentKey>>,
+    events: &[crate::rss_store::PendingLibraryEvent],
 ) -> Result<()> {
     let started = std::time::Instant::now();
     CHANGED_SAVE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -497,7 +525,8 @@ pub(crate) fn save_changed_records(
         let hash = durable_torrent_key(torrent)?;
         let current_state = torrent.state.as_str();
         let observed_at = unix_timestamp();
-        let (previous_state, previous_reason) = prior_lifecycle(&transaction, &hash, torrent)?;
+        let (previous_state, previous_reason, previous_annotation) =
+            prior_lifecycle(&transaction, &hash, torrent)?;
         let (torrent_json, raw_info) = encode_torrent(torrent)?;
         crate::persistence_metrics::SERIALIZED_BYTES
             .fetch_add(torrent_json.len() as u64, Ordering::Relaxed);
@@ -527,6 +556,7 @@ pub(crate) fn save_changed_records(
             &hash,
             previous_state.as_deref(),
             previous_reason.as_deref(),
+            previous_annotation.as_deref(),
             torrent,
         )?;
         write_canonical_info(&transaction, &hash, raw_info.as_deref())?;
@@ -569,6 +599,7 @@ pub(crate) fn save_changed_records(
             MAX_AUDIT_EVENT_ROWS,
         )?;
     }
+    append_outbox_events(&transaction, events)?;
     let result = transaction.commit().map_err(|error| {
         CoreError::Storage(format!("commit SQLite changed-record transaction: {error}"))
     });
@@ -721,11 +752,12 @@ fn save_sqlite_generation(
     path: &Path,
     state: &DaemonState,
     original_metainfo: Option<OriginalMetainfo>,
+    events: &[crate::rss_store::PendingLibraryEvent],
 ) -> Result<()> {
     verify_existing_sqlite_state_for_migration(path, true)?;
     let mut connection = open_sqlite(path)?;
     migrate_schema(&mut connection)?;
-    write_state_to_connection(&mut connection, state, original_metainfo.as_ref())?;
+    write_state_to_connection(&mut connection, state, original_metainfo.as_ref(), events)?;
     checkpoint_and_sync(connection, path)
 }
 
@@ -733,6 +765,7 @@ fn write_new_sqlite_generation(
     path: &Path,
     state: &DaemonState,
     original_metainfo: Option<OriginalMetainfo>,
+    events: &[crate::rss_store::PendingLibraryEvent],
 ) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
@@ -744,7 +777,7 @@ fn write_new_sqlite_generation(
         restrict_permissions(&temporary)?;
         configure_connection(&connection)?;
         migrate_schema(&mut connection)?;
-        write_state_to_connection(&mut connection, state, original_metainfo.as_ref())?;
+        write_state_to_connection(&mut connection, state, original_metainfo.as_ref(), events)?;
         checkpoint_and_sync(connection, &temporary)?;
         fs::rename(&temporary, path)
             .map_err(|error| CoreError::Storage(format!("replace daemon state: {error}")))?;
@@ -818,6 +851,12 @@ fn migrate_schema(connection: &mut Connection) -> Result<()> {
     }
     if applied == SQLITE_SCHEMA_V1 {
         apply_schema_v2(&transaction)?;
+        record_schema_migration(&transaction, SQLITE_SCHEMA_V2)?;
+        set_schema_version(&transaction, SQLITE_SCHEMA_V2)?;
+        applied = SQLITE_SCHEMA_V2;
+    }
+    if applied == SQLITE_SCHEMA_V2 {
+        apply_schema_v3(&transaction)?;
         record_schema_migration(&transaction, SQLITE_SCHEMA_VERSION)?;
         set_schema_version(&transaction, SQLITE_SCHEMA_VERSION)?;
         applied = SQLITE_SCHEMA_VERSION;
@@ -922,6 +961,23 @@ fn apply_schema_v2(transaction: &Transaction<'_>) -> Result<()> {
         .map_err(|error| {
             CoreError::Storage(format!("create SQLite metric history schema: {error}"))
         })
+}
+
+fn apply_schema_v3(transaction: &Transaction<'_>) -> Result<()> {
+    transaction
+        .execute_batch(
+            "CREATE TABLE rss_outbox (
+                id INTEGER PRIMARY KEY,
+                kind TEXT NOT NULL CHECK(kind IN ('completed', 'removed')),
+                canonical_key TEXT NOT NULL,
+                aliases_json BLOB NOT NULL,
+                name TEXT NOT NULL,
+                was_completed INTEGER NOT NULL,
+                occurred_at INTEGER NOT NULL
+             ) STRICT;
+             CREATE INDEX rss_outbox_time ON rss_outbox(occurred_at, id);",
+        )
+        .map_err(|error| CoreError::Storage(format!("create SQLite RSS outbox schema: {error}")))
 }
 
 fn record_schema_migration(transaction: &Transaction<'_>, version: u32) -> Result<()> {
@@ -1144,6 +1200,7 @@ fn verify_rebuild_schema(connection: &Connection) -> Result<()> {
         "torrent_metric_samples",
         "library_history",
         "audit_events",
+        "rss_outbox",
     ] {
         let exists: Option<i64> = connection
             .query_row(
@@ -1426,11 +1483,12 @@ fn write_state_to_connection(
     connection: &mut Connection,
     state: &DaemonState,
     original_metainfo: Option<&OriginalMetainfo>,
+    events: &[crate::rss_store::PendingLibraryEvent],
 ) -> Result<()> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| CoreError::Storage(format!("begin SQLite state transaction: {error}")))?;
-    write_state_transaction(&transaction, state, original_metainfo)?;
+    write_state_transaction(&transaction, state, original_metainfo, events)?;
     transaction
         .commit()
         .map_err(|error| CoreError::Storage(format!("commit SQLite state transaction: {error}")))
@@ -1440,6 +1498,7 @@ fn write_state_transaction(
     transaction: &Transaction<'_>,
     state: &DaemonState,
     original_metainfo: Option<&OriginalMetainfo>,
+    events: &[crate::rss_store::PendingLibraryEvent],
 ) -> Result<()> {
     transaction
         .execute_batch(
@@ -1456,7 +1515,8 @@ fn write_state_transaction(
         let hash = durable_torrent_key(torrent)?;
         let current_state = torrent.state.as_str();
         let observed_at = unix_timestamp();
-        let (previous_state, previous_reason) = prior_lifecycle(transaction, &hash, torrent)?;
+        let (previous_state, previous_reason, previous_annotation) =
+            prior_lifecycle(transaction, &hash, torrent)?;
         let (torrent_json, raw_info) = encode_torrent(torrent)?;
         transaction
             .execute(
@@ -1490,6 +1550,7 @@ fn write_state_transaction(
             &hash,
             previous_state.as_deref(),
             previous_reason.as_deref(),
+            previous_annotation.as_deref(),
             torrent,
         )?;
         write_canonical_info(transaction, &hash, raw_info.as_deref())?;
@@ -1535,6 +1596,7 @@ fn write_state_transaction(
         write_original_metainfo(transaction, original.key, &original.bytes)?;
     }
     write_queue_state(transaction, &state.queue)?;
+    append_outbox_events(transaction, events)?;
     prune_retained_rows(transaction, DURABLE_RETENTION)?;
     Ok(())
 }
@@ -1610,15 +1672,18 @@ fn prior_lifecycle(
     tx: &Transaction<'_>,
     hash: &str,
     torrent: &Torrent,
-) -> Result<(Option<String>, Option<String>)> {
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
     // Read the previous reason only when a paused-to-paused recheck could
-    // change it without an intervening durable "checking" generation.
+    // change it without an intervening durable "checking" generation. Read the
+    // previous annotation so an operator edit produces a durable audit event
+    // even when lifecycle state is unchanged.
     tx.query_row(
         "SELECT lifecycle_state, CASE WHEN ?2 AND lifecycle_state='paused'
-         THEN json_extract(CAST(torrent_json AS TEXT), '$.pause_reason') END
+         THEN json_extract(CAST(torrent_json AS TEXT), '$.pause_reason') END,
+         json_extract(CAST(torrent_json AS TEXT), '$.annotation')
          FROM torrent_records WHERE info_hash=?1",
         params![hash, torrent.current_pause_reason().is_some()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
     .optional()
     .map(Option::unwrap_or_default)
@@ -1630,6 +1695,7 @@ fn write_history(
     hash: &str,
     previous_state: Option<&str>,
     previous_reason: Option<&str>,
+    previous_annotation: Option<&str>,
     torrent: &Torrent,
 ) -> Result<bool> {
     let current_state = torrent.state.as_str();
@@ -1657,11 +1723,16 @@ fn write_history(
                 CoreError::Storage(format!("write durable library history: {error}"))
             })?;
     }
+    let annotation_changed = previous_annotation != torrent.annotation.as_deref();
     let action = match event_kind {
-        Some("registered") => "torrent_registered",
-        Some(_) => "torrent_state_changed",
-        None if pause_reason.as_str() != previous_reason => "torrent_pause_reason_changed",
-        None => return Ok(false),
+        Some("registered") => Some("torrent_registered"),
+        Some(_) => Some("torrent_state_changed"),
+        None if pause_reason.as_str() != previous_reason => Some("torrent_pause_reason_changed"),
+        None if annotation_changed => Some("torrent_annotation_changed"),
+        None => None,
+    };
+    let Some(action) = action else {
+        return Ok(false);
     };
     write_audit_event(
         transaction,
@@ -1672,9 +1743,118 @@ fn write_history(
             "previous_state": previous_state,
             "current_state": current_state,
             "pause_reason": pause_reason,
+            "annotation_changed": annotation_changed,
+            "annotation_updated_at": torrent.annotation_updated_at,
+            "annotation_updated_by": torrent.annotation_updated_by,
         }),
     )?;
     Ok(true)
+}
+
+/// Append pending RSS history events inside the caller's existing
+/// transaction. This is the durable handoff boundary: an event becomes
+/// visible only if the library change it describes also commits.
+fn append_outbox_events(
+    transaction: &Transaction<'_>,
+    events: &[crate::rss_store::PendingLibraryEvent],
+) -> Result<()> {
+    for event in events {
+        let aliases = serde_json::to_vec(&event.aliases)
+            .map_err(|error| CoreError::Storage(format!("encode RSS event aliases: {error}")))?;
+        transaction
+            .execute(
+                "INSERT INTO rss_outbox(
+                    kind, canonical_key, aliases_json, name, was_completed, occurred_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event.kind.as_str(),
+                    &event.canonical_key,
+                    aliases,
+                    &event.name,
+                    i64::from(event.was_completed),
+                    event.occurred_at as i64,
+                ],
+            )
+            .map_err(|error| CoreError::Storage(format!("append RSS outbox event: {error}")))?;
+    }
+    Ok(())
+}
+
+/// Read a bounded batch of unacknowledged RSS outbox events.
+pub(crate) fn load_outbox_events(
+    path: &Path,
+    limit: usize,
+) -> Result<Vec<crate::rss_store::PendingLibraryEvent>> {
+    if classify_state_file(path)? != StateFileKind::Sqlite {
+        return Ok(Vec::new());
+    }
+    let connection = open_sqlite(path)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, kind, canonical_key, aliases_json, name, was_completed, occurred_at
+             FROM rss_outbox ORDER BY id ASC LIMIT ?1",
+        )
+        .map_err(|error| CoreError::Storage(format!("prepare RSS outbox read: {error}")))?;
+    let rows = statement
+        .query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+            ))
+        })
+        .map_err(|error| CoreError::Storage(format!("read RSS outbox: {error}")))?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (id, kind, canonical_key, aliases, name, was_completed, occurred_at) =
+            row.map_err(|error| CoreError::Storage(format!("decode RSS outbox row: {error}")))?;
+        let aliases: Vec<String> = serde_json::from_slice(&aliases)
+            .map_err(|error| CoreError::Storage(format!("decode RSS outbox aliases: {error}")))?;
+        let kind = crate::rss_store::PendingEventKind::parse(&kind)
+            .ok_or_else(|| CoreError::Storage(format!("unknown RSS outbox event kind {kind}")))?;
+        events.push(crate::rss_store::PendingLibraryEvent {
+            id: Some(id),
+            kind,
+            canonical_key,
+            aliases,
+            name,
+            was_completed: was_completed != 0,
+            occurred_at: occurred_at.max(0) as u64,
+        });
+    }
+    drop(statement);
+    // A changed-record save intentionally leaves a WAL. Checkpoint and remove
+    // sidecars under the daemon state-write lane so a read leaves a complete,
+    // backup-ready generation and cannot race a concurrent writer.
+    checkpoint_and_sync(connection, path)?;
+    Ok(events)
+}
+
+/// Acknowledge events only after their idempotent RSS-history application
+/// has committed. Deleting an absent id remains harmless.
+pub(crate) fn acknowledge_outbox_events(path: &Path, ids: &[i64]) -> Result<()> {
+    if ids.is_empty() || classify_state_file(path)? != StateFileKind::Sqlite {
+        return Ok(());
+    }
+    let mut connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|error| CoreError::Storage(format!("open RSS outbox for ack: {error}")))?;
+    configure_connection(&connection)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|error| CoreError::Storage(format!("begin RSS outbox ack: {error}")))?;
+    for id in ids {
+        transaction
+            .execute("DELETE FROM rss_outbox WHERE id = ?1", params![id])
+            .map_err(|error| CoreError::Storage(format!("ack RSS outbox event: {error}")))?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| CoreError::Storage(format!("commit RSS outbox ack: {error}")))?;
+    checkpoint_and_sync(connection, path)
 }
 
 fn write_audit_event(

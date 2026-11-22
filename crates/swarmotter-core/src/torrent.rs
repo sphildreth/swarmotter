@@ -63,6 +63,19 @@ pub struct Torrent {
     pub active_peer_workers: usize,
     pub known_peers: usize,
     pub labels: Vec<String>,
+    /// Operator-authored note kept separate from source metainfo `comment`.
+    /// Missing from older state and never included in identity or metainfo
+    /// export.
+    #[serde(default)]
+    pub annotation: Option<String>,
+    #[serde(default)]
+    pub annotation_updated_at: Option<u64>,
+    #[serde(default)]
+    pub annotation_updated_by: Option<String>,
+    /// Exact tracker URLs disabled by an explicit operator action for this
+    /// torrent. This is deliberately separate from profile host rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_trackers: Vec<String>,
     /// Named profile assignment and explicit policy overrides. Missing from
     /// pre-profile state means normal global inheritance.
     #[serde(default)]
@@ -154,6 +167,10 @@ impl Torrent {
             active_peer_workers: 0,
             known_peers: 0,
             labels: Vec::new(),
+            annotation: None,
+            annotation_updated_at: None,
+            annotation_updated_by: None,
+            disabled_trackers: Vec::new(),
             policy: TorrentPolicy::default(),
             download_dir: None,
             date_added,
@@ -272,6 +289,13 @@ impl Torrent {
             piece_length: self.meta.piece_length,
             private: self.meta.is_private(),
             labels: self.labels.clone(),
+            comment: self.meta.comment.clone(),
+            created_by: self.meta.created_by.clone(),
+            creation_date: self.meta.creation_date,
+            encoding: self.meta.encoding.clone(),
+            annotation: self.annotation.clone(),
+            annotation_updated_at: self.annotation_updated_at,
+            annotation_updated_by: self.annotation_updated_by.clone(),
             download_dir: self.download_dir.clone(),
             download_limit: self.download_limit,
             upload_limit: self.upload_limit,

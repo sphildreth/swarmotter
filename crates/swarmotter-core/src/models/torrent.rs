@@ -249,6 +249,16 @@ pub struct TorrentSummary {
     pub piece_length: u64,
     pub private: bool,
     pub labels: Vec<String>,
+    /// Source metainfo fields when available. Magnet-only information
+    /// dictionaries leave outer fields unavailable (`null`).
+    pub comment: Option<String>,
+    pub created_by: Option<String>,
+    pub creation_date: Option<u64>,
+    pub encoding: Option<String>,
+    /// Operator annotation, distinct from source `comment`.
+    pub annotation: Option<String>,
+    pub annotation_updated_at: Option<u64>,
+    pub annotation_updated_by: Option<String>,
     pub download_dir: Option<String>,
     /// Per-torrent download limit in bytes/sec (0 = unlimited).
     pub download_limit: u64,

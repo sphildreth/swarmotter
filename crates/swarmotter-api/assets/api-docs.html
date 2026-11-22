@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SwarmOtter API explorer</title>
+<style>
+:root{color-scheme:dark;--bg:#101418;--panel:#171d23;--line:#2d3741;--text:#e6edf3;--muted:#93a1af;--accent:#7cc4ff;--danger:#ff9c8f}
+*{box-sizing:border-box}body{margin:0;font:14px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--text)}
+header{padding:1rem 1.25rem;border-bottom:1px solid var(--line);display:flex;gap:1rem;align-items:center;flex-wrap:wrap}
+h1{font-size:1.15rem;margin:0}main{display:grid;grid-template-columns:minmax(220px,300px) 1fr;min-height:calc(100vh - 70px)}
+aside{border-right:1px solid var(--line);padding:1rem;overflow:auto}.tag{margin:1rem 0 .35rem;color:var(--muted);font-size:.75rem;text-transform:uppercase;letter-spacing:.08em}
+.op{display:block;width:100%;text-align:left;border:0;background:transparent;color:var(--text);padding:.35rem .4rem;border-radius:5px;cursor:pointer}
+.op:hover,.op.active{background:#22303c}.method{font-weight:700;font-size:.72rem;padding:.05rem .35rem;border-radius:4px;background:#2d4657;margin-right:.35rem}
+.method.post,.method.put,.method.patch,.method.delete{background:#5a3228;color:#ffd8d0}
+section{padding:1.25rem;overflow:auto}.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:1rem;margin-bottom:1rem}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0b0f12;border:1px solid var(--line);padding:.75rem;border-radius:6px}
+input,textarea,button,select{font:inherit;color:var(--text);background:#0d1216;border:1px solid var(--line);border-radius:5px;padding:.45rem}
+button{cursor:pointer}button.primary{background:#214b66;border-color:#326786}button:disabled{opacity:.55;cursor:not-allowed}
+label{display:block;margin:.55rem 0 .2rem;color:var(--muted)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:.75rem}
+.warning{color:var(--danger);font-weight:600}.muted{color:var(--muted)}.row{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center}
+code{color:#b8e1ff}.status-ok{color:#8be28b}.status-error{color:#ff9c8f}
+@media(max-width:760px){main{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+</head>
+<body>
+<header>
+  <h1>SwarmOtter API explorer</h1>
+  <span id="version" class="muted">loading version…</span>
+  <a href="/api/openapi.json" class="muted">OpenAPI JSON</a>
+  <a href="/docs/api" class="muted">API guide</a>
+  <label for="token" class="muted">API token (kept only in this tab)</label>
+  <input id="token" type="password" autocomplete="off" placeholder="api.auth_token">
+</header>
+<main>
+  <aside id="index" aria-label="API operations"></aside>
+  <section id="detail"><div class="card"><p class="muted">Select an operation to inspect it. Requests use the normal same-origin API authentication and browser-origin controls.</p></div></section>
+</main>
+<script>
+let spec = null;
+let selected = null;
+const token = document.querySelector("#token");
+const detail = document.querySelector("#detail");
+const index = document.querySelector("#index");
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, ch => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+function refName(ref) { return String(ref || "").split("/").pop(); }
+function schemaFor(content) {
+  const first = Object.values(content || {})[0];
+  return first?.schema || {};
+}
+function exampleFor(content) {
+  const first = Object.values(content || {})[0];
+  if (first?.example !== undefined) return JSON.stringify(first.example, null, 2);
+  const name = refName(first?.schema?.$ref);
+  return name && spec?.components?.schemas?.[name]?.example
+    ? JSON.stringify(spec.components.schemas[name].example, null, 2)
+    : "{}";
+}
+
+async function load() {
+  const response = await fetch("/api/openapi.json", { headers: { accept: "application/json" } });
+  if (!response.ok) throw new Error(`OpenAPI document returned HTTP ${response.status}`);
+  spec = await response.json();
+  document.querySelector("#version").textContent = `v${spec.info?.version || "?"}`;
+  const groups = new Map();
+  for (const [path, methods] of Object.entries(spec.paths || {})) {
+    for (const [method, op] of Object.entries(methods)) {
+      const tag = (op.tags || ["Other"])[0];
+      if (!groups.has(tag)) groups.set(tag, []);
+      groups.get(tag).push({ path, method, op });
+    }
+  }
+  index.innerHTML = "";
+  for (const [tag, ops] of [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    const heading = document.createElement("div");
+    heading.className = "tag";
+    heading.textContent = tag;
+    index.appendChild(heading);
+    for (const entry of ops.sort((a, b) => `${a.path} ${a.method}`.localeCompare(`${b.path} ${b.method}`))) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "op";
+      button.innerHTML = `<span class="method ${entry.method}">${esc(entry.method.toUpperCase())}</span>${esc(entry.path)}`;
+      button.addEventListener("click", () => {
+        document.querySelectorAll(".op").forEach(node => node.classList.remove("active"));
+        button.classList.add("active");
+        show(entry);
+      });
+      index.appendChild(button);
+    }
+  }
+  const first = [...groups.values()].flat()[0];
+  if (first) show(first);
+}
+
+function parameterInputs(parameters) {
+  return (parameters || []).map(parameter => {
+    if (parameter.in === "path" || parameter.in === "query") {
+      return `<label for="p-${esc(parameter.name)}">${esc(parameter.name)} <span class="muted">(${esc(parameter.in)})</span></label>
+        <input id="p-${esc(parameter.name)}" data-param="${esc(parameter.name)}" data-in="${esc(parameter.in)}" placeholder="${esc(parameter.description || "")}">`;
+    }
+    return "";
+  }).join("");
+}
+
+function show(entry) {
+  selected = entry;
+  const op = entry.op;
+  const bodyContent = op.requestBody?.content || {};
+  const jsonBody = bodyContent["application/json"];
+  const bodyExample = jsonBody ? exampleFor({ "application/json": jsonBody }) : "";
+  const stateChanging = op["x-swarmotter-state-changing"] === true || ["POST", "PUT", "PATCH", "DELETE"].includes(entry.method.toUpperCase());
+  const security = (op.security || []).map(item => Object.keys(item)[0]).filter(Boolean);
+  const supported = op["x-swarmotter-supported-rpc-methods"];
+  const parity = op["x-swarmotter-compatibility"];
+  detail.innerHTML = `<div class="card">
+    <div class="row"><span class="method ${entry.method}">${esc(entry.method.toUpperCase())}</span><code>${esc(entry.path)}</code></div>
+    <h2>${esc(op.summary || "")}</h2>
+    <p>${esc(op.description || "")}</p>
+    ${stateChanging ? `<p class="warning">State-changing operation. It uses the normal API authorization and may mutate daemon state.</p>` : `<p class="muted">Read-only operation.</p>`}
+    <p class="muted">Security: ${security.length ? esc(security.join(", ")) : "none (public route)"}</p>
+    ${supported ? `<p class="muted">Supported Transmission methods: <code>${esc(supported.join(", "))}</code></p>` : ""}
+    ${parity ? `<p class="muted">Compatibility: ${esc(parity.surface)} — ${esc(parity.status)}. ${esc((parity.parity_limits || []).join(" "))}</p>` : ""}
+    ${parameterInputs(op.parameters)}
+    ${jsonBody ? `<label for="request-body">Request JSON</label><textarea id="request-body" rows="10">${esc(bodyExample)}</textarea>` : ""}
+    ${bodyContent["application/x-bittorrent"] ? `<p class="muted">This operation accepts raw binary .torrent bytes; use the Web UI or <code>swarmotterctl</code> for upload.</p>` : ""}
+    <div class="row" style="margin-top:.75rem"><button id="try" class="primary" type="button">Send request</button></div>
+    <div id="result"></div>
+  </div>`;
+  document.querySelector("#try").addEventListener("click", send);
+}
+
+async function send() {
+  if (!selected) return;
+  const entry = selected;
+  let path = entry.path;
+  const query = new URLSearchParams();
+  document.querySelectorAll("[data-param]").forEach(input => {
+    if (!input.value) return;
+    if (input.dataset.in === "path") path = path.replace(`{${input.dataset.param}}`, encodeURIComponent(input.value));
+    else query.set(input.dataset.param, input.value);
+  });
+  const url = query.toString() ? `${path}?${query}` : path;
+  const headers = { accept: "application/json" };
+  if (token.value.trim()) headers["x-swarmotter-auth"] = token.value.trim();
+  const options = { method: entry.method.toUpperCase(), headers };
+  const body = document.querySelector("#request-body");
+  if (body && body.value.trim()) {
+    headers["content-type"] = "application/json";
+    options.body = body.value;
+  }
+  const result = document.querySelector("#result");
+  result.innerHTML = `<p class="muted">Sending…</p>`;
+  try {
+    const response = await fetch(url, options);
+    const text = await response.text();
+    let pretty = text;
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch {}
+    result.innerHTML = `<p class="${response.ok ? "status-ok" : "status-error"}">HTTP ${response.status}</p><pre>${esc(pretty)}</pre>`;
+  } catch (error) {
+    result.innerHTML = `<p class="status-error">Request failed: ${esc(error.message)}</p>`;
+  }
+}
+
+load().catch(error => {
+  detail.innerHTML = `<div class="card"><p class="status-error">Could not load /api/openapi.json: ${esc(error.message)}</p></div>`;
+});
+</script>
+</body>
+</html>

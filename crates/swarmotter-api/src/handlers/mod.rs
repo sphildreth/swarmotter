@@ -3,7 +3,9 @@
 //! API request handlers.
 
 pub mod autopilot;
+pub mod creation;
 pub mod diagnostics;
+pub mod docs;
 pub mod events;
 pub mod files;
 pub mod health;
@@ -13,10 +15,12 @@ pub mod peers;
 pub mod policies;
 pub mod qbittorrent;
 pub mod queue;
+pub mod rss;
 pub mod settings;
 pub mod stats;
 pub mod storage;
 pub mod torrents;
 pub mod trackers;
 pub mod transmission;
+pub mod trash;
 pub mod watch;

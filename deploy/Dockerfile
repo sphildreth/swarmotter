@@ -12,17 +12,19 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --locked --release --bin swarmotterd \
-    && cp /src/target/release/swarmotterd /tmp/swarmotterd
+    cargo build --locked --release --bin swarmotterd --bin swarmotterctl \
+    && cp /src/target/release/swarmotterd /tmp/swarmotterd \
+    && cp /src/target/release/swarmotterctl /tmp/swarmotterctl
 
 FROM scratch AS binary
 COPY --from=builder /tmp/swarmotterd /swarmotterd
+COPY --from=builder /tmp/swarmotterctl /swarmotterctl
 
 FROM debian:bookworm-slim AS runtime-base
 
 ARG SWARMOTTER_BUILD_COMMIT=unknown
 ARG SWARMOTTER_IMAGE_CREATED=unknown
-ARG SWARMOTTER_VERSION=2.5.0
+ARG SWARMOTTER_VERSION=3.0.0
 
 LABEL org.opencontainers.image.title="SwarmOtter" \
       org.opencontainers.image.description="SwarmOtter BitTorrent daemon and web UI" \
@@ -56,6 +58,8 @@ CMD ["--config", "/etc/swarmotter/swarmotter.toml"]
 FROM runtime-base AS runtime-prebuilt
 ARG TARGETARCH
 COPY --chown=root:root image-binaries/linux-${TARGETARCH}/swarmotterd /usr/local/bin/swarmotterd
+COPY --chown=root:root image-binaries/linux-${TARGETARCH}/swarmotterctl /usr/local/bin/swarmotterctl
 
 FROM runtime-base AS runtime
 COPY --from=builder --chown=root:root /tmp/swarmotterd /usr/local/bin/swarmotterd
+COPY --from=builder --chown=root:root /tmp/swarmotterctl /usr/local/bin/swarmotterctl

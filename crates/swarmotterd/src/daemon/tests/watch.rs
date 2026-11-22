@@ -3,6 +3,20 @@
 use super::*;
 
 #[tokio::test]
+async fn empty_watch_configuration_is_optional_not_a_warning() {
+    let mut config = Config::default();
+    config.watch.clear();
+    let runtime = DaemonRuntime::new(config.clone(), disabled_health());
+    let mut checks = Vec::new();
+    runtime.add_watch_checks(&config, &mut checks).await;
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].id, "watch_folders");
+    assert_eq!(checks[0].level, DiagnosticLevel::Ok);
+    assert_eq!(checks[0].detail, "not configured (optional)");
+    assert!(checks[0].remediation.is_none());
+}
+
+#[tokio::test]
 async fn watch_profile_captures_storage_before_registration() {
     use swarmotter_core::config::StartBehavior;
     use swarmotter_core::policy::{PolicyProfile, PolicyStorage};

@@ -107,9 +107,9 @@ impl DaemonRuntime {
                 checks,
                 "watch_folders",
                 "Watch folders",
-                DiagnosticLevel::Warning,
-                "no watch folders are configured",
-                Some("add [[watch]] entries if automatic .torrent import is desired"),
+                DiagnosticLevel::Ok,
+                "not configured (optional)",
+                None,
             );
             return;
         }
@@ -757,6 +757,16 @@ pub(super) fn make_tracker(url: &str, tier: usize) -> TrackerInfo {
         scrape_leechers: None,
         scrape_downloads: None,
         last_scrape_error: None,
+        effective_priority: swarmotter_core::models::tracker::TrackerPriority::Normal,
+        allowed: true,
+        policy_source: "global".into(),
+        last_success: None,
+        last_attempt: None,
+        retries: 0,
+        latency_ms: None,
+        peers_returned: None,
+        sample_status: swarmotter_core::models::tracker::TrackerSampleStatus::Unavailable,
+        recent_errors: Vec::new(),
     }
 }
 

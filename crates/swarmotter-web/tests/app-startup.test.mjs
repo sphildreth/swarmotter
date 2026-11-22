@@ -294,7 +294,8 @@ try {
   assert.deepEqual(apiCalls.sort(), [
     "/api/v1/doctor",
     "/api/v1/network/diagnostics",
-    "/api/v1/network/health",
+    "/api/v1/network/health", // shared telemetry at startup
+    "/api/v1/network/health", // explicit diagnostics refresh
     "/api/v1/stats",
     "/api/v1/torrents/query",
   ]);

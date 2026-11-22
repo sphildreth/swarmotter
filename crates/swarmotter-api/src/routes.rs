@@ -126,6 +126,10 @@ pub fn app_router_with_body_limit(state: SharedState, max_request_body_bytes: us
         .layer(from_fn_with_state(state.clone(), browser_origin_guard));
 
     Router::new()
+        // Public, version-matched API documentation. Operations still use the
+        // normal same-origin API authentication when executed.
+        .route("/api/docs", get(handlers::docs::docs_page))
+        .route("/api/openapi.json", get(handlers::docs::openapi_json))
         // Public health route that neither mutates nor reveals torrent data.
         .route("/health", get(handlers::health::root_health))
         .route("/live", get(handlers::health::live))
@@ -168,6 +172,11 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
         .route("/torrents/magnet", post(handlers::torrents::add_magnet))
         .route("/torrents/file", post(handlers::torrents::add_torrent_file))
         .route("/torrents/bulk", post(handlers::torrents::add_torrents))
+        .route("/torrents/create", post(handlers::creation::create_torrent))
+        .route(
+            "/torrents/create/roots",
+            get(handlers::creation::creation_roots),
+        )
         .route(
             "/torrents/remove",
             post(handlers::torrents::remove_torrents),
@@ -189,6 +198,15 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             "/torrents/{hash}/metainfo",
             get(handlers::torrents::export_metainfo),
         )
+        .route(
+            "/torrents/{hash}/magnet",
+            get(handlers::torrents::get_magnet),
+        )
+        .route(
+            "/torrents/{hash}/annotation",
+            put(handlers::torrents::set_annotation),
+        )
+        .route("/torrents/export", post(handlers::torrents::export_archive))
         .route(
             "/torrents/{hash}",
             get(handlers::torrents::get_torrent).delete(handlers::torrents::remove_torrent),
@@ -263,6 +281,30 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             get(handlers::trackers::list_trackers).post(handlers::trackers::add_tracker),
         )
         .route(
+            "/torrents/{hash}/trackers/retry",
+            post(handlers::trackers::retry_tracker),
+        )
+        .route(
+            "/torrents/{hash}/trackers/policy",
+            post(handlers::trackers::set_tracker_policy),
+        )
+        .route(
+            "/torrents/{hash}/trackers/cleanup/preview",
+            post(handlers::trackers::cleanup_trackers_preview),
+        )
+        .route(
+            "/torrents/{hash}/trackers/cleanup",
+            post(handlers::trackers::cleanup_trackers),
+        )
+        .route(
+            "/torrents/{hash}/trackers/diagnostics",
+            get(handlers::trackers::tracker_diagnostics),
+        )
+        .route(
+            "/torrents/{hash}/webseeds",
+            get(handlers::trackers::list_webseeds),
+        )
+        .route(
             "/torrents/{hash}/trackers/{url}",
             axum::routing::delete(handlers::trackers::remove_tracker),
         )
@@ -317,6 +359,37 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             "/network/diagnostics",
             get(handlers::diagnostics::network_diagnostics),
         )
+        // Local trash, cleanup preview, restore, and retention rules
+        .route("/trash", get(handlers::trash::status))
+        .route("/trash/preview", post(handlers::trash::preview))
+        .route("/trash/apply", post(handlers::trash::apply))
+        .route("/trash/{id}/restore", post(handlers::trash::restore))
+        .route("/trash/{id}", axum::routing::delete(handlers::trash::purge))
+        // RSS subscriptions and durable history
+        .route(
+            "/rss",
+            get(handlers::rss::list_subscriptions).post(handlers::rss::create_subscription),
+        )
+        .route(
+            "/rss/{id}",
+            put(handlers::rss::update_subscription).delete(handlers::rss::delete_subscription),
+        )
+        .route(
+            "/rss/preview",
+            post(handlers::rss::preview_draft_subscription),
+        )
+        .route(
+            "/rss/{id}/preview",
+            get(handlers::rss::preview_subscription),
+        )
+        .route("/rss/{id}/poll", post(handlers::rss::poll_subscription))
+        .route("/rss/{id}/retry", post(handlers::rss::retry_subscription))
+        .route("/rss/{id}/decisions", get(handlers::rss::decisions))
+        .route(
+            "/rss/history/completions",
+            axum::routing::delete(handlers::rss::clear_completions),
+        )
+        .route("/rss/diagnostics", get(handlers::rss::diagnostics))
         // Watch folders
         .route("/watch/scan", post(handlers::watch::watch_scan))
         .route("/watch/history", get(handlers::watch::watch_history))

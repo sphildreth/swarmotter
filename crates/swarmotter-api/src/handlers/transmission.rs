@@ -1651,6 +1651,16 @@ mod tests {
             scrape_leechers: None,
             scrape_downloads: None,
             last_scrape_error: None,
+            effective_priority: swarmotter_core::models::tracker::TrackerPriority::Normal,
+            allowed: true,
+            policy_source: "global".into(),
+            last_success: None,
+            last_attempt: None,
+            retries: 0,
+            latency_ms: None,
+            peers_returned: None,
+            sample_status: swarmotter_core::models::tracker::TrackerSampleStatus::Unavailable,
+            recent_errors: Vec::new(),
         }]);
 
         assert_eq!(rows[0]["seeder_count"], json!(42));

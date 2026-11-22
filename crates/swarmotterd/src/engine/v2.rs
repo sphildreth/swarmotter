@@ -99,6 +99,10 @@ impl TorrentEngine {
             &mut peers,
             self.filter_allowed_peers(self.seed_peers.clone()),
         );
+        self.state
+            .lock()
+            .await
+            .record_peer_sources(self.seed_peers.iter().copied(), PeerSource::Direct);
         merge_unique_peers(&mut peers, self.discover_dht_peers().await);
         dedupe_peers(&mut peers);
         self.state.lock().await.peers = peers.clone();

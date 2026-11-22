@@ -2038,6 +2038,214 @@ async fn api_auth_blocks_v1_without_token_and_accepts_bearer() {
 }
 
 #[tokio::test]
+async fn torrent_creation_routes_require_api_auth() {
+    let mut cfg = Config::default();
+    cfg.api.require_auth = true;
+    cfg.api.auth_token = Some("create-token".into());
+    let app = swarmotter_api::app_router(fake_daemon::fake_state_with_config(cfg));
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/torrents/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"source":"/unused","format":"v1","seed":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let roots = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/torrents/create/roots")
+                .header("x-swarmotter-auth", "create-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(roots.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn trash_routes_require_api_auth() {
+    let mut cfg = Config::default();
+    cfg.api.require_auth = true;
+    cfg.api.auth_token = Some("trash-token".into());
+    let app = swarmotter_api::app_router(fake_daemon::fake_state_with_config(cfg));
+    for (method, uri, body) in [
+        ("GET", "/api/v1/trash", None),
+        (
+            "POST",
+            "/api/v1/trash/preview",
+            Some(r#"{"hashes":[],"mode":"torrent"}"#),
+        ),
+        (
+            "POST",
+            "/api/v1/trash/apply",
+            Some(r#"{"hashes":[],"mode":"torrent"}"#),
+        ),
+        ("POST", "/api/v1/trash/entry/restore", Some(r#"{}"#)),
+        ("DELETE", "/api/v1/trash/entry", None),
+    ] {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let request = builder
+            .body(body.map(Body::from).unwrap_or_else(Body::empty))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/trash")
+                .header("x-swarmotter-auth", "trash-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn provenance_routes_require_api_auth() {
+    let mut cfg = Config::default();
+    cfg.api.require_auth = true;
+    cfg.api.auth_token = Some("prov-token".into());
+    let app = swarmotter_api::app_router(fake_daemon::fake_state_with_config(cfg));
+    let hash = "dd8255ecdc7ca55fb0bbf81323d87062ba1f7a4e";
+    for request in [
+        Request::builder()
+            .uri(format!("/api/v1/torrents/{hash}/magnet"))
+            .body(Body::empty())
+            .unwrap(),
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/api/v1/torrents/{hash}/annotation"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"annotation":"note"}"#))
+            .unwrap(),
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/torrents/export")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"hashes":["{hash}"]}}"#)))
+            .unwrap(),
+    ] {
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/torrents/{hash}/magnet"))
+                .header("x-swarmotter-auth", "prov-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn openapi_document_and_explorer_are_public_and_version_matched() {
+    let app = swarmotter_api::app_router(fake_daemon::fake_state());
+    let docs = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/docs")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(docs.status(), StatusCode::OK);
+    assert_eq!(
+        docs.headers().get("content-type").unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let body = axum::body::to_bytes(docs.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("/api/openapi.json"));
+    assert!(html.contains("State-changing operation"));
+
+    let spec_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/openapi.json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(spec_response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(spec_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let spec: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(spec["openapi"], "3.1.0");
+    assert!(spec["paths"]["/api/v1/torrents/query"]["get"].is_object());
+    assert!(spec["paths"]["/api/v2/torrents/info"]["get"].is_object());
+    assert!(
+        spec["paths"]["/transmission/rpc"]["post"]["x-swarmotter-supported-rpc-methods"]
+            .as_array()
+            .is_some_and(|methods| methods.iter().any(|method| method == "session-get"))
+    );
+    assert!(
+        spec["paths"]["/api/v1/torrents/{hash}/metainfo"]["get"]["responses"]["200"]["content"]
+            ["application/x-bittorrent"]
+            .is_object()
+    );
+}
+
+#[tokio::test]
+async fn rss_routes_require_api_auth_and_return_subscription_status() {
+    let mut cfg = Config::default();
+    cfg.api.require_auth = true;
+    cfg.api.auth_token = Some("rss-token".into());
+    let app = swarmotter_api::app_router(fake_daemon::fake_state_with_config(cfg));
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/rss")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let authorized = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/rss")
+                .header("x-swarmotter-auth", "rss-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(authorized.status(), StatusCode::OK);
+    let body: serde_json::Value = axum::body::to_bytes(authorized.into_body(), usize::MAX)
+        .await
+        .map(|bytes| serde_json::from_slice(&bytes).unwrap())
+        .unwrap();
+    assert_eq!(body["data"], serde_json::json!([]));
+}
+
+#[tokio::test]
 async fn native_api_rejects_cross_origin_browser_mutations() {
     let state = fake_daemon::fake_state();
     let app = swarmotter_api::app_router(state);

@@ -57,14 +57,29 @@ impl TorrentEngine {
         !self.meta.is_private() && self.dht.is_some()
     }
 
-    pub(super) async fn tracker_announce_due(&self) -> bool {
-        if swarmotter_core::policy::prioritized_tracker_tiers(
+    pub(super) fn effective_tracker_tiers(&self) -> Vec<Vec<String>> {
+        swarmotter_core::policy::prioritized_tracker_tiers(
             self.meta.announce.as_deref(),
             &self.meta.announce_list,
             &self.tracker_host_rules,
         )
-        .is_empty()
-        {
+        .into_iter()
+        .map(|tier| {
+            tier.into_iter()
+                .filter(|url| {
+                    !self
+                        .disabled_trackers
+                        .iter()
+                        .any(|disabled| disabled == url)
+                })
+                .collect::<Vec<_>>()
+        })
+        .filter(|tier| !tier.is_empty())
+        .collect()
+    }
+
+    pub(super) async fn tracker_announce_due(&self) -> bool {
+        if self.effective_tracker_tiers().is_empty() {
             return false;
         }
         let state = self.state.lock().await;
@@ -110,6 +125,7 @@ impl TorrentEngine {
                     let mut s = self.state.lock().await;
                     s.dht_discovery_ok = !peers.is_empty();
                     s.dht_last_seen = Some(Instant::now());
+                    s.record_peer_sources(peers.iter().copied(), PeerSource::Dht);
                 }
                 tracing::debug!(
                     queried = lookup.queried_nodes,
@@ -134,11 +150,7 @@ impl TorrentEngine {
 impl TorrentEngine {
     /// Announce to all HTTP/UDP trackers and return discovered peers.
     pub(super) async fn announce(&self, event: AnnounceEvent) -> Vec<PeerAddr> {
-        let tiers = swarmotter_core::policy::prioritized_tracker_tiers(
-            self.meta.announce.as_deref(),
-            &self.meta.announce_list,
-            &self.tracker_host_rules,
-        );
+        let tiers = self.effective_tracker_tiers();
         let scrape_urls = tiers.iter().flatten().cloned().collect::<Vec<_>>();
         let (uploaded, downloaded, left) = {
             let s = self.state.lock().await;
@@ -228,6 +240,11 @@ impl TorrentEngine {
                     last_error: None,
                     last_message: Some("announce in progress".into()),
                     last_announce: Some(announce_at),
+                    last_success: None,
+                    retries: 0,
+                    latency_ms: None,
+                    peers_returned: None,
+                    recent_errors: Vec::new(),
                 },
             );
             let binder = self.binder.clone();
@@ -244,6 +261,7 @@ impl TorrentEngine {
                 compact: true,
             };
             tasks.spawn(async move {
+                let attempt_started = Instant::now();
                 let result = timeout(TRACKER_ANNOUNCE_TIMEOUT, async {
                     if url.starts_with("udp://") {
                         udp_tracker::udp_announce(binder.as_ref(), &req).await
@@ -254,7 +272,14 @@ impl TorrentEngine {
                 .await
                 .map_err(|_| CoreError::Internal("tracker announce timed out".into()))
                 .and_then(|r| r);
-                (url, result)
+                (
+                    url,
+                    result,
+                    attempt_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64,
+                )
             });
         }
 
@@ -274,7 +299,43 @@ impl TorrentEngine {
             s.tracker_interval_seconds = interval;
         }
         for (url, result) in &outcome.tracker_results {
-            s.tracker_announces.insert(url.clone(), result.clone());
+            let previous = s.tracker_announces.get(url).cloned();
+            let mut snapshot = result.clone();
+            match snapshot.status {
+                TrackerStatus::Ok | TrackerStatus::Working => {
+                    snapshot.retries = 0;
+                }
+                TrackerStatus::Error => {
+                    snapshot.retries = previous
+                        .as_ref()
+                        .map_or(0, |previous| previous.retries)
+                        .saturating_add(1);
+                    snapshot.last_success =
+                        previous.as_ref().and_then(|previous| previous.last_success);
+                    snapshot.peers_returned = previous
+                        .as_ref()
+                        .and_then(|previous| previous.peers_returned);
+                    let mut errors = previous
+                        .as_ref()
+                        .map(|previous| previous.recent_errors.clone())
+                        .unwrap_or_default();
+                    if let Some(error) = snapshot.last_error.as_ref() {
+                        errors.push(error.clone());
+                    }
+                    errors.truncate(8);
+                    snapshot.recent_errors = errors;
+                }
+                _ => {}
+            }
+            s.tracker_announces.insert(url.clone(), snapshot);
+        }
+        for (url, peers) in &outcome.tracker_peers {
+            for peer in peers {
+                s.peer_sources
+                    .entry(peer.socket_addr())
+                    .or_default()
+                    .insert(PeerSource::Tracker(url.clone()));
+            }
         }
         if outcome.ok {
             s.tracker_swarm_populated = outcome.tracker_results.values().any(|snapshot| {
@@ -327,6 +388,7 @@ impl TorrentEngine {
                     let mut s = self.state.lock().await;
                     s.dht_discovery_ok = !peers.is_empty();
                     s.dht_last_seen = Some(Instant::now());
+                    s.record_peer_sources(peers.iter().copied(), PeerSource::Dht);
                 }
                 tracing::debug!(
                     queried = lookup.queried_nodes,
@@ -428,6 +490,10 @@ impl TorrentEngine {
                     candidates.push(*p);
                 }
             }
+            self.state
+                .lock()
+                .await
+                .record_peer_sources(self.seed_peers.iter().copied(), PeerSource::Direct);
 
             let dht_peers = self.discover_magnet_dht_peers(magnet.wire_info_hash).await;
             merge_unique_peers(&mut candidates, dht_peers);
@@ -500,13 +566,13 @@ impl TorrentEngine {
 pub(super) fn record_tracker_joined_result(
     outcome: &mut TrackerAnnounceOutcome,
     joined: std::result::Result<
-        (String, Result<tracker::AnnounceResponse>),
+        (String, Result<tracker::AnnounceResponse>, u64),
         tokio::task::JoinError,
     >,
     announce_at: u64,
 ) {
     match joined {
-        Ok((url, Ok(resp))) => {
+        Ok((url, Ok(resp), latency_ms)) => {
             let effective_interval = resp
                 .interval
                 .max(resp.min_interval.unwrap_or(0))
@@ -523,6 +589,7 @@ pub(super) fn record_tracker_joined_result(
                 if !outcome.ok {
                     outcome.message = Some(aggregate);
                 }
+                let recent_error = fr.clone();
                 outcome.tracker_results.insert(
                     url,
                     TrackerAnnounceSnapshot {
@@ -534,6 +601,11 @@ pub(super) fn record_tracker_joined_result(
                         last_error: Some(fr),
                         last_message: None,
                         last_announce: Some(announce_at),
+                        last_success: None,
+                        retries: 0,
+                        latency_ms: Some(latency_ms),
+                        peers_returned: None,
+                        recent_errors: vec![recent_error],
                     },
                 );
                 return;
@@ -563,7 +635,7 @@ pub(super) fn record_tracker_joined_result(
                 message
             };
             outcome.tracker_results.insert(
-                url,
+                url.clone(),
                 TrackerAnnounceSnapshot {
                     status: TrackerStatus::Ok,
                     explicit_failure: false,
@@ -573,17 +645,24 @@ pub(super) fn record_tracker_joined_result(
                     last_error: None,
                     last_message: Some(last_message),
                     last_announce: Some(announce_at),
+                    last_success: Some(announce_at),
+                    retries: 0,
+                    latency_ms: Some(latency_ms),
+                    peers_returned: Some(peer_count as u64),
+                    recent_errors: Vec::new(),
                 },
             );
+            outcome.tracker_peers.insert(url, resp.peers.clone());
             outcome.peers.extend(resp.peers);
         }
-        Ok((url, Err(e))) => {
+        Ok((url, Err(e), latency_ms)) => {
             let error = e.to_string();
             outcome.failures = outcome.failures.saturating_add(1);
             if !outcome.ok {
                 outcome.message = Some(format!("{url}: {error}"));
             }
             tracing::debug!(tracker = %url, error = %error, "tracker announce failed");
+            let recent_error = error.clone();
             outcome.tracker_results.insert(
                 url,
                 TrackerAnnounceSnapshot {
@@ -595,6 +674,11 @@ pub(super) fn record_tracker_joined_result(
                     last_error: Some(error),
                     last_message: None,
                     last_announce: Some(announce_at),
+                    last_success: None,
+                    retries: 0,
+                    latency_ms: Some(latency_ms),
+                    peers_returned: None,
+                    recent_errors: vec![recent_error],
                 },
             );
         }
@@ -615,6 +699,7 @@ pub(super) fn merge_tracker_outcome(
     aggregate.failures = aggregate.failures.saturating_add(outcome.failures);
     aggregate.peers.append(&mut outcome.peers);
     aggregate.tracker_results.extend(outcome.tracker_results);
+    aggregate.tracker_peers.extend(outcome.tracker_peers);
     if let Some(interval) = outcome.interval_seconds {
         aggregate.interval_seconds = Some(
             aggregate
@@ -849,9 +934,11 @@ pub(super) fn add_pex_peers<I>(
     allow_ipv6: bool,
     peer_filter: &swarmotter_core::peer_filter::PeerFilter,
     max_peers: usize,
-) where
+) -> Vec<PeerAddr>
+where
     I: IntoIterator<Item = PeerAddr>,
 {
+    let mut added = Vec::new();
     for peer in peers {
         if !peer_allowed_by_config(&peer, allow_ipv6) {
             continue;
@@ -871,6 +958,8 @@ pub(super) fn add_pex_peers<I>(
         }
         if !discovered.contains(&peer) {
             discovered.push(peer);
+            added.push(peer);
         }
     }
+    added
 }

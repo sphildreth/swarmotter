@@ -42,6 +42,11 @@ async fn list_trackers_exposes_scrape_state_and_falls_back_without_announce_succ
             last_error: None,
             last_message: Some("announce returned 64 peers".into()),
             last_announce: Some(1234),
+            last_success: None,
+            retries: 0,
+            latency_ms: None,
+            peers_returned: None,
+            recent_errors: Vec::new(),
         },
     );
     state.tracker_announces.insert(
@@ -55,6 +60,11 @@ async fn list_trackers_exposes_scrape_state_and_falls_back_without_announce_succ
             last_error: Some("tracker announce timed out".into()),
             last_message: None,
             last_announce: Some(1235),
+            last_success: None,
+            retries: 0,
+            latency_ms: None,
+            peers_returned: None,
+            recent_errors: Vec::new(),
         },
     );
     state.tracker_scrapes.insert(
@@ -271,4 +281,519 @@ async fn tracker_scrape_snapshot_serializes_through_the_real_native_router() {
     assert_eq!(row["seeders"], 31);
     assert_eq!(row["leechers"], 32);
     assert_eq!(row["downloads"], 33);
+}
+
+#[tokio::test]
+async fn tracker_policy_sample_fields_and_measured_zero_are_explicit() {
+    use swarmotter_core::config::Config;
+    use swarmotter_core::models::network::{NetworkContainmentMode, NetworkHealth};
+    use swarmotter_core::models::tracker::{TrackerPriority, TrackerSampleStatus};
+    use swarmotter_core::policy::{PolicyProfile, PolicyTracker, QueuePriority, TrackerHostRule};
+
+    let mut config = Config::default();
+    config.network.mode = NetworkContainmentMode::Disabled;
+    config.profiles.profiles.insert(
+        "ops".into(),
+        PolicyProfile {
+            tracker: PolicyTracker {
+                host_rules: vec![
+                    TrackerHostRule {
+                        host_pattern: "backup.example".into(),
+                        enabled: None,
+                        priority: Some(QueuePriority::High),
+                    },
+                    TrackerHostRule {
+                        host_pattern: "disabled.example".into(),
+                        enabled: Some(false),
+                        priority: None,
+                    },
+                ],
+            },
+            ..Default::default()
+        },
+    );
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::new(config, health);
+    let primary = "http://primary.example/announce";
+    let backup = "http://backup.example/announce";
+    let disabled = "http://disabled.example/announce";
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "policy.bin",
+        b"policy payload",
+        8,
+        Some(primary),
+        false,
+    );
+    let mut meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    meta.announce_list = vec![vec![primary.into(), backup.into(), disabled.into()]];
+    let hash = TorrentKey::v1(meta.info_hash);
+    let mut torrent = Torrent::new(meta, 1);
+    torrent.policy.profile = Some("ops".into());
+    runtime.registry.lock().await.add(torrent).unwrap();
+    let now = now();
+    let mut state = EngineState {
+        tracker_interval_seconds: 300,
+        ..EngineState::default()
+    };
+    state.tracker_announces.insert(
+        primary.into(),
+        crate::engine::TrackerAnnounceSnapshot {
+            status: TrackerStatus::Ok,
+            explicit_failure: false,
+            seeders: 0,
+            leechers: 0,
+            downloads: 0,
+            last_error: None,
+            last_message: Some("announce returned 0 peers".into()),
+            last_announce: Some(now),
+            last_success: Some(now),
+            retries: 0,
+            latency_ms: Some(17),
+            peers_returned: Some(0),
+            recent_errors: Vec::new(),
+        },
+    );
+    state.tracker_announces.insert(
+        backup.into(),
+        crate::engine::TrackerAnnounceSnapshot {
+            status: TrackerStatus::Error,
+            explicit_failure: false,
+            seeders: 0,
+            leechers: 0,
+            downloads: 0,
+            last_error: Some("timeout".into()),
+            last_message: None,
+            last_announce: Some(now),
+            last_success: None,
+            retries: 2,
+            latency_ms: Some(30000),
+            peers_returned: None,
+            recent_errors: vec!["timeout".into()],
+        },
+    );
+    runtime
+        .engine_states
+        .write()
+        .await
+        .insert(hash, Arc::new(Mutex::new(state)));
+
+    let trackers = runtime.list_trackers(&hash).await.unwrap();
+    let primary_row = trackers.iter().find(|row| row.url == primary).unwrap();
+    assert!(primary_row.allowed);
+    assert_eq!(primary_row.effective_priority, TrackerPriority::Normal);
+    assert_eq!(primary_row.sample_status, TrackerSampleStatus::Current);
+    assert_eq!(primary_row.peers_returned, Some(0));
+    assert_eq!(primary_row.latency_ms, Some(17));
+    let backup_row = trackers.iter().find(|row| row.url == backup).unwrap();
+    assert!(backup_row.allowed);
+    assert_eq!(backup_row.effective_priority, TrackerPriority::High);
+    assert_eq!(backup_row.sample_status, TrackerSampleStatus::Unavailable);
+    assert_eq!(backup_row.peers_returned, None);
+    assert_eq!(backup_row.retries, 2);
+    assert_eq!(backup_row.recent_errors, vec!["timeout".to_string()]);
+    let disabled_row = trackers.iter().find(|row| row.url == disabled).unwrap();
+    assert!(!disabled_row.allowed);
+    assert_eq!(disabled_row.status, TrackerStatus::Disabled);
+    assert_eq!(disabled_row.sample_status, TrackerSampleStatus::Unavailable);
+}
+
+#[tokio::test]
+async fn webseeds_and_peer_sources_expose_only_observed_evidence() {
+    use swarmotter_core::models::peer::PeerSource;
+    use swarmotter_core::models::tracker::{TrackerStatus, WebseedInfo};
+    use swarmotter_core::peer::PeerAddr;
+
+    let config = Config::default();
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::new(config, health);
+    let bytes = swarmotter_core::meta::build_single_file_torrent_with_webseeds(
+        "webseed.bin",
+        b"webseed payload",
+        8,
+        None,
+        false,
+        &["https://seed.example/files/"],
+    );
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let hash = TorrentKey::v1(meta.info_hash);
+    runtime
+        .registry
+        .lock()
+        .await
+        .add(Torrent::new(meta, 1))
+        .unwrap();
+    let peer = PeerAddr {
+        ip: "192.0.2.10".parse().unwrap(),
+        port: 51413,
+    };
+    let mut state = EngineState::default();
+    state.webseeds.insert(
+        "https://seed.example/files/".into(),
+        crate::engine::WebseedSnapshot {
+            status: TrackerStatus::Error,
+            bytes_verified: 4096,
+            attempts: 3,
+            retries: 2,
+            last_success: Some(100),
+            last_attempt: Some(200),
+            last_error: Some("range timeout".into()),
+            recent_errors: vec!["range timeout".into()],
+            latency_ms: Some(500),
+        },
+    );
+    state
+        .peer_sources
+        .entry(peer.socket_addr())
+        .or_default()
+        .extend([
+            PeerSource::Tracker("http://tracker.example/announce".into()),
+            PeerSource::Pex,
+        ]);
+    state.peers.push(peer);
+    runtime
+        .engine_states
+        .write()
+        .await
+        .insert(hash, Arc::new(Mutex::new(state)));
+
+    let webseeds: Vec<WebseedInfo> = runtime.list_webseeds(&hash).await.unwrap();
+    assert_eq!(webseeds.len(), 1);
+    assert_eq!(webseeds[0].bytes_verified, 4096);
+    assert_eq!(webseeds[0].retries, 2);
+    assert_eq!(webseeds[0].last_error.as_deref(), Some("range timeout"));
+    let peers = runtime.list_peers(&hash).await.unwrap();
+    assert_eq!(peers.len(), 1);
+    assert!(peers[0].sources.contains(&PeerSource::Pex));
+    assert!(peers[0].sources.iter().any(
+        |source| matches!(source, PeerSource::Tracker(url) if url.contains("tracker.example"))
+    ));
+}
+
+#[tokio::test]
+async fn tracker_cleanup_preview_disable_and_diagnostics_redact_credentials() {
+    let config = Config::default();
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::new(config, health);
+    let tracker_url = "http://tracker.example/announce?passkey=super-secret&x=1";
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "cleanup.bin",
+        b"cleanup payload",
+        8,
+        Some(tracker_url),
+        false,
+    );
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let hash = TorrentKey::v1(meta.info_hash);
+    runtime
+        .registry
+        .lock()
+        .await
+        .add(Torrent::new(meta, 1))
+        .unwrap();
+    let now = now();
+    let mut state = EngineState::default();
+    state.tracker_announces.insert(
+        tracker_url.into(),
+        crate::engine::TrackerAnnounceSnapshot {
+            status: TrackerStatus::Error,
+            explicit_failure: false,
+            seeders: 0,
+            leechers: 0,
+            downloads: 0,
+            last_error: Some("timeout".into()),
+            last_message: None,
+            last_announce: Some(now),
+            last_success: None,
+            retries: 4,
+            latency_ms: Some(1000),
+            peers_returned: None,
+            recent_errors: vec!["timeout".into()],
+        },
+    );
+    runtime
+        .engine_states
+        .write()
+        .await
+        .insert(hash, Arc::new(Mutex::new(state)));
+
+    assert!(runtime
+        .cleanup_trackers_preview(&hash, 5)
+        .await
+        .unwrap()
+        .is_empty());
+    let preview = runtime.cleanup_trackers_preview(&hash, 3).await.unwrap();
+    assert_eq!(preview.len(), 1);
+    let diagnostics = runtime.tracker_diagnostics(&hash).await.unwrap();
+    assert!(diagnostics.contains("passkey=***"));
+    assert!(!diagnostics.contains("super-secret"));
+    assert!(diagnostics.contains("retries=4"));
+    let disabled = runtime.cleanup_trackers(&hash, 3).await.unwrap();
+    assert_eq!(disabled.len(), 1);
+    let trackers = runtime.list_trackers(&hash).await.unwrap();
+    assert!(!trackers[0].allowed);
+    assert_eq!(trackers[0].status, TrackerStatus::Disabled);
+}
+
+#[tokio::test]
+async fn tracker_cleanup_and_redacted_diagnostics_serialize_through_native_router() {
+    use axum::body::Body;
+    use swarmotter_api::state::{
+        AppState, BuildInfo, QbittorrentCompatState, TransmissionCompatState,
+    };
+    use tower::ServiceExt as _;
+
+    let config = Config::default();
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = Arc::new(DaemonRuntime::new(config.clone(), health));
+    let tracker_url = "http://tracker.example/announce?passkey=router-secret";
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "router-cleanup.bin",
+        b"generated router cleanup payload",
+        8,
+        Some(tracker_url),
+        false,
+    );
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let hash = TorrentKey::v1(meta.info_hash);
+    runtime
+        .registry
+        .lock()
+        .await
+        .add(Torrent::new(meta, 1))
+        .unwrap();
+    let mut engine = EngineState::default();
+    engine.tracker_announces.insert(
+        tracker_url.into(),
+        crate::engine::TrackerAnnounceSnapshot {
+            status: TrackerStatus::Error,
+            explicit_failure: false,
+            seeders: 0,
+            leechers: 0,
+            downloads: 0,
+            last_error: Some("timeout".into()),
+            last_message: None,
+            last_announce: Some(40),
+            last_success: None,
+            retries: 4,
+            latency_ms: Some(250),
+            peers_returned: None,
+            recent_errors: vec!["timeout".into()],
+        },
+    );
+    runtime
+        .engine_states
+        .write()
+        .await
+        .insert(hash, Arc::new(Mutex::new(engine)));
+    let app_state = Arc::new(AppState {
+        daemon: runtime,
+        config: Arc::new(Mutex::new(config)),
+        build: BuildInfo::default(),
+        broker: EventBroker::default(),
+        transmission: TransmissionCompatState::default(),
+        qbittorrent: QbittorrentCompatState::default(),
+    });
+
+    let response = swarmotter_api::app_router(app_state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!("/api/v1/torrents/{hash}/trackers/diagnostics"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert!(response
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/plain")));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let diagnostics = String::from_utf8(body.to_vec()).unwrap();
+    assert!(diagnostics.contains("passkey=***"));
+    assert!(!diagnostics.contains("router-secret"));
+    assert!(diagnostics.contains("retries=4"));
+
+    let cleanup_body = |confirm: bool| {
+        serde_json::to_vec(&serde_json::json!({
+            "failure_threshold": 3,
+            "confirm": confirm,
+        }))
+        .unwrap()
+    };
+    let response = swarmotter_api::app_router(app_state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/torrents/{hash}/trackers/cleanup"))
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(cleanup_body(false)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+
+    let response = swarmotter_api::app_router(app_state)
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/torrents/{hash}/trackers/cleanup"))
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(cleanup_body(true)))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(envelope["data"][0]["url"], tracker_url);
+    assert_eq!(envelope["data"][0]["retries"], 4);
+}
+
+#[tokio::test]
+async fn local_tracker_fixture_shows_contrasting_history_and_policy_change() {
+    use swarmotter_core::models::tracker::TrackerSampleStatus;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            let body: &[u8] = if request.contains("/scrape?") {
+                b"d5:filesdee"
+            } else if request.starts_with("GET /fail/announce?") {
+                b"d14:failure reason11:unavailablee"
+            } else {
+                b"d8:completei1e10:incompletei0e8:intervali30e5:peers0:e"
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        }
+    });
+
+    let failure_url = format!("http://{address}/fail/announce");
+    let success_url = format!("http://{address}/ok/announce");
+    let config = Config::default();
+    let health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    let runtime = DaemonRuntime::new(config, health);
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "local-tracker-fixture.bin",
+        b"local tracker fixture payload",
+        8,
+        Some(&failure_url),
+        false,
+    );
+    let mut meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    meta.announce_list = vec![vec![failure_url.clone()], vec![success_url.clone()]];
+    let hash = TorrentKey::v1(meta.info_hash);
+    runtime
+        .registry
+        .lock()
+        .await
+        .add(Torrent::new(meta, 1))
+        .unwrap();
+    let state = Arc::new(Mutex::new(EngineState::default()));
+    runtime
+        .engine_states
+        .write()
+        .await
+        .insert(hash, state.clone());
+    DaemonRuntime::seeder_announce_once(
+        &[vec![failure_url.clone()], vec![success_url.clone()]],
+        hash,
+        [0u8; 20],
+        6881,
+        Arc::new(swarmotter_core::net::binder::LoopbackBinder),
+        state,
+        AnnounceEvent::Started,
+    )
+    .await;
+    server.abort();
+
+    let trackers = runtime.list_trackers(&hash).await.unwrap();
+    let failed = trackers
+        .iter()
+        .find(|tracker| tracker.url == failure_url)
+        .unwrap();
+    assert_eq!(failed.status, TrackerStatus::Error);
+    assert_eq!(failed.sample_status, TrackerSampleStatus::Unavailable);
+    assert_eq!(failed.retries, 1);
+    assert_eq!(failed.last_error.as_deref(), Some("unavailable"));
+    assert!(failed.last_success.is_none());
+    assert!(failed.last_attempt.is_some());
+    let succeeded = trackers
+        .iter()
+        .find(|tracker| tracker.url == success_url)
+        .unwrap();
+    assert_eq!(succeeded.status, TrackerStatus::Ok);
+    assert_eq!(succeeded.sample_status, TrackerSampleStatus::Current);
+    assert_eq!(succeeded.peers_returned, Some(0));
+    assert_eq!(succeeded.retries, 0);
+    assert!(succeeded.last_success.is_some());
+
+    let preview = runtime.cleanup_trackers_preview(&hash, 1).await.unwrap();
+    assert_eq!(preview.len(), 1);
+    assert_eq!(preview[0].url, failure_url);
+    let disabled = runtime.cleanup_trackers(&hash, 1).await.unwrap();
+    assert_eq!(disabled.len(), 1);
+    let trackers = runtime.list_trackers(&hash).await.unwrap();
+    assert!(
+        !trackers
+            .iter()
+            .find(|tracker| tracker.url == failure_url)
+            .unwrap()
+            .allowed
+    );
+    let trackers = runtime
+        .set_tracker_enabled(&hash, &failure_url, true)
+        .await
+        .unwrap();
+    assert!(
+        trackers
+            .iter()
+            .find(|tracker| tracker.url == failure_url)
+            .unwrap()
+            .allowed
+    );
 }

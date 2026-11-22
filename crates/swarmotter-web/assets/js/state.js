@@ -41,6 +41,9 @@ export const TORRENT_TABLE_TO_QUERY_SORT = {
   rate_up: "up_rate",
   ratio: "ratio",
   active_peers: "peers",
+  queue_position: "queue",
+  date_added: "added",
+  date_completed: "completed",
 };
 export const TORRENT_QUERY_TO_TABLE_SORT = {
   name: "name",
@@ -53,12 +56,13 @@ export const TORRENT_QUERY_TO_TABLE_SORT = {
   up_rate: "rate_up",
   ratio: "ratio",
   peers: "active_peers",
-  added: "name",
-  completed: "name",
-  queue: "name",
+  added: "date_added",
+  completed: "date_completed",
+  queue: "queue_position",
 };
 
 export const EVENT_KINDS = [
+  "events_dropped",
   "torrent_added",
   "torrent_changed",
   "torrent_removed",
@@ -93,6 +97,11 @@ export const TORRENT_ACTIONS = [
     act: "resume",
     label: "Resume",
     icon: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 5v14l11-7-11-7z"/></svg>`,
+  },
+  {
+    act: "magnet",
+    label: "Copy Magnet",
+    icon: `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M10 13a5 5 0 0 0 7.07 0l2.12-2.12a5 5 0 0 0-7.07-7.07L11 5"/><path d="M14 11a5 5 0 0 0-7.07 0L4.81 13.12a5 5 0 0 0 7.07 7.07L13 19"/></svg>`,
   },
   {
     act: "recheck",

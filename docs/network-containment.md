@@ -12,6 +12,7 @@ It applies to torrent-related traffic:
 - HTTP and HTTPS tracker announces and supported scrape.
 - Webseeds.
 - Magnet metadata fetching.
+- RSS feed requests, redirects, DNS, and torrent attachment/metainfo downloads.
 - DNS used by torrent operations.
 
 The API and Web UI are separate control-plane traffic and use
@@ -30,7 +31,7 @@ flowchart LR
 
     subgraph data["Torrent data plane"]
         engine["SwarmOtter torrent engine"] -->|"containment boundary"| boundary["Required interface, source address, or contained namespace"]
-        boundary --> torrentNet["Peers, trackers, DHT, PEX peers, webseeds, and torrent DNS"]
+        boundary --> torrentNet["Peers, trackers, DHT, PEX peers, webseeds, RSS feed/attachments, and torrent DNS"]
     end
 ```
 
@@ -106,7 +107,8 @@ The Web UI displays the same health state.
 ## Live gate, recovery intent, and bind failures
 
 One process-wide gate covers binders, engines, trackers, peer sessions,
-webseeds, metadata, DHT, uTP, inbound listeners, and seeders. When a required
+webseeds, metadata, RSS polling and attachment retrieval, DHT, uTP, inbound
+listeners, and seeders. When a required
 path disappears, the gate blocks before socket-owning tasks are aborted. Every
 block advances the cancellation generation. A task from an older generation
 is therefore cancelled even if recovery follows before it next polls, and a
@@ -114,8 +116,8 @@ connected stream cannot bridge a fail-closed interval. The API/Web UI listener
 is outside this data-plane gate and remains available for diagnostics and
 repair.
 
-HTTP(S) tracker announce/scrape and webseed range reads use one contained
-HTTP/1 codec. Each redirect hop asks the binder to connect to the target host;
+HTTP(S) tracker announce/scrape, webseed range reads, RSS feed requests, and
+RSS attachment retrieval use one contained HTTP/1 codec. Each redirect hop asks the binder to connect to the target host;
 the ordinary contained binder resolves it on the contained path, while an
 enabled SOCKS5 binder keeps the hostname for remote target DNS. TLS wraps only
 that stream. No connector, independent resolver, or pool can open a data-plane
@@ -123,6 +125,11 @@ socket. HTTPS-to-HTTP redirects are rejected, decoded bodies are bounded, and
 exact webseed Range/Content-Range semantics are enforced. UDP scrape is
 unsupported and makes no network call; UDP announce remains contained and
 supported unless SOCKS5 TCP-only mode is enabled.
+
+When RSS polling or an attachment fetch is blocked, SwarmOtter does not add the
+listing. Failed feed/attachment decisions remain visible and retryable, and the
+shared RSS history database records the error state. The control plane remains
+available to preview the feed after containment recovery.
 
 Only work demonstrably live at the block edge receives durable recovery intent.
 After recovery, SwarmOtter consumes that intent and resumes those downloads,

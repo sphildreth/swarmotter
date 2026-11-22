@@ -25,6 +25,11 @@ fn terminal_tracker_error_requires_all_failures_and_no_successful_alternative() 
         last_error: Some("Requested download is not authorized".into()),
         last_message: None,
         last_announce: Some(42),
+        last_success: None,
+        retries: 0,
+        latency_ms: None,
+        peers_returned: None,
+        recent_errors: Vec::new(),
     };
     let mut state = EngineState {
         tracker_message: Some("Requested download is not authorized".into()),
@@ -146,6 +151,10 @@ impl NetworkBinder for DiscoveryFixtureBinder {
             body: self.body.lock().unwrap().clone(),
             final_url: url.into(),
             content_range: None,
+            etag: None,
+            last_modified: None,
+            content_type: None,
+            retry_after_seconds: None,
         })
     }
 
@@ -386,6 +395,7 @@ async fn successful_population_is_retained_across_retryable_announce_failure() {
         Ok((
             "http://127.0.0.1:9/tracker".into(),
             Err(CoreError::Internal("tracker announce timed out".into())),
+            0,
         )),
         now_secs(),
     );
@@ -858,6 +868,11 @@ async fn magnet_tracker_activity_scrapes_the_real_magnet_info_hash() {
             last_error: None,
             last_message: Some("magnet announce ok".into()),
             last_announce: Some(now_secs()),
+            last_success: None,
+            retries: 0,
+            latency_ms: None,
+            peers_returned: None,
+            recent_errors: Vec::new(),
         },
     );
     engine
@@ -2022,6 +2037,7 @@ pub(super) fn pure_v2_swarm_meta_with_piece_length(
         comment: None,
         created_by: None,
         creation_date: None,
+        encoding: None,
         is_multi_file: true,
         v2: Some(V2TorrentMeta {
             meta_version: 2,

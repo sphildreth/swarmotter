@@ -1,0 +1,35 @@
+[package]
+name = "swarmotterctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "API-backed command-line client for SwarmOtter"
+
+[[bin]]
+name = "swarmotterctl"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+url = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+swarmotter-api = { path = "../swarmotter-api" }
+swarmotter-core = { path = "../swarmotter-core" }
+swarmotterd = { path = "../swarmotterd" }
+axum = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

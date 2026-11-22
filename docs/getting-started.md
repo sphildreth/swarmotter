@@ -97,6 +97,21 @@ Open:
 http://127.0.0.1:9091/
 ```
 
+## Script with swarmotterctl
+
+Release tarballs and packages include `swarmotterctl`. Point it at the daemon and
+use a token file for authenticated remote access:
+
+```bash
+export SWARMOTTER_API_URL=http://127.0.0.1:9091
+swarmotterctl list
+swarmotterctl --json list --state downloading | jq '.data.rows'
+```
+
+For remote HTTPS, set `SWARMOTTER_API_TOKEN_FILE` to a `0600` file and use the
+daemon's certificate-valid endpoint. See [CLI Reference](cli.md) for commands,
+JSON schema, exit codes, and scripting examples.
+
 ## Add content
 
 Use the Web UI to add a magnet link, choose a `.torrent` file, or drag a
@@ -108,6 +123,107 @@ curl -X POST http://127.0.0.1:9091/api/v1/torrents/file \
   --data-binary @example.torrent \
   -H 'Content-Type: application/x-bittorrent'
 ```
+
+## Clean up safely with trash
+
+Configure a trash root outside your payload roots:
+
+```toml
+[trash]
+path = "/home/YOU/Downloads/swarmotter-trash"
+
+[[trash.retention]]
+name = "old-paused"
+label = "cleanup"
+states = ["paused"]
+min_age_seconds = 604800
+```
+
+In the Watch view, choose whole torrents or stale partials, select a retention
+rule or enter torrent hashes, and click **Preview**. The preview lists exact
+paths and explains every rule/blocker without changing files or queue state.
+**Apply Eligible** revalidates ownership, roots, symlinks, and shared payloads
+before moving data. Ready trash entries can be restored without overwriting or
+purged explicitly. Interrupted moves appear as incomplete staging entries and
+are never presented as restorable.
+
+## Inspect, share, and export torrents
+
+Torrent Details shows any source comment, creator, creation date, and encoding.
+Use **Copy Magnet** to copy a deterministic full-identity magnet; choose the
+tracker policy in the same control row, and confirm private-tracker inclusion
+when prompted. Use **Export .torrent** for the exact original document. The
+torrent list's **Export Metainfo** action creates a tar archive for selected
+torrents; its `manifest.json` marks each item as included or unavailable and is
+the authoritative list of which originals existed. Magnet-only and older
+records without a retained original are never reconstructed.
+
+The **Operator annotation** field is separate from the source comment and does
+not change the torrent identity or exported bytes.
+
+## Create and seed a torrent
+
+Create metainfo from a file or directory inside a configured storage root using
+the Add view or:
+
+```bash
+curl -X POST http://127.0.0.1:9091/api/v1/torrents/create \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"/home/YOU/Downloads/swarmotter/downloads/release","format":"hybrid","seed":true}'
+```
+
+The response contains `metainfo_hex`, the exact `.torrent` export bytes. The Web
+UI offers a direct download. `seed: true` registers the torrent and starts
+seeding from the verified source data. Use `"format":"v1"`, `"v2"`, or
+`"hybrid"`; BEP 52 formats require a power-of-two piece length. Trackers and
+webseeds are inserted only when supplied. Out-of-root paths, symlinks, and
+sources that change during hashing are rejected.
+
+## Subscribe to RSS feeds
+
+RSS feeds are optional user-configured intake. SwarmOtter fetches feeds and
+torrent attachments through the contained torrent network path, so strict
+containment must already be healthy. Add a subscription in the Watch view or
+through the native API:
+
+```toml
+[rss]
+# Defaults to <state file>.rss.sqlite. Back up this database with the state file.
+# history_file = "/home/YOU/.local/state/swarmotter/rss-history.sqlite"
+
+[[rss.subscriptions]]
+id = "distro-isos"
+name = "Distribution releases"
+url = "https://distributor.example/feed.xml"
+enabled = true
+poll_interval_seconds = 900
+start_behavior = "paused"
+import_mode = "new_only"   # or "current_matches"
+
+[[rss.subscriptions.rules.include]]
+title = "*ISO*"
+category = "*linux*"
+
+[[rss.subscriptions.rules.exclude]]
+title = "*live*"
+```
+
+The first successful poll establishes the baseline in `new_only` mode, so
+existing listings are recorded without being added. Use **Preview feed** in the
+Watch view or `GET /api/v1/rss/{id}/preview` to see each listing's proposed
+action and reason before intake. To import existing matches explicitly, choose
+`current_matches`, click **Import current**, or call:
+
+```bash
+curl -X POST http://127.0.0.1:9091/api/v1/rss/distro-isos/poll?import_current=true
+```
+
+Add the configured API token header when `api.require_auth = true`. RSS status
+redacts feed credentials. The dedicated history database records per-feed
+listings, decisions, retries, and verified completions; keep it with the main
+state file when backing up or restoring. See
+[Configuration](configuration.md#rss), [Web UI](web-ui.md#rss-subscriptions),
+and [API Reference](api.md#rss-subscriptions).
 
 ## LAN access
 

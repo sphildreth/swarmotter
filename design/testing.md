@@ -152,6 +152,11 @@ feature completion and acceptance criteria, not by time estimates.
   ES-module route matrix covers `/app.js` and every `/js/*.js` feature module,
   asserting HTTP 200, JavaScript content type, the shared `script-src 'self'`
   CSP, and the intentionally unchanged entry-script cache policy.
+- Exercise the six operational workspaces in Chromium using the production assets,
+  a deterministic loopback API fixture and a separate disposable embedded daemon.
+  Compare the native desktop captures against the approved PNGs, check the shared
+  telemetry across routes and test pane access at narrower widths.
+  [Commands, browser versions and comparison artifacts](ui/swarmotter_UI_refactor_evidence/VALIDATION_REPORT.md)
 - Import torrent from watch folder.
 - Pause/resume/remove lifecycle.
 - Recheck lifecycle.
@@ -470,5 +475,12 @@ and v1 complementary swarms, plus pure-v2 restore and damaged payload recheck.
 The deployment test starts the built daemon with its Compose environment,
 restarts a disposable VPN namespace owner, and verifies the daemon rejoins it
 and answers through the published port. Archive checks exercise custom state
-mounts, SQLite WAL recovery, and restarting the writer after a backup failure. The parallel worker tests cover bounded HAVE delivery and
+mounts, SQLite WAL recovery, paired RSS history verification, local torrent
+creation and immediate local-peer seeding, provenance/magnet/annotation behavior,
+mixed metainfo archive export, trash preview/apply/restore/purge and retention
+rules, API-backed CLI add/inspect/operate flows in human and JSON modes,
+OpenAPI route-catalog drift checks, emitted-schema examples, live
+native/qBittorrent/Transmission exchanges, tracker/peer/webseed diagnostics with
+local fixtures, and restarting the writer after a
+backup failure. The parallel worker tests cover bounded HAVE delivery and
 resume checkpoints while a peer round is open.

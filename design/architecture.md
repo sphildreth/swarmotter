@@ -106,11 +106,11 @@ SwarmOtter is a Rust async daemon with these layers:
 
 ```text
 crates/
-├── swarmotterd/      # daemon binary + lib (runtime, DaemonOps impl, live engine, seeder, metadata, dht, netbinder)
+├── swarmotterd/      # daemon binary + lib (runtime, DaemonOps impl, live engine, seeder, metadata, dht, netbinder, rss_store)
 ├── swarmotter-core/  # core types and engine logic
 │   └── src/ bencode, dht, endgame, error, extensions, hash, magnet, meta, models/, net/ (binder, config, probe),
 │            peer, peer_filter, policy, tracker, udp_tracker, utp/ (mod, header, sack, congestion, stream), queue, ratio, bandwidth, storage/ (io, layout, resume),
-│            torrent, watch, config
+│            torrent, watch, rss, config
 ├── swarmotter-api/   # API layer (routes, handlers, envelope, events)
 └── swarmotter-web/   # embedded static Web UI
 ```
@@ -126,6 +126,7 @@ swarmotterd/src/
 │   ├── lifecycle.rs                   # DaemonOps lifecycle implementation
 │   ├── scheduler.rs, seeding.rs       # queue and seeder ownership
 │   ├── settings.rs, watch.rs          # reconfiguration and watch ingestion
+│   ├── rss.rs                         # RSS polling, preview, intake, outbox consumer
 │   ├── policy_runtime.rs              # effective profile resolution + durable assignment
 │   ├── storage_controls.rs            # root admission, write pressure, recheck permits
 │   ├── containment.rs, diagnostics.rs # gate/recovery and observations
@@ -272,6 +273,116 @@ use create-new copy/remove semantics so an existing file is never replaced.
 Post-action failure remains attached to the primary result for UI/event
 reporting and requires operator intervention rather than repeated import.
 
+## Local torrent creation and immediate seeding
+
+Local creation is a daemon-owned blocking operation over a snapshot restricted
+to configured storage roots. Source entries must be regular files or
+directories; symlinks and special files are rejected, and file identity is
+checked before and after reading. The streaming hasher produces v1 SHA-1
+pieces across file order and BEP 52 block/piece roots per file without loading
+the source into memory. It runs under the most-specific root's recheck permit,
+so creation participates in existing storage budgets.
+
+The canonical builder emits v1, pure-v2, or hybrid bencode with optional tracker
+tiers, webseeds, and private flag. The exact document is re-parsed by the normal
+bounded parser before the API returns `metainfo_hex` or the Web UI offers a
+download. Immediate seeding registers the generated metainfo through the normal
+durable add mutation with the source parent as the data root and the creation
+hash as the completed verified piece map; queue/seeder reconciliation then
+starts the contained seeder. A duplicate or registration error still returns the
+export and reports the seed error (ADR-0083).
+
+## Discovery performance diagnostics
+
+Engine state retains bounded per-tracker attempt/success/retry/latency/yield
+evidence, per-peer discovery-source sets, and per-webseed verified-byte/error
+state. Tracker policy is resolved from live profile host rules plus exact
+per-torrent disables. The daemon exposes these facts through tracker/peer/webseed
+rows and safe maintenance endpoints; copied diagnostics redact passkeys and
+credentials. No diagnostic creates a socket outside the contained binder
+(ADR-0088).
+
+## Versioned OpenAPI and interactive documentation
+
+The API crate owns a route catalog that generates an OpenAPI 3.1 document served
+at `/api/openapi.json`. A test parses `routes.rs` and compares actual registered
+path/method pairs to the catalog; a deliberate drift fixture must fail. The
+document embeds representative JSON Schemas and examples for shared envelopes,
+torrents, creation, provenance, RSS, trash, and compatibility responses. Live
+local-daemon exchanges from native, qBittorrent, and Transmission surfaces are
+validated against those schemas.
+
+`/api/docs` serves a self-contained, dependency-free explorer. It fetches the
+same-origin document, uses normal API token authentication, marks
+state-changing operations, and loads no external scripts, CDNs, analytics, or
+remote styles. Documentation routes are public; invoked operations retain all
+normal auth/origin/compatibility controls (ADR-0087).
+
+## API-backed CLI
+
+`swarmotterctl` is a separate control-plane binary with no torrent data-plane or
+private-state access. It uses HTTP/1 over the native API, validated TLS for
+remote endpoints, file/environment credentials, server-side query pagination,
+and a stable human/JSON output and exit-code contract. All lifecycle and
+destructive semantics remain daemon-owned (ADR-0086).
+
+## Cleanup preview, trash, and retention
+
+Cleanup selection is recomputed at execution time: configured roots, current
+path ownership, symlink status, shared payload paths, and existence are checked
+again rather than trusting a preview snapshot. Whole-torrent moves use the
+existing exclusive storage move path, retain a serialized record and optional
+exact original metainfo, then remove the live record in the durable state
+transaction. Stale-partial moves retain only selected files and leave the record
+live.
+
+Trash entries are filesystem-backed under `entries/<id>`; in-progress moves stay
+under `.staging/<id>` and are visible as incomplete. Restore accepts only a
+fail collision policy and preflights every destination before moving. Retention
+rules select by effective profile, label, state, and age; they never delete
+data in the background. No trash operation creates torrent network traffic
+(ADR-0085).
+
+## Provenance, deterministic magnets, and portable export
+
+Source comment, creator, creation date, and encoding are parsed from metainfo and
+stored with the torrent record. Operator annotations are separate fields with
+durable update timestamp/actor; state-store history emits an annotation audit
+event when the annotation changes, and the original metainfo BLOB is never
+rewritten.
+
+Magnet generation uses the full identity model and produces deterministic
+ordering with percent-escaped query values. Tracker policy is all/primary-tier/
+none; private tracker URLs require explicit consent. The existing authenticated
+single-export endpoint remains the only source-document download. Batch export
+builds a tar archive containing a JSON manifest and retained original bytes only;
+each missing original is an explicit `unavailable` entry (ADR-0084).
+
+## RSS intake and durable history
+
+RSS subscriptions are configuration entries, but accepted magnets and torrent
+attachments use the same durable add transaction as API, magnet, and watch
+intake. Feed XML is parsed by a bounded core reader; feed and attachment
+requests use the shared contained HTTP client (ADR-0082). Preview evaluates
+rules and duplicate state without writing. The first successful poll establishes
+the baseline, with explicit current-match import and retry/reconsider actions as
+separate operations.
+
+The daemon owns one shared RSS SQLite history database (`<state file>.rss.sqlite`
+by default). It stores per-feed listings, decisions, poll/retry state, and
+identity attribution. Full v1 and v2 locators are indexed as aliases of the
+canonical record, so a renamed listing and a hybrid's v2 locator resolve to the
+same torrent. Verified completion evidence is source-agnostic and survives
+removal.
+
+The main SQLite schema adds `rss_outbox`. Completion and removal paths enqueue
+an event in the same transaction as the library update; a consumer applies it
+idempotently to the history database and then acknowledges it. The daemon
+serializes outbox reads/acknowledgements with the existing state-write lane.
+Duplicate checks consult stored completions, unacknowledged events, identity
+attribution, and the live registry. If history is unavailable, automatic RSS
+adds are deferred and the error is exposed rather than risking a duplicate.
+
 ## Runtime ownership and reconfiguration
 
 The daemon owns and awaits every torrent data-plane task: engines, tracker
@@ -353,3 +464,8 @@ Persistence doctor counters report cumulative lock wait, snapshot/scan, SQLite
 write, total/maximum operation latency, errors, and serialized record bytes.
 
 Startup readiness, verified peer completion notifications, incremental retention, and Compose recovery follow [ADR-0080](adr/0080-library-and-container-recovery.md).
+
+
+### Embedded browser workspaces
+
+The application shell, navigation, telemetry history and workspace primitives are shared by the six primary views. The router embeds the ES modules, vendored grid, font subsets and CSS in the daemon. The controls use the same authenticated v1 API as other clients. Browser-only fixture services live under Web UI tests. See [ADR-0089](adr/0089-shared-operational-workspaces.md).

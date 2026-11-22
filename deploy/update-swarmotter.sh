@@ -419,13 +419,14 @@ create_backup() {
 
     log "Creating backup at $backup_path"
     backup_paths paths
-    local known state_file running path sidecar covered
+    local known state_file rss_file running path sidecar covered
     local -a verify_options=()
     local verifier="$SCRIPT_DIR/verify-state-backup.py"
     known="$(docker_cmd container ls -a --format '{{.Names}}')"
     umask 077
     if grep -Fxq -- "$CONTAINER_NAME" <<<"$known"; then
         state_file="$(docker_cmd inspect "$CONTAINER_NAME" | sudo python3 "$verifier" --inspect-path)"
+        rss_file="$(docker_cmd inspect "$CONTAINER_NAME" | sudo python3 "$verifier" --inspect-rss-path)"
         running="$(docker_cmd inspect -f '{{.State.Running}}' "$CONTAINER_NAME")"
         case "$running" in
             true) stopped_for_backup=1; docker_cmd stop --timeout 45 "$CONTAINER_NAME" ;;
@@ -436,9 +437,11 @@ create_backup() {
             die "state writer is still running"
     else
         state_file="$(compose config --format json | sudo python3 "$verifier" --compose-path "$SERVICE_NAME")"
+        rss_file="$(compose config --format json | sudo python3 "$verifier" --compose-rss-path "$SERVICE_NAME")"
         if ! sudo test -e "$state_file"; then verify_options+=(--allow-empty); fi
     fi
     state_file="$(realpath -m -- "$state_file")"
+    rss_file="$(realpath -m -- "$rss_file")"
     local -a normalized_paths=()
     for path in "${paths[@]}"; do
         path="$(realpath -m -- "$path")"
@@ -466,7 +469,10 @@ create_backup() {
     paths=("${normalized_paths[@]}")
     # A custom state file may live on another mount. Include it and its SQLite
     # sidecars individually without archiving any adjacent payload directories.
-    for sidecar in "$state_file" "$state_file-wal" "$state_file-shm" "$state_file-journal"; do
+    # The paired RSS history database is recovered with the library.
+    [[ -n "$rss_file" ]] || rss_file="$state_file.rss.sqlite"
+    for sidecar in "$state_file" "$state_file-wal" "$state_file-shm" "$state_file-journal" \
+                   "$rss_file" "$rss_file-wal" "$rss_file-shm" "$rss_file-journal"; do
         sidecar="$(realpath -m -- "$sidecar")"
         sudo test -e "$sidecar" || continue
         covered=0
@@ -476,7 +482,7 @@ create_backup() {
         if [[ $covered == 0 ]]; then paths+=("$sidecar"); fi
     done
     sudo tar -czf - -- "${paths[@]}" > "$backup_tmp"
-    python3 "$verifier" "$backup_tmp" "$state_file" "${verify_options[@]}"
+    python3 "$verifier" "$backup_tmp" "$state_file" --rss-file "$rss_file" "${verify_options[@]}"
     mv "$backup_tmp" "$backup_path"
     sha256sum "$backup_path" > "$manifest_path"
 

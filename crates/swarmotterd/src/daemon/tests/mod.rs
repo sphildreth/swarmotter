@@ -255,17 +255,21 @@ fn disabled_health() -> NetworkHealth {
 
 mod autopilot;
 mod config_data_plane;
+mod creation;
 mod health;
 mod intake;
 mod metadata_identity;
 mod peer_engine;
 mod persistence;
 mod profiles;
+mod provenance;
 mod queue;
 mod recheck_control;
 mod reconcile;
+mod rss;
 mod scheduler;
 mod trackers;
+mod trash;
 mod watch;
 
 // --- Coalesced peer worker limit distribution (ADR-0071) ---

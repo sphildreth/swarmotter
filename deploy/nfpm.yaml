@@ -29,6 +29,12 @@ contents:
       mode: 0755
       owner: root
       group: root
+  - src: "@SWARMOTTER_CTL_BINARY@"
+    dst: /usr/bin/swarmotterctl
+    file_info:
+      mode: 0755
+      owner: root
+      group: root
   - dst: /etc/swarmotter
     type: dir
     file_info:

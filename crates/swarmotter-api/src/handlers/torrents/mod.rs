@@ -30,6 +30,7 @@ mod add;
 mod bulk;
 mod lifecycle;
 mod metainfo;
+mod provenance;
 mod query;
 mod settings;
 
@@ -46,6 +47,9 @@ pub use lifecycle::{
     BulkTorrentActionBody, BulkTorrentActionResult, RemoveTorrentsBody, RemoveTorrentsResult,
 };
 pub use metainfo::export_metainfo;
+pub use provenance::{
+    export_archive, get_magnet, set_annotation, AnnotationBody, ExportArchiveBody, MagnetQuery,
+};
 pub use query::{
     list_torrents, query_torrents, TorrentListCounts, TorrentListDirection, TorrentListGroup,
     TorrentListGroupBy, TorrentListQuery, TorrentListResponse, TorrentListSort,

@@ -639,6 +639,11 @@ impl DaemonOps for DaemonRuntime {
                 }
                 drop(reg);
                 if let Some(state) = final_state {
+                    if state == TorrentState::Completed {
+                        if let Some(torrent) = self.registry.lock().await.get(hash).cloned() {
+                            self.queue_rss_verified_completion(&torrent).await;
+                        }
+                    }
                     self.publish_torrent_event("torrent_changed", *hash, state);
                     if state == TorrentState::Completed {
                         self.publish_torrent_event("torrent_completed", *hash, state);
@@ -959,6 +964,28 @@ impl DaemonOps for DaemonRuntime {
         Ok(())
     }
 
+    async fn set_torrent_annotation(
+        &self,
+        hash: &TorrentKey,
+        annotation: Option<String>,
+    ) -> Result<TorrentSummary> {
+        self.set_torrent_annotation(hash, annotation).await
+    }
+
+    async fn torrent_magnet(
+        &self,
+        hash: &TorrentKey,
+        tracker_policy: swarmotter_core::magnet::MagnetTrackerPolicy,
+        include_private_trackers: bool,
+    ) -> Result<String> {
+        self.torrent_magnet(hash, tracker_policy, include_private_trackers)
+            .await
+    }
+
+    async fn export_metainfo_archive(&self, hashes: Vec<TorrentKey>) -> Result<Vec<u8>> {
+        self.export_metainfo_archive(hashes).await
+    }
+
     async fn set_torrent_limits(
         &self,
         hash: &TorrentKey,
@@ -1181,9 +1208,10 @@ impl DaemonOps for DaemonRuntime {
     async fn list_trackers(&self, hash: &TorrentKey) -> Option<Vec<TrackerInfo>> {
         let canonical_hash = self.canonical_torrent_key(*hash).await?;
         let hash = &canonical_hash;
-        // Reflect real per-tracker announce results from the live engine, if
-        // present. Success text is kept separate from last_error so the UI and
-        // Transmission emulation do not report successful announces as errors.
+        let torrent = self.registry.lock().await.get(hash).cloned()?;
+        let policy = self.effective_policy(&torrent).await;
+        let host_rules = policy.tracker.host_rules.value.clone();
+        let policy_source = format!("{:?}", policy.tracker.host_rules.source);
         let (engine_trackers, engine_scrapes, tracker_interval_seconds) = self
             .engine_states
             .read()
@@ -1198,45 +1226,100 @@ impl DaemonOps for DaemonRuntime {
                 )
             })
             .unwrap_or_default();
-        self.registry.lock().await.get(hash).map(|t| {
-            let mut out = Vec::new();
-            let tiers = tracker::announce_tiers(t.meta.announce.as_deref(), &t.meta.announce_list);
-            for (tier, urls) in tiers.iter().enumerate() {
-                for url in urls {
-                    let mut info = make_tracker(url, tier);
-                    if let Some(snapshot) = engine_trackers.get(url) {
-                        info.status = snapshot.status;
-                        info.seeders = snapshot.seeders;
-                        info.leechers = snapshot.leechers;
-                        info.downloads = snapshot.downloads;
-                        info.last_error = snapshot.last_error.clone();
-                        info.last_message = snapshot.last_message.clone();
-                        info.last_announce = snapshot.last_announce;
-                        info.next_announce = snapshot
-                            .last_announce
-                            .map(|last| last.saturating_add(tracker_interval_seconds.max(30)));
+        let now = now();
+        let mut out = Vec::new();
+        let tiers = tracker::announce_tiers(
+            torrent.meta.announce.as_deref(),
+            &torrent.meta.announce_list,
+        );
+        for (tier, urls) in tiers.iter().enumerate() {
+            for url in urls {
+                let mut info = make_tracker(url, tier);
+                let decision = swarmotter_core::policy::tracker_policy_decision(url, &host_rules);
+                let explicitly_disabled = torrent
+                    .disabled_trackers
+                    .iter()
+                    .any(|disabled| disabled == url);
+                info.allowed = decision.allowed && !explicitly_disabled;
+                info.effective_priority = match decision.priority {
+                    swarmotter_core::policy::QueuePriority::Low => {
+                        swarmotter_core::models::tracker::TrackerPriority::Low
                     }
-                    if let Some(scrape) = engine_scrapes.get(url) {
-                        info.scrape_status = scrape.status;
-                        info.last_scrape = scrape.last_scrape;
-                        info.scrape_seeders = scrape.seeders;
-                        info.scrape_leechers = scrape.leechers;
-                        info.scrape_downloads = scrape.downloads;
-                        info.last_scrape_error = scrape.last_error.clone();
-                        // Preserve successful announce counts as the primary
-                        // compatibility view. When announce has not succeeded,
-                        // fall back to the separately retained scrape counts.
-                        if !matches!(info.status, TrackerStatus::Working | TrackerStatus::Ok) {
-                            info.seeders = scrape.seeders.unwrap_or(info.seeders);
-                            info.leechers = scrape.leechers.unwrap_or(info.leechers);
-                        }
-                        info.downloads = scrape.downloads.unwrap_or(info.downloads);
+                    swarmotter_core::policy::QueuePriority::Normal => {
+                        swarmotter_core::models::tracker::TrackerPriority::Normal
                     }
-                    out.push(info);
+                    swarmotter_core::policy::QueuePriority::High => {
+                        swarmotter_core::models::tracker::TrackerPriority::High
+                    }
+                };
+                info.policy_source = if explicitly_disabled {
+                    "torrent override".into()
+                } else if decision.rule_index.is_some() {
+                    policy_source.clone()
+                } else {
+                    "global".into()
+                };
+                if !info.allowed {
+                    info.status = TrackerStatus::Disabled;
                 }
+                if let Some(snapshot) = engine_trackers.get(url) {
+                    info.status = if info.allowed {
+                        snapshot.status
+                    } else {
+                        TrackerStatus::Disabled
+                    };
+                    info.seeders = snapshot.seeders;
+                    info.leechers = snapshot.leechers;
+                    info.downloads = snapshot.downloads;
+                    info.last_error = snapshot.last_error.clone();
+                    info.last_message = snapshot.last_message.clone();
+                    info.last_announce = snapshot.last_announce;
+                    info.last_attempt = snapshot.last_announce;
+                    info.last_success = snapshot.last_success;
+                    info.retries = snapshot.retries;
+                    info.latency_ms = snapshot.latency_ms;
+                    info.peers_returned = snapshot.peers_returned;
+                    info.recent_errors = snapshot.recent_errors.clone();
+                    info.sample_status = match (snapshot.last_announce, snapshot.last_success) {
+                        (_, None) => {
+                            swarmotter_core::models::tracker::TrackerSampleStatus::Unavailable
+                        }
+                        (None, _) => {
+                            swarmotter_core::models::tracker::TrackerSampleStatus::Unavailable
+                        }
+                        (Some(_), Some(last_success)) => {
+                            let freshness = tracker_interval_seconds.saturating_mul(2).max(300);
+                            if now.saturating_sub(last_success) <= freshness {
+                                swarmotter_core::models::tracker::TrackerSampleStatus::Current
+                            } else {
+                                swarmotter_core::models::tracker::TrackerSampleStatus::Stale
+                            }
+                        }
+                    };
+                    info.next_announce = snapshot
+                        .last_announce
+                        .map(|last| last.saturating_add(tracker_interval_seconds.max(30)));
+                } else if !info.allowed {
+                    info.sample_status =
+                        swarmotter_core::models::tracker::TrackerSampleStatus::Unavailable;
+                }
+                if let Some(scrape) = engine_scrapes.get(url) {
+                    info.scrape_status = scrape.status;
+                    info.last_scrape = scrape.last_scrape;
+                    info.scrape_seeders = scrape.seeders;
+                    info.scrape_leechers = scrape.leechers;
+                    info.scrape_downloads = scrape.downloads;
+                    info.last_scrape_error = scrape.last_error.clone();
+                    if !matches!(info.status, TrackerStatus::Working | TrackerStatus::Ok) {
+                        info.seeders = scrape.seeders.unwrap_or(info.seeders);
+                        info.leechers = scrape.leechers.unwrap_or(info.leechers);
+                    }
+                    info.downloads = scrape.downloads.unwrap_or(info.downloads);
+                }
+                out.push(info);
             }
-            out
-        })
+        }
+        Some(out)
     }
 
     async fn add_tracker(&self, hash: &TorrentKey, url: String) -> Result<()> {
@@ -1317,6 +1400,46 @@ impl DaemonOps for DaemonRuntime {
         self.persist_state().await
     }
 
+    async fn retry_tracker(&self, hash: &TorrentKey, url: String) -> Result<()> {
+        self.retry_tracker(hash, &url).await
+    }
+
+    async fn set_tracker_enabled(
+        &self,
+        hash: &TorrentKey,
+        url: String,
+        enabled: bool,
+    ) -> Result<Vec<TrackerInfo>> {
+        self.set_tracker_enabled(hash, &url, enabled).await
+    }
+
+    async fn cleanup_trackers_preview(
+        &self,
+        hash: &TorrentKey,
+        failure_threshold: u32,
+    ) -> Result<Vec<TrackerInfo>> {
+        self.cleanup_trackers_preview(hash, failure_threshold).await
+    }
+
+    async fn cleanup_trackers(
+        &self,
+        hash: &TorrentKey,
+        failure_threshold: u32,
+    ) -> Result<Vec<TrackerInfo>> {
+        self.cleanup_trackers(hash, failure_threshold).await
+    }
+
+    async fn tracker_diagnostics(&self, hash: &TorrentKey) -> Result<String> {
+        self.tracker_diagnostics(hash).await
+    }
+
+    async fn list_webseeds(
+        &self,
+        hash: &TorrentKey,
+    ) -> Option<Vec<swarmotter_core::models::tracker::WebseedInfo>> {
+        self.list_webseeds(hash).await
+    }
+
     async fn list_peers(&self, hash: &TorrentKey) -> Option<Vec<Peer>> {
         let canonical_hash = self.canonical_torrent_key(*hash).await?;
         let hash = &canonical_hash;
@@ -1349,6 +1472,11 @@ impl DaemonOps for DaemonRuntime {
                 rate_up: 0,
                 flags: swarmotter_core::models::peer::PeerFlags::default(),
                 banned: manual_ban_ips.contains(&pa.ip),
+                sources: s
+                    .peer_sources
+                    .get(&pa.socket_addr())
+                    .map(|sources| sources.iter().cloned().collect())
+                    .unwrap_or_default(),
             })
             .collect();
         Some(peers)
@@ -1806,6 +1934,9 @@ impl DaemonOps for DaemonRuntime {
             "download state reset requested by API request"
         );
         let registry_hashes: Vec<TorrentKey> = torrents.iter().map(Torrent::key).collect();
+        for torrent in &torrents {
+            self.queue_rss_removal(torrent).await;
+        }
         self.stop_all_torrent_tasks(&registry_hashes).await;
         self.clear_download_runtime_state().await;
 
@@ -2482,6 +2613,154 @@ impl DaemonOps for DaemonRuntime {
 
     async fn watch_history(&self) -> Vec<watch::ImportResult> {
         self.watch_imports.lock().await.iter().cloned().collect()
+    }
+
+    async fn create_torrent(
+        &self,
+        request: swarmotter_core::creation::TorrentCreationRequest,
+    ) -> Result<swarmotter_core::creation::TorrentCreationResult> {
+        self.create_torrent(request).await
+    }
+
+    async fn torrent_creation_roots(&self) -> Vec<String> {
+        self.torrent_creation_roots().await
+    }
+
+    async fn trash_status(&self) -> Result<swarmotter_core::trash::TrashStatus> {
+        self.trash_status().await
+    }
+
+    async fn preview_trash(
+        &self,
+        request: swarmotter_core::trash::TrashSelectionRequest,
+    ) -> Result<swarmotter_core::trash::TrashPreview> {
+        self.preview_trash(request).await
+    }
+
+    async fn apply_trash(
+        &self,
+        request: swarmotter_core::trash::TrashSelectionRequest,
+    ) -> Result<swarmotter_core::trash::TrashApplyResult> {
+        self.apply_trash(request).await
+    }
+
+    async fn restore_trash(
+        &self,
+        entry_id: &str,
+        request: swarmotter_core::trash::RestoreRequest,
+    ) -> Result<swarmotter_core::trash::RestoreResult> {
+        self.restore_trash(entry_id, request).await
+    }
+
+    async fn purge_trash(&self, entry_id: &str) -> Result<()> {
+        self.purge_trash(entry_id).await
+    }
+
+    async fn rss_status(&self) -> Vec<swarmotter_core::rss::RssSubscriptionStatus> {
+        self.rss_status().await
+    }
+
+    async fn rss_upsert_subscription(
+        &self,
+        subscription: swarmotter_core::rss::RssSubscription,
+        previous_id: Option<String>,
+    ) -> Result<swarmotter_core::rss::RssSubscriptionStatus> {
+        subscription.validate()?;
+        let mut config = self.config.read().await.clone();
+        let previous_id = previous_id.unwrap_or_else(|| subscription.id.clone());
+        if let Some(index) = config
+            .rss
+            .subscriptions
+            .iter()
+            .position(|candidate| candidate.id == previous_id)
+        {
+            config.rss.subscriptions[index] = subscription.clone();
+        } else if config
+            .rss
+            .subscriptions
+            .iter()
+            .any(|candidate| candidate.id == subscription.id)
+        {
+            return Err(CoreError::InvalidConfig(format!(
+                "rss subscription {:?} already exists",
+                subscription.id
+            )));
+        } else {
+            config.rss.subscriptions.push(subscription.clone());
+        }
+        config.validate()?;
+        self.replace_config(config).await?;
+        Ok(self
+            .rss_status()
+            .await
+            .into_iter()
+            .find(|status| status.id == subscription.id)
+            .ok_or_else(|| CoreError::Internal("RSS subscription disappeared after save".into()))?)
+    }
+
+    async fn rss_delete_subscription(&self, id: &str) -> Result<()> {
+        let mut config = self.config.read().await.clone();
+        let before = config.rss.subscriptions.len();
+        config
+            .rss
+            .subscriptions
+            .retain(|candidate| candidate.id != id);
+        if config.rss.subscriptions.len() == before {
+            return Err(CoreError::NotFound(format!("rss subscription {id}")));
+        }
+        config.validate()?;
+        self.replace_config(config).await?;
+        Ok(())
+    }
+
+    async fn rss_preview(&self, id: &str) -> Result<swarmotter_core::rss::RssPreview> {
+        self.preview_rss_subscription(id).await
+    }
+
+    async fn rss_preview_draft(
+        &self,
+        subscription: swarmotter_core::rss::RssSubscription,
+    ) -> Result<swarmotter_core::rss::RssPreview> {
+        self.preview_rss_draft(&subscription).await
+    }
+
+    async fn rss_poll(
+        &self,
+        id: &str,
+        import_current: bool,
+        reconsider: bool,
+    ) -> Result<swarmotter_core::rss::RssPollResult> {
+        self.poll_rss_subscription(id, import_current, reconsider)
+            .await
+    }
+
+    async fn rss_retry(
+        &self,
+        id: &str,
+        entry_key: Option<String>,
+    ) -> Result<swarmotter_core::rss::RssPollResult> {
+        self.retry_rss_listing(id, entry_key.as_deref()).await
+    }
+
+    async fn rss_decisions(
+        &self,
+        id: &str,
+        limit: usize,
+        before: Option<i64>,
+    ) -> Result<swarmotter_core::rss::RssDecisionPage> {
+        self.rss_decisions(id, limit, before).await
+    }
+
+    async fn rss_clear_completions(&self) -> Result<usize> {
+        self.clear_rss_completions().await
+    }
+
+    async fn rss_duplicate_lookup_is_indexed(&self) -> Result<bool> {
+        self.rss_duplicate_lookup_is_indexed().await
+    }
+
+    async fn rss_backfill_completion_evidence(&self) {
+        self.backfill_rss_completion_evidence().await
     }
 }
 

@@ -1,0 +1,14 @@
+{
+  "chromium": "156.0.8078.4",
+  "checks": [
+    "Read-only navigation on all six views and a single authenticated-fetch event stream",
+    "Library search, state filter, server sort, independent hash selection, partial lifecycle failure and keep-data removal",
+    "Magnet validation, side-effect-free inspection, selection of start policy, retry, double submission, binary upload and creation request",
+    "Network diagnostics error and recovery, configured port test, health fetch failure and explicit disabled containment",
+    "Configuration field validation, confirmed reload, preserved failed edits, persisted save response, restart and retained RSS configuration",
+    "RSS inspection by ID, saved and draft decision previews, create/edit/pause, explicit poll, watch scan and cleanup preview",
+    "Log search, severity filter, copy, filtered export, pause, CRLF stream, bounded buffer, reconnect and local clear with tail recovery",
+    "Persisted light and dark theme control",
+    "Repeated navigation leaves one periodic global statistics request per sampling interval"
+  ]
+}

@@ -779,6 +779,7 @@ impl DaemonRuntime {
             intake_selection,
             partial_file_suffix,
             tracker_host_rules,
+            disabled_trackers,
         ) = {
             let complete_dir = snapshot.complete_dir.clone();
             let active_dir = snapshot.active_dir.clone();
@@ -823,6 +824,7 @@ impl DaemonRuntime {
                 snapshot.intake_selection.clone(),
                 snapshot.partial_file_suffix.clone(),
                 snapshot.tracker_host_rules.clone(),
+                snapshot.disabled_trackers.clone(),
             )
         };
 
@@ -1076,6 +1078,9 @@ impl DaemonRuntime {
         if !tracker_host_rules.is_empty() {
             engine = engine.with_tracker_host_rules(tracker_host_rules);
         }
+        if !disabled_trackers.is_empty() {
+            engine = engine.with_disabled_trackers(disabled_trackers);
+        }
         if let Some(selection) = intake_selection {
             engine = engine.with_intake_selection(selection);
         }
@@ -1244,6 +1249,12 @@ impl DaemonRuntime {
                         };
                         runtime_for_task.publish_torrent_event(event, hash_for_task, state);
                         if state == TorrentState::Completed {
+                            let completed = registry.lock().await.get(&hash_for_task).cloned();
+                            if let Some(torrent) = completed {
+                                runtime_for_task
+                                    .queue_rss_verified_completion(&torrent)
+                                    .await;
+                            }
                             runtime_for_task.publish_torrent_event(
                                 "torrent_completed",
                                 hash_for_task,

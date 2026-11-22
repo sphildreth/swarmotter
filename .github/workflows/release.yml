@@ -82,15 +82,16 @@ jobs:
                 export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
               fi
               mkdir -p dist/binary dist/packages
-              cargo build --locked --release --target "$RUST_TARGET" --bin swarmotterd
+              cargo build --locked --release --target "$RUST_TARGET" --bin swarmotterd --bin swarmotterctl
               install -m 0755 "target/$RUST_TARGET/release/swarmotterd" dist/binary/swarmotterd
+              install -m 0755 "target/$RUST_TARGET/release/swarmotterctl" dist/binary/swarmotterctl
             '
           sudo chown -R "$(id -u):$(id -g)" dist target
 
       - name: Verify release binary glibc compatibility
         run: |
           max_glibc="$(
-            strings dist/binary/swarmotterd \
+            { strings dist/binary/swarmotterd; strings dist/binary/swarmotterctl; } \
               | grep -Eo 'GLIBC_[0-9]+[.][0-9]+' \
               | sed 's/^GLIBC_//' \
               | sort -Vu \
@@ -115,6 +116,7 @@ jobs:
 
           mkdir -p "${stage}/bin" "${stage}/config" "${stage}/deploy" "${stage}/docs"
           install -m 0755 dist/binary/swarmotterd "${stage}/bin/swarmotterd"
+          install -m 0755 dist/binary/swarmotterctl "${stage}/bin/swarmotterctl"
           cp LICENSE README.md CHANGELOG.md THIRD_PARTY_LICENSES.md "${stage}/"
           cp config/swarmotter.toml.example config/swarmotter.container.toml.example "${stage}/config/"
           cp deploy/.env.example deploy/compose.yml deploy/gluetun.env.example deploy/swarmotterd.service deploy/update-swarmotter.sh deploy/verify-state-backup.py "${stage}/deploy/"
@@ -129,6 +131,7 @@ jobs:
             -e "s|@NFPM_ARCH@|${{ matrix.nfpm_arch }}|g" \
             -e "s|@SWARMOTTER_VERSION@|${{ steps.version.outputs.version }}|g" \
             -e "s|@SWARMOTTER_BINARY@|${GITHUB_WORKSPACE}/dist/binary/swarmotterd|g" \
+            -e "s|@SWARMOTTER_CTL_BINARY@|${GITHUB_WORKSPACE}/dist/binary/swarmotterctl|g" \
             deploy/nfpm.yaml > dist/nfpm.yaml
 
       - name: Package deb
@@ -189,9 +192,11 @@ jobs:
 
           tar -xzf "image-artifacts/swarmotter-v${version}-linux-x86_64.tar.gz" -C /tmp/swarmotter-release-extract
           install -m 0755 "/tmp/swarmotter-release-extract/swarmotter-v${version}-linux-x86_64/bin/swarmotterd" image-binaries/linux-amd64/swarmotterd
+          install -m 0755 "/tmp/swarmotter-release-extract/swarmotter-v${version}-linux-x86_64/bin/swarmotterctl" image-binaries/linux-amd64/swarmotterctl
 
           tar -xzf "image-artifacts/swarmotter-v${version}-linux-aarch64.tar.gz" -C /tmp/swarmotter-release-extract
           install -m 0755 "/tmp/swarmotter-release-extract/swarmotter-v${version}-linux-aarch64/bin/swarmotterd" image-binaries/linux-arm64/swarmotterd
+          install -m 0755 "/tmp/swarmotter-release-extract/swarmotter-v${version}-linux-aarch64/bin/swarmotterctl" image-binaries/linux-arm64/swarmotterctl
 
       - name: Log in to GHCR
         uses: docker/login-action@v4

@@ -23,6 +23,19 @@ pub struct PeerFlags {
     pub snubbed: bool,
 }
 
+/// Discovery provenance attached to a peer when known. Multiple sources are
+/// retained; unknown provenance is never invented.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerSource {
+    Tracker(String),
+    Dht,
+    Pex,
+    Direct,
+    Resume,
+    Unknown,
+}
+
 /// A connected peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Peer {
@@ -36,6 +49,9 @@ pub struct Peer {
     pub rate_up: u64,
     pub flags: PeerFlags,
     pub banned: bool,
+    /// Known discovery sources. Empty means provenance was not observed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<PeerSource>,
 }
 
 /// Per-peer health signals used by the engine to feed the health calculator.

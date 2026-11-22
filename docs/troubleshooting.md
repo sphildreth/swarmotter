@@ -431,3 +431,147 @@ and serialized bytes currently cover changed-record saves.
 Application logs retain the active file and five numbered archives. Docker logs
 are capped separately. Check both the download filesystem and state filesystem
 for free space; download reserves do not protect a separate SQLite volume.
+
+## RSS subscription problems
+
+RSS status and poll errors are explicit. `rss history unavailable` or a storage
+error means the dedicated history database (`<state file>.rss.sqlite` by default,
+or `rss.history_file`) could not be opened or checked. Automatic RSS
+imports are deferred, not guessed, in that state. Confirm the state directory is
+writable, that both the main state file and RSS history database were restored
+together, and that file permissions allow the daemon user to open the history
+database. Run the offline backup verifier against the pair if SQLite integrity
+is in doubt.
+
+A `network_blocked`, timeout, HTTP status, or transient attachment decision
+remains eligible for retry with backoff, even after the listing leaves the feed.
+Check the subscription's `next_attempt_at` and `latest_error`; use **Retry
+dismissed** or `POST /api/v1/rss/{id}/retry` after fixing the cause. A permanent
+`unsupported` decision (page-only listing, malformed metainfo, or malformed
+magnet) requires a different feed item; it is not retried forever.
+
+A listing that was imported and then deliberately removed before completion is
+`dismissed` until explicit retry. If a later feed offers the same torrent after
+a verified completion, it is reported as `previously_completed` and is not added
+again. Completion identities survive routine pruning and subscription deletion;
+clearing them is an explicit destructive API action. Preview never marks entries
+seen, so use it to adjust rules before a poll. The first successful poll
+establishes the baseline; only `current_matches` or an explicit import-current
+action imports existing matches at that point.
+
+## Torrent creation problems
+
+Creation accepts only source paths inside a configured storage root
+(`storage.download_dir`, `storage.incomplete_dir`, `storage.temp_dir`, or a
+`storage.root_controls` path). An `outside the configured storage roots` error
+means the resolved source path is not under those boundaries. Move the source
+into a managed root or add an explicit root control; do not rely on a symlink,
+because symlink sources and symlink entries are rejected.
+
+`source data changed` means the file set, length, modification identity, or
+inode changed between the initial snapshot, hashing, or the post-hash
+revalidation. Stop writers or copying processes and retry. A failed hash never
+publishes an export or a completed seed.
+
+BEP 52 and hybrid output require a power-of-two piece length of at least 16384
+bytes. The default is 262144 bytes. A generated document larger than the 16 MiB
+metadata limit is rejected; reduce the piece count by using a larger piece
+length.
+
+Immediate seeding requires the torrent name to equal the source basename so the
+torrent-relative paths resolve to the existing files. A custom name is valid for
+export but returns a seed error for in-place seeding. If seeding reports a
+duplicate, the torrent already exists in the library and the generated export
+is still returned. Hashing is bounded by the root's
+`max_concurrent_rechecks`; active verification can make creation wait.
+
+## Magnet, annotation, and export problems
+
+Copy Magnet can return a private-consent error. That is intentional: a private
+torrent does not expose its tracker URLs until the operator confirms inclusion
+or chooses the no-tracker policy.
+
+Annotation saves do not change the source comment or original `.torrent` bytes.
+If the data appears unchanged after editing, check whether you are looking at
+`Source comment` versus `Operator annotation`; they are separate fields.
+
+Single export and batch export include only retained original documents. A
+`metainfo unavailable` or manifest `unavailable` entry means the torrent came
+from a magnet or predates original-byte retention. SwarmOtter does not
+reconstruct a source document from canonical `info` bytes. Re-add a locally
+supplied `.torrent` if you need to establish a new retained original.
+
+## Cleanup and trash problems
+
+If `trash.path` overlaps a configured payload or storage root, configuration
+validation rejects it. Choose a local path outside download/incomplete/temp and
+root-control roots.
+
+A preview item with `eligible: false` explains the blocker: a shared payload
+path, an unsupported symlink/special file, a missing/changed source path, or a
+retention rule whose `qualifies_at` is still in the future. Preview never
+changes anything; run it again after resolving the blocker.
+
+Restore refuses to overwrite an existing destination. Remove/move the conflicting
+file deliberately and retry; the trash entry remains intact. Entries listed as
+`incomplete` came from an interrupted move under `.staging/<id>`. Inspect or purge
+them; they are not restorable without a complete manifest. Purging is permanent
+and removes the trash copy, so confirm the entry is no longer needed.
+
+## swarmotterctl failures
+
+`swarmotterctl` distinguishes failure classes by exit code and, with `--json`,
+emits a versioned error document on stdout:
+
+- `3`: authentication/authorization — check the token file/environment or daemon
+  `api.require_auth` settings.
+- `4`: missing torrent/resource — list or query again; the item may have been
+  removed.
+- `5`: connection/DNS/TLS/timeout — check `SWARMOTTER_API_URL`, the listener,
+  reverse proxy, and certificate trust.
+- `6`: validation or rejected request — inspect the error code/message and the
+  API contract.
+- `2`: local usage/configuration, including an invalid URL or missing token file.
+
+The CLI never prints the token. Do not place a token in a command argument; use
+`SWARMOTTER_API_TOKEN_FILE` or `--token-file`. For large libraries use
+`--per-page` or `--all`; the client uses server-side pagination rather than
+reading daemon-private state.
+
+## OpenAPI and API explorer problems
+
+`/api/openapi.json` and `/api/docs` are public documentation routes, but the
+explorer's requests still require the daemon's normal authentication when
+`api.require_auth = true`. If a Try request returns 401, enter the API token in
+the explorer header; it is sent as `X-SwarmOtter-Auth` and is not stored in the
+document.
+
+The explorer intentionally lists only supported operations. A qBittorrent method
+or Transmission RPC method absent from the document is not implemented; do not
+infer support from another client. Transmission support is listed in
+`x-swarmotter-supported-rpc-methods`, and qBittorrent parity limits are in
+`x-swarmotter-compatibility`.
+
+If `/api/openapi.json` is unavailable, check that the daemon build is current and
+that the control-plane listener is reachable. The document is generated from the
+same route catalog checked against the router in CI.
+
+## Weak swarm or tracker diagnostics
+
+Open Torrent Details → Trackers. A tracker with `sample_status: unavailable`
+has no successful sample yet; `measured zero` appears as `peers_returned: 0`,
+which is different from `null`/unavailable. `last_attempt` can update while
+`last_success` stays older, and `retries` counts consecutive failures. Check the
+effective priority/allowed state and policy source before assuming a tracker is
+being used.
+
+If one tracker is failing, inspect the others and the Peers table. Peer sources
+show tracker, DHT, PEX, direct, or resume provenance when observed; an empty
+Sources column means SwarmOtter did not observe provenance, not that the peer is
+invalid. Webseeds have a separate tab with verified byte contributions and
+recent errors.
+
+Use **Preview Failure Cleanup** before disabling trackers. The preview identifies
+the exact affected URLs and the apply action requires confirmation. Tracker
+disable is reversible through the same table. **Copy Diagnostics** redacts
+tracker passkeys and credentials; do not paste an unredacted URL yourself.

@@ -140,6 +140,28 @@ updates use two API paths:
   `archive_dir` and `failure_dir` actions create missing directories but never
   overwrite an existing destination. Observation/history state is deliberately
   not durable (ADR-0054).
+- `[trash]` is disabled unless a local `path` is set. It must not overlap a
+  configured payload/storage root. Retention rules combine optional effective
+  profile, case-insensitive label, lifecycle state set, and minimum age. Rules
+  only select preview/apply candidates; there is no background deletion. Trash
+  entries use ready and staging directories, fail-only restore collisions, and
+  explicit purge (ADR-0085).
+- Torrent creation sources are confined to existing local storage roots
+  (`download_dir`, `incomplete_dir`, `temp_dir`, or a `root_controls` path).
+  Symlinks and special files are rejected. Hashing uses the most-specific root's
+  `max_concurrent_rechecks` permit; no new creation-specific config table is
+  required. Piece length, tracker tiers, webseeds, privacy, and immediate-seed
+  intent are per-request values (ADR-0083).
+- `[rss]` subscriptions are operator-visible intake configuration. The feed
+  id is immutable, intervals and parser/document/attachment limits are
+  validated, and include/exclude wildcard rules are case-insensitive with
+  exclusions winning. The first successful poll establishes the baseline; an
+  explicit current-matches import and reconsider/retry actions are separate.
+  Feed and attachment traffic uses the contained HTTP client. The dedicated
+  shared history database is `<state file>.rss.sqlite` by default (or
+  `rss.history_file`) and is paired with the main database for backup/restore.
+  Completion/removal events are written to the main transactional outbox before
+  being applied idempotently to history (ADR-0082).
 - Transport option changes are release-facing compatibility decisions.
 
 ## Compatibility boundaries

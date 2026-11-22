@@ -221,6 +221,28 @@ pub trait DaemonOps: Send + Sync + 'static {
     ) -> Result<()>;
     /// Update labels/categories.
     async fn set_labels(&self, hash: &TorrentKey, labels: Vec<String>) -> Result<()>;
+    /// Set or clear an operator annotation without changing source metadata.
+    async fn set_torrent_annotation(
+        &self,
+        _hash: &TorrentKey,
+        _annotation: Option<String>,
+    ) -> Result<TorrentSummary> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
+    /// Generate a deterministic full-identity magnet for one torrent.
+    async fn torrent_magnet(
+        &self,
+        _hash: &TorrentKey,
+        _tracker_policy: swarmotter_core::magnet::MagnetTrackerPolicy,
+        _include_private_trackers: bool,
+    ) -> Result<String> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
+    /// Build a tar archive of retained original metainfo with a per-item
+    /// manifest. Missing originals are reported, never reconstructed.
+    async fn export_metainfo_archive(&self, _hashes: Vec<TorrentKey>) -> Result<Vec<u8>> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
     /// Set per-torrent bandwidth limits (bytes/sec; 0 = unlimited). Applies
     /// live to a running engine/seeder.
     async fn set_torrent_limits(
@@ -297,6 +319,48 @@ pub trait DaemonOps: Send + Sync + 'static {
     /// Edit a tracker.
     async fn edit_tracker(&self, hash: &TorrentKey, old_url: String, new_url: String)
         -> Result<()>;
+    /// Retry tracker discovery now. The daemon may reannounce every configured
+    /// tracker for the torrent; the supplied URL identifies the operator action.
+    async fn retry_tracker(&self, _hash: &TorrentKey, _url: String) -> Result<()> {
+        Err(CoreError::NotFound("tracker".into()))
+    }
+    /// Enable or disable one exact tracker URL for this torrent.
+    async fn set_tracker_enabled(
+        &self,
+        _hash: &TorrentKey,
+        _url: String,
+        _enabled: bool,
+    ) -> Result<Vec<TrackerInfo>> {
+        Err(CoreError::NotFound("tracker".into()))
+    }
+    /// Preview trackers at or above a consecutive-failure threshold.
+    async fn cleanup_trackers_preview(
+        &self,
+        _hash: &TorrentKey,
+        _failure_threshold: u32,
+    ) -> Result<Vec<TrackerInfo>> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
+    /// Disable affected trackers after a preview. The daemon revalidates the
+    /// threshold at execution time.
+    async fn cleanup_trackers(
+        &self,
+        _hash: &TorrentKey,
+        _failure_threshold: u32,
+    ) -> Result<Vec<TrackerInfo>> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
+    /// Redacted tracker/webseed/peer-source diagnostic text.
+    async fn tracker_diagnostics(&self, _hash: &TorrentKey) -> Result<String> {
+        Err(CoreError::NotFound("torrent".into()))
+    }
+    /// Enabled webseeds and their verified byte/error/retry evidence.
+    async fn list_webseeds(
+        &self,
+        _hash: &TorrentKey,
+    ) -> Option<Vec<swarmotter_core::models::tracker::WebseedInfo>> {
+        None
+    }
 
     /// List peers for a torrent.
     async fn list_peers(&self, hash: &TorrentKey) -> Option<Vec<Peer>>;
@@ -483,6 +547,121 @@ pub trait DaemonOps: Send + Sync + 'static {
     async fn watch_status(&self) -> WatchStatus;
     /// Watch-folder import history.
     async fn watch_history(&self) -> Vec<swarmotter_core::watch::ImportResult>;
+
+    /// Current local trash status and retention rules.
+    async fn trash_status(&self) -> Result<swarmotter_core::trash::TrashStatus> {
+        Err(CoreError::NotFound("trash".into()))
+    }
+    /// Preview cleanup without touching files, queue state, or metainfo.
+    async fn preview_trash(
+        &self,
+        _request: swarmotter_core::trash::TrashSelectionRequest,
+    ) -> Result<swarmotter_core::trash::TrashPreview> {
+        Err(CoreError::NotFound("trash".into()))
+    }
+    /// Execute a previously previewed cleanup selection with execution-time
+    /// ownership and root revalidation.
+    async fn apply_trash(
+        &self,
+        _request: swarmotter_core::trash::TrashSelectionRequest,
+    ) -> Result<swarmotter_core::trash::TrashApplyResult> {
+        Err(CoreError::NotFound("trash".into()))
+    }
+    /// Restore one ready trash entry. Existing destinations are never
+    /// overwritten.
+    async fn restore_trash(
+        &self,
+        _entry_id: &str,
+        _request: swarmotter_core::trash::RestoreRequest,
+    ) -> Result<swarmotter_core::trash::RestoreResult> {
+        Err(CoreError::NotFound("trash".into()))
+    }
+    /// Permanently purge one trash entry.
+    async fn purge_trash(&self, _entry_id: &str) -> Result<()> {
+        Err(CoreError::NotFound("trash".into()))
+    }
+
+    /// Create metainfo from a bounded local source and optionally seed it.
+    async fn create_torrent(
+        &self,
+        _request: swarmotter_core::creation::TorrentCreationRequest,
+    ) -> Result<swarmotter_core::creation::TorrentCreationResult> {
+        Err(CoreError::NotFound("torrent creation".into()))
+    }
+    /// Configured local roots permitted to contain creation sources.
+    async fn torrent_creation_roots(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// RSS subscription status, including poll state and bounded counts.
+    async fn rss_status(&self) -> Vec<swarmotter_core::rss::RssSubscriptionStatus> {
+        Vec::new()
+    }
+    /// Create or replace one RSS subscription through the daemon's validated
+    /// configuration transaction. `previous_id` supports an id-preserving
+    /// edit; renaming is intentionally a delete plus create.
+    async fn rss_upsert_subscription(
+        &self,
+        _subscription: swarmotter_core::rss::RssSubscription,
+        _previous_id: Option<String>,
+    ) -> Result<swarmotter_core::rss::RssSubscriptionStatus> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
+    /// Delete one RSS subscription. History and verified completions remain
+    /// durable unless completions are explicitly cleared.
+    async fn rss_delete_subscription(&self, _id: &str) -> Result<()> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
+    /// Preview a feed without adding torrents or marking entries seen.
+    async fn rss_preview(&self, _id: &str) -> Result<swarmotter_core::rss::RssPreview> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
+    /// Preview an unsaved subscription body without persisting it, adding
+    /// torrents, or marking entries seen.
+    async fn rss_preview_draft(
+        &self,
+        _subscription: swarmotter_core::rss::RssSubscription,
+    ) -> Result<swarmotter_core::rss::RssPreview> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
+    /// Poll one feed on demand. `import_current` explicitly imports current
+    /// matches; `reconsider` re-evaluates stored older listings.
+    async fn rss_poll(
+        &self,
+        _id: &str,
+        _import_current: bool,
+        _reconsider: bool,
+    ) -> Result<swarmotter_core::rss::RssPollResult> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
+    /// Explicitly retry dismissed or failed listings for one subscription.
+    async fn rss_retry(
+        &self,
+        _id: &str,
+        _entry_key: Option<String>,
+    ) -> Result<swarmotter_core::rss::RssPollResult> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
+    /// Paginated RSS decision history.
+    async fn rss_decisions(
+        &self,
+        _id: &str,
+        _limit: usize,
+        _before: Option<i64>,
+    ) -> Result<swarmotter_core::rss::RssDecisionPage> {
+        Err(CoreError::NotFound("rss subscription".into()))
+    }
+    /// Explicitly clear every verified completion identity. Routine pruning
+    /// and feed deletion never do this.
+    async fn rss_clear_completions(&self) -> Result<usize> {
+        Ok(0)
+    }
+    /// Whether durable duplicate lookups are using their indexes.
+    async fn rss_duplicate_lookup_is_indexed(&self) -> Result<bool> {
+        Ok(true)
+    }
+    /// Backfill completion evidence supported by current durable state.
+    async fn rss_backfill_completion_evidence(&self) {}
 }
 
 /// A patch of safe runtime settings.

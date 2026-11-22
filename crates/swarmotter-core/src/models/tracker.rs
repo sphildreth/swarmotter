@@ -67,6 +67,57 @@ pub enum TrackerScrapeStatus {
     Unsupported,
 }
 
+/// Effective tracker priority after profile host rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackerPriority {
+    Low,
+    #[default]
+    Normal,
+    High,
+}
+
+impl TrackerPriority {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::High => "high",
+        }
+    }
+}
+
+/// Whether a tracker diagnostic sample is current, stale, or absent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackerSampleStatus {
+    /// No announce attempt has produced evidence yet.
+    #[default]
+    Unavailable,
+    /// The latest successful sample is older than the freshness window.
+    Stale,
+    /// Recent measured evidence exists. A successful zero-peer announce is a
+    /// measured zero, not an unavailable sample.
+    Current,
+}
+
+/// One BEP 19 webseed and its runtime evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebseedInfo {
+    pub url: String,
+    pub enabled: bool,
+    pub status: TrackerStatus,
+    /// Bytes verified from this webseed in the current/last engine run.
+    pub bytes_verified: u64,
+    pub attempts: u64,
+    pub retries: u32,
+    pub last_success: Option<u64>,
+    pub last_attempt: Option<u64>,
+    pub last_error: Option<String>,
+    pub recent_errors: Vec<String>,
+    pub latency_ms: Option<u64>,
+}
+
 /// A tracker URL and its tier grouping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackerTier {
@@ -99,6 +150,58 @@ pub struct TrackerInfo {
     pub scrape_leechers: Option<u64>,
     pub scrape_downloads: Option<u64>,
     pub last_scrape_error: Option<String>,
+    /// Effective profile tracker priority after host rules.
+    pub effective_priority: TrackerPriority,
+    /// Whether the effective profile policy allows this tracker.
+    pub allowed: bool,
+    pub policy_source: String,
+    /// Last successful announce sample, distinct from last attempt.
+    pub last_success: Option<u64>,
+    /// Last announce attempt, success or failure.
+    pub last_attempt: Option<u64>,
+    /// Consecutive failed announce attempts.
+    pub retries: u32,
+    pub latency_ms: Option<u64>,
+    /// Peers returned by the last successful announce. `None` means never
+    /// measured; `Some(0)` is a measured zero yield.
+    pub peers_returned: Option<u64>,
+    pub sample_status: TrackerSampleStatus,
+    /// Bounded recent announce errors.
+    pub recent_errors: Vec<String>,
+}
+
+/// Redact tracker user information and sensitive query values for diagnostics.
+pub fn redact_tracker_url(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return "<invalid-tracker-url>".to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    if url.query().is_some() {
+        let pairs = url
+            .query_pairs()
+            .map(|(name, value)| {
+                let lower = name.to_ascii_lowercase();
+                let sensitive = lower.contains("pass")
+                    || lower.contains("key")
+                    || lower.contains("token")
+                    || lower.contains("auth")
+                    || lower.contains("secret")
+                    || lower.contains("signature")
+                    || lower == "sig";
+                (
+                    name.into_owned(),
+                    if sensitive && !value.is_empty() {
+                        "***".to_string()
+                    } else {
+                        value.into_owned()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        url.query_pairs_mut().clear().extend_pairs(pairs);
+    }
+    url.to_string()
 }
 
 /// Build effective BEP 12 tracker tiers. `announce-list` takes precedence over

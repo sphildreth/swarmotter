@@ -1,0 +1,143 @@
+{
+  "api": {
+    "bind_address": "127.0.0.1:9091",
+    "auth_token": null,
+    "require_auth": false,
+    "max_request_body_bytes": 16777216
+  },
+  "compatibility": {
+    "transmission": {
+      "enabled": false
+    },
+    "qbittorrent": {
+      "enabled": false
+    }
+  },
+  "storage": {
+    "download_dir": "/downloads",
+    "incomplete_dir": "/incomplete",
+    "resume_dir": null,
+    "state_dir": null,
+    "temp_dir": null,
+    "minimum_free_space_bytes": 0,
+    "minimum_free_space_percent": 0,
+    "preallocate": false,
+    "sparse": true,
+    "cow_strategy": "conservative",
+    "root_controls": []
+  },
+  "network": {
+    "mode": "disabled",
+    "required_interface": null,
+    "required_source_ipv4": null,
+    "required_source_ipv6": null,
+    "required_network_namespace": null,
+    "allow_ipv6": true,
+    "fail_closed": true,
+    "validate_route": false,
+    "validate_dns": false,
+    "socks5": {
+      "enabled": false,
+      "host": null,
+      "port": 1080,
+      "username": null,
+      "password": null
+    }
+  },
+  "torrent": {
+    "listen_port": 51413,
+    "allow_ipv6": true,
+    "utp_enabled": true,
+    "utp_prefer_tcp": true,
+    "encryption_mode": "preferred",
+    "selfish": false
+  },
+  "bandwidth": {
+    "global_download": 0,
+    "global_upload": 0,
+    "alt_download": 0,
+    "alt_upload": 0,
+    "alt_enabled": false,
+    "max_peers": 0,
+    "max_peers_per_torrent": 0
+  },
+  "queue": {
+    "max_active_downloads": 5,
+    "max_active_metadata_fetches": 100,
+    "max_active_seeds": 5,
+    "auto_start": true
+  },
+  "seeding": {
+    "global_ratio_limit": 2.0,
+    "global_idle_limit": 1800
+  },
+  "profiles": {
+    "profiles": {},
+    "labels": {}
+  },
+  "autopilot": {
+    "mode": "act"
+  },
+  "dht": {
+    "enabled": false,
+    "bootstrap_nodes": [
+      "dht.transmissionbt.com:6881",
+      "router.bittorrent.com:6881",
+      "router.utorrent.com:6881"
+    ],
+    "port": 51413
+  },
+  "pex": {
+    "enabled": true,
+    "max_peers": 0
+  },
+  "peer_filter": {
+    "enabled": false,
+    "rules": [],
+    "blocklist_paths": [],
+    "manual_bans": [],
+    "blocked_client_ids": []
+  },
+  "port_mapping": {
+    "enabled": false,
+    "protocols": [
+      "nat_pmp",
+      "upnp"
+    ],
+    "nat_pmp_gateway": null,
+    "upnp_service_url": null,
+    "lease_seconds": 3600,
+    "refresh_before_expiry_seconds": 300
+  },
+  "port_test": {
+    "enabled": false,
+    "endpoint": null,
+    "cache_ttl_seconds": 900,
+    "timeout_seconds": 10
+  },
+  "watch": [],
+  "trash": {
+    "path": null,
+    "retention": []
+  },
+  "rss": {
+    "history_file": null,
+    "subscriptions": [],
+    "max_feed_bytes": 2097152,
+    "max_attachment_bytes": 4194304,
+    "max_entries": 2000,
+    "request_timeout_seconds": 30,
+    "max_concurrent_polls": 2,
+    "max_retries": 5,
+    "retry_base_seconds": 60,
+    "retry_max_seconds": 3600,
+    "decision_retention": 5000,
+    "listing_retention": 10000
+  },
+  "logging": {
+    "level": "info",
+    "json": false,
+    "file": false,
+    "file_path": null
+  }
+}

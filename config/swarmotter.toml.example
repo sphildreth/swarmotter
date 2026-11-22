@@ -209,6 +209,40 @@ blocked_client_ids = []
 # destinations are never overwritten. In-root archive/failure descendants are
 # excluded from this folder's recursive scan; no watch/action path may be blank
 # or normalize to the watch root itself.
+# Local cleanup trash is disabled unless path is set. The path must not overlap
+# configured payload/storage roots. Retention rules select preview/apply
+# candidates; nothing is deleted in the background.
+# [trash]
+# path = "/data/trash"
+#
+# [[trash.retention]]
+# name = "old-paused"
+# label = "cleanup"
+# states = ["paused", "completed"]
+# min_age_seconds = 2592000
+
+# RSS intake is user-configured. Feed and attachment requests use the contained
+# network path. The dedicated history database defaults to
+# <state file>.rss.sqlite and must be backed up with the main state file.
+# [rss]
+# history_file = "/data/state/rss-history.sqlite"
+#
+# [[rss.subscriptions]]
+# id = "distro-isos"
+# name = "Distribution releases"
+# url = "https://distributor.example/feed.xml"
+# enabled = true
+# poll_interval_seconds = 900
+# profile = "archive"
+# start_behavior = "paused"
+# import_mode = "new_only"   # or "current_matches"
+#
+# [[rss.subscriptions.rules.include]]
+# title = "*ISO*"
+#
+# [[rss.subscriptions.rules.exclude]]
+# title = "*live*"
+
 # [[watch]]
 # path = "/data/watch"
 # recursive = false

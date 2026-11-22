@@ -24,9 +24,15 @@
 </p>
 
 <p align="center">
-  <a href="assets/screenshots/v1.2.0/output.gif" title="Click for Screenshots">
-    <img src="assets/screenshots/v1.2.0/output.png" alt="Static screenshot of the SwarmOtter Web UI torrent table" width="50%" title="Click for Screenshots">
+  <a href="assets/screenshots/web-ui-tour.gif">
+    <picture>
+      <source media="(prefers-reduced-motion: reduce)" srcset="assets/screenshots/web-ui-torrents.png">
+      <img src="assets/screenshots/web-ui-tour.gif" alt="SwarmOtter shows a Debian ISO finishing its download and starting to seed, then tours Add, Network, Settings, Watch, and Logs." width="100%">
+    </picture>
   </a>
+  <br>
+  <em>Simulated transfers of Linux ISOs and Blender Open Movies</em>
+  &middot; <a href="assets/screenshots/web-ui-torrents.png">View the still screenshot</a>
 </p>
 
 ---
@@ -59,6 +65,13 @@ SwarmOtter provides a comprehensive set of BitTorrent features:
 - **Fast resume** and forced recheck capabilities
 - **Versioned SQLite storage** with migration from legacy JSON state
 - **Watch-folder import** functionality
+- **RSS subscription intake** with preview, wildcard rules, durable cross-feed history, and verified-completion deduplication
+- **Local torrent creation** for v1, pure v2, and hybrid formats with export and immediate verified seeding
+- **Provenance and portability** with source metadata, separate annotations, deterministic magnets, and exact single/batch metainfo export
+- **Cleanup safety** with dry-run previews, profile/label/state retention rules, recoverable local trash, no-overwrite restore, and explicit purge
+- **`swarmotterctl`** API-backed CLI with human and versioned JSON output, stable exit codes, filters, pagination, and SSH/job scripting
+- **Versioned OpenAPI 3.1** and a dependency-free interactive API explorer with explicit qBittorrent/Transmission parity limits
+- **Discovery diagnostics** for tracker policy/yield/latency/retries, peer-source attribution, webseed contribution/errors, and safe tracker maintenance
 - **Advanced controls** for file selection, queueing, bandwidth, ratio, and seeding
 - **Policy profiles** with deterministic label selection
 - **Disk-aware storage** with filesystem diagnostics and placement

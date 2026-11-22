@@ -333,6 +333,112 @@ not accept restart-required fields.
   Existing ratio/uploaded fields use native truthful accounting; no new
   compatibility policy controls are implied by this endpoint.
 
+## Torrent creation API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| POST | `/torrents/create` | Create v1, pure v2, or hybrid metainfo from a local file/directory; optional immediate seed. |
+| GET | `/torrents/create/roots` | Configured storage roots permitted to contain creation sources. |
+
+The request carries `source`, optional `name`, `format`, `piece_length`,
+ordered `tracker_tiers`, `webseeds`, `private`, and `seed`. The response carries
+the exact document as `metainfo_hex`, canonical identities, size/piece/file
+counts, and `seeded`/`seed_error`. Source traversal rejects out-of-root paths,
+symlinks, and special files; streaming hashing runs under root-scoped recheck
+limits, verifies v1 and BEP 52 hashes, revalidates the source snapshot, and
+requires the generated document to round-trip through the normal parser
+(ADR-0083).
+
+## Tracker, peer-source, and webseed diagnostics
+
+Tracker rows expose effective priority, allowed/disabled state, policy source,
+last attempt, last success, retries, latency, measured peer yield (`null` vs
+zero), sample freshness, and bounded recent errors. Peer rows expose observed
+discovery sources (tracker/DHT/PEX/direct/resume) with multiple sources allowed
+and empty meaning unknown. Webseed rows expose enabled status, verified bytes,
+attempts, retries, latency, last success/attempt, and bounded recent errors.
+
+Maintenance endpoints provide retry-now, exact tracker enable/disable,
+failure-threshold cleanup preview and confirmed apply, and redacted diagnostic
+text. Preview lists affected trackers; apply revalidates. All discovery traffic
+remains on the contained binder (ADR-0088).
+
+## OpenAPI and interactive documentation
+
+`GET /api/openapi.json` serves the version-matched OpenAPI 3.1 document.
+`GET /api/docs` serves a self-contained explorer that consumes the same document,
+uses normal same-origin API authentication, and marks state-changing operations.
+The document is generated from a route catalog checked against `routes.rs`; a
+deliberate drift fixture fails CI. Native routes, request/response schemas,
+envelopes/errors, binary metainfo, pagination, and events are documented.
+qBittorrent and Transmission are documented as supported subsets with explicit
+parity extensions (`x-swarmotter-compatibility`,
+`x-swarmotter-supported-rpc-methods`). Representative examples and live
+native/qBittorrent/Transmission exchanges are validated against emitted JSON
+Schemas (ADR-0087).
+
+## CLI consumer contract
+
+`swarmotterctl` is a separate API-only client. It supports add (magnet/file),
+list with server-side filters/sorting/pagination, details, health, lifecycle
+actions, remove, recheck, reannounce, and limits. Human output goes to stdout and
+diagnostics to stderr. `--json` emits one versioned document with
+`format_version: 1`, `command`, `success`, `data`, and `error`. Exit codes
+classify success, daemon/IO, usage/config, auth, missing item, connection, and
+validation failures. Endpoint/token resolution is environment/file based; raw
+tokens are never command-line arguments. Large lists use server pagination and
+`--all` walks pages explicitly (ADR-0086).
+
+## Cleanup, trash, and retention API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/trash` | Trash path, retention rules, ready entries, and incomplete staging entries. |
+| POST | `/trash/preview` | Dry-run selection by hashes or retention rule; returns exact paths, rule decision, qualification, and blockers. |
+| POST | `/trash/apply` | Revalidate and move whole torrents or stale partials into trash. |
+| POST | `/trash/{id}/restore` | Restore ready entry with fail-only collision policy. |
+| DELETE | `/trash/{id}` | Explicit permanent purge. |
+
+Selections distinguish whole-torrent cleanup from stale-partial cleanup. Trash
+paths use exclusive/no-overwrite moves, ready manifests, and visible staging
+entries. Restore preflights every destination and re-registers whole records
+through the normal durable add transaction. Shared paths, symlinks, changed
+layouts, missing paths, and restore conflicts are per-item outcomes (ADR-0085).
+
+## Provenance, magnet, and export API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/torrents/:hash/magnet` | Deterministic full-identity magnet with `all`, `primary_tier`, or `none` tracker policy and explicit private-tracker consent. |
+| PUT | `/torrents/:hash/annotation` | Separate operator annotation with durable update timestamp/actor; source comment and original bytes are untouched. |
+| POST | `/torrents/export` | Authenticated tar archive of retained originals plus `manifest.json`; unavailable items are listed individually. |
+
+Torrent details expose source `comment`, `creator`, `creation_date`, `encoding`,
+and separate annotation fields. A magnet that supplied only an information
+dictionary leaves outer source fields null. Magnet ordering is deterministic:
+identity topics, display name, BEP 53 selection, tracker tiers, webseeds.
+Private trackers require consent. Batch export never reconstructs metadata and
+never substitutes canonical `info` bytes for an original document (ADR-0084).
+
+## RSS subscription API
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET/POST | `/rss` | List or create subscriptions. |
+| POST | `/rss/preview` | Preview an unsaved subscription body without persisting or marking entries seen. |
+| PUT/DELETE | `/rss/{id}` | Replace or delete a subscription. History and completions survive deletion. |
+| GET | `/rss/{id}/preview` | Explain listing decisions without adding or marking entries seen. |
+| POST | `/rss/{id}/poll` | Poll on demand; optional explicit current-match import or reconsider. |
+| POST | `/rss/{id}/retry` | Explicit retry after dismissal or transient failure. |
+| GET | `/rss/{id}/decisions` | Paginated per-feed decision history. |
+| DELETE | `/rss/history/completions` | Explicitly clear verified completion identities. |
+| GET | `/rss/diagnostics` | Indexed duplicate-lookup diagnostic. |
+
+Status rows expose poll state, baseline state, last success/error, retry
+schedule, bounded counts, and redacted feed URLs. Decision actions distinguish
+import, already present, previously completed, filtered, dismissed, unsupported,
+failed, deferred, and baseline (ADR-0082).
+
 ## Watch-folder API and event contract
 
 - `ImportResult` retains `path`, `success`, `info_hash_hex`, `error`, and

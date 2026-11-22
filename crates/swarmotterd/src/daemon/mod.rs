@@ -15,13 +15,20 @@ mod lifecycle;
 mod persistence;
 mod reliability;
 pub use reliability::Watchdog;
+#[path = "creation.rs"]
+mod creation_runtime;
 mod policy_runtime;
 mod port_mapping;
 mod port_test;
+mod provenance;
+#[path = "rss.rs"]
+mod rss_runtime;
 mod scheduler;
 mod seeding;
 mod settings;
 mod storage_controls;
+mod tracker_ops;
+mod trash;
 #[path = "watch.rs"]
 mod watch_runtime;
 
@@ -197,6 +204,8 @@ enum ConfigFileSnapshot {
     Bytes(Vec<u8>),
 }
 
+type RssStoreCache = Arc<RwLock<Option<(PathBuf, Arc<crate::rss_store::RssStore>)>>>;
+
 #[derive(Clone)]
 pub struct DaemonRuntime {
     pub registry: Arc<Mutex<TorrentRegistry>>,
@@ -217,6 +226,22 @@ pub struct DaemonRuntime {
     /// Prevents the background loop and manual scan endpoint from processing
     /// the same eligible fingerprint concurrently.
     watch_scan_lock: Arc<Mutex<()>>,
+    /// Lazily initialized shared RSS history database. The path is derived
+    /// from the active state file (or `rss.history_file`) and re-resolved when
+    /// configuration changes it.
+    rss_store: RssStoreCache,
+    /// Serializes overlapping polls for one subscription while allowing
+    /// unrelated feeds to poll under the configured concurrency bound.
+    rss_poll_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Subscription ids with a poll currently in flight.
+    rss_polls_in_progress: Arc<RwLock<HashSet<String>>>,
+    /// Global intake serialization keeps simultaneous cross-feed offers from
+    /// racing duplicate detection; the library add transaction remains the
+    /// final authority.
+    rss_import_lock: Arc<Mutex<()>>,
+    /// Library changes captured before persistence and written to the main
+    /// database outbox in the same transaction as the library state.
+    rss_pending_events: Arc<Mutex<Vec<crate::rss_store::PendingLibraryEvent>>>,
     config_path: Option<PathBuf>,
     config_write_lock: Arc<Mutex<()>>,
     /// Serializes engine construction with data-plane configuration swaps.
@@ -538,6 +563,7 @@ struct EngineStartSnapshot {
     intake_selection: Option<swarmotter_core::policy::IntakePolicySnapshot>,
     partial_file_suffix: Option<String>,
     tracker_host_rules: Vec<swarmotter_core::policy::TrackerHostRule>,
+    disabled_trackers: Vec<String>,
     magnet_info_hash: Option<InfoHash>,
     magnet_identity: Option<swarmotter_core::hash::TorrentIdentity>,
     magnet_name: Option<String>,
@@ -574,6 +600,7 @@ impl EngineStartSnapshot {
                 .as_ref()
                 .and_then(|snapshot| snapshot.partial_file_suffix.clone()),
             tracker_host_rules: policy.tracker.host_rules.value,
+            disabled_trackers: torrent.disabled_trackers.clone(),
             magnet_info_hash: torrent.magnet_info_hash,
             magnet_identity: torrent.magnet_identity.clone(),
             magnet_name: torrent.magnet_name.clone(),

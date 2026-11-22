@@ -29,6 +29,7 @@ futures-util = { workspace = true }
 once_cell = { workspace = true }
 clap = { workspace = true }
 url = { workspace = true }
+hex = { workspace = true }
 rustls = { workspace = true }
 libc = { workspace = true }
 socket2 = { workspace = true }

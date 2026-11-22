@@ -18,7 +18,7 @@ pub use diagnostics::{
 };
 pub use health::{HealthCalculator, HealthInput};
 pub use network::{NetworkContainmentMode, NetworkContainmentStatus, NetworkHealth};
-pub use peer::{EnginePeerHealth, Peer, PeerDirection, PeerFlags};
+pub use peer::{EnginePeerHealth, Peer, PeerDirection, PeerFlags, PeerSource};
 pub use stats::{
     AutopilotAction, AutopilotActionKind, AutopilotDecision, AutopilotInput, AutopilotReason,
     AutopilotSnapshot, GlobalStats, SchedulerDiagnostics, SlowCause, TorrentDiagnostics,
@@ -26,4 +26,7 @@ pub use stats::{
 };
 pub use storage::{StorageDiagnostics, StorageRootDiagnostics, StorageRootRole};
 pub use torrent::{FilePriority, SeedingStatus, TorrentFile, TorrentState, TorrentSummary};
-pub use tracker::{TrackerId, TrackerInfo, TrackerKind, TrackerStatus, TrackerTier};
+pub use tracker::{
+    TrackerId, TrackerInfo, TrackerKind, TrackerPriority, TrackerSampleStatus, TrackerStatus,
+    TrackerTier, WebseedInfo,
+};

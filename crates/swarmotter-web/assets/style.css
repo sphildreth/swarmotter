@@ -223,6 +223,47 @@ nav { display: flex; gap: 0.3rem; }
 .watch-layout .card {
   margin-bottom: 0;
 }
+.rss-subscription-list {
+  display: grid;
+  gap: 0.75rem;
+}
+.rss-subscription {
+  min-width: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--tile-soft-bg);
+}
+.rss-subscription-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.5rem 1rem;
+}
+.rss-subscription-head h4 {
+  margin: 0;
+}
+.rss-subscription-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+.rss-subscription-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: 0.55rem 1rem;
+  margin-top: 0.65rem;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+.rss-subscription-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-top: 0.75rem;
+}
 .settings-layout {
   display: grid;
   gap: 0.85rem;
@@ -1094,4 +1135,27 @@ table.health-subscores td {
   padding: 0.2rem 0.5rem;
   text-align: left;
   font-size: 0.85rem;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 11rem;
+  padding: 0.25rem;
+  background: var(--panel, #1b1f24);
+  border: 1px solid var(--border, #3a424c);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.context-menu button {
+  display: block;
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  background: transparent;
+  border: 0;
+}
+.context-menu button:hover,
+.context-menu button:focus-visible {
+  background: var(--accent-soft, rgba(120, 180, 255, 0.18));
 }

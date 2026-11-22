@@ -7,6 +7,141 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [3.0.0] - [2026-11-22]
+
+Version 3.0.0 marks the Web UI rewrite. Torrents, Add, Network, Settings,
+Watch, and Logs now share one navigation bar and live transfer strip.
+Existing API clients continue to use `/api/v1`.
+
+### Changed
+
+- Torrents opens on the library. Selecting a row opens its inspector, while
+  checkboxes choose the targets for bulk actions. Named views save library
+  queries in the browser.
+- Add can inspect the fields in a magnet link before registering a torrent.
+  Network shows transfer history and containment diagnostics. Settings groups
+  configuration by task and shows pending edits and restart requirements.
+- Watch brings feed rules, decision previews, and scan history into one
+  workspace. Logs lets operators pause the on-screen stream, inspect an
+  event, and export filtered entries.
+- On smaller screens, the navigation rail and inspector open on demand.
+  [Web UI guide](docs/web-ui.md)
+- RSS naming no longer asks operators to choose an API/history key in the
+  primary form. Configuration files and API clients may still provide explicit
+  ids.
+
+### Fixed
+
+- Library saves wake the RSS history worker only when they commit an event.
+  This avoids a competing SQLite checkpoint when restoring a newly added magnet.
+- A clean installation no longer reports unconfigured watch folders as a
+  doctor warning. Watch folders are optional; the check now reports `ok` with
+  `not configured (optional)` until a folder is added.
+- The Watch view now generates stable RSS subscription identifiers from the
+  subscription name, adds a suffix on collision, and hides the identifier input.
+  Existing identifiers still display under the subscription name for API use.
+- RSS **Preview feed** now previews the current unsaved form through the new
+  draft preview endpoint, scrolls to the preview results, and saving a
+  subscription automatically displays its preview.
+- Watch keeps subscription actions reachable from the feed list and inspector. Editing opens the subscription form.
+
+### Added
+
+- Tracker diagnostics now show effective priority/allow policy, last success
+  separately from last attempt, consecutive retries, latency, measured peer
+  yield, bounded recent errors, and current/stale/unavailable sample status.
+- Peer rows expose tracker, DHT, PEX, direct, and resume discovery provenance
+  where observed, retaining multiple sources and leaving unknown provenance
+  empty.
+- Webseed diagnostics expose enabled status, verified byte contribution,
+  attempts, retries, latency, last success/attempt, and recent errors.
+- Added reversible per-tracker disable/enable, retry-now, failure-threshold
+  cleanup preview/apply, and redacted copyable diagnostics. All network
+  operations remain contained and diagnostics are bounded.
+- ADR-0088 and API/Web UI/troubleshooting documentation for discovery
+  diagnostics and maintenance.
+
+- A version-matched OpenAPI 3.1 document at `/api/openapi.json` and a
+  dependency-free interactive explorer at `/api/docs`. The document covers
+  native `/api/v1`, explicit qBittorrent and Transmission compatibility subsets,
+  envelopes/errors, binary metainfo operations, paginated queries, events, and
+  state-changing markers.
+- Route-catalog drift checks, emitted JSON Schema validation, a deliberate
+  drift fixture, and live local-daemon exchange validation across native,
+  qBittorrent, and Transmission surfaces.
+- ADR-0087 and API/CLI/troubleshooting documentation for discovery,
+  authentication, compatibility parity, and the OpenAPI update process.
+
+- `swarmotterctl`, an API-backed CLI for add, list/filter/sort, details, health,
+  pause/resume/start/stop, remove, recheck, reannounce, and per-torrent limits.
+  It provides human output and a versioned JSON document with stable exit codes
+  for authentication, validation, missing-item, and connection failures.
+- `swarmotterctl` is included in release tarballs, Linux packages, and container
+  images, with local/remote endpoint and credential configuration, pagination,
+  secret-handling, and scripting documentation.
+
+- Cleanup preview and local trash workflows for whole torrents and stale
+  partials. Preview lists exact paths, ownership, actions, retention-rule
+  decisions, qualification times, and blockers without changing files, queue
+  state, or metainfo; apply performs execution-time root/ownership/symlink/path
+  revalidation and exclusive no-overwrite moves.
+- Configurable retention rules select candidates by effective profile,
+  case-insensitive label, lifecycle state, and minimum age. Ready trash entries
+  retain the serialized record and exact original metainfo when available,
+  restore with a fail-only collision policy, and support explicit purge.
+  Interrupted moves remain visible as incomplete staging entries.
+- Added ADR-0085 plus API, configuration, Web UI, operations, architecture,
+  requirements, testing, README, and troubleshooting documentation for cleanup,
+  trash, retention, recovery, and per-item failure reporting.
+
+- Torrent details now expose source comment, creator, creation date, and
+  encoding when present. A separate operator annotation can be set or cleared
+  without changing source metadata or retained original bytes, and annotation
+  changes are recorded in durable audit history.
+- Deterministic full-identity magnet generation with display name, webseeds,
+  BEP 53 selections, and all/primary-tier/no-tracker policies. Private tracker
+  URLs require explicit consent. Copy Magnet actions are available in torrent
+  details and the torrent action menu.
+- Exact single `.torrent` export remains available, and a new batch tar archive
+  includes retained originals plus a per-item manifest that identifies
+  unavailable magnet-only, older, or missing records without reconstruction.
+- ADR-0084 documents provenance fields, annotation audit separation, magnet
+  ordering, tracker policy, private consent, and portable export behavior.
+
+- Local torrent creation from the native API and Web UI. Operators can create
+  v1, pure BEP 52 v2, or hybrid metainfo from a file or directory inside a
+  configured storage root, with configurable piece length, ordered tracker
+  tiers, optional webseeds, and the private flag.
+- Generated metainfo is exported as exact bytes through `metainfo_hex` and a
+  Web UI download. An explicit immediate-seed action registers the verified
+  source data and starts a contained seeder; a local peer can download and
+  verify the original payload.
+- Creation streaming hashes run under existing storage-root recheck permits,
+  reject out-of-root paths, symlinks, special files, and changing sources, and
+  round-trip every generated document through the normal bounded parser.
+- ADR-0083 documents creation source confinement, streaming hash behavior,
+  canonical metainfo construction, export, and immediate-seeding decisions.
+
+- RSS subscriptions in the Watch UI and authenticated native API. Operators can
+  preview each listing decision, configure interval, intake profile, start
+  behavior, first-poll mode, and case-insensitive title/category include and
+  exclude rules, pause or enable automatic polling, poll on demand, explicitly
+  import current matches, reconsider older listings, retry dismissals, and page
+  through decision history.
+- A dedicated shared RSS history database records per-feed listings, decisions,
+  retry state, poll state, cross-feed torrent identity aliases, and verified
+  completions. A transactional outbox in the main database captures verified
+  completion and removal evidence, including selfish-mode removal, and applies
+  it idempotently across crashes and restarts.
+- RSS feed requests, DNS, redirects, and torrent attachments use the contained
+  HTTP client with bounded document/attachment sizes, entry counts, redirects,
+  retries, concurrency, request timeouts, conditional requests, and redacted
+  credentials.
+- Backup verification now checks the paired RSS history database when present,
+  and the updater archives both databases and their SQLite sidecars.
+- ADR-0082 documents RSS containment, matching, identity, database handoff,
+  retention, and backup behavior.
+
 ## [2.5.0] - [2026-11-20]
 
 ### Added
