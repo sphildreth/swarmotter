@@ -373,6 +373,24 @@ version already matches the latest release:
 For a pinned rollback, set `SWARMOTTER_IMAGE` in `deploy/.env` to a `vX.Y.Z` or
 `sha-<shortsha>` tag and run the update commands again.
 
+### Validate a production fix from a local image
+
+Build the working tree for the production host architecture and give it a
+unique local tag. Transfer it with `docker save` and `docker load`. Supply the
+full image ID for the exported platform to the updater on the production host.
+For an amd64 export, get that ID with
+`docker image inspect --platform linux/amd64 -f '{{.Id}}' "$candidate_tag"`
+on the build machine.
+
+```bash
+SWARMOTTER_LOCAL_IMAGE_ID="$image_id" ./update-swarmotter.sh "$candidate_tag"
+```
+
+The updater verifies the image ID before stopping the daemon and checks the
+running container’s image ID after restart. Configuration preflight, backup,
+rollback and health checks apply. Verify the affected production operation
+before committing and publishing the fix.
+
 ## LAN Web UI with contained torrents
 
 This exposes the control plane to the LAN while binding torrent data-plane

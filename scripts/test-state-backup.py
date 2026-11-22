@@ -72,6 +72,25 @@ class StateBackupTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "RSS history file is absent"):
                 verify(archive, state, rss_file=rss, require_rss=True)
 
+    def test_candidate_requires_the_expected_local_image_id(self):
+        updater = Path(__file__).resolve().parents[1] / "deploy/update-swarmotter.sh"
+        script = r"""
+            source "$1"
+            TARGET_IMAGE=swarmotter:fixture
+            LOCAL_IMAGE_ID="$2"
+            FIXTURE_IMAGE_ID="$3"
+            docker_cmd() {
+                [[ "$*" == "image inspect -f {{.Id}} swarmotter:fixture" ]] || return 2
+                echo "$FIXTURE_IMAGE_ID"
+            }
+            verify_local_image
+        """
+        image = "sha256:" + "1" * 64
+        for supplied, accepted in [(image, True), ("sha256:" + "2" * 64, False), ("short", False)]:
+            result = subprocess.run(["bash", "-c", script, "_", str(updater), supplied, image],
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode == 0, accepted, result.stderr)
+
     def test_late_upgrade_failure_restores_prior_generation_before_health_check(self):
         updater = Path(__file__).resolve().parents[1] / "deploy/update-swarmotter.sh"
         with tempfile.TemporaryDirectory() as temporary:

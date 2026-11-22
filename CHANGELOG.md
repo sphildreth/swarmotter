@@ -9,6 +9,11 @@ date or duration estimates.
 
 ## [3.1.1] - [2026-11-22]
 
+### Changed
+
+- The Compose updater can deploy a manually transferred candidate by its
+  full local image ID with the normal preflight, backup and rollback checks.
+
 ### Fixed
 
 - Magnet intake treats an empty or whitespace-only optional display name as

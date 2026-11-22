@@ -134,7 +134,12 @@ Examples:
 4. Re-scan the repository for stale release-version strings.
 5. Validate that package metadata, tests, Docker build metadata, and docs still
    line up.
-6. Create the release tag when the project is ready to publish.
+6. For a production fix, build an image from the working tree and deploy it
+   manually using the local image ID. Verify the affected operation on the
+   production daemon. Record the image ID and the observed result.
+7. Commit the validated changes, open the pull request and merge after its
+   checks pass. Tag the merged commit and publish the release. Further test
+   builds use local candidate tags until the production behavior is verified.
 
 ## 5. Validation checklist
 

@@ -27,6 +27,12 @@ policy reattaches the daemon. Preserve the shared namespace as the containment
 boundary. Before replacing an image, stop the state writer and verify the
 archived database, including its sidecars, in a temporary restore directory.
 
+Operators can validate a production fix using a locally transferred candidate
+before publishing its release. The updater accepts an explicit tag and full
+local image ID, checks the ID on the host before replacement, and checks the
+running container against it. Candidate and published images use the same
+configuration preflight, backup, rollback and health checks.
+
 Pair the previous image with the quiescent library and RSS history generation
 taken before replacement. A late validation failure can occur after migration
 or new writes. Stop the stack, retain the failed generation separately, stage
