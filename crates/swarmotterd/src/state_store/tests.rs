@@ -209,6 +209,57 @@ fn fresh_sqlite_file_receives_versioned_schema_migration() {
 }
 
 #[test]
+fn sqlite_v2_load_migrates_outbox_and_preserves_library_and_metric_history() {
+    let path = unique_path("sqlite-v2-outbox-migration");
+    let state = single_torrent_state();
+    save(&path, &state).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE rss_outbox;
+         DELETE FROM schema_migrations WHERE version = 3;
+         PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    let metric = |db: &Connection| {
+        db.query_row(
+            "SELECT info_hash, observed_at, downloaded FROM torrent_metric_samples",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    let original_metric = metric(&connection);
+    drop(connection);
+
+    let restored = load(&path).unwrap().unwrap();
+    assert_eq!(restored.torrents.len(), 1);
+    assert_eq!(restored.torrents[0].key(), state.torrents[0].key());
+    assert_eq!(restored.queue.order, state.queue.order);
+    let connection = Connection::open(&path).unwrap();
+    assert_eq!(metric(&connection), original_metric);
+    let (version, events, migrations): (u32, u32, u32) = connection
+        .query_row(
+            "SELECT user_version, (SELECT COUNT(*) FROM rss_outbox),
+                (SELECT COUNT(*) FROM schema_migrations WHERE version = 3)
+         FROM pragma_user_version",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!((version, events, migrations), (3, 0, 1));
+    drop(connection);
+    remove_state(&path);
+}
+
+#[test]
 fn sqlite_v1_state_migrates_to_metric_history_schema_without_losing_state() {
     let path = unique_path("sqlite-v1-metric-history-migration");
     let state = single_torrent_state();

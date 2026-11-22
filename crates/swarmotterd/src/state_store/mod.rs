@@ -34,9 +34,10 @@ use swarmotter_core::queue::QueueState;
 use swarmotter_core::torrent::Torrent;
 
 const LEGACY_STATE_VERSION: u32 = 1;
-const SQLITE_SCHEMA_VERSION: u32 = 3;
+const SQLITE_SCHEMA_VERSION: u32 = SQLITE_SCHEMA_V3;
 const SQLITE_SCHEMA_V1: u32 = 1;
 const SQLITE_SCHEMA_V2: u32 = 2;
+const SQLITE_SCHEMA_V3: u32 = 3;
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Rebuild operations intentionally process a bounded number of authoritative
@@ -857,9 +858,9 @@ fn migrate_schema(connection: &mut Connection) -> Result<()> {
     }
     if applied == SQLITE_SCHEMA_V2 {
         apply_schema_v3(&transaction)?;
-        record_schema_migration(&transaction, SQLITE_SCHEMA_VERSION)?;
-        set_schema_version(&transaction, SQLITE_SCHEMA_VERSION)?;
-        applied = SQLITE_SCHEMA_VERSION;
+        record_schema_migration(&transaction, SQLITE_SCHEMA_V3)?;
+        set_schema_version(&transaction, SQLITE_SCHEMA_V3)?;
+        applied = SQLITE_SCHEMA_V3;
     }
     if applied != SQLITE_SCHEMA_VERSION {
         return Err(CoreError::Storage(format!(
@@ -1078,10 +1079,8 @@ fn verify_existing_sqlite_state_for_migration(
             }
             Ok(())
         }
-        SQLITE_SCHEMA_V1 => verify_state_schema_tables(
-            &connection,
-            SQLITE_SCHEMA_V1,
-            &[
+        SQLITE_SCHEMA_V1 | SQLITE_SCHEMA_V2 | SQLITE_SCHEMA_V3 => {
+            let mut tables = vec![
                 "schema_migrations",
                 "torrent_records",
                 "queue_state",
@@ -1091,26 +1090,15 @@ fn verify_existing_sqlite_state_for_migration(
                 "torrent_metrics_current",
                 "library_history",
                 "audit_events",
-            ],
-            "before schema migration",
-        ),
-        SQLITE_SCHEMA_VERSION => verify_state_schema_tables(
-            &connection,
-            SQLITE_SCHEMA_VERSION,
-            &[
-                "schema_migrations",
-                "torrent_records",
-                "queue_state",
-                "queue_entries",
-                "torrent_metainfo",
-                "torrent_health_snapshots",
-                "torrent_metrics_current",
-                "torrent_metric_samples",
-                "library_history",
-                "audit_events",
-            ],
-            "before schema migration",
-        ),
+            ];
+            if version >= SQLITE_SCHEMA_V2 {
+                tables.push("torrent_metric_samples");
+            }
+            if version >= SQLITE_SCHEMA_V3 {
+                tables.push("rss_outbox");
+            }
+            verify_state_schema_tables(&connection, version, &tables, "before schema migration")
+        }
         newer if newer > SQLITE_SCHEMA_VERSION => Err(CoreError::Storage(format!(
             "unsupported SQLite state schema version {newer}; expected at most {SQLITE_SCHEMA_VERSION}"
         ))),
