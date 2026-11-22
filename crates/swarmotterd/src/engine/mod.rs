@@ -46,7 +46,7 @@ use swarmotter_core::peer::{
 use swarmotter_core::peer_filter::PeerFilter;
 use swarmotter_core::policy::{IntakePolicySnapshot, TrackerHostRule};
 use swarmotter_core::storage::resume::PieceBitfield;
-use swarmotter_core::storage::{piece_file_ranges, verify_piece, StorageIo, StorageIoMetrics};
+use swarmotter_core::storage::{verify_piece, FileLayout, FileSlice, StorageIo, StorageIoMetrics};
 use swarmotter_core::tracker::{self, AnnounceEvent, AnnounceRequest};
 use swarmotter_core::udp_tracker;
 use swarmotter_core::utp::{self, PeerTransport};
@@ -160,24 +160,23 @@ impl PieceSelection {
         if priorities.len() != meta.files.len() || wanted.len() != meta.files.len() {
             return Ok(Self::all(meta));
         }
-        let priorities = (0..meta.piece_count())
-            .map(|piece| -> Result<Option<i32>> {
-                Ok(piece_file_ranges(meta, piece)?
-                    .into_iter()
-                    .filter_map(|slice| {
-                        let priority = priorities[slice.file_index];
-                        (wanted[slice.file_index] && priority != FilePriority::Unwanted)
-                            .then_some(priority.weight())
-                    })
-                    .max())
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let target_count = priorities
+        let layout = FileLayout::from_meta(meta)?;
+        let mut piece_priorities = vec![None; meta.piece_count()];
+        for (file, pieces) in layout.file_piece_ranges(meta) {
+            let priority = priorities[file];
+            if wanted[file] && priority != FilePriority::Unwanted {
+                let weight = Some(priority.weight());
+                for piece in &mut piece_priorities[pieces] {
+                    *piece = (*piece).max(weight);
+                }
+            }
+        }
+        let target_count = piece_priorities
             .iter()
             .filter(|priority| priority.is_some())
             .count();
         Ok(Self {
-            priorities: Arc::new(priorities),
+            priorities: Arc::new(piece_priorities),
             target_count,
         })
     }

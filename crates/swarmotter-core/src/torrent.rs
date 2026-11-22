@@ -394,6 +394,8 @@ pub fn verified_bytes(meta: &TorrentMeta, bitfield: &crate::storage::PieceBitfie
 pub struct TorrentRecords {
     inner: BTreeMap<TorrentKey, Torrent>,
     summaries: BTreeMap<TorrentKey, TorrentSummary>,
+    projected: BTreeMap<TorrentKey, Arc<TorrentSummary>>,
+    revision: u64,
 }
 
 impl std::ops::Deref for TorrentRecords {
@@ -406,6 +408,8 @@ impl std::ops::Deref for TorrentRecords {
 impl std::ops::DerefMut for TorrentRecords {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.summaries.clear();
+        self.projected.clear();
+        self.revision = crate::next_list_revision();
         &mut self.inner
     }
 }
@@ -447,6 +451,7 @@ impl TorrentRegistry {
                 return Err(*key);
             }
         }
+        self.torrents.revision = crate::next_list_revision();
         self.torrents.inner.insert(primary, torrent);
         for key in keys {
             if key != primary {
@@ -468,6 +473,8 @@ impl TorrentRegistry {
     pub fn remove(&mut self, key: &TorrentKey) -> Option<Torrent> {
         let primary = self.canonical_key(key)?;
         self.aliases.retain(|_, target| *target != primary);
+        self.torrents.revision = crate::next_list_revision();
+        self.torrents.projected.remove(&primary);
         self.torrents.summaries.remove(&primary);
         self.torrents.inner.remove(&primary)
     }
@@ -479,6 +486,8 @@ impl TorrentRegistry {
 
     pub fn get_mut(&mut self, key: &TorrentKey) -> Option<&mut Torrent> {
         let primary = self.canonical_key(key)?;
+        self.torrents.revision = crate::next_list_revision();
+        self.torrents.projected.remove(&primary);
         self.torrents.summaries.remove(&primary);
         self.torrents.inner.get_mut(&primary)
     }
@@ -487,7 +496,9 @@ impl TorrentRegistry {
         &mut self,
         mut project: impl FnMut(&Torrent, TorrentSummary) -> TorrentSummary,
     ) -> Vec<TorrentSummary> {
-        let TorrentRecords { inner, summaries } = &mut self.torrents;
+        let TorrentRecords {
+            inner, summaries, ..
+        } = &mut self.torrents;
         inner
             .iter()
             .map(|(key, torrent)| {
@@ -495,6 +506,34 @@ impl TorrentRegistry {
                     .entry(*key)
                     .or_insert_with(|| torrent.to_summary());
                 project(torrent, base.clone())
+            })
+            .collect()
+    }
+
+    pub fn list_revision(&self) -> u64 {
+        self.torrents.revision
+    }
+
+    /// Share unchanged rows across immutable query snapshots. The caller
+    /// invalidates all projections when queue positions or policy inputs change.
+    pub fn projected_summaries(
+        &mut self,
+        reset: bool,
+        mut project: impl FnMut(&Torrent) -> TorrentSummary,
+    ) -> Vec<Arc<TorrentSummary>> {
+        let TorrentRecords {
+            inner, projected, ..
+        } = &mut self.torrents;
+        if reset {
+            projected.clear();
+        }
+        inner
+            .iter()
+            .map(|(key, torrent)| {
+                projected
+                    .entry(*key)
+                    .or_insert_with(|| Arc::new(project(torrent)))
+                    .clone()
             })
             .collect()
     }

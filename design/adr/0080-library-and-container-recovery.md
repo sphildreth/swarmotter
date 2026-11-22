@@ -27,6 +27,14 @@ policy reattaches the daemon. Preserve the shared namespace as the containment
 boundary. Before replacing an image, stop the state writer and verify the
 archived database, including its sidecars, in a temporary restore directory.
 
+Pair the previous image with the quiescent library and RSS history generation
+taken before replacement. A late validation failure can occur after migration
+or new writes. Stop the stack, retain the failed generation separately, stage
+both verified original databases and their sidecars on their destination
+filesystems, and health-check the previous image after restoring them. Leave
+the stack stopped if the paired restore fails. Resolve external RSS history
+using the same environment-over-TOML precedence as the daemon.
+
 Parallel rounds keep a sequence of completed pieces for their lifetime. Each
 session advertises from its own cursor. The coordinator owns checkpoints and
 handles pending commands while workers run. Cached library summaries are

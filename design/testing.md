@@ -484,3 +484,17 @@ native/qBittorrent/Transmission exchanges, tracker/peer/webseed diagnostics with
 local fixtures, and restarting the writer after a
 backup failure. The parallel worker tests cover bounded HAVE delivery and
 resume checkpoints while a peer round is open.
+
+Removal tests inject SQLite errors before payload deletion and during the final
+checkpoint. They check library visibility, queue membership, on-disk payload,
+RSS events, restart and retry. The storage suite holds a reader open across
+metadata export and a full-generation commit to verify SQLite snapshot
+isolation. The updater harness exercises a late validation failure, preservation
+of post-upgrade writes, paired restoration and fallback health validation.
+
+RSS tests cover conditional HTTP 304 attachment retries, unavailable identity
+sources, a pending hybrid completion beyond the first outbox batch, and idle
+pruning while SQLite has a writer. The library query tests check row reuse and
+invalidation on queue moves, policy changes and record edits. Local swarm tests
+exercise stale webseeds followed by a valid mirror and immediate-start pure-v2
+magnet file selection.

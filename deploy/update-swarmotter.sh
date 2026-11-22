@@ -30,6 +30,10 @@ env_updated=0
 updated_service=0
 stopped_for_backup=0
 backup_tmp=""
+verified_backup=""
+recovery_state=""
+recovery_history=""
+require_history=0
 
 usage() {
     cat <<EOF
@@ -409,7 +413,7 @@ backup_paths() {
 create_backup() {
     local stamp backup_path manifest_path
     local -a paths
-    stamp="$(date -u +'%Y%m%dT%H%M%SZ')"
+    stamp="$(date -u +'%Y%m%dT%H%M%S%NZ')-$$"
     backup_path="$BACKUP_DIR/swarmotter-backup-$stamp.tar.gz"
     backup_tmp="$backup_path.tmp"
     manifest_path="$backup_path.sha256"
@@ -419,14 +423,14 @@ create_backup() {
 
     log "Creating backup at $backup_path"
     backup_paths paths
-    local known state_file rss_file running path sidecar covered
+    local known state_file rss_file running path sidecar covered resolved
+    local -a recovery=()
     local -a verify_options=()
     local verifier="$SCRIPT_DIR/verify-state-backup.py"
     known="$(docker_cmd container ls -a --format '{{.Names}}')"
     umask 077
     if grep -Fxq -- "$CONTAINER_NAME" <<<"$known"; then
-        state_file="$(docker_cmd inspect "$CONTAINER_NAME" | sudo python3 "$verifier" --inspect-path)"
-        rss_file="$(docker_cmd inspect "$CONTAINER_NAME" | sudo python3 "$verifier" --inspect-rss-path)"
+        resolved="$(docker_cmd inspect "$CONTAINER_NAME" | sudo python3 "$verifier" --inspect-recovery)"
         running="$(docker_cmd inspect -f '{{.State.Running}}' "$CONTAINER_NAME")"
         case "$running" in
             true) stopped_for_backup=1; docker_cmd stop --timeout 45 "$CONTAINER_NAME" ;;
@@ -436,12 +440,20 @@ create_backup() {
         [[ "$(docker_cmd inspect -f '{{.State.Running}}' "$CONTAINER_NAME")" == false ]] ||
             die "state writer is still running"
     else
-        state_file="$(compose config --format json | sudo python3 "$verifier" --compose-path "$SERVICE_NAME")"
-        rss_file="$(compose config --format json | sudo python3 "$verifier" --compose-rss-path "$SERVICE_NAME")"
-        if ! sudo test -e "$state_file"; then verify_options+=(--allow-empty); fi
+        resolved="$(compose config --format json | sudo python3 "$verifier" --compose-recovery "$SERVICE_NAME")"
     fi
-    state_file="$(realpath -m -- "$state_file")"
-    rss_file="$(realpath -m -- "$rss_file")"
+    mapfile -t recovery <<<"$resolved"
+    [[ ${#recovery[@]} == 3 ]] || die "could not resolve database paths"
+    state_file="$(realpath -m -- "${recovery[0]}")"
+    rss_file="$(realpath -m -- "${recovery[1]}")"
+    require_history="${recovery[2]}"
+    if [[ "$require_history" == 1 ]] || sudo test -e "$rss_file"; then
+        require_history=1
+        verify_options+=(--require-rss)
+    fi
+    if ! grep -Fxq -- "$CONTAINER_NAME" <<<"$known" && ! sudo test -e "$state_file"; then
+        verify_options+=(--allow-empty)
+    fi
     local -a normalized_paths=()
     for path in "${paths[@]}"; do
         path="$(realpath -m -- "$path")"
@@ -486,6 +498,9 @@ create_backup() {
     mv "$backup_tmp" "$backup_path"
     sha256sum "$backup_path" > "$manifest_path"
 
+    verified_backup="$backup_path"
+    recovery_state="$state_file"
+    recovery_history="$rss_file"
     log "Backup complete: $backup_path"
 }
 
@@ -607,13 +622,27 @@ validate_egress() {
 
 rollback() {
     local code="$1"
+    trap - EXIT
+    local -a options=()
 
     [[ -z "$backup_tmp" ]] || rm -f -- "$backup_tmp"
     if [[ "$updated_service" == "1" && "$ROLLBACK_ON_FAILURE" == "1" && -n "$rollback_tag" ]]; then
-        log "Validation failed; rolling back to $rollback_tag"
+        log "Validation failed; stopping writers and restoring the pre-upgrade generation for $rollback_tag"
+        compose down || die "could not stop the failed stack; recovery archive: $verified_backup"
+        [[ -n "$verified_backup" ]] || die "missing verified pre-upgrade backup"
+        sha256sum --check -- "$verified_backup.sha256" || die "backup checksum failed; stack is stopped"
+        [[ "$require_history" == 0 ]] || options+=(--require-rss)
+        local failed_generation="${verified_backup%.tar.gz}.failed-state.tar.gz"
+        sudo python3 "$SCRIPT_DIR/verify-state-backup.py" --restore-databases \
+            "$verified_backup" "$recovery_state" "$recovery_history" "$failed_generation" "${options[@]}" ||
+            die "state recovery failed; stack is stopped. Inspect $verified_backup and $failed_generation"
+        log "Saved post-upgrade state at $failed_generation"
         set_env_image "$rollback_tag"
-        recreate_stack || true
-        log "Rollback attempted. Backup remains in $BACKUP_DIR"
+        compose up -d || die "rollback stack failed to start"
+        TARGET_IMAGE="$rollback_tag"
+        validate_container
+        validate_health
+        log "Rollback healthy; original upgrade failed"
         exit "$code"
     fi
 

@@ -1233,14 +1233,33 @@ impl DaemonRuntime {
     /// itself because it does NOT await the engine task's own join handle
     /// (that would deadlock); the already-returning task is simply detached.
     pub(super) async fn selfish_remove_completed(&self, hash: TorrentKey) {
-        let completed = self.registry.lock().await.get(&hash).cloned();
-        let name = completed
-            .as_ref()
-            .map(|t| t.name().to_string())
-            .unwrap_or_default();
-        if let Some(torrent) = completed.as_ref() {
-            self.queue_rss_removal(torrent).await;
+        let runtime = self.clone();
+        // The engine may be cancelled by a concurrent explicit Remove. Finish
+        // the SQLite and in-memory generation in an independently owned task.
+        let result = tokio::spawn(async move { runtime.remove_completed_record(hash).await }).await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "failed to persist selfish completion removal")
+            }
+            Err(error) => tracing::error!(%error, "selfish completion removal task failed"),
         }
+    }
+
+    async fn remove_completed_record(&self, hash: TorrentKey) -> Result<()> {
+        let _ownership = self.storage_ownership_lock.lock().await;
+        let Some(torrent) = self.registry.lock().await.get(&hash).cloned() else {
+            return Ok(());
+        };
+        if !matches!(
+            torrent.state,
+            TorrentState::Completed | TorrentState::Seeding
+        ) {
+            return Ok(());
+        }
+        let name = torrent.name().to_owned();
+        self.commit_removal_checkpoint(&[(hash, torrent)], &HashSet::from([hash]), false)
+            .await?;
         // Stop the inbound seeder (a separate task; safe to await).
         self.stop_seeder(&hash).await;
         // Clear live engine bookkeeping. We deliberately do NOT await the
@@ -1255,10 +1274,6 @@ impl DaemonRuntime {
         if let Some(handle) = engine_handle {
             drop(handle);
         }
-        // Remove the torrent record; downloaded data is preserved (no
-        // delete-data behavior is invoked).
-        self.registry.lock().await.remove(&hash);
-        self.queue.lock().await.remove(&hash);
         tracing::info!(
             info_hash = %hash,
             name = %name,
@@ -1268,12 +1283,6 @@ impl DaemonRuntime {
         );
         self.publish_event(torrent_removed_event(hash, false));
         self.publish_event(stats_updated_event());
-        // A removal must stage the complete registry: the changed-record path
-        // intentionally only upserts surviving records and cannot delete a
-        // torrent row. The full transaction also carries the queued RSS
-        // completion/removal events and any pending queue change.
-        if let Err(error) = self.persist_state_full().await {
-            tracing::error!(%error, "failed to persist selfish completion removal");
-        }
+        Ok(())
     }
 }

@@ -216,6 +216,26 @@ impl<'a, B: NetworkBinder + ?Sized> ContainedHttpClient<'a, B> {
         Ok(response)
     }
 
+    /// A provider detail page is a single bounded GET. A redirect (including
+    /// a login redirect) never grants permission to inspect another page.
+    pub async fn get_rss_detail(&self, url: &str, max_body: usize) -> Result<Vec<u8>> {
+        let parsed = parse_http_url(url)?;
+        let policy = RequestPolicy::Fetch { max_body };
+        let request = build_request_with_headers(&parsed, policy, &[])?;
+        let response = tokio::time::timeout(
+            self.request_timeout,
+            self.request_one_with_request(&parsed, policy, max_body, request),
+        )
+        .await??;
+        if !response.status.is_success() {
+            return Err(CoreError::HttpStatus(format!(
+                "RSS detail page returned HTTP {}",
+                response.status
+            )));
+        }
+        Ok(response.body)
+    }
+
     /// GET one exact inclusive webseed range. The caller supplies an exclusive
     /// end to match storage range conventions.
     pub async fn get_webseed_range(
@@ -1400,6 +1420,23 @@ mod tests {
             validate_response_headers(&over, &url),
             Err(CoreError::HttpProtocol(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn rss_detail_does_not_follow_a_login_redirect() {
+        let (address, requests, server) = spawn_http_scripts(vec![ScriptedResponse::close(
+            redirect_response("302 Found", Some("/login")),
+        )])
+        .await;
+        let binder = SpyBinder::new([(("detail.test".into(), 80), address)]);
+        let error = ContainedHttpClient::new(&binder)
+            .get_rss_detail("http://detail.test/listing", 1024)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("302"));
+        server.await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(binder.connect_count(), 1);
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -22,7 +23,7 @@ use swarmotter_core::rss::{
     RssAction, RssCounts, RssDecision, RssDecisionPage, RssEntry, RssFeedState,
 };
 
-const RSS_SCHEMA_VERSION: u32 = 1;
+const RSS_SCHEMA_VERSION: u32 = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,11 +163,15 @@ pub struct CompletionRecord {
 #[derive(Clone)]
 pub struct RssStore {
     path: PathBuf,
+    last_pruned_limits: Arc<Mutex<Option<(i64, i64)>>>,
 }
 
 impl RssStore {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            last_pruned_limits: Arc::default(),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -285,6 +290,35 @@ impl RssStore {
             transaction
                 .commit()
                 .map_err(|error| CoreError::Storage(format!("commit RSS schema: {error}")))?;
+        }
+        if version == 1 {
+            // Older pollers retried baseline entries on later polls. Restore
+            // their first-poll exclusion where the decision history proves it.
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    CoreError::Storage(format!("begin RSS baseline repair: {error}"))
+                })?;
+            transaction
+                .execute_batch(
+                    "UPDATE listings SET status = 'baseline', next_attempt_at = NULL,
+                    reason = 'first observed on the new-only baseline'
+                 WHERE imported_at IS NULL AND completed_at IS NULL AND dismissed = 0
+                   AND status IN ('failed', 'deferred', 'unsupported')
+                   AND (subscription_id, entry_key) IN (
+                      SELECT subscription_id, entry_key FROM decisions WHERE action = 'baseline'
+                   );
+                 UPDATE listings SET status = 'unsupported', next_attempt_at = NULL,
+                    retry_count = 0, reason = 'previous attachment failed; check the detail magnet on the next feed appearance'
+                 WHERE imported_at IS NULL AND completed_at IS NULL AND dismissed = 0
+                   AND status = 'failed' AND reason LIKE '%downgrade%'
+                   AND (link GLOB 'https://www.limetorrents.fun/*' OR link GLOB 'https://limetorrents.fun/*');
+                 PRAGMA user_version = 2;",
+                )
+                .map_err(|error| CoreError::Storage(format!("restore RSS baselines: {error}")))?;
+            transaction.commit().map_err(|error| {
+                CoreError::Storage(format!("commit RSS baseline repair: {error}"))
+            })?;
         }
         self.checkpoint(connection)
     }
@@ -503,29 +537,17 @@ impl RssStore {
         for alias in aliases {
             let owner: Option<String> = connection
                 .query_row(
-                    "SELECT canonical_key FROM listing_identities WHERE alias_key = ?1",
+                    "SELECT i.canonical_key FROM listing_identities i
+                     JOIN listings l ON l.subscription_id = i.subscription_id AND l.entry_key = i.entry_key
+                     WHERE i.alias_key = ?1 AND l.imported_at IS NOT NULL
+                       AND l.completed_at IS NULL AND l.dismissed = 0 LIMIT 1",
                     params![alias],
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(|error| {
-                    CoreError::Storage(format!("lookup RSS listing identity: {error}"))
-                })?;
-            if let Some(canonical) = owner {
-                let imported: Option<i64> = connection
-                    .query_row(
-                        "SELECT imported_at FROM listings
-                         WHERE subscription_id = (SELECT subscription_id FROM listing_identities WHERE alias_key = ?1)
-                           AND entry_key = (SELECT entry_key FROM listing_identities WHERE alias_key = ?1)
-                           AND imported_at IS NOT NULL AND completed_at IS NULL AND dismissed = 0",
-                        params![alias],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .map_err(|error| CoreError::Storage(format!("lookup RSS import owner: {error}")))?;
-                if imported.is_some() {
-                    return Ok(Some(canonical));
-                }
+                .map_err(|error| CoreError::Storage(format!("lookup RSS import owner: {error}")))?;
+            if owner.is_some() {
+                return Ok(owner);
             }
         }
         Ok(None)
@@ -577,7 +599,7 @@ impl RssStore {
                 (retry.max(0) as u32, first, imported, completed)
             })
             .unwrap_or((0, now as i64, None, None));
-        let retry_count = if action == RssAction::Failed {
+        let retry_count = if matches!(action, RssAction::Failed | RssAction::Deferred) {
             retry_count.saturating_add(1)
         } else if action == RssAction::Import {
             0
@@ -640,21 +662,25 @@ impl RssStore {
                 ],
             )
             .map_err(|error| CoreError::Storage(format!("write RSS listing: {error}")))?;
-        for alias in torrent_keys {
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO listing_identities(
+        // A deferred lookup has no confirmed attribution yet. Its stored
+        // listing retains the offers and full keys for the next retry.
+        if action != RssAction::Deferred {
+            for alias in torrent_keys {
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO listing_identities(
                         alias_key, canonical_key, subscription_id, entry_key, first_seen_at
                      ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        alias,
-                        torrent_keys.first(),
-                        subscription_id,
-                        entry_key,
-                        now as i64
-                    ],
-                )
-                .map_err(|error| CoreError::Storage(format!("write RSS identity: {error}")))?;
+                        params![
+                            alias,
+                            torrent_keys.first(),
+                            subscription_id,
+                            entry_key,
+                            now as i64
+                        ],
+                    )
+                    .map_err(|error| CoreError::Storage(format!("write RSS identity: {error}")))?;
+            }
         }
         transaction
             .execute(
@@ -676,6 +702,10 @@ impl RssStore {
         transaction
             .commit()
             .map_err(|error| CoreError::Storage(format!("commit RSS decision: {error}")))?;
+        *self
+            .last_pruned_limits
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
         self.checkpoint(connection)?;
         Ok(decision_id)
     }
@@ -698,7 +728,7 @@ impl RssStore {
                 "INSERT INTO listings(
                     subscription_id, entry_key, guid, title, link, category, pub_date, entry_json,
                     torrent_keys, status, reason, first_seen_at, last_seen_at, last_decision_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '[]', 'baseline', 'first observed', ?9, ?9, ?9)
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, x'5b5d', 'baseline', 'first observed', ?9, ?9, ?9)
                  ON CONFLICT(subscription_id, entry_key) DO UPDATE SET
                     guid = excluded.guid,
                     title = excluded.title,
@@ -878,8 +908,7 @@ impl RssStore {
             .query_map(
                 params![subscription_id, before, (limit + 1) as i64],
                 |row| {
-                    let keys: Vec<u8> = row.get(5)?;
-                    let keys: Vec<String> = serde_json::from_slice(&keys).unwrap_or_default();
+                    let keys = read_json_column(row, 5)?;
                     Ok(RssDecision {
                         decision_id: Some(row.get(0)?),
                         entry_key: row.get(1)?,
@@ -917,6 +946,16 @@ impl RssStore {
     /// Prune routine decision/listings rows while retaining every completion
     /// identity and every imported/completed listing attribution.
     pub fn prune(&self, decision_retention: i64, listing_retention: i64) -> Result<()> {
+        // Idle ticks share this cache with manual polls. A committed decision
+        // invalidates it, and changing either limit also forces a new pass.
+        let mut last = self
+            .last_pruned_limits
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let limits = (decision_retention, listing_retention);
+        if *last == Some(limits) {
+            return Ok(());
+        }
         let mut connection = self.open()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -924,9 +963,10 @@ impl RssStore {
         transaction
             .execute(
                 "DELETE FROM decisions WHERE id IN (
-                    SELECT id FROM decisions d
-                    WHERE (SELECT COUNT(*) FROM decisions x
-                           WHERE x.subscription_id = d.subscription_id AND x.id >= d.id) > ?1
+                    SELECT id FROM (
+                        SELECT id, row_number() OVER (PARTITION BY subscription_id ORDER BY id DESC) AS position
+                        FROM decisions
+                    ) WHERE position > ?1
                  )",
                 params![decision_retention],
             )
@@ -934,20 +974,22 @@ impl RssStore {
         transaction
             .execute(
                 "DELETE FROM listings WHERE id IN (
-                    SELECT id FROM listings l
-                    WHERE l.status NOT IN ('imported', 'completed', 'previously_completed')
-                      AND l.imported_at IS NULL
-                      AND l.completed_at IS NULL
-                      AND (SELECT COUNT(*) FROM listings x
-                           WHERE x.subscription_id = l.subscription_id AND x.id >= l.id) > ?1
-                 )",
+                    SELECT id FROM (
+                        SELECT id, row_number() OVER (PARTITION BY subscription_id ORDER BY id DESC) AS position
+                        FROM listings
+                    ) WHERE position > ?1
+                 ) AND status NOT IN ('imported', 'completed', 'previously_completed')
+                   AND imported_at IS NULL AND completed_at IS NULL
+                   AND next_attempt_at IS NULL",
                 params![listing_retention],
             )
             .map_err(|error| CoreError::Storage(format!("prune RSS listings: {error}")))?;
         transaction
             .commit()
             .map_err(|error| CoreError::Storage(format!("commit RSS prune: {error}")))?;
-        self.checkpoint(connection)
+        self.checkpoint(connection)?;
+        *last = Some(limits);
+        Ok(())
     }
 
     /// Explicitly clear verified completion identities. Routine pruning and
@@ -1009,11 +1051,23 @@ impl RssStore {
     }
 }
 
+// An unreadable history row cannot establish a safe import decision.
+fn read_json_column<T: serde::de::DeserializeOwned>(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<T> {
+    let value = row.get_ref(index)?;
+    let bytes = value.as_blob().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(index, value.data_type(), Box::new(error))
+    })?;
+    serde_json::from_slice(bytes).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(index, value.data_type(), Box::new(error))
+    })
+}
+
 fn decode_listing(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredListing> {
-    let entry_json: Vec<u8> = row.get(3)?;
-    let entry: RssEntry = serde_json::from_slice(&entry_json).unwrap_or_default();
-    let torrent_keys: Vec<String> =
-        serde_json::from_slice(&row.get::<_, Vec<u8>>(4)?).unwrap_or_default();
+    let entry = read_json_column(row, 3)?;
+    let torrent_keys = read_json_column(row, 4)?;
     Ok(StoredListing {
         id: row.get(0)?,
         subscription_id: row.get(1)?,

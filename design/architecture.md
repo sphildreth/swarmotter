@@ -227,6 +227,18 @@ to avoid blocking each other indefinitely. Separate accesses release their
 guards before acquiring the other lock; persistence releases both before
 serialization and database writes.
 
+Paginated library queries share an immutable snapshot. Record mutations
+invalidate the changed rows. Changes to queue order or inherited seeding policy
+invalidate the associated projections. Filtering and sorting run after releasing
+the lifecycle and registry locks. A repeated query can reuse its page and
+facet counts until the snapshot changes.
+
+Removal checkpoints the projected registry, queue and RSS removal evidence
+before publishing the new generation. For explicit payload deletion, the daemon
+first checkpoints a stopped, retryable record. If unlinking or the final
+checkpoint fails, that record remains available to finish the operation. A
+disconnected API caller does not cancel a removal between these steps.
+
 Resolving magnet metadata establishes its piece space. The engine marks the
 first correctly sized empty map as provisional until storage supplies verified
 progress. Persistence recovers a malformed in-memory update from a compatible
@@ -362,8 +374,9 @@ each missing original is an explicit `unavailable` entry (ADR-0084).
 
 RSS subscriptions are configuration entries, but accepted magnets and torrent
 attachments use the same durable add transaction as API, magnet, and watch
-intake. Feed XML is parsed by a bounded core reader; feed and attachment
-requests use the shared contained HTTP client (ADR-0082). Preview evaluates
+intake. The bounded core reader handles RSS and Atom. Feeds, attachments and
+the two supported hash-checked detail-page formats use the shared contained
+HTTP client (ADR-0082). Preview evaluates
 rules and duplicate state without writing. The first successful poll establishes
 the baseline, with explicit current-match import and retry/reconsider actions as
 separate operations.

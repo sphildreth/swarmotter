@@ -79,6 +79,8 @@ pub struct AtomicTokenBucket {
     tokens: AtomicU64,
     capacity: AtomicU64,
     last_refill_ms: AtomicU64,
+    // Written only by the caller that owns REFILL_IN_PROGRESS.
+    fractional_millibytes: AtomicU64,
 }
 
 impl AtomicTokenBucket {
@@ -87,6 +89,7 @@ impl AtomicTokenBucket {
             tokens: AtomicU64::new(capacity_per_sec),
             capacity: AtomicU64::new(capacity_per_sec),
             last_refill_ms: AtomicU64::new(now_ms),
+            fractional_millibytes: AtomicU64::new(0),
         }
     }
 
@@ -126,10 +129,11 @@ impl AtomicTokenBucket {
                     let capacity = self.capacity.load(Ordering::Acquire);
                     if capacity > 0 {
                         let elapsed = now_ms.saturating_sub(last_refill);
-                        let add = (capacity as u128) * (elapsed as u128) / 1000;
-                        if add > 0 {
-                            self.add_tokens(add, capacity);
-                        }
+                        let credit = u128::from(capacity) * u128::from(elapsed)
+                            + u128::from(self.fractional_millibytes.load(Ordering::Relaxed));
+                        let full = self.add_tokens(credit / 1000, capacity);
+                        let carry = if full { 0 } else { (credit % 1000) as u64 };
+                        self.fractional_millibytes.store(carry, Ordering::Relaxed);
                     }
                     self.last_refill_ms.store(now_ms, Ordering::Release);
                     return;
@@ -139,16 +143,19 @@ impl AtomicTokenBucket {
         }
     }
 
-    fn add_tokens(&self, add: u128, capacity: u64) {
+    fn add_tokens(&self, add: u128, capacity: u64) -> bool {
         loop {
             let current = self.tokens.load(Ordering::Acquire);
             let refilled = ((current as u128 + add).min(capacity as u128)) as u64;
+            if current == refilled {
+                return current == capacity;
+            }
             if self
                 .tokens
                 .compare_exchange_weak(current, refilled, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return;
+                return refilled == capacity;
             }
         }
     }
@@ -397,6 +404,24 @@ mod tests {
         assert_eq!(tb.refill_and_consume(500, 0), 0);
         assert_eq!(tb.available(), 1000);
         assert_eq!(tb.refill_and_consume(500, 1500), 1000);
+    }
+
+    #[test]
+    fn fractional_refills_survive_frequent_polling() {
+        for (rate, step_ms) in [(1, 500), (7, 50), (100, 5), (1_501, 1)] {
+            let bucket = AtomicTokenBucket::new(rate, 0);
+            assert_eq!(bucket.refill_and_consume(0, rate), rate);
+            let admitted: u64 = (step_ms..=10_000)
+                .step_by(step_ms as usize)
+                .map(|now| bucket.refill_and_consume(now, u64::MAX))
+                .sum();
+            assert_eq!(admitted, rate * 10);
+        }
+
+        let full = AtomicTokenBucket::new(1, 0);
+        assert_eq!(full.refill_and_consume(999, 1), 1);
+        assert_eq!(full.refill_and_consume(1000, 1), 0);
+        assert_eq!(full.refill_and_consume(1999, 1), 1);
     }
 
     #[test]

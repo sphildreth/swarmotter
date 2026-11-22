@@ -24,7 +24,6 @@ impl TorrentEngine {
     /// advertising an upgrade that cannot yet prove both hash formats.
     pub(super) async fn run_v2(&mut self) -> Result<EngineState> {
         let layout = self.meta.v2_piece_layout()?;
-        self.prepare_v2_file_selection();
 
         {
             let mut state = self.state.lock().await;
@@ -140,23 +139,6 @@ impl TorrentEngine {
                 Some("pure-v2 direct peers supplied no missing verified pieces".into());
         }
         Ok(self.state.lock().await.clone())
-    }
-
-    fn prepare_v2_file_selection(&mut self) {
-        if self.file_priorities.len() != self.meta.files.len()
-            || self.wanted.len() != self.meta.files.len()
-        {
-            self.file_priorities = vec![FilePriority::Normal; self.meta.files.len()];
-            self.wanted = vec![true; self.meta.files.len()];
-        }
-        if let Some(selection) = self.intake_selection.as_ref() {
-            swarmotter_core::policy::apply_intake_selection(
-                &self.meta.files,
-                &mut self.file_priorities,
-                &mut self.wanted,
-                selection,
-            );
-        }
     }
 
     fn v2_selected_files(&self) -> Vec<bool> {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded RSS 2.0 intake model, wildcard rules, and durable-history helpers.
+//! Bounded RSS 2.0 and Atom 1.0 intake model, wildcard rules, and durable-history helpers.
 //!
 //! This module deliberately contains no network or filesystem I/O. The daemon
 //! fetches feeds and torrent attachments through the contained HTTP client,
@@ -15,7 +15,8 @@
 
 use crate::config::StartBehavior;
 use crate::error::{CoreError, Result};
-use crate::hash::TorrentIdentity;
+use crate::hash::{InfoHash, TorrentIdentity};
+use crate::magnet::Magnet;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -624,14 +625,14 @@ pub struct RssEnclosure {
     pub length: Option<u64>,
 }
 
-/// A parsed RSS 2.0 document.
+/// A parsed RSS or Atom document.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RssFeed {
     pub title: String,
     pub entries: Vec<RssEntry>,
 }
 
-/// Parse RSS 2.0 with explicit size and entry-count bounds. A document with
+/// Parse RSS 2.0 or Atom 1.0 with explicit size and entry-count bounds. A document with
 /// no recognizable channel or item element is rejected rather than silently
 /// treated as an empty successful feed.
 pub fn parse_feed(bytes: &[u8], max_bytes: usize, max_entries: usize) -> Result<RssFeed> {
@@ -662,6 +663,8 @@ pub fn parse_feed_str(text: &str, max_entries: usize) -> Result<RssFeed> {
         current: None,
         capture: None,
         capture_text: String::new(),
+        depth: 0,
+        atom_prefix: None,
         saw_rss: false,
         saw_item: false,
     };
@@ -682,6 +685,8 @@ struct FeedParser<'a> {
     current: Option<RssEntry>,
     capture: Option<String>,
     capture_text: String,
+    depth: usize,
+    atom_prefix: Option<String>,
     saw_rss: bool,
     saw_item: bool,
 }
@@ -791,6 +796,68 @@ impl FeedParser<'_> {
             parse_attributes(&body[name_end..])
         };
 
+        if closing {
+            self.depth = self.depth.saturating_sub(1);
+        }
+        let depth = self.depth;
+        if !closing && !self_closing {
+            self.depth += 1;
+        }
+        let prefix = qualified.rsplit_once(':').map_or("", |(prefix, _)| prefix);
+        if depth == 0 && !closing && local == "feed" {
+            let xmlns = if prefix.is_empty() {
+                "xmlns".to_owned()
+            } else {
+                format!("xmlns:{prefix}")
+            };
+            if attribute(&attributes, &xmlns).as_deref() == Some("http://www.w3.org/2005/Atom") {
+                self.saw_rss = true;
+                self.atom_prefix = Some(prefix.to_owned());
+            }
+        }
+        // Atom fields are direct children. A nested source, XHTML content or
+        // extension can have its own title, ID and links.
+        let local = if let Some(atom_prefix) = &self.atom_prefix {
+            if prefix != atom_prefix {
+                return Ok(());
+            }
+            match (depth, local.as_str()) {
+                (1, "entry") => "item".to_owned(),
+                (1 | 2, "title") => local,
+                (2, "id") => "guid".to_owned(),
+                (2, "updated" | "published") => "date".to_owned(),
+                (2, "link") if !closing => {
+                    if let Some(entry) = self.current.as_mut() {
+                        if let Some(href) = attribute(&attributes, "href") {
+                            match attribute(&attributes, "rel").as_deref() {
+                                Some("enclosure") => entry.enclosures.push(RssEnclosure {
+                                    url: href,
+                                    mime_type: attribute(&attributes, "type"),
+                                    length: attribute(&attributes, "length")
+                                        .and_then(|v| v.parse().ok()),
+                                }),
+                                None | Some("alternate") if entry.link.is_none() => {
+                                    entry.link = Some(href)
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                (2, "category") if !closing => {
+                    if let (Some(entry), Some(term)) =
+                        (self.current.as_mut(), attribute(&attributes, "term"))
+                    {
+                        entry.categories.push(term);
+                    }
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
+        } else {
+            local
+        };
         if closing {
             self.close_element(&local);
             return Ok(());
@@ -1023,6 +1090,7 @@ fn decode_entities(input: &str) -> String {
 pub enum RssOfferKind {
     Magnet,
     Attachment,
+    MagnetPage(InfoHash),
     PageOnly,
 }
 
@@ -1107,10 +1175,117 @@ fn looks_like_torrent_attachment(url: &str, mime_type: Option<&str>) -> bool {
     // Some distributors serve metainfo from suffixless download endpoints.
     // These markers are deliberately narrow; a plain page URL is never
     // fetched as metainfo.
-    let lowered = parsed.as_str().to_ascii_lowercase();
-    ["torrent", "/download", "action=download", "gettorrent"]
+    path.split('/').any(|part| {
+        matches!(
+            part,
+            "download" | "downloads" | "download.php" | "gettorrent" | "gettorrent.php" | "torrent"
+        )
+    }) || parsed.query_pairs().any(|(key, value)| {
+        key.eq_ignore_ascii_case("action") && value.eq_ignore_ascii_case("download")
+    })
+}
+
+fn public_https_url(value: &str) -> Option<url::Url> {
+    let url = url::Url::parse(value).ok()?;
+    (url.scheme() == "https"
+        && url.port().is_none()
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then_some(url)
+}
+
+/// A provider detail page is eligible only when the subscription and page
+/// share a known HTTPS origin and the listing independently names a BTIH.
+pub fn feed_entry_offers(feed: &str, entry: &RssEntry) -> (Vec<RssOffer>, Vec<RssOffer>) {
+    let (mut offers, pages) = entry_offers(entry);
+    if offers
         .iter()
-        .any(|marker| lowered.contains(marker))
+        .any(|offer| offer.kind == RssOfferKind::Magnet)
+    {
+        return (offers, pages);
+    }
+    if let Some((link, expected)) = entry
+        .link
+        .as_deref()
+        .and_then(|link| Some((link, page_identity(feed, link, entry)?)))
+    {
+        offers.insert(
+            0,
+            RssOffer {
+                kind: RssOfferKind::MagnetPage(expected),
+                url: link.to_owned(),
+                mime_type: None,
+            },
+        );
+    }
+    (offers, pages)
+}
+
+fn page_identity(feed: &str, page: &str, entry: &RssEntry) -> Option<InfoHash> {
+    let feed = public_https_url(feed)?;
+    let page = public_https_url(page)?;
+    if feed.origin() != page.origin() {
+        return None;
+    }
+    let host = page.host_str()?;
+    match host.strip_prefix("www.").unwrap_or(host) {
+        "torrentdownload.info" => InfoHash::from_hex(page.path_segments()?.next_back()?).ok(),
+        "limetorrents.fun" if page.path().ends_with(".html") => {
+            entry.enclosures.iter().find_map(|enc| {
+                let file = public_https_url(&enc.url)?;
+                if !matches!(file.host_str()?, "itorrents.org" | "itorrents.net") {
+                    return None;
+                }
+                let hash = file
+                    .path()
+                    .strip_prefix("/torrent/")?
+                    .strip_suffix(".torrent")?;
+                InfoHash::from_hex(hash).ok()
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Extract an actual magnet anchor from a bounded provider response. Ignore
+/// raw text, comments, scripts and unrelated recommendations.
+pub fn matching_page_magnet(body: &[u8], expected: InfoHash) -> Option<(String, TorrentIdentity)> {
+    let html = String::from_utf8_lossy(body);
+    let mut rest = html.as_ref();
+    while let Some((_, after)) = rest.split_once('<') {
+        if let Some(comment) = after.strip_prefix("!--") {
+            rest = comment.split_once("-->")?.1;
+            continue;
+        }
+        let end = find_tag_end(after)?;
+        let tag = &after[..end];
+        rest = &after[end + 1..];
+        let name_end = tag.find(char::is_whitespace).unwrap_or(tag.len());
+        let name = &tag[..name_end];
+        if ["script", "style", "textarea", "title"]
+            .iter()
+            .any(|raw| name.eq_ignore_ascii_case(raw))
+        {
+            let close = format!("</{name}>");
+            let index = rest
+                .as_bytes()
+                .windows(close.len())
+                .position(|w| w.eq_ignore_ascii_case(close.as_bytes()))?;
+            rest = &rest[index + close.len()..];
+        } else if name.eq_ignore_ascii_case("a") {
+            if let Some(href) = attribute(&parse_attributes(&tag[name_end..]), "href") {
+                let href = href.trim();
+                if href.starts_with("magnet:?") {
+                    if let Ok(magnet) = Magnet::parse(href) {
+                        if magnet.identity.v1_info_hash() == Some(expected) {
+                            return Some((href.to_owned(), magnet.identity));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Case-insensitive glob match supporting `*` and `?`.
@@ -1462,6 +1637,75 @@ mod tests {
         let (offers, pages) = entry_offers(&feed.entries[3]);
         assert!(offers.is_empty());
         assert_eq!(pages[0].kind, RssOfferKind::PageOnly);
+    }
+
+    #[test]
+    fn atom_maps_direct_entry_fields_and_respects_the_limit() {
+        let atom = r#"<a:feed xmlns:a="http://www.w3.org/2005/Atom"><a:title>Feed</a:title>
+          <a:entry><a:title>Fixture</a:title><a:id>tag:example,2026:1</a:id>
+          <a:updated>2026-11-22</a:updated><a:category term="FOSS"/>
+          <a:link href="https://example.test/details/1"/>
+          <a:link rel="enclosure" type="application/x-bittorrent" href="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&amp;dn=Fixture"/>
+          <a:source><a:id>other</a:id><a:title>Other title</a:title></a:source>
+          </a:entry></a:feed>"#;
+        let feed = parse_feed_str(atom, 1).unwrap();
+        let first = &feed.entries[0];
+        assert_eq!(feed.title, "Feed");
+        assert_eq!(first.title, "Fixture");
+        assert_eq!(first.identity(), "guid:tag:example,2026:1");
+        assert_eq!(first.categories, ["FOSS"]);
+        assert_eq!(first.pub_date.as_deref(), Some("2026-11-22"));
+        let (offers, pages) = entry_offers(first);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(offers.len(), 1);
+        assert_eq!(
+            Magnet::parse(&offers[0].url)
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Fixture")
+        );
+        assert!(parse_feed_str(&atom.replace("</a:feed>", "<a:entry/></a:feed>"), 1).is_err());
+    }
+
+    #[test]
+    fn provider_pages_require_matching_origin_hash_and_real_anchor() {
+        let hash = InfoHash::from_bytes([0xab; 20]);
+        let magnet = format!("magnet:?xt=urn:btih:{hash}");
+        let page = format!("https://www.torrentdownload.info/Fixture/{hash}");
+        let mut entry = RssEntry {
+            link: Some(page),
+            ..Default::default()
+        };
+        assert!(feed_entry_offers("https://foreign.test/rss", &entry)
+            .0
+            .is_empty());
+        let (offers, _) = feed_entry_offers("https://www.torrentdownload.info/feed_latest", &entry);
+        assert_eq!(offers[0].kind, RssOfferKind::MagnetPage(hash));
+        entry.link = Some("https://www.limetorrents.fun/Fixture-torrent-123.html".into());
+        entry.enclosures.push(RssEnclosure {
+            url: format!("https://itorrents.org/torrent/{hash}.torrent?title=Fixture"),
+            ..Default::default()
+        });
+        let (offers, _) = feed_entry_offers("https://www.limetorrents.fun/rss/17/", &entry);
+        assert_eq!(
+            offers.iter().map(|o| &o.kind).collect::<Vec<_>>(),
+            [&RssOfferKind::MagnetPage(hash), &RssOfferKind::Attachment]
+        );
+        let decoys = format!("<!--<a href='{magnet}'>--><script>let s = \"<a href='{magnet}'>\";</script><a href='magnet:?xt=urn:btih:{}'>Other</a>", InfoHash::ZERO);
+        assert!(matching_page_magnet(decoys.as_bytes(), hash).is_none());
+        let html = format!("{decoys}<A class='button' HREF='{magnet}&amp;dn=Fixture'>Download</A>");
+        assert_eq!(
+            matching_page_magnet(html.as_bytes(), hash).unwrap().0,
+            format!("{magnet}&dn=Fixture")
+        );
+        entry.link = Some("https://en.metal-tracker.com/torrents/123.html".into());
+        entry.enclosures.clear();
+        assert!(
+            feed_entry_offers("https://en.metal-tracker.com/site/rss.html", &entry)
+                .0
+                .is_empty()
+        );
     }
 
     #[test]

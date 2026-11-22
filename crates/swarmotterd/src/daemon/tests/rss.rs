@@ -229,6 +229,93 @@ fn xml_escape(value: &str) -> String {
 }
 
 #[tokio::test]
+async fn atom_new_only_imports_a_new_magnet_once_and_preserves_the_original_baseline() {
+    use swarmotter_core::rss::RssAction;
+    let root = unique_dir("atom-baseline");
+    let state_path = root.join("state.json");
+    let (base, responses, server) = fixture_server().await;
+    let runtime = start_runtime(
+        rss_config(
+            &root,
+            &state_path,
+            vec![subscription(
+                "atom",
+                format!("{base}/atom"),
+                RssRuleSet::default(),
+                RssImportMode::NewOnly,
+            )],
+        ),
+        &state_path,
+    );
+    let make_entry = |id: &str, hash: &str| {
+        format!(
+            r#"<entry><id>{id}</id><title>{id}</title><link rel="enclosure" href="magnet:?xt=urn:btih:{hash}&amp;dn={id}"/></entry>"#
+        )
+    };
+    let original = make_entry("original", &"01".repeat(20));
+    let added_hash = "02".repeat(20);
+    let added = make_entry("new", &added_hash);
+    for (etag, entries, expected_adds) in [
+        ("v1", original.clone(), 0),
+        ("v2", format!("{original}{added}"), 1),
+        ("v3", format!("{added}{original}"), 0),
+    ] {
+        let atom = format!(r#"<feed xmlns="http://www.w3.org/2005/Atom">{entries}</feed>"#);
+        responses
+            .lock()
+            .await
+            .insert("/atom".into(), FixtureResponse::xml(atom, etag));
+        let preview = runtime.preview_rss_subscription("atom").await.unwrap();
+        assert!(preview
+            .decisions
+            .iter()
+            .any(|d| d.entry_key == "guid:original" && d.action == RssAction::Baseline));
+        let result = runtime
+            .poll_rss_subscription("atom", false, false)
+            .await
+            .unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(result.imported.len(), expected_adds);
+        assert!(result
+            .decisions
+            .iter()
+            .any(|d| d.entry_key == "guid:original" && d.action == RssAction::Baseline));
+    }
+    let store = runtime.rss_history_store().await.unwrap();
+    let listing = store.listing("atom", "guid:new").unwrap().unwrap();
+    assert!(listing.imported_at.is_some());
+    assert_eq!(
+        listing.torrent_keys.as_slice(),
+        std::slice::from_ref(&added_hash)
+    );
+    assert!(runtime
+        .registry
+        .lock()
+        .await
+        .get(&TorrentKey::from_locator(&added_hash).unwrap())
+        .is_some());
+    // Model a v1 database with a baseline overwritten by an attachment failure.
+    let connection = rusqlite::Connection::open(store.path()).unwrap();
+    connection.execute_batch("UPDATE listings SET status='failed',next_attempt_at=123 WHERE entry_key='guid:original'; PRAGMA user_version=1;").unwrap();
+    drop(connection);
+    store.initialize().unwrap();
+    assert_eq!(
+        store
+            .listing("atom", "guid:original")
+            .unwrap()
+            .unwrap()
+            .action(),
+        RssAction::Baseline
+    );
+    assert!(store
+        .pending_retries("atom", u32::MAX.into(), 10)
+        .unwrap()
+        .is_empty());
+    server.abort();
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test]
 async fn rss_end_to_end_imports_match_explains_exclusion_and_skips_after_selfish_removal_restart() {
     let root = unique_dir("rss-e2e");
     let state_path = root.join("state.json");
@@ -585,7 +672,21 @@ async fn transient_attachment_failure_remains_eligible_after_leaving_feed() {
             && decision.reason.contains("transient")
     }));
     assert!(runtime.registry.lock().await.torrents.is_empty());
-    // The listing leaves the feed; only the durable retry row remains.
+    let store = runtime.rss_history_store().await.unwrap();
+    let set_retry_time = |when: i64| {
+        let connection = rusqlite::Connection::open(store.path()).unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE listings SET next_attempt_at = ?1 WHERE status = 'failed'",
+                    [when]
+                )
+                .unwrap(),
+            1
+        );
+    };
+    set_retry_time(i64::MAX);
+    // The listing disappears in a changed feed before the retry is due.
     responses.lock().await.insert(
         "/retry.xml".into(),
         FixtureResponse::xml(
@@ -593,18 +694,34 @@ async fn transient_attachment_failure_remains_eligible_after_leaving_feed() {
             "\"r2\"",
         ),
     );
+    let changed = runtime
+        .poll_rss_subscription("retry-feed", false, false)
+        .await
+        .unwrap();
+    assert!(!changed.conditional_not_modified);
+    assert!(changed.imported.is_empty());
+
     responses.lock().await.insert(
         "/retry-attachment".into(),
         FixtureResponse::torrent(torrent_bytes),
     );
-    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    set_retry_time(0);
     let second = runtime
         .poll_rss_subscription("retry-feed", false, false)
         .await
         .unwrap();
-    assert!(second.success, "{:?}", second.error);
-    assert!(second.imported.contains(&key.to_locator()), "{second:?}");
+    assert!(
+        second.success && second.conditional_not_modified,
+        "{second:?}"
+    );
+    assert_eq!(second.imported, [key.to_locator()]);
     assert_eq!(runtime.registry.lock().await.torrents.len(), 1);
+    let unchanged = runtime
+        .poll_rss_subscription("retry-feed", false, false)
+        .await
+        .unwrap();
+    assert!(unchanged.conditional_not_modified);
+    assert!(unchanged.decisions.is_empty());
     server.abort();
     std::fs::remove_dir_all(root).ok();
 }
@@ -719,6 +836,151 @@ async fn outbox_replay_is_idempotent_across_crash_boundaries() {
 }
 
 #[tokio::test]
+async fn unavailable_identity_sources_defer_intake_until_they_can_be_checked() {
+    use swarmotter_core::rss::RssAction;
+
+    let (base, responses, server) = fixture_server().await;
+    let (bytes, key) = torrent_fixture("lookups.bin");
+    let attachment = format!("{base}/attachment");
+    responses.lock().await.insert("/feed".into(), FixtureResponse::xml(feed(&format!(
+        "<item><title>Fixture</title><guid>item</guid><enclosure url=\"{attachment}\" type=\"application/x-bittorrent\"/></item>"
+    )), "\"v1\""));
+    responses
+        .lock()
+        .await
+        .insert("/attachment".into(), FixtureResponse::torrent(bytes));
+
+    for table in ["completion_aliases", "listing_identities", "rss_outbox"] {
+        let root = unique_dir(table);
+        let state_path = root.join("state.sqlite");
+        let config = rss_config(
+            &root,
+            &state_path,
+            vec![subscription(
+                "feed",
+                format!("{base}/feed"),
+                RssRuleSet::default(),
+                RssImportMode::CurrentMatches,
+            )],
+        );
+        let runtime = start_runtime(config, &state_path);
+        runtime.persist_state_full().await.unwrap();
+        let store = runtime.rss_history_store().await.unwrap();
+        let path = if table == "rss_outbox" {
+            state_path.as_path()
+        } else {
+            store.path()
+        };
+        {
+            let connection = rusqlite::Connection::open(path).unwrap();
+            connection
+                .execute_batch(&format!("ALTER TABLE {table} RENAME TO unavailable"))
+                .unwrap();
+        }
+
+        let preview = runtime.preview_rss_subscription("feed").await.unwrap_err();
+        assert!(matches!(preview, CoreError::Storage(_)), "{preview:?}");
+        let poll = runtime
+            .poll_rss_subscription("feed", false, false)
+            .await
+            .unwrap();
+        assert_eq!(poll.decisions[0].action, RssAction::Deferred, "{poll:?}");
+        assert!(poll.decisions[0].reason.contains("history unavailable"));
+        assert!(poll.imported.is_empty());
+        assert!(runtime.registry.lock().await.torrents.is_empty());
+
+        {
+            let connection = rusqlite::Connection::open(path).unwrap();
+            connection
+                .execute_batch(&format!("ALTER TABLE unavailable RENAME TO {table}"))
+                .unwrap();
+        }
+        rusqlite::Connection::open(store.path())
+            .unwrap()
+            .execute(
+                "UPDATE listings SET next_attempt_at = 0 WHERE status = 'deferred'",
+                [],
+            )
+            .unwrap();
+        let recovered = runtime
+            .poll_rss_subscription("feed", false, false)
+            .await
+            .unwrap();
+        assert!(recovered.conditional_not_modified);
+        assert_eq!(recovered.imported, [key.to_locator()]);
+        std::fs::remove_dir_all(root).ok();
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn pending_hybrid_completion_beyond_the_outbox_batch_blocks_import() {
+    use crate::rss_store::PendingLibraryEvent;
+    use crate::state_store::{save_with_original_metainfo_and_events, DaemonState};
+    use swarmotter_core::rss::RssAction;
+
+    let root = unique_dir("rss-deep-outbox");
+    let path = root.join("state.sqlite");
+    let (base, responses, server) = fixture_server().await;
+    let canonical = format!("{:040x}", 700);
+    let alias = format!("{:064x}", 701);
+    let mut events = (0..512)
+        .map(|i| {
+            PendingLibraryEvent::removal(format!("{i:040x}"), vec![], "unrelated".into(), false, 1)
+        })
+        .collect::<Vec<_>>();
+    events.push(PendingLibraryEvent::removal(
+        canonical.clone(),
+        vec![alias.clone()],
+        "completed hybrid".into(),
+        true,
+        2,
+    ));
+    save_with_original_metainfo_and_events(
+        &path,
+        &DaemonState::new(Vec::new(), Default::default()),
+        None,
+        &events,
+    )
+    .unwrap();
+    let xml = format!("<item><title>V2 only</title><guid>a</guid><link>magnet:?xt=urn:btmh:1220{alias}</link></item>
+                       <item><title>V1 only</title><guid>b</guid><link>magnet:?xt=urn:btih:{canonical}</link></item>");
+    responses
+        .lock()
+        .await
+        .insert("/feed".into(), FixtureResponse::xml(feed(&xml), "\"v1\""));
+    let config = rss_config(
+        &root,
+        &path,
+        vec![subscription(
+            "feed",
+            format!("{base}/feed"),
+            RssRuleSet::default(),
+            RssImportMode::CurrentMatches,
+        )],
+    );
+    // No consumer is running; all evidence is still in the durable outbox.
+    let runtime = start_runtime(config, &path);
+    let preview = runtime.preview_rss_subscription("feed").await.unwrap();
+    let poll = runtime
+        .poll_rss_subscription("feed", false, false)
+        .await
+        .unwrap();
+    for decisions in [preview.decisions, poll.decisions] {
+        assert_eq!(decisions.len(), 2);
+        assert!(
+            decisions
+                .iter()
+                .all(|row| row.action == RssAction::PreviouslyCompleted),
+            "{decisions:?}"
+        );
+    }
+    assert!(runtime.registry.lock().await.torrents.is_empty());
+    server.abort();
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn indexed_duplicate_lookup_handles_large_seeded_history() {
     use crate::rss_store::RssStore;
     let root = unique_dir("rss-scale");
@@ -780,6 +1042,110 @@ async fn indexed_duplicate_lookup_handles_large_seeded_history() {
         listings <= 60,
         "pruning kept more listing rows than expected"
     );
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn cross_feed_lookup_finds_the_actual_import_owner() {
+    use crate::rss_store::RssStore;
+    use swarmotter_core::rss::{RssAction, RssEntry};
+
+    let root = unique_dir("rss-identity-owners");
+    let store = RssStore::new(root.join("history.sqlite"));
+    store.initialize().unwrap();
+    let aliases = vec![format!("{:040x}", 16)];
+    let entry = RssEntry {
+        title: "Fixture".into(),
+        ..Default::default()
+    };
+    // The first indexed alias belongs to a feed that merely observed it.
+    for (feed, action) in [("a", RssAction::AlreadyPresent), ("b", RssAction::Import)] {
+        store
+            .record_decision(
+                feed,
+                &entry,
+                "item",
+                action,
+                "fixture",
+                &aliases,
+                1,
+                None,
+                false,
+                action == RssAction::Import,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store.imported_alias(&aliases).unwrap().as_ref(),
+        aliases.first()
+    );
+    drop(store);
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn pruning_tracks_new_decisions_and_limits_and_preserves_retryable_listings() {
+    use crate::rss_store::RssStore;
+    use swarmotter_core::rss::{RssAction, RssEntry};
+
+    let root = unique_dir("rss-retention");
+    let store = RssStore::new(root.join("history.sqlite"));
+    store.initialize().unwrap();
+    let record = |feed: &str, key: &str, action| {
+        store
+            .record_decision(
+                feed,
+                &RssEntry {
+                    title: key.into(),
+                    ..Default::default()
+                },
+                key,
+                action,
+                "fixture",
+                &[],
+                1,
+                (action == RssAction::Failed).then_some(2),
+                false,
+                action == RssAction::Import,
+            )
+            .unwrap();
+    };
+    for feed in ["a", "b"] {
+        record(feed, "retry", RssAction::Failed);
+        record(feed, "import", RssAction::Import);
+        record(feed, "complete", RssAction::PreviouslyCompleted);
+        record(feed, "first", RssAction::Filtered);
+        record(feed, "second", RssAction::Filtered);
+    }
+    store.prune(2, 2).unwrap();
+    // No new writes: pruning must work even while another connection owns
+    // the SQLite writer. A needless second write transaction would fail.
+    {
+        let mut connection = rusqlite::Connection::open(store.path()).unwrap();
+        let _writer = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        store.clone().prune(2, 2).unwrap();
+    }
+    record("a", "third", RssAction::Filtered);
+    store.clone().prune(2, 2).unwrap();
+    assert!(store.listing("a", "first").unwrap().is_none());
+    assert!(store.listing("b", "first").unwrap().is_some());
+    assert_eq!(
+        store.decision_page("a", 10, None).unwrap().decisions.len(),
+        2
+    );
+    store.prune(1, 1).unwrap();
+    for feed in ["a", "b"] {
+        assert_eq!(
+            store.decision_page(feed, 10, None).unwrap().decisions.len(),
+            1
+        );
+        assert!(store.listing(feed, "first").unwrap().is_none());
+        assert!(store.listing(feed, "import").unwrap().is_some());
+        assert!(store.listing(feed, "complete").unwrap().is_some());
+        assert_eq!(store.pending_retries(feed, 3, 10).unwrap().len(), 1);
+    }
     std::fs::remove_dir_all(root).ok();
 }
 
@@ -969,4 +1335,35 @@ async fn subscription_controls_create_edit_pause_and_delete() {
             .is_err()
     );
     std::fs::remove_dir_all(root).ok();
+}
+
+#[test]
+fn malformed_identity_history_returns_an_error_instead_of_empty_aliases() {
+    let root = unique_dir("malformed-rss-identities");
+    let path = root.join("rss.sqlite");
+    let store = crate::rss_store::RssStore::new(&path);
+    store.initialize().unwrap();
+    store
+        .touch_listing(
+            "feed",
+            &swarmotter_core::rss::RssEntry::default(),
+            "entry",
+            10,
+        )
+        .unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    assert!(store
+        .listing("feed", "entry")
+        .unwrap()
+        .unwrap()
+        .torrent_keys
+        .is_empty());
+    db.execute(
+        "UPDATE listings SET torrent_keys=CAST('incomplete JSON' AS BLOB)",
+        [],
+    )
+    .unwrap();
+    assert!(store.listing("feed", "entry").is_err());
+    drop(db);
+    std::fs::remove_dir_all(root).unwrap();
 }

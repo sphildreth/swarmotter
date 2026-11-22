@@ -3,12 +3,38 @@
 use super::*;
 
 impl TorrentEngine {
-    pub async fn run(mut self) -> Result<EngineState> {
-        let magnet_select_only_file_indices = self
+    pub(super) fn prepare_file_selection(&mut self) {
+        if self.file_priorities.len() != self.meta.files.len()
+            || self.wanted.len() != self.meta.files.len()
+        {
+            self.file_priorities = vec![FilePriority::Normal; self.meta.files.len()];
+            self.wanted = vec![true; self.meta.files.len()];
+        }
+        if let Some(selection) = self.intake_selection.as_ref() {
+            swarmotter_core::policy::apply_intake_selection(
+                &self.meta.files,
+                &mut self.file_priorities,
+                &mut self.wanted,
+                selection,
+            );
+        }
+        if let Some(magnet) = self
             .magnet
             .as_ref()
-            .map(|magnet| magnet.select_only_file_indices.clone())
-            .unwrap_or_default();
+            .filter(|m| !m.select_only_file_indices.is_empty())
+        {
+            // Profile/API intake exclusions run first and only remove files;
+            // BEP 53 then narrows that result without allowing a URI to
+            // re-enable a local exclusion.
+            swarmotter_core::magnet::apply_select_only_file_indices(
+                &mut self.file_priorities,
+                &mut self.wanted,
+                &magnet.select_only_file_indices,
+            );
+        }
+    }
+
+    pub async fn run(mut self) -> Result<EngineState> {
         // If this is a magnet (no real metadata yet), fetch executable
         // metadata before downloading. Pure-v2 magnets obtain their BEP 9
         // `info` bytes plus verified BEP 52 piece layers on the contained
@@ -47,32 +73,9 @@ impl TorrentEngine {
                 return Ok(state.clone());
             }
         }
+        self.prepare_file_selection();
         if self.meta.requires_v2_data_plane() {
             return self.run_v2().await;
-        }
-        if self.file_priorities.len() != self.meta.files.len()
-            || self.wanted.len() != self.meta.files.len()
-        {
-            self.file_priorities = vec![FilePriority::Normal; self.meta.files.len()];
-            self.wanted = vec![true; self.meta.files.len()];
-        }
-        if let Some(selection) = self.intake_selection.as_ref() {
-            swarmotter_core::policy::apply_intake_selection(
-                &self.meta.files,
-                &mut self.file_priorities,
-                &mut self.wanted,
-                selection,
-            );
-        }
-        if !magnet_select_only_file_indices.is_empty() {
-            // Profile/API intake exclusions run first and only remove files;
-            // BEP 53 then narrows that result without allowing a URI to
-            // re-enable a local exclusion.
-            swarmotter_core::magnet::apply_select_only_file_indices(
-                &mut self.file_priorities,
-                &mut self.wanted,
-                &magnet_select_only_file_indices,
-            );
         }
         self.piece_selection =
             PieceSelection::from_files(&self.meta, &self.file_priorities, &self.wanted)?;
@@ -174,6 +177,7 @@ impl TorrentEngine {
         let mut peer_backoff: HashMap<SocketAddr, Instant> = HashMap::new();
         let mut last_discovery_refresh = Instant::now();
         let mut candidate_cursor: usize = 0;
+        let mut webseed_cursor = 0;
         // Only completed discovery can establish an empty swarm. Skipped
         // refreshes do not supply evidence; once discovery has finished, a
         // bounded grace period still lets genuinely empty engines exit.
@@ -240,7 +244,9 @@ impl TorrentEngine {
                 last_discovery_refresh = Instant::now();
             }
 
-            let mut made_progress = self.run_webseed_round(&storage, &mut have).await;
+            let mut made_progress = self
+                .run_webseed_round(&storage, &mut have, &mut webseed_cursor)
+                .await;
             if self.piece_selection.complete(&have) {
                 continue;
             }

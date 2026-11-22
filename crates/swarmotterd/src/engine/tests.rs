@@ -498,6 +498,33 @@ fn piece_selection_skips_unwanted_files_and_completes_selected_set() {
 }
 
 #[test]
+fn empty_files_do_not_select_payload_and_crossing_files_share_highest_priority() {
+    let files = vec![
+        (vec!["a".into()], 2),
+        (vec!["empty".into()], 0),
+        (vec!["b".into()], 6),
+        (vec!["c".into()], 1),
+    ];
+    let bytes =
+        build_multi_file_torrent("selection", &files, &[b"aa", b"", b"bbbbbb", b"c"], 4, None);
+    let meta = swarmotter_core::meta::parse_torrent(&bytes).unwrap();
+    let priorities = [
+        FilePriority::High,
+        FilePriority::High,
+        FilePriority::Low,
+        FilePriority::Normal,
+    ];
+    let empty_only =
+        PieceSelection::from_files(&meta, &priorities, &[false, true, false, false]).unwrap();
+    assert_eq!(empty_only.target_count, 0);
+    let selection =
+        PieceSelection::from_files(&meta, &priorities, &[true, true, true, false]).unwrap();
+    assert_eq!(selection.priority(0), FilePriority::High.weight());
+    assert_eq!(selection.priority(1), FilePriority::Low.weight());
+    assert!(!selection.includes(2));
+}
+
+#[test]
 fn selected_file_includes_cross_file_boundary_piece() {
     let files = vec![(vec!["a.bin".into()], 2), (vec!["b.bin".into()], 2)];
     let contents: Vec<&[u8]> = vec![b"aa", b"bb"];
@@ -2209,9 +2236,10 @@ async fn pure_v2_engine_completes_a_contained_local_swarm() {
     std::fs::remove_dir_all(output).ok();
 }
 
-/// Build executable pure-v2 metainfo whose BEP 9 `info` dictionary needs a
-/// top-level piece layer. Three logical pieces exercise the padded BEP 52
-/// hash response instead of treating raw v2 `info` bytes as runnable data.
+const SELECTED_V2_PAYLOAD: &[u8] = b"selected file for the local pure-v2 swarm";
+
+/// The first file spans three pieces and requires a padded BEP 52 hash
+/// response. The second file fits in one piece and can transfer independently.
 fn pure_v2_metadata_candidate_fixture() -> (TorrentMeta, TorrentIdentity) {
     let piece_length = V2_BLOCK_LENGTH * 2;
     let content = (0..(piece_length * 2 + 17))
@@ -2249,6 +2277,14 @@ fn pure_v2_metadata_candidate_fixture() -> (TorrentMeta, TorrentIdentity) {
     integer(&mut info, content.len() as u64);
     string(&mut info, b"pieces root");
     string(&mut info, pieces_root.as_bytes());
+    info.extend_from_slice(b"ee");
+    string(&mut info, b"z-selected.bin");
+    info.extend_from_slice(b"d0:d");
+    string(&mut info, b"length");
+    integer(&mut info, SELECTED_V2_PAYLOAD.len() as u64);
+    string(&mut info, b"pieces root");
+    let selected_root = swarmotter_core::v2_file_root(SELECTED_V2_PAYLOAD).unwrap();
+    string(&mut info, selected_root.as_bytes());
     info.extend_from_slice(b"eee");
     string(&mut info, b"meta version");
     integer(&mut info, 2);
@@ -2277,17 +2313,36 @@ fn pure_v2_metadata_candidate_fixture() -> (TorrentMeta, TorrentIdentity) {
 /// peer path, verify BEP 52 layers, and stop before creating payload storage.
 #[tokio::test]
 async fn pure_v2_metadata_only_preview_resolves_verified_candidate_without_payload_work() {
+    run_pure_v2_magnet_fixture(true).await;
+}
+
+#[tokio::test]
+async fn pure_v2_immediate_magnet_only_transfers_selected_file() {
+    run_pure_v2_magnet_fixture(false).await;
+}
+
+async fn run_pure_v2_magnet_fixture(metadata_only: bool) {
     let (seed_meta, identity) = pure_v2_metadata_candidate_fixture();
     let seed_dir = unique_dir("pure-v2-preview-seed");
     let seed_storage = Arc::new(StorageIo::new(
         Arc::new(seed_meta.clone()),
         seed_dir.clone(),
     ));
-    let piece_count = seed_meta.data_piece_count().unwrap();
+    let layout = seed_meta.v2_piece_layout().unwrap();
+    let piece_count = layout.piece_count();
+    assert_eq!(piece_count, 4);
+    let mut available = PieceBitfield::new(piece_count);
+    if !metadata_only {
+        seed_storage
+            .write_v2_piece(&layout, 3, SELECTED_V2_PAYLOAD)
+            .await
+            .unwrap();
+        available.set(3);
+    }
     let seed_state = Arc::new(Mutex::new(EngineState {
         piece_count,
         total_length: seed_meta.total_length,
-        pieces_have: PieceBitfield::new(piece_count),
+        pieces_have: available,
         ..EngineState::default()
     }));
 
@@ -2357,38 +2412,56 @@ async fn pure_v2_metadata_only_preview_resolves_verified_candidate_without_paylo
             wire_info_hash,
             name: seed_meta.name.clone(),
             trackers: Vec::new(),
-            select_only_file_indices: Vec::new(),
+            select_only_file_indices: vec![1],
         }),
     )
-    .with_metadata_only()
     .with_transport(false, true)
     .with_encryption_mode(PeerEncryptionMode::Disabled);
 
+    let engine = if metadata_only {
+        engine.with_metadata_only()
+    } else {
+        engine
+    };
     let final_state = tokio::time::timeout(Duration::from_secs(20), engine.run())
         .await
-        .expect("pure-v2 metadata-only preview did not finish")
-        .expect("pure-v2 metadata-only preview failed");
+        .expect("pure-v2 magnet did not finish")
+        .expect("pure-v2 magnet failed");
     let resolved = final_state
         .resolved_meta
-        .expect("preview must return resolved pure-v2 metainfo");
+        .expect("magnet must return resolved pure-v2 metainfo");
     assert_eq!(resolved.identity, identity);
     assert!(resolved.requires_v2_data_plane());
     assert!(resolved
         .v2
         .as_ref()
         .is_some_and(|v2| v2.piece_layers_verified));
-    assert_eq!(resolved.data_piece_count().unwrap(), 3);
-    assert!(!final_state.finished);
-    assert!(final_state.metadata_progress_pending);
-    assert_eq!(final_state.piece_count, 3);
-    assert!(final_state.pieces_have.fits_piece_count(3));
-    assert_eq!(final_state.pieces_have.count(3), 0);
-    assert!(final_state.tracker_announces.is_empty());
-    assert!(final_state.last_announce.is_none());
-    assert!(
-        !preview_dir.exists(),
-        "metadata-only pure-v2 preview must not create payload storage"
-    );
+    assert_eq!(resolved.data_piece_count().unwrap(), piece_count);
+    assert_eq!(final_state.piece_count, piece_count);
+    assert!(final_state.pieces_have.fits_piece_count(piece_count));
+    if metadata_only {
+        assert!(!final_state.finished);
+        assert!(final_state.metadata_progress_pending);
+        assert_eq!(final_state.pieces_have.count(piece_count), 0);
+        assert!(final_state.tracker_announces.is_empty());
+        assert!(final_state.last_announce.is_none());
+        assert!(!preview_dir.exists(), "preview created payload storage");
+    } else {
+        let storage = StorageIo::new(resolved, &preview_dir);
+        assert!(final_state.finished);
+        assert!(final_state.pieces_have.has(3));
+        assert_eq!(final_state.pieces_have.count(piece_count), 1);
+        assert_eq!(
+            final_state.bytes_completed,
+            SELECTED_V2_PAYLOAD.len() as u64
+        );
+        assert_eq!(
+            std::fs::read(storage.file_path(1).unwrap()).unwrap(),
+            SELECTED_V2_PAYLOAD
+        );
+        assert!(!storage.file_path(0).unwrap().exists());
+        std::fs::remove_dir_all(&preview_dir).unwrap();
+    }
 
     let _ = torrent_shutdown_tx.send(true);
     let _ = hub_shutdown_tx.send(true);

@@ -16,7 +16,7 @@ fn engine(meta: &TorrentMeta, path: &std::path::Path) -> TorrentEngine {
         vec![],
         0,
     );
-    engine.prepare_v2_file_selection();
+    engine.prepare_file_selection();
     engine
 }
 

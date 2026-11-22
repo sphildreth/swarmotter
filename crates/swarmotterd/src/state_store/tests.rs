@@ -62,6 +62,23 @@ fn state_write_uses_sqlite_and_round_trips() {
 }
 
 #[test]
+fn rss_outbox_reads_committed_events_while_a_writer_holds_the_database() {
+    let path = unique_path("outbox-concurrent-read");
+    save(&path, &single_torrent_state()).unwrap();
+    let writer = open_sqlite(&path).unwrap();
+    let insert = "INSERT INTO rss_outbox(kind, canonical_key, aliases_json, name, was_completed, occurred_at)
+                  VALUES ('completed', 'fixture', x'5b5d', 'fixture', 1, 1)";
+    writer.execute(insert, []).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    writer.execute(insert, []).unwrap();
+    assert_eq!(load_outbox_events(&path, 10).unwrap().len(), 1);
+    writer.execute_batch("COMMIT").unwrap();
+    assert_eq!(load_outbox_events(&path, 10).unwrap().len(), 2);
+    drop(writer);
+    remove_state(&path);
+}
+
+#[test]
 fn legacy_json_state_migrates_atomically_on_save() {
     let path = unique_path("legacy-migration");
     let mut state = single_torrent_state();
@@ -575,17 +592,9 @@ fn raw_metainfo_blobs_hydrate_losslessly() {
         Some(OriginalMetainfo::new(key, bytes.clone())),
     )
     .unwrap();
-    eprintln!(
-        "after save wal={} shm={}",
-        sqlite_sidecar_path(&path, "-wal").exists(),
-        sqlite_sidecar_path(&path, "-shm").exists()
-    );
-
-    // Keep this inspection read-only. Opening a writable connection to a
-    // WAL-mode database can itself recreate `-wal`/`-shm` sidecars, which
-    // would make the assertion below test the fixture rather than the
-    // original-metainfo lookup.
+    // An existing reader may still own SQLite's WAL and shared-memory files.
     let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    connection.execute_batch("BEGIN").unwrap();
     let original: Vec<u8> = connection
         .query_row(
             "SELECT metainfo FROM torrent_metainfo WHERE representation = 'original_torrent'",
@@ -594,27 +603,33 @@ fn raw_metainfo_blobs_hydrate_losslessly() {
         )
         .unwrap();
     assert_eq!(original, bytes);
-    drop(connection);
-    eprintln!(
-        "after inspect wal={} shm={}",
-        sqlite_sidecar_path(&path, "-wal").exists(),
-        sqlite_sidecar_path(&path, "-shm").exists()
-    );
-
     let state_before_lookup = fs::read(&path).unwrap();
     assert_eq!(
         load_original_metainfo(&path, key).unwrap(),
         Some(bytes.clone())
     );
-    eprintln!(
-        "after lookup wal={} shm={}",
-        sqlite_sidecar_path(&path, "-wal").exists(),
-        sqlite_sidecar_path(&path, "-shm").exists()
-    );
     assert_eq!(fs::read(&path).unwrap(), state_before_lookup);
-    assert!(!sqlite_sidecar_path(&path, "-wal").exists());
-    assert!(!sqlite_sidecar_path(&path, "-shm").exists());
-
+    // Keep the reader open across a new commit. Both the existing reader and
+    // a newly opened one must see the same complete generation.
+    let mut updated = state;
+    updated.torrents[0].labels.push("new-label".into());
+    save(&path, &updated).unwrap();
+    connection.execute_batch("COMMIT").unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA integrity_check", [], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+    let labels: String = connection
+        .query_row(
+            "SELECT json_extract(torrent_json, '$.labels[0]') FROM torrent_records",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(labels, "new-label");
+    drop(connection);
     let loaded = load(&path).unwrap().unwrap();
     assert_eq!(loaded.torrents[0].meta.raw_info, expected_info);
     remove_state(&path);

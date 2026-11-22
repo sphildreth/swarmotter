@@ -10,11 +10,12 @@ impl TorrentEngine {
         &self,
         storage: &StorageIo,
         have: &mut PieceBitfield,
+        mirror_cursor: &mut usize,
     ) -> bool {
         if self.meta.webseeds.is_empty() || !self.binder.traffic_allowed() {
             return false;
         }
-        let webseeds = webseed_http_urls(&self.meta);
+        let mut webseeds = webseed_http_urls(&self.meta);
         if webseeds.is_empty() {
             return false;
         }
@@ -41,6 +42,14 @@ impl TorrentEngine {
             return false;
         }
 
+        // Keep each piece's per-round retry budget while allowing its next
+        // round to continue with mirrors outside the previous attempt window.
+        if webseeds.len() > WEBSEED_MAX_MIRROR_ATTEMPTS {
+            webseeds.rotate_left(*mirror_cursor);
+            let stride = webseed_mirror_stride(webseeds.len());
+            *mirror_cursor =
+                (*mirror_cursor + WEBSEED_MAX_MIRROR_ATTEMPTS * stride) % webseeds.len();
+        }
         let shared_have = Arc::new(Mutex::new(have.clone()));
         let storage = Arc::new(storage.clone());
         let webseeds = Arc::new(webseeds);
@@ -173,13 +182,8 @@ pub(super) async fn download_webseed_piece(
         }
     }
 
-    let data = fetch_webseed_piece(binder, &meta, piece_index, &webseeds, &state).await?;
-    if !verify_piece(&meta, piece_index, &data) {
-        return Err(CoreError::Internal(format!(
-            "webseed piece {piece_index} hash mismatch"
-        )));
-    }
-
+    let slices = storage.piece_file_slices(piece_index)?;
+    let data = fetch_webseed_piece(binder, &meta, piece_index, &slices, &webseeds, &state).await?;
     limiter
         .acquire(RateDirection::Download, data.len() as u64)
         .await;
@@ -202,6 +206,7 @@ pub(super) async fn fetch_webseed_piece(
     binder: Arc<dyn NetworkBinder>,
     meta: &TorrentMeta,
     piece_index: usize,
+    slices: &[FileSlice],
     webseeds: &[String],
     state: &Arc<Mutex<EngineState>>,
 ) -> Result<Vec<u8>> {
@@ -227,7 +232,7 @@ pub(super) async fn fetch_webseed_piece(
                 snapshot.last_attempt = Some(now_secs());
             }
         }
-        match fetch_piece_from_webseed(binder.as_ref(), meta, piece_index, base).await {
+        match fetch_piece_from_webseed(binder.as_ref(), meta, piece_index, slices, base).await {
             Ok(piece) => {
                 let mut state = state.lock().await;
                 if let Some(snapshot) = state.webseeds.get_mut(base) {
@@ -266,19 +271,13 @@ pub(super) async fn fetch_piece_from_webseed(
     binder: &dyn NetworkBinder,
     meta: &TorrentMeta,
     piece_index: usize,
+    slices: &[FileSlice],
     base_url: &str,
 ) -> Result<Vec<u8>> {
-    let (piece_start, _) = meta
-        .piece_byte_range(piece_index as u64)
-        .ok_or_else(|| CoreError::Internal(format!("piece {piece_index} out of range")))?;
     let piece_len = usize::try_from(piece_length_for_meta(meta, piece_index))
         .map_err(|_| CoreError::Internal(format!("piece {piece_index} length exceeds usize")))?;
-    let mut piece = vec![0u8; piece_len];
-
-    for slice in piece_file_ranges(meta, piece_index)? {
-        if slice.length == 0 {
-            continue;
-        }
+    let mut piece = Vec::with_capacity(piece_len);
+    for slice in slices {
         let file_url = webseed_file_url(base_url, meta, slice.file_index)?;
         let end_exclusive = slice
             .offset_in_file
@@ -310,24 +309,13 @@ pub(super) async fn fetch_piece_from_webseed(
             )));
         }
 
-        let file_start = file_absolute_start(meta, slice.file_index)?;
-        let absolute_start = file_start
-            .checked_add(slice.offset_in_file)
-            .ok_or_else(|| CoreError::Internal("webseed absolute offset overflow".into()))?;
-        let piece_offset = absolute_start
-            .checked_sub(piece_start)
-            .ok_or_else(|| CoreError::Internal("webseed slice starts before piece".into()))?;
-        let piece_offset = usize::try_from(piece_offset)
-            .map_err(|_| CoreError::Internal("webseed piece offset exceeds usize".into()))?;
-        let end = piece_offset
-            .checked_add(expected_len)
-            .ok_or_else(|| CoreError::Internal("webseed piece copy range overflowed".into()))?;
-        let dest = piece.get_mut(piece_offset..end).ok_or_else(|| {
-            CoreError::Internal(format!("webseed slice exceeds piece {piece_index} bounds"))
-        })?;
-        dest.copy_from_slice(&response.body);
+        piece.extend_from_slice(&response.body);
     }
-
+    if piece.len() != piece_len || !verify_piece(meta, piece_index, &piece) {
+        return Err(CoreError::Internal(format!(
+            "webseed piece {piece_index} hash mismatch"
+        )));
+    }
     Ok(piece)
 }
 
@@ -390,21 +378,6 @@ pub(super) fn webseed_file_url(
         }
     }
     Ok(url.to_string())
-}
-
-pub(super) fn file_absolute_start(meta: &TorrentMeta, file_index: usize) -> Result<u64> {
-    if file_index >= meta.files.len() {
-        return Err(CoreError::Internal(format!(
-            "file index {file_index} out of range"
-        )));
-    }
-    meta.files
-        .iter()
-        .take(file_index)
-        .try_fold(0u64, |acc, file| {
-            acc.checked_add(file.length)
-                .ok_or_else(|| CoreError::Internal("torrent file offset overflow".into()))
-        })
 }
 
 pub(super) fn piece_length_for_meta(meta: &TorrentMeta, piece_index: usize) -> u64 {

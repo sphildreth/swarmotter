@@ -7,6 +7,40 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [3.1.0] - [2026-11-22]
+
+### Added
+
+- RSS subscriptions accept Atom 1.0 magnet and torrent enclosures. Public
+  TorrentDownload and LimeTorrents listings can import a same-origin HTTPS
+  detail-page magnet after verifying its info hash against the feed.
+
+### Fixed
+
+- Updated the URL parser to 2.5.9 for RUSTSEC-2026-0592.
+- RSS intake distinguishes detail pages from torrent files on hosts with
+  “torrent” in the name. Scheduled polls keep first-poll `new_only` entries
+  excluded. The upgrade restores that exclusion for older failed entries with
+  a recorded baseline decision.
+
+- Single and bulk removal publish library and queue changes after the SQLite
+  checkpoint succeeds. Payload deletion records a retryable stopped state
+  before unlinking files. SQLite retains ownership of live WAL sidecars across
+  library checkpoints and metadata reads.
+- RSS import defers on unavailable duplicate history, recognizes pending
+  completions throughout the outbox, and retries attachments on unchanged feeds.
+  Reading pending events no longer forces a competing checkpoint during restore.
+  Retention prunes by indexed feed order and skips unchanged idle history.
+- Pure-v2 magnets honor immediate-start file selection. Bandwidth limits
+  accumulate fractional credit. Webseeds verify pieces before counting bytes
+  and retry other mirrors on hash mismatch.
+- Multifile selection and storage use file offsets to avoid repeated full file
+  scans. Paginated library requests share immutable rows and reuse the last
+  page while its inputs remain current.
+- The Compose updater verifies explicitly configured RSS history on external
+  mounts and restores the previous image with its compatible database pair.
+  It archives post-upgrade state and validates the recovered daemon.
+
 ## [3.0.1] - [2026-11-22]
 
 ### Fixed

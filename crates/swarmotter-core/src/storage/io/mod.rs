@@ -32,7 +32,7 @@ use crate::hash::TorrentKey;
 use crate::meta::TorrentMeta;
 use crate::storage::metrics::StorageIoMetrics;
 use crate::storage::resume::{FastResume, PieceBitfield, ResumeFileStamp};
-use crate::storage::{piece_file_ranges, verify_piece};
+use crate::storage::{piece_file_ranges, verify_piece, FileLayout, FileSlice};
 use crate::v2::V2PieceLayout;
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -307,6 +307,8 @@ struct CachedFileHandle {
 #[derive(Clone)]
 pub struct StorageIo {
     meta: Arc<TorrentMeta>,
+    // Immutable metainfo is shared by every reader and writer of this handle.
+    file_layout: Arc<std::sync::OnceLock<Result<FileLayout>>>,
     /// The canonical daemon/durable identity used for fast-resume and path
     /// ownership. This deliberately remains distinct from `meta.info_hash`,
     /// which is zero for pure-v2 metainfo.
@@ -422,6 +424,7 @@ impl StorageIo {
             Arc::new(Mutex::new(WritableHandleCache::default()));
         Self {
             meta,
+            file_layout: Arc::default(),
             torrent_key,
             download_dir: download_dir.into(),
             partial_file_suffix: None,
@@ -902,7 +905,7 @@ impl StorageIo {
                 self.meta.total_length
             )));
         }
-        let slices = byte_ranges_to_file_slices(&self.meta, abs_start, abs_end)?;
+        let slices = self.file_slices(abs_start, abs_end)?;
         let mapped_len = slices.iter().try_fold(0u64, |total, slice| {
             total
                 .checked_add(slice.length)
@@ -932,6 +935,28 @@ impl StorageIo {
             metrics.record_payload_write(data_len);
         }
         Ok(())
+    }
+
+    fn file_slices(&self, start: u64, end: u64) -> Result<Vec<FileSlice>> {
+        if start > end || end > self.meta.total_length {
+            return Err(CoreError::Storage(format!(
+                "byte range {start}..{end} is outside torrent length {}",
+                self.meta.total_length
+            )));
+        }
+        let layout = self
+            .file_layout
+            .get_or_init(|| FileLayout::from_meta(&self.meta));
+        layout
+            .as_ref()
+            .map(|layout| layout.slices(start, end))
+            .map_err(|error| CoreError::Storage(error.to_string()))
+    }
+
+    /// Map a v1 piece to ordered byte slices using this handle's shared index.
+    pub fn piece_file_slices(&self, piece_index: usize) -> Result<Vec<FileSlice>> {
+        let (start, end) = self.piece_range(piece_index)?;
+        self.file_slices(start, end)
     }
 
     fn piece_range(&self, piece_index: usize) -> Result<(u64, u64)> {
@@ -992,7 +1017,7 @@ impl StorageIo {
                 "piece {piece_index} out of range"
             )));
         };
-        let slices = byte_ranges_to_file_slices(&self.meta, start, end)?;
+        let slices = self.file_slices(start, end)?;
         self.flush_writable_file_slices(&slices).await?;
         let mut out = Vec::with_capacity((end - start) as usize);
         for slice in slices {
@@ -1059,7 +1084,7 @@ impl StorageIo {
         length: usize,
     ) -> Result<Vec<u8>> {
         let (abs_start, abs_end) = self.checked_piece_range(piece_index, offset, length)?;
-        let slices = byte_ranges_to_file_slices(&self.meta, abs_start, abs_end)?;
+        let slices = self.file_slices(abs_start, abs_end)?;
         self.flush_writable_file_slices(&slices).await?;
         let mut out = Vec::with_capacity(length);
         for slice in slices {
@@ -1319,7 +1344,7 @@ impl StorageIo {
                 "BEP 52 storage read {offset}..{end} exceeds file {file_index} length {file_length}"
             )));
         }
-        self.flush_writable_file_slices(&[FileSliceRange {
+        self.flush_writable_file_slices(&[FileSlice {
             file_index,
             offset_in_file: offset,
             length: length_u64,
@@ -1362,7 +1387,7 @@ impl StorageIo {
         out
     }
 
-    async fn flush_writable_file_slices(&self, slices: &[FileSliceRange]) -> Result<()> {
+    async fn flush_writable_file_slices(&self, slices: &[FileSlice]) -> Result<()> {
         let indices: Vec<usize> = slices.iter().map(|slice| slice.file_index).collect();
         let handles = self.collect_writable_handles_for(&indices).await;
         for file in handles {
@@ -1883,48 +1908,6 @@ impl StorageIo {
         }
         Ok(())
     }
-}
-
-/// A file slice within a piece, with absolute file index and offset.
-#[derive(Debug, Clone, Copy)]
-struct FileSliceRange {
-    file_index: usize,
-    offset_in_file: u64,
-    length: u64,
-}
-
-/// Map an absolute byte range `[start, end)` within the torrent to the file
-/// slices it covers. This is the storage equivalent of
-/// [`crate::storage::piece_file_ranges`] generalized to arbitrary ranges.
-fn byte_ranges_to_file_slices(
-    meta: &TorrentMeta,
-    start: u64,
-    end: u64,
-) -> Result<Vec<FileSliceRange>> {
-    if start > end || end > meta.total_length {
-        return Err(CoreError::Storage(format!(
-            "byte range {start}..{end} is outside torrent length {}",
-            meta.total_length
-        )));
-    }
-    let mut out = Vec::new();
-    let mut offset = 0u64;
-    for (i, file) in meta.files.iter().enumerate() {
-        let file_end = offset.checked_add(file.length).ok_or_else(|| {
-            CoreError::Storage(format!("file layout overflows at file index {i}"))
-        })?;
-        if file_end > start && offset < end {
-            let slice_start = offset.max(start) - offset;
-            let slice_end = file_end.min(end) - offset;
-            out.push(FileSliceRange {
-                file_index: i,
-                offset_in_file: slice_start,
-                length: slice_end - slice_start,
-            });
-        }
-        offset = file_end;
-    }
-    Ok(out)
 }
 
 /// Join a base directory with a file's path components, guarding against path
