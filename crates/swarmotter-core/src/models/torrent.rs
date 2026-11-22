@@ -234,6 +234,9 @@ pub struct TorrentSummary {
     pub pause_reason: Option<PauseReason>,
     /// Last terminal/runtime error associated with this torrent, if any.
     pub error: Option<String>,
+    /// True until a magnet has resolved the metadata defining its payload size.
+    #[serde(default)]
+    pub needs_metadata: bool,
     pub total_length: u64,
     pub bytes_completed: u64,
     pub uploaded: u64,

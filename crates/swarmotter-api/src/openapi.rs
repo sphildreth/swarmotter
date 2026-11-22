@@ -1375,6 +1375,7 @@ fn components() -> Value {
                     "state": { "type": "string" },
                     "error": { "type": ["string", "null"] },
                     "total_length": { "type": "integer" },
+                    "needs_metadata": { "type": "boolean", "description": "True while the payload size is unknown." },
                     "bytes_completed": { "type": "integer" },
                     "uploaded": { "type": "integer" },
                     "downloaded": { "type": "integer" },

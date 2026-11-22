@@ -7,6 +7,12 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [3.2.0] - [2026-11-22]
+
+### Changed
+
+- The Torrents grid shows total size beside the name. Click Size once for largest first across the filtered library or again for smallest first. Magnets awaiting metadata appear last and show Pending. The native torrent summary exposes `needs_metadata` for clients displaying size.
+
 ## [3.1.1] - [2026-11-22]
 
 ### Changed
