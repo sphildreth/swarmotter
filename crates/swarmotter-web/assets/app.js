@@ -3,7 +3,8 @@
 
 import { refreshTelemetry } from "./js/workspace.js";
 import { state } from "./js/state.js";
-import { $, $$, applyTheme, toggleTheme, setThemeRefreshHandler, setLogHandler } from "./js/ui.js";
+import { $, $$, applyTheme, toggleTheme, setThemeRefreshHandler, setLogHandler, showToast, showError } from "./js/ui.js";
+import { api } from "./js/api.js";
 import { pollTorrents, refreshTorrents, refreshTorrentTableTheme, setOpenDetailsHandler, applySavedTorrentQueryView, refreshProfileChoices } from "./js/torrents.js";
 import { openDetails, setRefreshTorrentsHandler } from "./js/details.js";
 import { refreshSettings, setSettingsDependencies } from "./js/settings.js";
@@ -16,7 +17,7 @@ import { refreshIntake } from "./js/intake.js";
 setOpenDetailsHandler(openDetails);
 setRefreshTorrentsHandler(refreshTorrents);
 setSettingsDependencies({ refreshTorrents, refreshLogs, refreshDoctorBadge });
-setEventsDependencies({ refreshSettings });
+setEventsDependencies({ refreshSettings, refreshTorrents });
 setThemeRefreshHandler(refreshTorrentTableTheme);
 setLogHandler(appendLogLine);
 
@@ -44,6 +45,27 @@ function openView(view, activeButton = null) {
 $$(".nav").forEach(button => button.addEventListener("click", () => openView(button.dataset.view, button)));
 const themeToggle = $("#theme-toggle");
 if (themeToggle) themeToggle.addEventListener("click", toggleTheme);
+
+const sessionToggle = $("#session-toggle");
+if (sessionToggle) sessionToggle.addEventListener("click", async () => {
+  const currentlyPaused = sessionToggle.getAttribute("aria-pressed") === "true";
+  const paused = !currentlyPaused;
+  sessionToggle.disabled = true;
+  try {
+    await api("/session", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ paused }),
+    });
+    await Promise.all([refreshTelemetry(), refreshTorrents()]);
+    showToast(paused ? "All traffic paused" : "All traffic resumed",
+      paused ? "Downloads, uploads, and metadata fetches are stopped." : "Queue and seeding policy resumed.", "info");
+  } catch (error) {
+    showError("Session control failed", error);
+  } finally {
+    sessionToggle.disabled = false;
+  }
+});
 
 (async function init() {
   applyTheme(state.currentTheme, { persist: false });

@@ -7,6 +7,17 @@ This file records notable project changes. It follows the
 All notable changes are recorded by capability and acceptance criteria, not by
 date or duration estimates.
 
+## [3.3.0] - [2026-11-24]
+
+### Added
+
+- A durable master traffic switch (`GET`/`PUT /api/v1/session`,
+  `swarmotterctl pause-all`/`resume-all`, and the Web UI Pause all/Resume all
+  control). While active it stops every downloader, metadata fetch, seeder, DHT
+  lookup, and inbound peer listener and prevents new transfer work, including
+  start-now bypass. It survives restart, reports as `stats.session_paused`, and
+  leaves per-torrent pause reasons unchanged.
+
 ## [3.2.0] - [2026-11-22]
 
 ### Changed

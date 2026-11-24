@@ -52,6 +52,10 @@ pub struct GlobalStats {
     pub total_uploaded: u64,
     pub free_space: Option<u64>,
     pub uptime_seconds: u64,
+    /// True while the master traffic switch has stopped all download and
+    /// upload activity. Individual torrent `paused` states are unchanged.
+    #[serde(default)]
+    pub session_paused: bool,
     #[serde(default)]
     pub scheduler: SchedulerDiagnostics,
 }

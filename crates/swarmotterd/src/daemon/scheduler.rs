@@ -215,6 +215,12 @@ impl DaemonRuntime {
         let reg = self.registry.lock().await;
         let mut queue = self.queue.lock().await;
         queue.limits = cfg.queue.clone();
+        if queue.is_paused() {
+            // The master switch outranks queue order, start-now bypass, and
+            // retry state. No downloader or metadata-fetch engine may start
+            // until it is explicitly cleared.
+            return Vec::new();
+        }
         let now = Instant::now();
         let stale_queue_entries = queue
             .order
@@ -707,6 +713,12 @@ impl DaemonRuntime {
     /// This is used only by serialized reconstruction transactions so normal
     /// API/queue starts cannot interleave with a partially rebuilt live set.
     pub(super) async fn start_engine_while_transition_locked(&self, hash: TorrentKey) {
+        if self.queue.lock().await.is_paused() {
+            // A concurrent master-pause transition owns the stop path. Never
+            // start an engine after the switch becomes durable, including for
+            // start-now bypass work and containment recovery.
+            return;
+        }
         let health = self.network_health.read().await.clone();
         if !health.traffic_allowed && health.mode != NetworkContainmentMode::Disabled {
             // Network blocked: do not start the engine; mark torrent.
@@ -1486,6 +1498,7 @@ impl DaemonRuntime {
         {
             let mut queue = self.queue.lock().await;
             queue.clear();
+            queue.set_paused(false);
         }
         self.engine_states.write().await.clear();
         self.engine_cmds.lock().await.clear();

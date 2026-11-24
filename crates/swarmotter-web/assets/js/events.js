@@ -2,7 +2,7 @@
 
 import { addLog, replaceLogTail, logTailRevision, setConnection, hasLogSnapshot, showLogView } from "./log-explorer.js";
 import { updateWatchMetrics } from "../rss.js";
-import { badge, glyph, metric, titleCase, selectPanel, setText } from "./workspace.js";
+import { badge, glyph, metric, titleCase, selectPanel, setText, refreshTelemetry } from "./workspace.js";
 import { state, TORRENT_QUERY_STORAGE_KEY, TORRENT_DEFAULT_PER_PAGE, TORRENT_MAX_PER_PAGE, TORRENT_SORT_OPTIONS, TORRENT_TABLE_TO_QUERY_SORT, TORRENT_QUERY_TO_TABLE_SORT, TORRENT_ACTIONS, EVENT_KINDS, MAX_LOG_LINES, watchHistoryUi } from "./state.js";
 import * as ui from "./ui.js";
 import * as requests from "./api.js";
@@ -442,6 +442,10 @@ export function appendEventLine(kind, raw) {
   if (kind === "daemon_health_changed") refreshDoctorBadge();
   if ((kind === "network_status_changed" || kind === "port_mapping_changed" || kind === "port_test_changed") && !$("#view-network").classList.contains("hidden")) refreshNetwork();
   if ((kind === "watch_folder_imported" || kind === "watch_folder_failed") && !$("#view-watch").classList.contains("hidden")) refreshWatch();
+  if (kind === "session_changed") {
+    refreshTelemetry();
+    eventsDependencies.refreshTorrents?.();
+  }
   if (kind === "settings_changed" && !$("#view-settings").classList.contains("hidden")) eventsDependencies.refreshSettings();
 }
 

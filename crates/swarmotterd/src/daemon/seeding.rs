@@ -25,6 +25,11 @@ impl DaemonRuntime {
         complete_dir: String,
         state: Arc<Mutex<EngineState>>,
     ) -> Result<()> {
+        if self.queue.lock().await.is_paused() {
+            // The master switch prohibits starting any seeder, including
+            // containment recovery and creation-time seeding.
+            return Ok(());
+        }
         let _lifecycle = self.seeder_lifecycle_lock.lock().await;
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         {
@@ -1007,6 +1012,7 @@ impl DaemonRuntime {
         let now_secs = now();
         let cfg = self.config.read().await.clone();
         let seeding_limit = cfg.queue.max_active_seeds;
+        let globally_paused = self.queue.lock().await.is_paused();
         let samples = self.rate_samples.read().await.clone();
         let mut running_seeders = {
             let _lifecycle = self.seeder_lifecycle_lock.lock().await;
@@ -1050,6 +1056,7 @@ impl DaemonRuntime {
             let status = automatic_seeding_status(torrent, &cfg, idle_seconds);
             desired_status.insert(*hash, status);
             if status == SeedingStatus::Queued
+                && !globally_paused
                 && (seeding_limit == 0 || allowed.len() < seeding_limit)
             {
                 allowed.push(*hash);

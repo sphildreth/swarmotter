@@ -1961,6 +1961,31 @@ async fn stats_endpoint() {
 }
 
 #[tokio::test]
+async fn session_master_pause_switch_round_trips() {
+    let (state, daemon) = fake_daemon::fake_state_with_config_and_daemon(Config::default());
+    let app = swarmotter_api::app_router(state);
+
+    let (status, initial) = get_json(&app, "/api/v1/session").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(initial["data"]["paused"], false);
+
+    let (status, updated) = put_raw(&app, "/api/v1/session", r#"{"paused":true}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(updated["data"]["paused"], true);
+    assert!(daemon.session_paused().await);
+
+    let (_, current) = get_json(&app, "/api/v1/session").await;
+    assert_eq!(current["data"]["paused"], true);
+    let (_, stats) = get_json(&app, "/api/v1/stats").await;
+    assert_eq!(stats["data"]["session_paused"], true);
+
+    let (status, resumed) = put_raw(&app, "/api/v1/session", r#"{"paused":false}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(resumed["data"]["paused"], false);
+    assert!(!daemon.session_paused().await);
+}
+
+#[tokio::test]
 async fn duplicate_torrent_returns_conflict() {
     let state = fake_daemon::fake_state();
     let app = swarmotter_api::app_router(state);

@@ -186,6 +186,27 @@ header nav .nav.active {
 .header-actions {
   gap: 10px;
 }
+header #session-toggle {
+  height: 29px;
+  padding: 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--fg);
+}
+header #session-toggle:hover {
+  background: var(--button-ghost-bg);
+}
+header #session-toggle[aria-pressed="true"] {
+  background: var(--warning);
+  border-color: var(--warning);
+  color: var(--text-on-warning);
+}
+body.session-paused #telemetry {
+  border-color: var(--warning);
+}
 header #theme-toggle {
   width: 34px;
   height: 32px;

@@ -337,6 +337,11 @@ fn api_v1_router(state: SharedState, max_request_body_bytes: usize) -> Router<Sh
             "/torrents/{hash}/queue/move-bottom",
             post(handlers::queue::move_bottom),
         )
+        // Master session traffic switch
+        .route(
+            "/session",
+            get(handlers::session::get_session).put(handlers::session::set_session),
+        )
         // Settings
         .route(
             "/settings",

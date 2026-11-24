@@ -78,6 +78,7 @@ export const EVENT_KINDS = [
   "port_test_changed",
   "watch_folder_imported",
   "watch_folder_failed",
+  "session_changed",
   "settings_changed",
   "daemon_health_changed",
 ];

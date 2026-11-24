@@ -188,7 +188,8 @@ large-library diagnostics. Scheduler fields include managed and queued torrent
 counts, running engine counts, requested and granted download/metadata slots,
 retry-backoff counts, active queue limits, peer-worker budget fields, and
 boolean saturation flags for download slots, metadata fetch slots, and peer
-worker budget.
+worker budget. `session_paused` reports whether the master traffic switch is
+active; it is independent of per-torrent `paused` counts.
 
 The authoritative process-wide peer-session fields are:
 
@@ -702,6 +703,20 @@ successful replacement. It also reports any fail-closed loading detail.
 | POST | `/torrents/:hash/queue/move-top` | Move to top. |
 | POST | `/torrents/:hash/queue/move-bottom` | Move to bottom. |
 
+## Master session traffic switch
+
+| Method | Path | Description |
+| --- | --- | --- |
+| GET | `/session` | Read `{ "paused": boolean }`. |
+| PUT | `/session` | Set `{ "paused": boolean }` and return the committed state. |
+
+While `paused` is true, the daemon force-stops every downloader, magnet
+metadata fetch, seeder, DHT lookup, and shared inbound peer listener. Queue and
+seeding reconciliation do not admit new transfer work, including start-now
+bypass requests and containment recovery. Per-torrent operator pauses and their
+`pause_reason` values are unchanged. The switch is stored in the durable queue
+generation, so a restart remains paused until it is explicitly cleared.
+
 ## Settings
 
 | Method | Path | Description |
@@ -969,7 +984,9 @@ Current event kinds include `torrent_added`, `torrent_changed`,
 `torrent_completed`, `torrent_files_changed`, `torrent_trackers_changed`,
 `torrent_peers_changed`, `stats_updated`, `network_status_changed`,
 `port_mapping_changed`, `port_test_changed`, `watch_folder_imported`,
-`watch_folder_failed`, `settings_changed`, and `daemon_health_changed`.
+`watch_folder_failed`, `session_changed`, `settings_changed`, and
+`daemon_health_changed`. `session_changed` carries `{ "paused": boolean }` for
+the master traffic switch.
 
 `watch_folder_imported` covers both `imported` and successful `duplicate`.
 `watch_folder_failed` covers permanent and transient attempts. Their payloads

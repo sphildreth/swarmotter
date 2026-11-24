@@ -1598,6 +1598,14 @@ impl DaemonOps for DaemonRuntime {
         self.persist_state().await
     }
 
+    async fn session_paused(&self) -> bool {
+        self.session_pause_state().await
+    }
+
+    async fn set_session_paused(&self, paused: bool) -> Result<()> {
+        self.set_session_pause_state(paused).await
+    }
+
     async fn get_config(&self) -> Config {
         self.config.read().await.clone()
     }
@@ -2386,6 +2394,7 @@ impl DaemonOps for DaemonRuntime {
     }
 
     async fn global_stats(&self) -> GlobalStats {
+        let session_paused = self.queue.lock().await.is_paused();
         let desired = self.desired_download_hashes().await;
         let scheduler = self.scheduler_diagnostics(&desired).await;
         let _lifecycle = self.seeder_lifecycle_lock.lock().await;
@@ -2423,6 +2432,7 @@ impl DaemonOps for DaemonRuntime {
             paused,
             total_downloaded,
             total_uploaded,
+            session_paused,
             scheduler,
             ..Default::default()
         }

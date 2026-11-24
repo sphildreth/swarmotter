@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use swarmotter_core::autopilot::{AutopilotAnalyzer, AutopilotConfig, AutopilotMode};
 use swarmotter_core::config::{Config, PeerEncryptionMode, StartBehavior};
@@ -52,6 +53,7 @@ pub struct FakeDaemon {
     /// guard must reject an unsafe browser request before this list changes.
     pub calls: Arc<Mutex<Vec<&'static str>>>,
     pub watch_imports: Arc<Mutex<Vec<ImportResult>>>,
+    session_paused: Arc<AtomicBool>,
     #[allow(dead_code)]
     pub events: Arc<Mutex<Vec<String>>>,
 }
@@ -73,6 +75,7 @@ impl FakeDaemon {
             config: Arc::new(Mutex::new(config)),
             health: Arc::new(Mutex::new(health)),
             calls: Arc::new(Mutex::new(Vec::new())),
+            session_paused: Arc::new(AtomicBool::new(false)),
             events: Arc::new(Mutex::new(Vec::new())),
             watch_imports: Arc::new(Mutex::new(Vec::new())),
         }
@@ -1025,10 +1028,19 @@ impl swarmotter_api::state::DaemonOps for FakeDaemon {
             truncated: false,
         }
     }
+    async fn session_paused(&self) -> bool {
+        self.session_paused.load(Ordering::Acquire)
+    }
+    async fn set_session_paused(&self, paused: bool) -> Result<()> {
+        self.record_call("set_session_paused").await;
+        self.session_paused.store(paused, Ordering::Release);
+        Ok(())
+    }
     async fn global_stats(&self) -> GlobalStats {
         let reg = self.registry.lock().await;
         GlobalStats {
             torrent_count: reg.torrents.len(),
+            session_paused: self.session_paused.load(Ordering::Acquire),
             ..Default::default()
         }
     }

@@ -342,6 +342,7 @@ fn queue_fingerprint(queue: &QueueState<TorrentKey>) -> u64 {
     hash.update(&queue.limits.max_active_downloads.to_le_bytes());
     hash.update(&queue.limits.max_active_seeds.to_le_bytes());
     hash.update(&queue.limits.max_active_metadata_fetches.to_le_bytes());
+    hash.update(&[u8::from(queue.is_paused())]);
     hash.finish()
 }
 

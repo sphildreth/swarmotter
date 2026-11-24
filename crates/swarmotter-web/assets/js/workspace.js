@@ -88,6 +88,19 @@ function drawRates() {
   chart.innerHTML = `<div class="axis-y">${[scale, (scale * 2) / 3, scale / 3, 0].map((n) => `<span>${n} MiB/s</span>`).join("")}</div><svg viewBox="0 0 900 170" preserveAspectRatio="none" aria-label="Download and upload over the last 15 minutes"><defs><linearGradient id="throughput-fill" x2="0" y2="1"><stop stop-color="var(--accent)" stop-opacity=".26"/><stop offset="1" stop-color="var(--accent)" stop-opacity="0"/></linearGradient></defs><polygon fill="url(#throughput-fill)" points="${series[0].split(" ")[0].split(",")[0]},170 ${series[0]} 900,170"/>${series.map((line, i) => `<polyline fill="none" stroke="${i ? "var(--purple)" : "var(--accent)"}" stroke-width="${i ? 2 : 3}" points="${line}"/>`).join("")}</svg>`;
 }
 
+export function renderSessionControl(paused) {
+  const button = $("#session-toggle");
+  if (!button) return;
+  const active = Boolean(paused);
+  button.dataset.paused = String(active);
+  button.setAttribute("aria-pressed", String(active));
+  button.textContent = active ? "Resume all" : "Pause all";
+  button.title = active
+    ? "All download and upload activity is paused. Click to resume."
+    : "Pause all download and upload activity";
+  document.body.classList.toggle("session-paused", active);
+}
+
 export function refreshTelemetry() {
   if (pending) return pending;
   const signal = AbortSignal.timeout(12000);
@@ -98,6 +111,7 @@ export function refreshTelemetry() {
   pending = Promise.all([
     api("/stats", { signal })
       .then((stats) => {
+        renderSessionControl(stats.session_paused);
         for (const [id, value] of Object.entries({
           count: stats.torrent_count,
           downloads: stats.active_downloads,

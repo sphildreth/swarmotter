@@ -227,6 +227,15 @@ to avoid blocking each other indefinitely. Separate accesses release their
 guards before acquiring the other lock; persistence releases both before
 serialization and database writes.
 
+The queue generation also carries the durable master traffic switch. Activating
+it stops every live downloader, metadata fetch, seeder, DHT lookup, and shared
+inbound listener under the data-plane transition lock, marks affected records
+queued/completed, and persists before the lock is released. Downloader and
+seeder admission check the same flag, so queue reconciliation, start-now
+bypass, and containment recovery cannot reintroduce traffic until an explicit
+unpause persists first and then reconciles the queue. See
+[ADR-0090](adr/0090-durable-master-traffic-switch.md).
+
 Paginated library queries share an immutable snapshot. Record mutations
 invalidate the changed rows. Changes to queue order or inherited seeding policy
 invalidate the associated projections. Filtering and sorting run after releasing

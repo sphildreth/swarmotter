@@ -7,7 +7,7 @@
 //! `torrent_metadata_received`, `torrent_completed`, `torrent_files_changed`,
 //! `torrent_trackers_changed`, `torrent_peers_changed`, `stats_updated`,
 //! `network_status_changed`, `watch_folder_imported`, `watch_folder_failed`,
-//! `settings_changed`, `daemon_health_changed`.
+//! `session_changed`, `settings_changed`, `daemon_health_changed`.
 //!
 //! Clients subscribe via `/api/v1/events` (SSE) or `/api/v1/ws` (WebSocket)
 //! and may filter to a specific torrent via `?info_hash=<hex>`.

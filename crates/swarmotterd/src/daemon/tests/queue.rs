@@ -433,3 +433,115 @@ async fn paginated_queries_reuse_rows_and_follow_mutations_queue_and_policy() {
     runtime.registry.lock().await.remove(&keys[1]);
     assert_eq!(runtime.query_torrent_page(query).await.total, 1);
 }
+
+#[tokio::test]
+async fn master_pause_stops_all_transfer_and_survives_restore() {
+    let root = unique_dir("master-pause");
+    let state_path = root.join("state.sqlite");
+    let mut cfg = Config::default();
+    cfg.network.mode = NetworkContainmentMode::Disabled;
+    cfg.storage.download_dir = Some(root.display().to_string());
+    cfg.torrent.listen_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    cfg.queue.max_active_seeds = 0;
+    cfg.queue.auto_start = false;
+    cfg.dht.enabled = false;
+    cfg.pex.enabled = false;
+    cfg.seeding.global_ratio_limit = None;
+    cfg.seeding.global_idle_limit = None;
+    let mut health = NetworkHealth::blocked(
+        NetworkContainmentMode::Disabled,
+        swarmotter_core::models::network::NetworkContainmentStatus::Disabled,
+        "disabled",
+    );
+    health.traffic_allowed = true;
+
+    let runtime = DaemonRuntime::with_paths_broker_and_state(
+        cfg.clone(),
+        health.clone(),
+        None,
+        None,
+        Some(state_path.clone()),
+        EventBroker::default(),
+    );
+    let (seeded, _) = add_complete_seed_fixture(&runtime, "seed.bin", b"seed payload").await;
+    runtime.reconcile_seeders().await;
+    assert!(
+        runtime.seeder_registry.contains(&seeded).await,
+        "fixture seeder must be live before the master pause"
+    );
+
+    let bytes = swarmotter_core::meta::build_single_file_torrent(
+        "download.bin",
+        b"download payload",
+        8,
+        None,
+        false,
+    );
+    let download = runtime.add_torrent_file(bytes, None).await.unwrap();
+    runtime.queue.lock().await.start_now(&download);
+    assert_eq!(runtime.desired_download_hashes().await, vec![download]);
+
+    runtime.set_session_paused(true).await.unwrap();
+    assert!(runtime.session_paused().await);
+    assert!(runtime.desired_download_hashes().await.is_empty());
+    assert!(runtime.engine_handles_empty().await);
+    assert!(runtime.seeder_registries_empty().await);
+    assert_eq!(
+        runtime
+            .registry
+            .lock()
+            .await
+            .get(&seeded)
+            .map(|torrent| torrent.state),
+        Some(TorrentState::Completed)
+    );
+    assert_eq!(
+        runtime
+            .registry
+            .lock()
+            .await
+            .get(&download)
+            .map(|torrent| torrent.state),
+        Some(TorrentState::Queued)
+    );
+    assert_eq!(
+        runtime
+            .registry
+            .lock()
+            .await
+            .get(&seeded)
+            .map(|torrent| (torrent.state, torrent.seeding_status)),
+        Some((TorrentState::Completed, SeedingStatus::Queued))
+    );
+
+    // A start-now request must not bypass the master switch.
+    runtime.start_now(&download).await.unwrap();
+    assert!(runtime.desired_download_hashes().await.is_empty());
+    assert!(!runtime.engine_running_for_key_for_test(download).await);
+
+    drop(runtime);
+
+    let restarted = DaemonRuntime::with_paths_broker_and_state(
+        cfg,
+        health,
+        None,
+        None,
+        Some(state_path),
+        EventBroker::default(),
+    );
+    assert_eq!(restarted.restore_persisted_state().await.unwrap(), 2);
+    assert!(restarted.session_paused().await);
+    assert!(restarted.desired_download_hashes().await.is_empty());
+    assert!(restarted.engine_handles_empty().await);
+    assert!(restarted.seeder_registries_empty().await);
+    let stats = restarted.global_stats().await;
+    assert!(stats.session_paused);
+    assert_eq!(stats.active_downloads, 0);
+    assert_eq!(stats.active_seeds, 0);
+
+    restarted.set_session_paused(false).await.unwrap();
+    assert!(!restarted.session_paused().await);
+}

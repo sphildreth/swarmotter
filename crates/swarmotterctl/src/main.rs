@@ -86,6 +86,10 @@ enum Command {
     Pause { hash: String },
     /// Resume one torrent.
     Resume { hash: String },
+    /// Pause all download and upload activity (master traffic switch).
+    PauseAll,
+    /// Clear the master traffic switch and resume queue/seeding policy.
+    ResumeAll,
     /// Start one torrent now, bypassing queue admission.
     Start { hash: String },
     /// Stop one torrent.
@@ -226,6 +230,15 @@ impl ApiClient {
 
     async fn get(&self, path: &str) -> Result<Value, CliError> {
         self.request_json(Method::GET, path, None, None).await
+    }
+
+    async fn put(&self, path: &str, body: Option<Value>) -> Result<Value, CliError> {
+        let bytes = body
+            .map(|value| serde_json::to_vec(&value))
+            .transpose()
+            .map_err(|error| CliError::Usage(format!("encode request JSON: {error}")))?;
+        self.request_json(Method::PUT, path, bytes, Some("application/json"))
+            .await
     }
 
     async fn post(&self, path: &str, body: Option<Value>) -> Result<Value, CliError> {
@@ -515,6 +528,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Health { .. } => "health",
         Command::Pause { .. } => "pause",
         Command::Resume { .. } => "resume",
+        Command::PauseAll => "pause-all",
+        Command::ResumeAll => "resume-all",
         Command::Start { .. } => "start",
         Command::Stop { .. } => "stop",
         Command::Remove { .. } => "remove",
@@ -561,6 +576,8 @@ async fn execute(cli: Cli) -> Result<CommandOutput, CliError> {
         Command::Health { hash } => health(&client, hash.as_deref()).await,
         Command::Pause { hash } => action(&client, &hash, "pause", "paused").await,
         Command::Resume { hash } => action(&client, &hash, "resume", "resumed").await,
+        Command::PauseAll => session(&client, true).await,
+        Command::ResumeAll => session(&client, false).await,
         Command::Start { hash } => action(&client, &hash, "start", "started").await,
         Command::Stop { hash } => action(&client, &hash, "stop", "stopped").await,
         Command::Remove { hash, delete_data } => remove(&client, &hash, delete_data).await,
@@ -922,6 +939,21 @@ async fn action(
         command: action,
         data: json!({ "info_hash": hash, "action": action }),
         human: format!("{human}: {hash}"),
+    })
+}
+
+async fn session(client: &ApiClient, paused: bool) -> Result<CommandOutput, CliError> {
+    let data = client
+        .put("/api/v1/session", Some(json!({ "paused": paused })))
+        .await?;
+    Ok(CommandOutput {
+        command: if paused { "pause-all" } else { "resume-all" },
+        data,
+        human: if paused {
+            "all download and upload activity paused".to_string()
+        } else {
+            "master traffic switch cleared".to_string()
+        },
     })
 }
 
