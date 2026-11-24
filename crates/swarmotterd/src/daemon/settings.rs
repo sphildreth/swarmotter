@@ -321,6 +321,9 @@ impl DaemonRuntime {
     }
 
     pub(super) async fn eligible_seeder_hashes(&self) -> HashSet<TorrentKey> {
+        if self.queue.lock().await.is_paused() {
+            return HashSet::new();
+        }
         let cfg = self.config.read().await.clone();
         let samples = self.rate_samples.read().await.clone();
         let completed = self

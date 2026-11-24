@@ -61,6 +61,12 @@ ADR-0009 and ADR-0010.
   libraries should use `GET /api/v1/torrents/query` for explicit filtering,
   sorting, pagination, counts, and grouping without changing the legacy
   response shape; see ADR-0036.
+- `GET /api/v1/session` and `PUT /api/v1/session` expose a durable master
+  traffic switch (`{ "paused": boolean }`). While active, no downloader,
+  metadata fetch, seeder, DHT lookup, or shared inbound peer listener may run,
+  and start-now bypass cannot override it. The switch is persisted with the
+  queue generation and never changes per-torrent `pause_reason` attribution;
+  `GET /api/v1/stats` reports it as `session_paused` (ADR-0090).
 - `GET /api/v1/stats` includes scheduler diagnostics for large libraries:
   configured active caps, requested and granted download/metadata slots,
   running engine counts, retry-backoff counts, peer-worker budget, and

@@ -26,6 +26,7 @@ mod provenance;
 mod rss_runtime;
 mod scheduler;
 mod seeding;
+mod session;
 mod settings;
 mod storage_controls;
 mod tracker_ops;

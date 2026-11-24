@@ -67,6 +67,8 @@ swarmotterctl health <locator>
 # Operate
 swarmotterctl pause <locator>
 swarmotterctl resume <locator>
+swarmotterctl pause-all
+swarmotterctl resume-all
 swarmotterctl stop <locator>
 swarmotterctl recheck <locator>
 swarmotterctl reannounce <locator>
@@ -77,6 +79,12 @@ swarmotterctl remove <locator> --delete-data
 Locators are the API's full 40-character v1/hybrid-primary or 64-character
 pure-v2 values. The daemon owns all lifecycle semantics; an existing paused or
 queued torrent behaves exactly as it does through the API/Web UI.
+
+`pause-all` activates the durable master traffic switch. It stops every
+downloader, metadata fetch, seeder, DHT lookup, and shared inbound peer
+listener, and prevents new transfer work from starting, including start-now
+requests. `resume-all` clears the switch and reconciles queue and seeding
+policy. Both commands are equivalent to `PUT /api/v1/session`.
 
 Lists use the server-side query endpoint. `--page` and `--per-page` request one
 page (maximum 500). `--all` fetches every server page and combines the rows for

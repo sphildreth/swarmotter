@@ -525,6 +525,12 @@ const ROUTES: &[RouteDoc] = &[
         gated: true,
     },
     RouteDoc {
+        path: "/api/v1/session",
+        methods: &["GET", "PUT"],
+        tag: "System",
+        gated: true,
+    },
+    RouteDoc {
         path: "/api/v1/settings",
         methods: &["GET", "PATCH", "PUT"],
         tag: "Configuration",
@@ -865,6 +871,9 @@ fn description(path: &str, method: &str) -> String {
         "/api/v1/torrents/export" => {
             "Authenticated tar archive of retained original .torrent documents with a per-item manifest. Missing originals are reported, never reconstructed.".to_string()
         }
+        "/api/v1/session" => {
+            "Read or set the durable master traffic switch. While paused, every downloader, metadata fetch, seeder, DHT lookup, and shared inbound peer listener is stopped and new work is not admitted; per-torrent pause reasons are unchanged.".to_string()
+        }
         "/api/v1/trash/preview" => {
             "Dry-run cleanup preview. No files, queue state, or metainfo are changed.".to_string()
         }
@@ -1074,6 +1083,7 @@ fn request_body(path: &str, method: &str) -> Option<Value> {
             "LimitsRequest",
             json!({ "download_limit": 1048576, "upload_limit": 524288 }),
         ),
+        ("/api/v1/session", "PUT") => json_body("SessionUpdate", json!({ "paused": true })),
         ("/api/v1/trash/preview", "POST") | ("/api/v1/trash/apply", "POST") => json_body(
             "TrashSelectionRequest",
             json!({
@@ -1449,6 +1459,18 @@ fn components() -> Value {
                 "type": "object",
                 "required": ["hashes"],
                 "properties": { "hashes": { "type": "array", "items": { "type": "string" } } },
+                "additionalProperties": false
+            },
+            "SessionState": {
+                "type": "object",
+                "required": ["paused"],
+                "properties": { "paused": { "type": "boolean" } },
+                "additionalProperties": false
+            },
+            "SessionUpdate": {
+                "type": "object",
+                "required": ["paused"],
+                "properties": { "paused": { "type": "boolean" } },
                 "additionalProperties": false
             },
             "TrackerUrlRequest": {

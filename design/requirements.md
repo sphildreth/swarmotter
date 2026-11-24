@@ -113,7 +113,9 @@ time or duration estimates.
   recheck, reannounce, move data, rename path, labels/categories, queue
   position, file priorities, per-torrent limits.
 - **Queueing:** global active download/seed limits, queue order (up/down/top/
-  bottom), start-now/bypass, auto-start behavior, per-torrent paused state.
+  bottom), start-now/bypass, auto-start behavior, per-torrent paused state, and
+  a durable master traffic switch that stops all download, upload, metadata,
+  DHT, and inbound peer activity until explicitly cleared.
 - **Seeding/ratio:** global and persisted per-torrent ratio limits, idle seed
   limits, seed-forever precedence, stop at target, upload/download accounting,
   ratio calculation, and a truthful queued/active/automatic/manual seeding

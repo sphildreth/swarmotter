@@ -104,6 +104,11 @@ pub struct QueueState<K = InfoHash> {
     /// Ordered list of torrent keys (position = index).
     pub order: Vec<K>,
     pub bypass: Vec<K>,
+    /// Master traffic switch. While true, no downloader or seeder task may be
+    /// admitted, including start-now bypass entries. The flag is persisted with
+    /// the queue generation so a restart cannot silently resume traffic.
+    #[serde(default)]
+    pub paused: bool,
 
     #[serde(skip, default)]
     order_revision: u64,
@@ -121,6 +126,7 @@ impl<K> Default for QueueState<K> {
             limits: QueueLimits::default(),
             order: Vec::new(),
             bypass: Vec::new(),
+            paused: false,
             order_revision: 0,
             order_set: HashSet::new(),
             bypass_set: HashSet::new(),
@@ -141,6 +147,8 @@ where
         struct QueueStateSerde<K> {
             #[serde(default)]
             limits: QueueLimits,
+            #[serde(default)]
+            paused: bool,
             order: Option<Vec<K>>,
             bypass: Option<Vec<K>>,
         }
@@ -150,6 +158,7 @@ where
             limits: restored.limits,
             order: restored.order.unwrap_or_default(),
             bypass: restored.bypass.unwrap_or_default(),
+            paused: restored.paused,
             order_revision: 0,
             order_set: HashSet::new(),
             bypass_set: HashSet::new(),
@@ -169,6 +178,7 @@ where
             limits,
             order: Vec::new(),
             bypass: Vec::new(),
+            paused: false,
             order_revision: 0,
             order_set: HashSet::new(),
             bypass_set: HashSet::new(),
@@ -180,6 +190,20 @@ where
 
     pub fn order_revision(&self) -> u64 {
         self.order_revision
+    }
+
+    /// Whether the master traffic switch is currently active.
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Set the master traffic switch. Returns true when the value changed.
+    pub fn set_paused(&mut self, paused: bool) -> bool {
+        if self.paused == paused {
+            return false;
+        }
+        self.paused = paused;
+        true
     }
 
     fn rebuild_membership_sets(&mut self) {
@@ -606,5 +630,23 @@ mod tests {
         assert_eq!(restored.order, vec![first, second]);
         assert_eq!(restored.position(&second), Some(2));
         assert_eq!(restored.active_download_slots()[0], second);
+    }
+
+    #[test]
+    fn master_pause_survives_serde_and_defaults_off_for_legacy_state() {
+        let mut queue: QueueState<TorrentKey> = QueueState::new(QueueLimits::default());
+        queue.add(TorrentKey::v1(h(1)));
+        assert!(queue.set_paused(true));
+        assert!(!queue.set_paused(true));
+
+        let json = serde_json::to_string(&queue).unwrap();
+        let restored: QueueState<TorrentKey> = serde_json::from_str(&json).unwrap();
+        assert!(restored.is_paused());
+
+        let legacy: QueueState<TorrentKey> = serde_json::from_str(
+            "{\"limits\":{\"max_active_downloads\":5,\"max_active_metadata_fetches\":100,\"max_active_seeds\":5,\"auto_start\":true},\"order\":[],\"bypass\":[]}",
+        )
+        .unwrap();
+        assert!(!legacy.is_paused());
     }
 }

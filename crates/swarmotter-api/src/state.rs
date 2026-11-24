@@ -399,6 +399,17 @@ pub trait DaemonOps: Send + Sync + 'static {
     /// Queue: move to bottom.
     async fn queue_move_to_bottom(&self, hash: &TorrentKey) -> Result<()>;
 
+    /// Whether the master traffic switch is active. While active, no
+    /// download, upload, metadata fetch, or inbound peer service may start.
+    async fn session_paused(&self) -> bool {
+        false
+    }
+    /// Set the durable master traffic switch. Implementations must stop all
+    /// live transfer work before returning when activating the switch.
+    async fn set_session_paused(&self, _paused: bool) -> Result<()> {
+        Ok(())
+    }
+
     /// Get the current configuration (read-only view).
     async fn get_config(&self) -> Config;
     /// Update safe runtime settings (bandwidth/queue/seeding limits).

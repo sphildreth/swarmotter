@@ -165,6 +165,9 @@ feature completion and acceptance criteria, not by time estimates.
 - PEX peer discovery behavior.
 - File priority behavior.
 - Queue behavior.
+- Master traffic switch behavior: activation stops live and queued transfer,
+  outranks start-now bypass, survives restart, and clears per-torrent
+  `pause_reason` semantics unchanged.
 - Settings behavior.
 - Native profile/label add, watch, compatibility, detail, and replacement
   routes, including durable storage preservation and explainable effective
